@@ -1,0 +1,16 @@
+# Quark C++ style — matches the code samples in the RFC specs.
+BasedOnStyle: LLVM
+Standard: c++20            # clang-format has no c++23 token yet; c++20 parses our code
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+PointerAlignment: Left
+NamespaceIndentation: None
+FixNamespaceComments: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+BinPackParameters: false
+AlwaysBreakTemplateDeclarations: Yes
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive

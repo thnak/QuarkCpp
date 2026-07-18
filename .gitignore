@@ -1,0 +1,22 @@
+# Build
+/build/
+/build-*/
+*.o
+*.a
+*.so
+*.out
+compile_commands.json
+
+# Sanitizer / profiling artifacts
+*.gcda
+*.gcno
+perf.data*
+callgrind.out.*
+
+# Editor
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

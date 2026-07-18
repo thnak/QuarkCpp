@@ -1,0 +1,195 @@
+# Quark Engine — RFC
+
+Quark is a high-performance **C++ actor engine**. The runtime owns optimization;
+developers express only intent. This repository is the design RFC — a set of
+specification documents, not yet an implementation.
+
+> **Status:** the RFC is now mostly **Accepted for x86-64/Linux** — **25 of 27 specs**
+> plus the overview. The mailbox hot path (001, 002, 003, 015) is proven under
+> [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md); the developer-facing surface
+> (004, 005, 006, 008, 013) under
+> [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)/[008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md)/[010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md);
+> and the surrounding subsystems (009, 011, 012, 014, 017, 018, 020, 021, 022, 027) are Accepted
+> as **design-settled with their load-bearing mechanisms proven by the cited ADRs** and their
+> open questions resolved or deferred. **007 is Accepted (x86-64, core)** via
+> [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) — the D1
+> zero-cost guard core is proven while the grafted `Supervision<Tree>` / `OnRestartAsk<Retry>`
+> / `OnResourceFailure<Degrade>` knobs stay Draft pending re-gating against that guard.
+>
+> The cluster data path is now proven too:
+> [ADR-011](decisions/ADR-011-cluster-relay-and-placement-gate-verification.md) executed the
+> named gates — **FIFO-under-relay CORRECT** promotes **026 → Accepted** and **010 → Accepted
+> (x86-64, core)** (its cross-node backpressure design question is the named residual), and the
+> **Stateless<N> pool** is proven exactly-once + faster than hand-rolled. **025 is now Accepted
+> (x86-64)** too: its Weighted-HRW distribution gate, after ADR-011 caught a real ADR-006
+> formula/threshold defect and ADR-012 exposed a mis-specified band, was re-gated **CORRECT**
+> under a like-for-like preregistered p99-vs-p99 band against an independent multinomial
+> ([ADR-013](decisions/ADR-013-weighted-hrw-distribution-regate-2.md)) — both halves (Stateless
+> + Weighted-distribution) now proven.
+>
+> **027 (Reminders)** is newly **Accepted (x86-64)** via
+> [ADR-017](decisions/ADR-017-durable-reminder-mass-due-scale-gate.md): a `design → debate → prove`
+> loop ran 3 competing designs through red-team + executed C++23, and the winning **SEGSTREAM**
+> durable-reminder design proves the mass-due gate — a 10⁶-at-9 PM wave flattens to `peak == fire_rate`
+> (re-measured from a clean build here) with zero committed-reminder loss across crash
+> ([`reminder_service.hpp`](include/quark/core/reminder_service.hpp) + test + bench + sample 14).
+>
+> **Still Draft (2):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
+> whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
+> Zen4/SPR reference re-baseline and the ARM64 ratio. *Accepted (x86-64)* means the design is
+> settled and backed on the current support target; ARM64 promotion waits on the weak-memory
+> proof ([OpenQuestions.md](OpenQuestions.md)).
+
+## Locked design decisions
+
+These are settled and every spec is written against them:
+
+| Decision | Choice | Consequence |
+|---|---|---|
+| **Language standard** | C++23 | `std::expected` for validation results, coroutines for async handlers, `std::stop_token` for cancellation, `std::pmr` for shard-owned allocators, concepts + deducing-this for the actor API. No RTTI/reflection on the hot path. |
+| **Handler execution** | Hybrid | Handlers are **synchronous by default** (zero-cost, drained inline). An actor opts into **coroutine handlers** (`quark::task<>`) per message type when it does async I/O. |
+| **Intent declaration** | CRTP policy types | Policies are template parameters on the `Actor<Derived, Policies...>` base. Zero-cost, visible at the declaration site, resolved to metadata at startup. **No attributes, no reflection.** |
+| **Portability** | Cross-platform target | Linux, Windows, macOS on x86-64 + ARM64. The core is portable C++23; OS-specific facilities (sockets/event loop, durable file flush, thread affinity/NUMA) sit behind a thin **Platform Abstraction Layer (PAL)** with a per-OS backend. No POSIX-only assumptions leak into subsystem logic. |
+
+There is **no .NET / managed-runtime vocabulary** anywhere in this RFC. Concepts
+that originated in that lineage (attributes, DI containers, service scopes,
+cancellation tokens) are expressed in idiomatic C++ instead — see the glossary.
+
+**Current support phase.** Cross-platform remains the *design* target and the PAL
+keeps OS/arch specifics abstracted — no subsystem logic assumes an OS or a memory
+model. But the hardware on hand is **Linux/x86-64**, so that is the **primary
+supported and verified target for now**. Windows/macOS and ARM64 stay
+*designed-for* behind the PAL and are promoted as hardware — and the weak-memory
+proofs they need ([OpenQuestions.md](OpenQuestions.md)) — become available.
+**Abstract/formal models are how confidence reaches those targets once the Linux
+baseline is stable**, rather than blocking on the hardware: the deterministic
+simulation backend (014) and weak-memory litmus (herd7/GenMC) extend a proof made
+on x86-64 to a weakly-ordered target without one in hand.
+
+## Reading order
+
+| # | Document | Covers | Maturity |
+|---|---|---|---|
+| — | [ActorEngineSpecification.md](ActorEngineSpecification.md) | Vision, principles, core invariants, glossary | **Accepted** (x86-64) |
+| 001 | [001-Actor-Execution-Model.md](001-Actor-Execution-Model.md) | Lifecycle, activation, single-executor invariant, hybrid handlers | **Accepted** (x86-64) |
+| 002 | [002-Scheduler.md](002-Scheduler.md) | Workers, shards, work-stealing, wakeup, fairness | **Accepted** (x86-64) |
+| 003 | [003-Memory.md](003-Memory.md) | Descriptors, payloads, allocators, ownership | **Accepted** (x86-64) |
+| 004 | [004-Resources.md](004-Resources.md) | Resource lifetimes, resolution, message context | **Accepted** (x86-64) |
+| 005 | [005-Developer-Model.md](005-Developer-Model.md) | Actor API, CRTP policies, registration | **Accepted** (x86-64) |
+| 006 | [006-Messaging-and-Addressing.md](006-Messaging-and-Addressing.md) | `ActorRef`, `tell`/`ask`, identity | **Accepted** (x86-64) |
+| 007 | [007-Failure-and-Supervision.md](007-Failure-and-Supervision.md) | Error model, restart/resume/stop/escalate | **Accepted** (x86-64, core) |
+| 008 | [008-Metadata-and-Startup.md](008-Metadata-and-Startup.md) | Discovery, validation, type identity, metadata compilation | **Accepted** (x86-64) |
+| 009 | [009-Observability.md](009-Observability.md) | Metrics, tracing, deadline accounting, dead-letters | **Accepted** (x86-64) |
+| 010 | [010-Distribution.md](010-Distribution.md) | Node placement (HRW), SWIM membership, transport/serialization seams | **Accepted** (x86-64, core) |
+| 011 | [011-Timers-and-Scheduled-Work.md](011-Timers-and-Scheduled-Work.md) | Timing wheel, delayed/periodic sends, deadlines | **Accepted** (x86-64) |
+| 012 | [012-Persistence.md](012-Persistence.md) | Snapshot & event-sourced durability, recovery, fencing | **Accepted** (x86-64) |
+| 013 | [013-Configuration.md](013-Configuration.md) | Policy-vs-config boundary, `EngineConfig`, overrides | **Accepted** (x86-64) |
+| 014 | [014-Testing-Model.md](014-Testing-Model.md) | Deterministic simulation, fault injection, `TestKit` | **Accepted** (x86-64) |
+| 015 | [015-Reentrancy-and-Quiescence.md](015-Reentrancy-and-Quiescence.md) | Reentrancy model, admission control, the quiescence primitive (cross-cutting) | **Accepted** (x86-64) |
+| 016 | [016-Serialization.md](016-Serialization.md) | One `describe` per type; canonical tagged encoding; schema evolution & migrations (cross-cutting) | **Accepted** (x86-64) |
+| 017 | [017-Delivery-Guarantees.md](017-Delivery-Guarantees.md) | At-most/at-least/effectively-once; transactional outbox; partition proof (cross-cutting) | **Accepted** (x86-64) |
+| 018 | [018-Clocks-and-Deadlines.md](018-Clocks-and-Deadlines.md) | Monotonic deadlines; cross-node remaining-duration propagation; inheritance (cross-cutting) | **Accepted** (x86-64) |
+| 019 | [019-Platform-Abstraction-Layer.md](019-Platform-Abstraction-Layer.md) | The single OS seam: event loop, sockets, affinity/NUMA, durable flush, clock; sim backend | Draft |
+| 020 | [020-Security.md](020-Security.md) | Trust model, node identity & admission, transport security, authorization & principal propagation, secrets, at-rest (cross-cutting) | **Accepted** (x86-64) |
+| 021 | [021-Cluster-Formation-and-Lifecycle.md](021-Cluster-Formation-and-Lifecycle.md) | Trust-root bootstrap, discovery/seeds, connection dial & dedup, elastic scale-up/down, drain & fenced hand-off, rolling upgrade (cross-cutting) | **Accepted** (x86-64) |
+| 022 | [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md) | Bounded resources, rate limiting, deadline-aware load shedding, circuit breaking, fair sharing (cross-cutting) | **Accepted** (x86-64) |
+| 023 | [023-Performance-Targets-and-Budgets.md](023-Performance-Targets-and-Budgets.md) | Quantified latency/throughput/footprint budgets, reference machine, benchmark & regression harness (cross-cutting) | Draft |
+| 024 | [024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md) | Inbound stream ingestion: per-stream credit-ring, derived credit, batch drain, backpressure-not-shedding, zero-copy (cross-cutting) | **Accepted** (x86-64) |
+| 025 | [025-Placement-Policies-and-Stateless-Workers.md](025-Placement-Policies-and-Stateless-Workers.md) | Node capabilities, capability/affinity/weighted placement modifiers, stateless worker pools (cross-cutting) | **Accepted** (x86-64) |
+| 026 | [026-Large-Scale-Cluster-Topology.md](026-Large-Scale-Cluster-Topology.md) | Scaling to 10³–10⁴ nodes: VirtualBins O(1) placement, bounded partial-view, DHT-relay; configurable topology/connection/cache axes (cross-cutting) | **Accepted** (x86-64) |
+| 027 | [027-Reminders.md](027-Reminders.md) | Durable, wall-clock, at-least-once scheduled wake-ups on the 012 `Store` seam; SEGSTREAM token-bucket drain flattens mass-due (10⁶-at-9PM) to `peak == fire_rate` (cross-cutting) | **Accepted** (x86-64) |
+
+## Proven decisions (ADRs)
+
+Where a hot-path or safety-critical design choice needs more than argument, it is
+settled by the **design → red-team → prove → judge** loop: competing designs are
+implemented in real C++23, compiled under GCC + Clang, run under ASan/UBSan/TSan,
+and benchmarked (percentiles, not means) before a judge picks a winner. The
+durable records live in [`decisions/`](decisions/):
+
+| ADR | Question | Outcome |
+|---|---|---|
+| [ADR-001](decisions/ADR-001-mailbox-mpsc-hot-path.md) | Mailbox MPSC hot path (round 1) | Superseded by ADR-002 |
+| [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md) | Mailbox MPSC hot path (round 2, post-fix) | **Intrusive Vyukov MPSC** — exchange-published, single-consumer, tombstone-lazy. 8/8 claims proven; binds 001/002/003/015. |
+| [ADR-003](decisions/ADR-003-mailbox-mpsc-hot-path-r3.md) | Mailbox MPSC hot path (round 3, REX challenge) | Winner **unchanged**; challenger rejected. Corrected three load-bearing details now in the specs: `seq_cst` wakeup rendezvous (Dekker), `acq_rel` enqueue, portable compile guard (Clang), packed-CAS cancellation. |
+| [ADR-004](decisions/ADR-004-mailbox-mpsc-hot-path-r4.md) | Mailbox MPSC hot path (round 4, SEG-FAA/REX-CAS challenge) | Winner **unchanged** (4th round). Refinements now in the specs: 48-bit generation (u32 wraps in ~24h @ 50M/s), symmetric store+`seq_cst`-fence+load close-out (48% magnitude corrected to ~0.05–0.09%), tombstone-skips charged to drain budget, stub on its own cache line, claim-CAS-failure→tombstone. |
+| [ADR-005](decisions/ADR-005-inbound-stream-ingestion-hot-path.md) | Inbound stream-ingestion hot path | **StreamChannel** credit-ring — one pre-allocated per-stream SPSC ring, one reusable descriptor per arm-edge (not per frame), derived credit (no shared RMW), split `disp`/`tail` cursors for async-suspend exactly-once. 8/8 proven; 30–57 M frames/s, 0 alloc, 0 drain-RMW. Spec: 024. |
+| [ADR-006](decisions/ADR-006-large-scale-cluster-topology.md) | Large-scale cluster topology | **VirtualBins + Bounded Partial-View + DHT-Relay** — O(1) N-independent placement (5–6 ns), O(log N) sockets/gossip, content-addressed determinism, ≤⌈log₂N⌉ relay hops. Three configurable axes; flat clusters pay nothing. D2 Partitioned kept for >10⁴ nodes. Spec: 026 (FIFO-under-relay is the Draft→Accepted gate). |
+| [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md) | Actor-authoring & handler-dispatch API | **JumpTable-Dispatch** (D1) — dense per-actor `.rodata` jump-table keyed by `consteval slot_of<A,M>` over `using protocol = Protocol<…>`; one indexed indirect call, ≈260 B/actor, no RTTI/vtable, beats the 008 scan and ties a hand-switch (uniform+skew). Async-only `ask` (no `ask_sync`), always-typed `ActorRef<A>`, member-field resources, pooled-`ReplyCell` reply ordering. 27/1 proven/disproven; sync tell p99 62 ns, ask p99 130 ns, 0 alloc. Closes 005/006/001 open questions; binds 004/008/023. |
+| [ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md) | Configuration + activation-lifecycle policy | **Frozen-Core + Hot-Leaf** (D3) — every knob declares an override scope (defaults < engine < node < type < instance, resolved once) and a reconfig class (BuildOnly fail-fast vs Live). Live operational read-set packs into one 8-byte atomic word per `(shard × type_index)`: hot read = single `mov + mask`, 0 RMW, no tear; live publish = single relaxed store (67–73 ns, 0 alloc, can't stall drain). Guarded `add_actor_type<T>()` (incremental Validation + release table swap, pre-sized to `max_types`). Idle deactivation rides the 011 wheel on the actor's own lane. Closes 013/008 open questions; binds 005/011/023. |
+| [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) | Failure, supervision & recovery policy | **Minimal / Assert-Intact** (D1) + D3's proven knobs — zero-cost Itanium `try/catch` handler guard (p99 54.4 ns guarded vs 53.5 ns control, 0 alloc); `Resume` assert-intact by default, opt-in Sequential-only `Transactional<>`; `Supervision<Node|PerType|Tree>` bounded by depth + `escalation_ttl` + 022 rate limiter; `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>` (default Fail); deadline/cancel carved out of the restart decision; `PerMessage` factory failure fails the message (checked pre-handler); EventSourced staging fence. 13/0 proven/disproven. Closes 007/004 open questions; binds 015/012/023. |
+| [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md) | Priority & fairness scheduling policy | **K-band per-shard run-queue** (D1) — `Priority<P>` becomes `std::array<ActivationMpsc, K>` bands; `UniformFIFO` (K=1) default objdumps **byte-identical** to today's single MPSC (zero-cost when uniform). Enqueue = compile-time band subscript on the same `tail_.exchange` (0 added RMW); O(K≤8) relaxed top-band probe. Per-actor mailbox FIFO inviolable; high-band p99 ~316× lower. Anti-starvation is a knob: `RotatingReserve<M>` (default, bound `(d+1)·K·M`) or `WeightedDRR<w…>`. EDF-banding evaluated and deferred (degrades below FIFO under overload). 7/0 proven/disproven. Closes the 002 priority open question; binds 005/011/023. |
+| [ADR-011](decisions/ADR-011-cluster-relay-and-placement-gate-verification.md) | Cluster relay & placement gate verification | **Verification record** (not a redesign). **FIFO-under-relay CORRECT** — path-pinning + drain-boundary promotion holds per-`(S,A)` FIFO across a mid-stream variable-hop path change (0 inversions / 100×10⁶ arrivals, unpinned control inverts 88–96%) → **026 Accepted, 010 Accepted (core)**, 023 FIFO cell proven. **Stateless-pool CORRECT** (exactly-once under concurrency, beats hand-rolled 1.5–2.8×). **Weighted-HRW WRONG** — caught a real defect: ADR-006's `weight·H` formula is non-proportional (fix: `w/(−ln H)`, proven proportional + bounded-churn) and the `CoV≤0.2` balance threshold is a uniform-only quantization floor → **025 held Draft** pending the formula/threshold repair (applied) + re-gate. |
+| [ADR-012](decisions/ADR-012-weighted-hrw-distribution-regate.md) | Weighted-HRW re-gate (025) | **Verification record** — re-gate of the corrected log-WRH form. **INCONCLUSIVE**, and it's the honest verdict: the scheme is **demonstrably at the multinomial floor** (WRH within 1.9% of the ideal sampler at every N; churn exact — 0 bins between unchanged nodes) but the decision *band* was still ill-posed (compared p99 vs a mean-level closed-form floor, a band the ideal sampler itself busts). Refused to fake CORRECT (post-hoc widening) or WRONG (blaming the scheme for a threshold defect). Supersedes ADR-011 Gate B's WRONG for the corrected form. 025 stays Draft pending a like-for-like preregistered re-gate (running). |
+| [ADR-013](decisions/ADR-013-weighted-hrw-distribution-regate-2.md) | Weighted-HRW re-gate #2 (025) | **Verification record — CORRECT.** Re-gated the corrected proportional log-WRH `score = w_n/(−ln H)` under the like-for-like instrument ADR-012 prescribed: a **preregistered** p99-vs-p99 band derived from an independent `mt19937_64` multinomial's own bootstrap dispersion and printed **before** any WRH number was computed (no shared code/RNG, 256 paired seeds, no post-hoc widening). `R(N) ∈ [0.8765, 1.1051]` at every N (0.96/1.01/1.02/1.00); share-error ≤ MC p99·1.10 against an extreme-value-adjusted cap; churn between *unchanged* nodes = 0 exactly, non-vacuous. Both mandatory controls fired — modulo reshard moves ≥0.98, non-proportional `w·H` misses 4–26× (8–28σ). Anti-circularity <1% at every N (fixes ADR-012's 3.98% artifact); sanitizers clean with teeth, cross-compiler byte-identical (g++14.2 / clang20.1). With ADR-011 Gate C (Stateless) this satisfies the AND → **025 Accepted (x86-64)**. Residual doc-only: ADR-006 line 104 already carries the log-WRH correction. |
+| [ADR-014](decisions/ADR-014-streaming-async-suspend-real-scheduler-gate.md) | Streaming async-suspend real-scheduler gate (024) | **Verification record — CORRECT.** 024's single named promotion gate: the async-suspend/resume seam wired to the **real 002 multi-threaded scheduler + 015 admission gate** (not the ADR-005 model resolver). At 10⁷ frames on g++ 14.2 + clang 20.1: `lost = dup = torn = fifo_violations = 0`, descriptor membership ≤1 (no double-enqueue/orphan), credit only for completed frames, **0** steady-drain heap allocs + **0** cross-core RMW/frame, TSan clean; the transfer path is genuinely taken (32282/32282 parked activations off all workers). All **three** mandatory controls fired non-vacuously — single-cursor (tears/loses + credits parked frames), re-enqueue (dup ≤602016, two executors, wedge), fence-removed (loses ~194K vs 0). → **024 Accepted (x86-64)**. Deferred: Hard absolute-latency (023 silicon) and the ARM64 weak-memory re-gate of the `seq_cst` Dekker close-out (TSO-proven only). |
+| [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md) | Actor execution vehicle: passive+stackless vs fibers | **Design decision** — a 4-vehicle debate-prove (32 CORRECT / 1 DISPROVEN, real C++ + sanitizers). **Core = passive + stackless run-to-completion**, unchanged: 192 B/idle-actor (5.59 M/GB, identical at 10⁶↔10⁷), depth-bounded suspended frame beating a fiber at every D≤8, sync p99 96.4 ns / 41.8 M/s drain, 0 ctx-switch, 0 hot-path alloc — the only vehicle passing the safety gate *and* winning the idle-economy+throughput axis. Every fiber-per-actor vehicle is disqualified as core (Fibra breaches the 250 ns HARD ceiling on cold resume 6853 ns p999 and hits a VMA wall at ~32 K actors; BorrowedFiber pins ~16 KiB/suspended-actor ≈120×). **The "pool green threads across idle actors" hypothesis is disproven** — a fiber pins bytes+VMA the moment it runs. But a fiber facility **earned a scoped place**: an opt-in, off-hot-path, per-blocking-invocation (never per-actor) **`BlockingHandler`** — thread-backed `quark::blocking<>` (asm-free default) + gated stackful `quark::fiber<>` — for the one axis stackless physically cannot serve (suspending an un-colorable foreign-C chain in place; +C4 multiplexing). Folded into 001/002/015/024/023. |
+| [ADR-016](decisions/ADR-016-serialization-wire-fast-path-encode-gate.md) | Serialization wire fast-path encode gate (016) | **Verification record — CORRECT.** 016's promotion gate: the negotiated **tagless packed** wire encode budget + negotiation/evolution correctness. In all 4 build cells ({g++ 14.2, clang 20.1} × {-O2, -O3}), tagless encode of a 24 B POD is **p99 25–28 ns** (~20× under the 500 ns Hard ceiling, inside the 200 ns goal), **near-memcpy** (0.85–1.06× of `memcpy`), **0 alloc** / 1.2×10⁶ encodes, **reflection-free** (`-fno-rtti`, 0 RTTI symbols in the codec TU); round-trip + additive evolution + v1→v2→v3 migration all pass under clean ASan/UBSan. All three mandatory controls fired — fingerprint-mismatch **corrupts** under forced-tagless (ASan heap-overflow + wrong value), endian/ABI-mismatch **corrupts** (byte-swapped id), tagged 1.67–1.83× slower than tagless. → **016 Accepted (x86-64)**. Deferred: the ≤200 ns *goal*-stamp to 023 reference silicon, and the ARM64/big-endian cross-peer re-gate (its fallback proven load-bearing). |
+
+## Performance (measured)
+
+The 023 budgets are not assertions — they are gates a benchmark passes or fails. [`bench/`](bench/) turns each
+hot-path claim into a **verdict a benchmark prints** against the 023 budget table, and the full code-and-result
+report lives in **[PERFORMANCE.md](PERFORMANCE.md)** (machine-of-record, per-feature code + numbers, reproduce
+steps). Headline figures — **release + `-march=native`, single core pinned** on a *virtualized Xeon Silver 4208
+@ 2.1 GHz* (deliberately **not** the 023 Zen4/SPR reference core, so these are regression tripwires, not the
+canonical stamp — the reference numbers live in the ADRs):
+
+| Feature (spec) | Metric | Measured | 023 budget | |
+|---|---|---|---|---|
+| `tell` — mailbox (003) | enqueue→dequeue p50 | **59 ns** | ≤ 100 ns | `[goal]` |
+| `tell` — scheduler (002) | full-lifecycle throughput | **11.0 M/s** | ≥ 10 M/s | `[goal]` |
+| priority (002) | `UniformFIFO` vs raw MPSC | **+0.45 ns** | within noise | `[free]` |
+| `ask` (006) | engine-overhead p50 / p99 | **147 / 226 ns** | p50 ≤ 1 µs | `[goal]` |
+| streaming (024) | sustained ingest / per-frame | **140.8 M/s / 7.1 ns** | ≥ 10 M/s / ≤ 100 ns | `[goal]` |
+| streaming (024) | ingest vs discrete `tell` | **5.0× cheaper** | ≥ 3× | `[goal]` |
+| activate/deactivate (001) | cold activation p50 / cycle | **111 ns / 14.8 M/s** | ≤ 10 µs / ≥ 10 M/s | `[goal]` |
+| idle density (003) | activations / GB | **1.95 M/GB** | ≥ 1 M/GB | `[goal]` |
+| serialize (016) | tagless wire encode p99 | **50 ns** | ≤ 200 ns | `[goal]` |
+| placement (010/026) | VirtualBins lookup, N-indep. | **12.5 ns (0.99×)** | ≤ 20 ns | `[goal]` |
+| supervision (007) | guarded vs no-guard success path | **~1.0×** | ≤ noise | `[free]` |
+
+The machine-independent **invariant** gates — descriptor ≤ 64 B, **0 hot-path allocations**, **0 cross-core RMW on
+the drain path**, and the objdump zero-cost parity checks — are pass/fail CTest gates in [`tests/`](tests/), not
+noise-sensitive benchmarks; see PERFORMANCE.md §"What this document is not".
+
+## Dependency posture
+
+The engine **core is std-only** (C++23), with all OS-specific facilities behind a
+thin **Platform Abstraction Layer** (Linux/Windows/macOS backends — sockets +
+event loop, durable file flush, thread affinity/NUMA). Every subsystem that would
+otherwise pull a heavy dependency is expressed as a **seam** with a self-contained
+default, and heavier backends are optional adapters that are never linked into a
+minimal build:
+
+| Subsystem | Std-only default | Optional adapter (behind a seam) |
+|---|---|---|
+| Transport (010) | TCP + length-prefixed frames; per-OS event loop (epoll/io_uring · kqueue · IOCP) via the PAL | gRPC/QUIC/RDMA |
+| Serialization (016) | canonical tagged TLV from one `QUARK_SERIALIZE` per type + negotiated tagless wire fast path | protobuf / FlatBuffers / Cap'n Proto |
+| Membership (010) | in-house SWIM gossip | etcd / Consul |
+| Persistence (012) | `InMemoryStore` (reference) + `FileStore` (append-only WAL + `fdatasync`, crash-durable) — see [PersistenceAdapters.md](PersistenceAdapters.md) | `SqliteStore` / `RocksStore` (opt-in: `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`); Postgres/object-store behind the same `Store` seam |
+| Metrics/Trace (009) | snapshot API + Prometheus text | OpenTelemetry / OTLP |
+| Config (013) | programmatic `EngineConfig` + env vars | TOML/JSON file loader |
+| Governance (022) | per-node token-bucket rate limits + bounded queues + circuit breakers | distributed exact-limit coordinator (Redis/etcd) |
+| Benchmark harness (023) | in-house timing loop over the PAL clock (dev tooling) | google-benchmark (dev-only, never linked) |
+| Inbound streaming (024) | pre-allocated per-stream SPSC credit-ring + shard-`pmr` arena; copy into inline slots | transport-registered zero-copy RX buffers (io_uring/RDMA) via the PAL |
+| Large-scale topology (026) | in-house VirtualBins + bounded partial-view (SWIM) + Kademlia relay, coordinator-free | external coordinator (etcd/Consul) behind the `Membership` seam |
+
+Remaining cross-cutting design questions are tracked in
+[OpenQuestions.md](OpenQuestions.md).
+
+## Glossary — the vocabulary this RFC uses
+
+| Term | Meaning | (Replaces the managed-runtime notion of) |
+|---|---|---|
+| **Actor** | Unit of state + sequential behavior, addressed by id | actor / grain |
+| **Activation** | The *right to execute* an actor; at most one exists per actor | grain activation |
+| **Worker** | A transient execution lane (thread) that borrows activations | thread-pool thread |
+| **Shard** | Owner of activation queues, an allocator, and metrics; selected by `ActorId → hash` | partition |
+| **Mailbox** | Intrusive Vyukov MPSC queue owning message *ordering only* (FIFO); the queue node *is* the descriptor (003, ADR-002) | mailbox |
+| **MessageHandle / Descriptor / Payload** | `{Descriptor*, generation}` handle → fixed-size metadata (intrusively linked) → separately-stored payload | message envelope |
+| **Policy** | A CRTP template parameter expressing intent (`Sequential`, `Placement<…>`, …) | attribute |
+| **Resource** | A dependency with a lifetime scope, resolved at activation or by factory | injected service |
+| **MessageContext** | Ambient per-message values: `std::stop_token`, deadline, trace id, headers | cancellation token / ambient scope |
+| **`quark::task<>`** | The coroutine return type for async handlers | `Task` |
+| **`ActorRef<A>`** | Typed handle used to `tell`/`ask` an actor | typed grain reference |

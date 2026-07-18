@@ -1,0 +1,115 @@
+# Quark CI — the correctness + performance gate.
+#
+#  * test:      builds and runs the full ctest suite across the four verified configurations
+#               (gcc Release, clang Release, ASan+UBSan, TSan) — the same clean-from-scratch matrix
+#               used locally. A red test here blocks the merge.
+#  * perf-gate: builds the 023 microbenchmarks and runs bench/ci_bench_gate.sh, which FAILS the job
+#               on a Hard-budget violation ([MISS]) and only WARNS on a Goal regression
+#               ([hard]/[floor]) — 023 §"Regression gating": "fails when a Hard budget is violated,
+#               or a Goal metric regresses beyond a noise band." On a shared (noisy) runner the
+#               hard-veto is the trustworthy signal; the ns-scale Goal numbers are a reference-machine
+#               concern (023 §"The reference machine"), so they annotate, they do not block.
+#
+# Toolchain: Quark is C++23 and is verified on g++-14.2 + clang-20.1 (CONVENTIONS.md). The setup step
+# installs g++-14 and LLVM 20; bump these together with the locally-verified compilers.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc-release
+            cxx: g++-14
+            build_type: Release
+            sanitize: ""
+            build_jobs: 2
+            ctest_jobs: 2
+          - name: clang-release
+            cxx: clang++-20
+            build_type: Release
+            sanitize: ""
+            build_jobs: 2
+            ctest_jobs: 2
+          - name: asan-ubsan
+            cxx: g++-14
+            build_type: Debug
+            sanitize: "address;undefined"
+            build_jobs: 2
+            ctest_jobs: 2
+            # detect_leaks on; the one deliberate-OOB control sets its own ASAN_OPTIONS in CMake.
+            ctest_env: "ASAN_OPTIONS=abort_on_error=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
+          - name: tsan
+            cxx: g++-14
+            build_type: Debug
+            sanitize: "thread"
+            # A clean TSan COMPILE is memory-heavy — build serially so a limited-RAM runner does not
+            # OOM-kill the compiler (mirrors the local -j1 TSan rule). Tests are memory-light: -j2.
+            build_jobs: 1
+            ctest_jobs: 2
+            ctest_env: "TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake ninja-build
+          if [[ "${{ matrix.cxx }}" == clang++* ]]; then
+            wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+            sudo apt-get install -y clang-20 libc++-20-dev libc++abi-20-dev || true
+          fi
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            ${SAN:+-DQUARK_SANITIZE="$SAN"}
+        env:
+          SAN: ${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build build -j ${{ matrix.build_jobs }}
+
+      - name: Test
+        run: ${{ matrix.ctest_env }} ctest --test-dir build -j ${{ matrix.ctest_jobs }} --output-on-failure
+
+      - name: Upload ctest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-${{ matrix.name }}
+          path: build/Testing/**/*.log
+          if-no-files-found: ignore
+
+  perf-gate:
+    name: perf-gate (023 budgets)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake
+
+      - name: Configure (gcc Release + bench gate)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
+
+      - name: Build benches + run 023 gate
+        # The custom target builds every *_bench then runs ci_bench_gate.sh: exit non-zero ONLY on a
+        # Hard-budget [MISS]; Goal regressions are printed as warnings and keep the job green.
+        run: cmake --build build --target bench-gate -j 2
