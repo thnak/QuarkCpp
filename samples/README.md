@@ -30,6 +30,8 @@ set covers one subsystem apiece.
 | 12 | [`12_capability_actor`](12_capability_actor/main.cpp) | capability-constrained placement: `Require`/`Prefer`/`Weighted` on typed node capabilities (GPU, zone, capacity) | 025 |
 | 13 | [`13_cache_affinity`](13_cache_affinity/main.cpp) | "same user → same GPU node" so a warm cache is reused: identity-as-cache-key + HRW stickiness, measured vs hash%N and a load-balancer | 010, 026 |
 | 14 | [`14_durable_reminders`](14_durable_reminders/main.cpp) | durable wall-clock reminders (SEGSTREAM): one-shot + periodic, survival across a simulated restart, and the 9 PM mass-due wave flattening to `peak == fire_rate` instead of a spike | 027 |
+| 15 | [`15_tcp_cluster`](15_tcp_cluster/main.cpp) | sample 08 over the **real** `net::TcpTransport`: two nodes on ephemeral 127.0.0.1 ports; local fast path (0 wire) vs remote lazily-dialed over TCP, FIFO + one-connection-per-peer intact | 010, 019, 021 |
+| 16 | [`16_tcp_request_reply`](16_tcp_request_reply/main.cpp) | bidirectional over TCP: a far-node actor replies home by addressing a remote actor from inside its own handler; the reply reuses the same full-duplex socket (no dial-back) | 010, 019, 021 |
 
 ## Build & run
 
