@@ -227,6 +227,14 @@ sketch:
 - **008 scan retained for the non-statically-typed path.** Any future untyped/wire-arrival path
   must recover the thunk via the 008 `type_index` scan; the dense slot must **never** be
   serialized or forwarded across actor types (it renumbers when handlers change).
+- **Extended by [ADR-018](ADR-018-outbound-streaming-replies.md) (streaming replies).** The
+  single-shot monotonic-gen `ReplyCell` above is **preserved verbatim** for ordinary asks. A
+  multi-item streaming reply (an `ask` that returns a stream) does **not** reuse it: it rides a
+  **distinct** `StreamReplyCell` (a single OPEN resolve, 16 B on the same `reply_` field) + a
+  credit-ring + an in-band EoS — never a mid-stream cell reuse (which ADR-018's BASELINE proved
+  is a lost/UAF class of bug). The permanent reply-lifetime ASan+TSan CI gate above **extends**
+  to the multi-terminal (close/cancel/deadline) reclaim + cross-node replay surface, a strictly
+  larger concurrent-reclaim state space than the single-shot cell.
 
 ---
 

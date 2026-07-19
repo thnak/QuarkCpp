@@ -116,6 +116,30 @@ latency budget is stamped.
 | Steady hot-path heap allocations | **0** (measured) | 0 | 0 / 50M frames |
 | Cross-core atomic RMW on the drain path | **0** (measured) | 0 | 0/frame, both compilers — O(empty-transitions), not O(frames) |
 
+### Outbound streaming replies (006 / 024, ADR-018)
+
+An `ask` that returns a stream rides the 024 credit-ring run **backward** (callee =
+producer, caller = consumer). Same batch-drain hot path as inbound, so it gets its own
+block. Proven by
+[ADR-018](decisions/ADR-018-outbound-streaming-replies.md) (winner Reply-Credit-Ring /
+PUSH, x86-64, GCC 14.2 + Clang 20.1) — re-measure absolute throughput on the reference
+core before any Hard-latency stamp; 006 outbound stays Draft pending the 015 OPEN-cell
+re-admit gate.
+
+| Metric | Goal | Hard | Proven (ADR-018) |
+|---|---|---|---|
+| Per-item amortization vs. a discrete `ask`/reply | ≥ **3×** cheaper | — | ring 14.9–15.3 ns/item vs discrete 125.9–126.7 ns → **8.3×** (ratio 0.119–0.121) |
+| **Cross-core atomic RMW on the caller (consumer) drain** | **0** (measured) | **0 (Hard gate)** | **0** — objdump both compilers (RMW lives in `poll_unstall`, O(batches)). The gate **PUSH passes and PULL fails** (PULL concedes 0.00391 RMW/item) |
+| Per-item hot-path heap allocations | **0** (measured) | 0 | **0** — alloc slope 5M→50M items, both compilers (cold `task<>` frame = 1/ask, eliminable via pooled promise) |
+| Sustained outbound-reply throughput | ≥ **10 M/s/core** | ≥ 4 M/s/core | **5.29 M/s (gcc) / 6.42 M/s (clang)** @50M — **4M hard floor MET, 10M goal MISSED** for PUSH; PULL hits 31–33 M/s but **violates the 0-RMW Hard gate** |
+
+The 0-RMW caller-drain row is the same Hard gate as line 117 above, symmetrized to the
+reply direction. Throughput **does not override** it: PULL's ~5× raw throughput cannot buy
+back the 0-RMW violation, and the idle-density footprint tax (a whole ring per in-flight
+streaming ask vs. a 64 B scalar `ReplyCell`, ADR-018) is a footprint ceiling the throughput
+tiebreak may not trade away either. The 10M/s goal is a tracked Hard-budget miss for PUSH,
+not a gate failure (path: pooled `promise_type` + cap tuning + reference-core re-measure).
+
 ### Blocking / fiber adapter (ADR-015) — explicitly *off* the sync budget
 
 The opt-in `BlockingHandler`/`FiberHandler` adapter (001) is a **µs–ms offload path, not

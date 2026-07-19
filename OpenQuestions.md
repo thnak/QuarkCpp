@@ -6,6 +6,30 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
 
 ## Resolved
 
+- **Outbound streaming replies — an `ask` that returns a stream** (006 + 024 + 017 + 018 +
+  010 + ADR-007 reply seam) — the **one remaining pure-design cross-cutting item** — resolved
+  in [ADR-018](decisions/ADR-018-outbound-streaming-replies.md) by a 3-design debate-prove
+  (28 CORRECT / 11 disproven, real C++23 + GCC/Clang + ASan/UBSan/TSan). The winner is
+  **Reply-Credit-Ring (PUSH)**: an outbound streaming reply is the **024 inbound credit-ring
+  run backward** — callee = `head` producer, caller = `disp`/`tail` consumer, credit derived
+  `capacity-(head-tail)` with **no shared counter**. Three seams around the (verbatim) ring: a
+  **single-resolve `StreamReplyCell`** OPEN handshake (rides the ADR-007 `reply_` field; the
+  ordinary single-shot `ReplyCell` is **untouched**), the **N-item ring**, and an **in-band
+  EoS**; per-item identity is a **callee-assigned `producer_seq`** deduped by the caller's
+  `disp` watermark (017), cross-node credit-return is **monotone max-merge** (010), and
+  cancel/deadline do a **two-part terminal wake** (002/018). The **N-discrete-reply baseline was
+  measured and disqualified** (fails GATE-3/4/5 + cross-node GATE-2/6: unbounded/shed, ReplyCell
+  reuse UAF, post-teardown delivery). The pull alternative (`DemandChannel`) **hit 31–33 M/s but
+  conceded the 023 0-RMW hard gate** (0.00391 RMW/item vs PUSH's measured 0), so it is adopted
+  only as a secondary **`ReplyMode::Pull`** for high-RTT links. The **item-transport leg is proven**
+  (it is the shipped 024 `StreamChannel`/`StreamActivation` flipped: 8.3× amortization, 0 per-item
+  heap, 0 caller-drain RMW, 5.3–6.4 M/s ≥ the 4M floor). **006 outbound stays Draft** — promotion
+  is gated on the **015 OPEN-cell re-admit** (`co_await` on-lane resume, still stubbed in
+  `detail/reply_cell.hpp`) clearing an ADR-014-grade real-scheduler run; the item leg does not
+  wait on it. Folded into 006/024/017/018/010/004/003/002/001/022/023. **New residual:** the
+  fan-in deriving-reply hazard (017); AArch64 weak-memory re-gate of the flipped ring (inherits
+  024).
+
 - **Actor execution vehicle — passive+stackless vs green threads/fibers** (001/002/015/024/023)
   — resolved in [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)
   by a 4-vehicle debate-prove (32 CORRECT / 1 DISPROVEN, real C++ + sanitizers). The
@@ -336,11 +360,13 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
 
 - *(Empty — every subsystem the RFC set out to cover is now drafted, including
   inbound streaming (024). The former entries here (Security, DoS/governance,
-  benchmark harness) are resolved by 020, 022, and 023 respectively. The three
-  remaining cross-cutting items are all **verification to run, not specs to design**:
-  the `type_key` conformance test, the AArch64 weak-memory proof of the mailbox
-  handoff, and the stream async-suspend run against the real scheduler (above). The
-  one open **design** question left is outbound streaming replies, 006.)*
+  benchmark harness) are resolved by 020, 022, and 023 respectively. **Outbound streaming
+  replies — the last open *design* question — is now resolved in mechanism by
+  [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)** (above). What remains is all
+  **verification to run, not specs to design**: the `type_key` conformance test, the AArch64
+  weak-memory proof of the mailbox handoff, and the **015 OPEN-cell re-admit real-scheduler
+  gate** — which now blocks *both* an ordinary `ask`'s co_await resume and 006 outbound's OPEN
+  handshake promotion.)*
 
 ## Decisions locked (do not reopen without cause)
 

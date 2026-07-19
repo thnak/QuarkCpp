@@ -164,6 +164,14 @@ writes a flag into the reused descriptor.
 | Payload | Shard arena/pool | Descriptor released |
 | Actor state | Its home shard | Actor deactivated (see lifecycle policies, 005) |
 | Stream ring + slots + arena (024) | Shard `pmr`, pre-allocated at stream-open (cold path) | Stream closed — **0 per-frame hot-path allocations** (measured: 0 / 50M frames). Zero-copy where the transport DMAs into the registered arena; a by-reference slot's buffer lifetime is tied to the credit/read-cursor advance (or the in-order byte-prefix credit under `ZeroCopyRetained`). |
+| Reply ring + slots + arena (ADR-018) | **Caller** shard `pmr`, pre-allocated cold at `ask_stream` | Stream terminal (close/cancel/deadline) — **0 per-item steady-state heap on both the produce and drain legs** (the 024 ring flipped: callee produces, caller drains). |
+
+An outbound streaming reply carries **0 per-item steady-state heap on both legs** —
+the callee's produce leg and the caller's drain leg
+([ADR-018](decisions/ADR-018-outbound-streaming-replies.md), the 024 ring run
+backward). The one acknowledged non-zero is the callee's **cold `task<>` frame at 1
+alloc/ask**; it is eliminable by an **optional pooled `promise_type` operator new**
+(a shard frame-slab) that **does not touch the item path**.
 
 ## Open questions
 

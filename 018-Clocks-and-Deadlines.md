@@ -87,6 +87,26 @@ is inherently wall-clock and, if added, uses `system_clock` and does **not**
 participate in remaining-duration propagation. It is out of scope here and noted
 so the two are not conflated.
 
+## Reply-stream deadlines (ADR-018)
+
+An outbound streaming reply (`ask_stream`, ADR-018 — the 024 credit-ring run
+backward, callee = producer, caller = consumer) carries **one** deadline for the
+whole stream, and it obeys Rule 2 unchanged: the deadline travels as
+**remaining-duration**, and the callee reconstructs it locally —
+
+```
+callee (node B):  deadline_B = now_B + remaining − transit   // pal::BootClock
+```
+
+— never a raw remote instant (same reconstruction as Rule 2/2a; `transit` reused
+from SWIM's RTT). The clock is `pal::BootClock` (CLOCK_BOOTTIME, §Suspend), so a
+stream whose callee was suspended sees its deadline **already expired on resume**.
+On expiry the wheel entry (011) fires the **terminal CAS**, which performs the
+ADR-018 **two-part wake**: it **arms the caller's drain** *and* **bumps
+`credit_gen`**, so both a blocked consumer and a producer stalled on a full credit
+window observe teardown (002 §Reply-stream terminal edge). Nothing is delivered
+after the terminal CAS.
+
 ## Self-debate
 
 - **Ship an absolute UTC deadline instead of a duration?** Both ends measure

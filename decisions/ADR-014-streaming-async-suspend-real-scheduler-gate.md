@@ -195,3 +195,14 @@ non-blocking residual, consistent with an x86-64-scoped Accepted.
    ADR-005 and 024 and are **outside** this gate's scope — this gate proved the
    inline-default and by-reference exactly-once suspend seam, not the pinned-buffer
    pool policy.
+
+5. **[extended by [ADR-018](ADR-018-outbound-streaming-replies.md) — outbound reply drain
+   needs its own real-scheduler run]** The outbound streaming-reply item-drain **is** this
+   gate's item-drain flipped (callee = producer, caller = consumer), and ADR-018 proved that
+   flipped leg CORRECT under the shipped `StreamChannel`/`StreamActivation` headers. But the
+   two seams unique to the reply direction — the single-resolve OPEN `StreamReplyCell`'s **015
+   re-admit** (`co_await` on-lane resume, still unwired in `reply_cell.hpp`) and the two-part
+   **terminal-wake edge** (terminal CAS arms the caller drain **and** bumps `credit_gen`) —
+   were proven only in a wrapper, not against the real 002 scheduler + ADR-007 reply router.
+   Each needs its **own ADR-014-grade real-scheduler run** before 006 outbound streaming
+   promotes Draft→Accepted.

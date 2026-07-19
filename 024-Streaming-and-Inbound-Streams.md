@@ -192,6 +192,35 @@ quark::StreamRef<Sample> s = system.open_stream<Sample>(ingest_id, transport_ep)
 | 023 | Streaming budget block (throughput / amortization / latency / 0-alloc / 0-RMW). |
 | 001/015 (ADR-015) | A stream handler may itself be a `BlockingHandler`/`FiberHandler` — e.g. a **foreign-C stream decoder** that cannot be colored as a coroutine. If so it follows the **same "transferred, not parked" 015 re-admission** as a suspended stream handler (ADR-014): the split `disp`/`tail` cursors freeze at the parked frame, the un-colorable leaf offloads off the mailbox lane, and the 015 gate re-enters `StreamChannel::drain` on completion. The stackful `quark::fiber<>` form additionally enables the **C4 multiplexing** case — many foreign-frame stream callbacks issuing nested `ask`s multiplexed on one cooperative driver, versus a thread-backed carrier ceiling of `P`. |
 
+## Outbound / reply-direction (ADR-018)
+
+The ring is **symmetric**. An `ask` that returns a stream (`006 §ask_stream`) is this
+exact `StreamChannel<F>`/`StreamActivation<F>` **with the producer/consumer roles
+flipped** — no forked buffer, no second wakeup protocol
+([ADR-018](decisions/ADR-018-outbound-streaming-replies.md), winner *Reply-Credit-Ring /
+PUSH*). The item-transport leg is therefore the shipped, proven inbound leg run backward:
+
+| Inbound (024) | Outbound reply (ADR-018) |
+|---|---|
+| producer = transport/foreign source, off-lane | producer = **callee** (local) or the caller-node **transport thread** (cross-node) |
+| consumer = the owning actor draining on its lane | consumer = the **caller** draining on its lane |
+| ring owned by the receiving activation | ring **allocated on the caller shard** (the consumer owns it), pre-allocated cold at `ask_stream` |
+| credit = `capacity-(head-tail)`, derived, no counter | **identical** — credit flows caller→callee for free through the same arithmetic |
+| producer un-stall = reverse-Dekker rendezvous | **reused verbatim** |
+
+- **Roles flipped, machinery unchanged.** The producer arm-edge is executed by the
+  callee (local) or the caller-node transport thread (cross-node), **off the caller
+  drain lane**; the caller's 0-RMW batch drain, split `disp`/`tail` exactly-once-across-
+  suspend, and `seq_cst` Dekker close-out are the same code. The three outbound-specific
+  seams (single-resolve `StreamReplyCell` OPEN handshake, `producer_seq` item identity,
+  monotone-max-merge cross-node credit-return) sit **around** the ring, not inside it.
+- **`ReplyMode::{Push(default), Pull}`.** Push is this flipped ring — the default, and the
+  only path meeting the 023 0-RMW caller-drain gate. `Pull` (`DemandChannel`, demand-gated
+  `co_yield`) is a secondary policy for high-RTT / bursty-idle links; it wins cross-node
+  teardown by construction but concedes the 0-RMW gate (ADR-018 §Decision).
+- **Promotion.** The item leg is proven; 006 outbound stays **Draft** until the **015
+  OPEN-cell re-admit** clears its real-scheduler gate (same as an ordinary `ask`).
+
 ## Self-debate
 
 ### Off the mailbox, or a mailbox variant?
@@ -222,9 +251,11 @@ load and collapse to low latency when idle.
 
 ## Non-goals
 
-- **Outbound streaming replies** (an `ask` returning a `std::generator<>`/stream) —
-  006 still lists this; this spec is **inbound** only. The credit-ring is reusable for
-  it but the reply-routing/one-shot-channel interaction is separate.
+- **Outbound streaming replies** (an `ask` returning a stream) — **now specced**, as the
+  reply-direction of this same ring (see *Outbound / reply-direction* above and
+  [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)). This spec's *primitive* is
+  the shared substrate for both directions; the outbound reply-routing seams (OPEN
+  handshake, `producer_seq`, cross-node credit-return) live in 006/010/017, not here.
 - **Multi-source fan-in into one stream** — stays on the mailbox (SPSC precondition).
 - **Transport framing / wire format** — 010/016 own the bytes; 024 owns what happens
   once frames are in the ring.

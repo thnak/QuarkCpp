@@ -158,6 +158,25 @@ Exactly-once is **not** offered as a transport property; where it matters it is
 built from at-least-once + idempotent handlers + fenced persistence — the full
 mechanism and its partition proof are in `017-Delivery-Guarantees.md`.
 
+## Cross-node reply-stream credit-return (ADR-018)
+
+An `ask` that returns a **stream** across nodes runs the 024 credit-ring backward
+(callee = producer, caller = consumer; ADR-018). Reply-direction credit is returned to
+the remote callee by an **edge-triggered** `CreditReturn{stream_id, tail}` frame carrying
+the **absolute** caller `tail`, applied `shadow_tail = max(shadow_tail, tail)`:
+
+- **Monotone max-merge** makes the return **reorder- and duplicate-safe** — a stale or
+  replayed `CreditReturn` can never retract credit (an *additive* delta could). A low-rate
+  **tail heartbeat** carries the same absolute tail so a dropped *final* `CreditReturn`
+  never wedges the callee with a full window.
+- `stream_id` is a **process-monotonic nonce** (not a reused index), so the transport's
+  `stream_id → ring*` map has **no ABA**. The receive path **gen-gates before any write**
+  to ring memory: a frame for a torn-down or reincarnated stream is dropped, never applied.
+
+This is the reply-direction dual of, and **composes with**, the cross-node backpressure
+open question below (a remote full mailbox is a *producer stall* via the credit window,
+not head-of-line blocking on the shared connection).
+
 ## Dependencies
 
 Std + the Platform Abstraction Layer's socket/event-loop backend (epoll·io_uring /
