@@ -126,6 +126,25 @@ solely to the path change. TSan/ASan/UBSan clean (a deliberate-race control trip
 teeth proven). This was the **Draft→Accepted Hard gate**; it is met, and 026 is **Accepted
 (x86-64)**.
 
+## Relay-tree broadcast variant (Draft — ADR-019)
+
+A `Topic<M>` best-effort broadcast
+([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)) that spans many
+nodes has two cross-node fan-out shapes. The source-by-node unicast form (010) has the source
+emit one frame per distinct subscriber-node — amplification = #nodes, borne entirely by the
+publisher. As an **alternative at scale**, the fan-out can route via the **bounded relay
+tree** already maintained here: a publish flows outward over the DHT-relay in **≤⌈log₂N⌉
+hops**, spreading the encode/forward cost across relays instead of concentrating it on the
+source. A dead/unreachable node is dropped mid-tree without stalling the publisher, same as an
+ordinary relayed send.
+
+**Status: Draft.** This variant is gated on the same two proofs the cross-node broadcast owes:
+the **ADR-011 path-pinned per-(pub,sub) FIFO** re-proof (a broadcast stream that changes path
+mid-tree must not reorder — the "Cross-node FIFO under relay" discipline above, re-gated for
+the fan-out case) and a **real-transport amplification + dead-node proof**. ADR-019's GATE 7
+covers only an in-process simulation, which is **necessary but not sufficient** to stamp the
+relay-tree broadcast Accepted.
+
 ## The D2 Partitioned tier (beyond ~10⁴ nodes)
 
 D3's roster stays **O(N)** (~160 KB @ N=4096) because global determinism needs the

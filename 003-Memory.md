@@ -155,6 +155,43 @@ and the flip. ADR-003 exposed a **TOCTOU** when they are two independent atomics
 the cancel reads a matching generation, `release()` recycles, then the stale cancel
 writes a flag into the reused descriptor.
 
+## Shared-payload reclamation (broadcast)
+
+A `Topic<M>` publish (ADR-019) allocates **one** immutable, pool-allocated
+`SharedPayload<M>` and fans it to N subscribers as N thin descriptors — so the
+payload has N potential last-users and must be reclaimed **exactly once** no matter
+which subscriber gets there:
+
+```cpp
+struct alignas(64) SharedPayload {
+    std::atomic<uint32_t> rc;   // own cache line — padded away from M below
+    void (*dtor)(void*);        // type-erased dtor thunk (the tell path's mechanism)
+    // ---- 64-byte boundary ----
+    M payload;                  // immutable after publish
+};
+```
+
+- **Refcount protocol.** Init `rc`, then `fetch_add` once per **admitted** enqueue
+  under a publisher **BUILD** ref held across the whole fan-out (so `rc` cannot
+  reach zero mid-publish even if the first subscriber drains instantly). The
+  publisher drops its BUILD ref last; whichever party runs the final
+  `fetch_sub(acq_rel)` observing the pre-decrement value `== 1` runs the
+  **type-erased `dtor` thunk** (the same mechanism the point-to-point tell path
+  already carries) and returns the cell to its pool.
+- **Reclaimed exactly once** whether a subscriber **consumes**, **drops** (mailbox
+  full / deadline), **unsubscribes**, or **dies** — every terminal path funnels
+  through the same `fetch_sub`, so there is no leak and no double-free (ADR-019
+  GATE 4: ASan/UBSan/TSan clean, with skip-dec → leak and extra-dec → UAF controls
+  both firing).
+- **`rc` on its own cache line**, `alignas(64)` and padded away from the immutable
+  `M`, so read-side consumers touching `M` do not false-share with reclaim-side
+  writers hammering `rc`.
+
+The residual **O(N) coherence traffic on the reclaim line** (N cores bouncing the
+`rc` cache line as they decrement) is a **consumer-lane cost** — it lands on the
+draining workers, **off the publisher's critical path** (the publish leg does only
+one `fetch_add` per admitted enqueue and never waits for a decrement).
+
 ## Ownership summary
 
 | Thing | Owned by | Freed when |

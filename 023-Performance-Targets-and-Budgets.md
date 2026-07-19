@@ -140,6 +140,29 @@ streaming ask vs. a 64 B scalar `ReplyCell`, ADR-018) is a footprint ceiling the
 tiebreak may not trade away either. The 10M/s goal is a tracked Hard-budget miss for PUSH,
 not a gate failure (path: pooled `promise_type` + cap tuning + reference-core re-measure).
 
+### Broadcast / publish (006, ADR-019)
+
+Best-effort `Topic<M>` fan-out lowers to N ordinary `tell`s sharing **one** immutable
+refcounted payload (006), so it inherits the discrete-`tell` per-subscriber floor and
+adds its own copy/alloc-volume budgets. Proven by
+[ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md) (local fan-out,
+x86-64, GCC 14.2 + Clang 20.1, ASan/UBSan/TSan with firing controls). **Accepted
+(x86-64) local; cross-node Draft.**
+
+| Metric | Goal | Hard | Proven (ADR-019) |
+|---|---|---|---|
+| Payload copies / publish | **1** (independent of N and `sizeof(M)`) | 1 | 1 for all N∈{1,64,1024} × M∈{16 B,256 B,4 KB}; **amortization ratio = N** (1024× at N=1024) |
+| Heap allocations / publish | **0** (pool-warmed) | 0 | 0 malloc/pub; O(1) per-publish heap |
+| Publisher latency under a full + dead subscriber (**GATE 1**) | **flat** (does not rise) | flat | full+dead-local+dead-remote vs all-empty p99 delta −1.6% / −6.6% (does NOT rise); all pathological legs O(1) |
+| Sustained fan-out throughput | — | — | **~22.5 M subscribers/s** |
+| Per-subscriber wall-clock | — | — | **~44 ns/subscriber at N=1024** |
+
+**Honest note:** per-subscriber wall-clock is **floored by the ~40 ns ADR-002 enqueue** —
+broadcast does **not** beat a single `tell`. The win is copy/alloc **volume** (1 shared
+immutable payload vs N independent copies, 0 malloc), O(1) and N-independent, **not**
+per-subscriber wall-clock. The over-claim that a shared payload is cheaper per subscriber
+than a discrete `tell` was falsified in the debate (ADR-019); do not restate it.
+
 ### Blocking / fiber adapter (ADR-015) — explicitly *off* the sync budget
 
 The opt-in `BlockingHandler`/`FiberHandler` adapter (001) is a **µs–ms offload path, not

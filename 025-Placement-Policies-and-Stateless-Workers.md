@@ -194,6 +194,15 @@ dead-lettered** (007) — there is no state to reconstruct, no `Restart` quiesce
 no fencing (017). The pool re-grows on demand. `IdleTimeout` shrinks it; the pool
 size `N` is a **bounded resource** (022) and a natural fair-share unit.
 
+### Broadcast is orthogonal to the pool (ADR-019)
+
+`Stateless<N>` is fan-**to-one**: a `tell`/`ask` routes to *one* least-loaded pool activation.
+The `Topic<M>` best-effort broadcast
+([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)) is the opposite axis
+— fan-**to-many**. A stateless pool worker **MAY be a subscriber** on a topic, but `publish`
+does **not** route to a single pool member: the two mechanisms are orthogonal and do not
+compose into "broadcast picks one worker."
+
 ## Interaction
 
 | Spec | Interaction |

@@ -27,6 +27,29 @@ Exactly-*once delivery* remains impossible (two-generals); `EffectivelyOnce` is
 exactly-once **effects**. Validation (008) rejects `EffectivelyOnce` on a
 non-persistent actor or an eventually-consistent store.
 
+### Best-effort broadcast is `AtMostOnce`, at distinct-sender granularity
+
+`Topic<M>` publish/subscribe (ADR-019) lives at the **`AtMostOnce`** level — but
+one rung *below* even the point-to-point default: a slow, full, or dead subscriber
+is **dropped**, never retried, and the publisher never blocks on it. The guarantee
+is `AtMostOnce` at a **distinct-sender granularity** (the same lens streams use):
+per `(topic, subscriber)`, delivery is 0–1 and drops are **counted, not silent**
+(surfaced in `PublishReceipt{delivered, dropped_full, dropped_deadline, remote}`).
+
+- **No retry, no ack, no dedup.** Nothing on the broadcast path recovers a drop or
+  suppresses a duplicate — there is nothing to suppress, because the publisher
+  fires each descriptor exactly once.
+- **No cross-subscriber order.** Ordering is guaranteed only per `(pub, sub)`
+  (FIFO, from the mailbox's `tail_` modification order); across subscribers of one
+  topic there is no ordering relation.
+- **`MessageId = (sender, seq)` is carried for FIFO/observability only** — never
+  for duplicate suppression, unlike the effectively-once dedup watermark above.
+
+Layering `AtLeastOnce` (or `EffectivelyOnce`) *on broadcast* is **out of scope**: a
+per-subscriber ack would reintroduce a publisher stall and violate ADR-019's
+GATE 1 (publisher never blocks). An application that needs reliable fan-out builds
+it from N point-to-point `AtLeastOnce`/`EffectivelyOnce` sends, not from `Topic<M>`.
+
 ## Message identity, made deterministic
 
 Effectively-once needs to *recognize* a duplicate, which requires stable identity:

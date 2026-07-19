@@ -282,6 +282,15 @@ sketch:
 
 ---
 
+## Downstream reuse (back-reference)
+
+- **Best-effort broadcast reuses this dense-slot dispatch.**
+  [ADR-019](ADR-019-best-effort-broadcast-publish-primitive.md) (`Topic<M>`) stamps its
+  per-subscriber descriptors with the **existing** compile-time `slot_of<A,M>` and drains
+  through the same `.rodata` indexed indirect call — set to `kind = Broadcast` and carrying
+  **no responder/reply field** (fire-and-forget, no `ReplyCell` binding). **No change to the
+  ADR-007 dispatch contract** — broadcast is a pure consumer of the dense-slot table.
+
 ## Tie-breaking experiment (if this decision is contested)
 
 Evidence is not insufficient — D1 wins on the ranking as executed. The single experiment that
