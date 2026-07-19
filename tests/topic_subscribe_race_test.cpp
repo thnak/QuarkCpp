@@ -42,7 +42,12 @@ void check(bool c, const char* what, bool& ok) {
 
 int main() {
     bool ok = true;
-    constexpr std::uint64_t kRounds = 20'000;   // churn rounds
+    // 20,000 churn rounds left the QUARK_TOPIC_NO_QUIESCE control (topic_no_quiesce_control) an
+    // observed NOT-FIRED false-negative on a noisy shared CI runner (the UAF race window is narrow;
+    // fewer rounds means fewer draws against it) — seen on both x86-64 and arm64, so this is runner
+    // scheduling noise, not an architecture difference. 10x the rounds for a much lower false-negative
+    // rate; each round is cheap (µs-scale) even under ASan, so this stays well inside the ctest budget.
+    constexpr std::uint64_t kRounds = 200'000;  // churn rounds
     constexpr std::uint32_t kStable = 8;        // stable subscribers so publishers always have work
 
     Topic<Ev> topic(4096);

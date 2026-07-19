@@ -191,9 +191,25 @@ TrialResult run_trial(bool pinned, std::uint64_t seed, bool& ok) {
     for (std::uint64_t seq = 0; seq < switch_at; ++seq) r1.push(static_cast<int>(seq));
     res.inflight_at_switch = switch_at;  // every slow message is in the relay pipe at the switch
 
+    // NOTE: `gate_open` must flip while EACH waiter's own mutex is held, not just via the atomic
+    // store. relay_loop's `cv.wait(lk, pred)` checks `pred()` (reading gate_open) and, if false,
+    // transitions into the actual wait — that whole check-then-wait sequence holds `in.m` throughout
+    // (libstdc++'s wait(lock, pred) is `while (!pred()) wait(lock);`, and only the `wait(lock)` call
+    // itself atomically unlocks + registers). A store+notify with NO mutex held can land in the
+    // narrow window between "checked false" and "registered as a waiter" and be lost forever — the
+    // relay thread then sleeps on a notify that will never come again (open_gate runs once). Taking
+    // each channel's mutex around the store (even as an empty critical section for the second one)
+    // serializes against that window: the waiter is provably either not-yet-checking (sees the new
+    // value directly) or already registered (the notify reaches it) by the time we can acquire it.
     auto open_gate = [&] {
-        gate_open.store(true);
+        {
+            std::lock_guard<std::mutex> g(r1.m);
+            gate_open.store(true);
+        }
         r1.cv.notify_all();
+        {
+            std::lock_guard<std::mutex> g(r2.m);
+        }
         r2.cv.notify_all();
     };
 
