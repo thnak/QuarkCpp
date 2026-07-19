@@ -131,3 +131,23 @@ per-actor.
   linear-chain derivation is correct and is what the acceptance test exercises; the
   durable-counter form is the fan-in generalization, deferred with the id-derivation
   open question above.
+
+## Outbound streaming replies (ADR-018)
+
+An `ask` that returns a **stream** (ADR-018, "Reply-Credit-Ring / PUSH") needs its own
+per-item identity, distinct from a scalar reply's `MessageId`:
+
+- **Per-item reply identity = `(stream_id, producer_seq)`.** `producer_seq` is
+  **callee-assigned, stream-relative, and replay-deterministic** — on re-activation the
+  callee re-emits the *same* `producer_seq` for the same logical item. The caller dedups
+  by its `disp` **high-watermark**, exactly as a receiver dedups inbound `seq` above.
+- A **caller-local ring index is *not* a valid identity.** It is re-assigned on
+  re-activation, so a replay delivers duplicates that the watermark cannot recognize —
+  it identifies a *slot*, not an *item*. Only the callee-assigned `producer_seq` is
+  stable across replay.
+- **Durability makes no new claim.** Crash-recovery exactly-once for a reply stream is
+  still 017 Persistent's transactional `{state, watermark, outbox}`; a **volatile** reply
+  ring dedups only transport retransmit under 010 per-stream FIFO and makes **no
+  durability claim** across a real callee crash.
+- The **fan-in deriving-reply hazard** above (a forwarded/derived reply through an
+  effectively-once pipeline) applies unchanged to reply items and **remains open**.

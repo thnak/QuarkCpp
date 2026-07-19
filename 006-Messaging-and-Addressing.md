@@ -78,6 +78,49 @@ value, not an exception across the boundary:
 std::expected<Confirmation, quark::error> r = co_await order.ask<Confirmation>(q);
 ```
 
+### `ask_stream` — a reply that is a *stream* (ADR-018)
+
+When a reply is **multi-item** (a query answered by many frames, a subscription, a
+paged scan) the single-shot `ReplyCell` cannot carry it — it resolves **once**, a
+stream resolves **N times then completes**. `ask_stream<F>` is the outbound
+counterpart of 024's inbound ingestion: **the 024 credit-ring run backward** — the
+**callee is the producer, the caller is the consumer** (ADR-018, winner
+*Reply-Credit-Ring / PUSH*).
+
+```cpp
+// caller: ask for a stream of F; drain it batch-per-turn like an inbound stream.
+quark::ReplyStream<Row> rs = (co_await scan.ask_stream<Row>(Query{ … })).value();
+while (auto row = rs.next()) { use(*row); }        // 0-RMW batch drain (024 §drain)
+// rs terminal state: Closed (EoS) / Cancelled / DeadlineExceeded / Failed(error)
+```
+
+- **Mechanism.** `ask_stream<F>(M) -> task<expected<ReplyStream<F>, error>>`. The
+  reply rides a bounded, pre-allocated `StreamChannel<F>` **flipped**: callee = `head`
+  producer, caller = `disp`/`tail` consumer. Credit is the **derived**
+  `capacity-(head-tail)` — **no shared counter** — so a slow caller stalls a fast
+  callee (a producer stall, **never** a mid-stream drop; 022). The item-drain leg **is**
+  the shipped 024 `StreamChannel`/`StreamActivation`, so intra-stream FIFO, 0 per-item
+  heap, and 0 cross-core RMW on the caller drain come for free (proven — ADR-018 F1–F3).
+- **Three seams.** A **single-resolve `StreamReplyCell`** (the OPEN handshake — 16 B,
+  rides the ADR-007 `reply_` field; **the ordinary single-shot `ReplyCell` is
+  untouched**), the **N-item ring**, and an **in-band EoS**. ADR-007 reply-ordering
+  governs delivery of the **OPEN handle** (Sequential → request order, Reentrant →
+  completion order); intra-stream FIFO is the orthogonal monotone `head` order.
+- **Identity & exactly-once.** Each item carries a **callee-assigned, replay-deterministic
+  `producer_seq`**; the caller dedups by its `disp` high-watermark (a caller-local ring
+  index is **not** a valid identity — see `017`). Cross-node, the reply stream rides the
+  010 transport with a monotone-max-merge credit-return; the deadline travels as
+  remaining-duration and is reconstructed against the callee clock (`018`).
+- **Cancel / deadline** tear the stream down, return credit, stop the callee, and deliver
+  nothing after teardown — a two-part terminal wake (arm the caller drain **and** wake a
+  stalled callee; `002`). The ring + handle are reclaimed **exactly once** with no UAF
+  (the ADR-007 reply-UAF gate extended to the multi-terminal reclaim surface).
+- **`ReplyMode::{Push(default), Pull}`.** Push (above) is the default and the only path
+  that meets the 023 **0-RMW** caller-drain gate. A secondary `Pull` (demand-driven,
+  `DemandChannel`) is adopted for high-RTT cross-node links and bursty subscribe-style
+  replies where the callee must be *provably idle*; it trades the 0-RMW gate for intrinsic
+  backpressure and higher raw throughput (ADR-018 §Decision).
+
 ## Protocol
 
 An actor's **protocol** is the set of message types it enumerates in
@@ -131,9 +174,16 @@ handled-but-unlisted overload is itself a compile error, per 005 Validation).
   generalized to every exhaustible resource, plus rate limiting, deadline-aware load
   shedding, and circuit breaking — in
   [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md).
-- **Streaming replies**: `ask` returning `std::generator<>`/a stream for multi-item
-  responses. *(The **inbound** direction is resolved — a `StreamRef<F>` handle +
-  `handle(StreamBatch<F>&)` drain overload over the credit-ring of
-  [024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md). The
-  **outbound** `ask`-returns-a-stream case remains open; the credit-ring is reusable
-  for it but the reply-routing interaction is unspecced.)*
+- **Streaming replies** — **resolved in mechanism ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)), Draft pending the 015 OPEN re-admit gate.**
+  `ask` returning a stream for multi-item responses is the **024 credit-ring flipped**
+  (callee = producer, caller = consumer) — see `ask_stream<F>` above. The **inbound**
+  direction was already Accepted (a `StreamRef<F>` handle + `handle(StreamBatch<F>&)` drain
+  over the credit-ring of
+  [024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md)); the
+  **outbound** reply-routing interaction is now specced (three seams: single-resolve
+  `StreamReplyCell`, the N-item ring, in-band EoS; `producer_seq` identity; monotone
+  credit-return). The **item-transport leg is proven** (it is the shipped 024 ring), but
+  006 outbound stays **Draft** until the **015 OPEN-cell re-admit** (`co_await` on-lane
+  resume) clears an ADR-014-grade real-scheduler gate — the same unfinished seam an
+  *ordinary* `ask`'s OPEN handshake still inherits (`detail/reply_cell.hpp`). *Residual
+  open design item: multi-source fan-in deriving a reply (017).*

@@ -87,6 +87,23 @@ and **by-reference / registered-RX** (the slot references a transport buffer the
 transport may DMA into — zero-copy; its lifetime tied to the credit/read-cursor
 advance). This is the resource-layer view of 024's buffer ownership (003).
 
+### Outbound streaming replies are caller-shard resources (ADR-018)
+
+An outbound streaming reply — an `ask_stream<F>` that returns `ReplyStream<F>` — is
+the 024 inbound credit-ring **run backward** (callee = producer, caller = consumer),
+so its reply ring + slots + payload arena are **caller-shard `pmr`-owned,
+pre-allocated cold at `ask_stream` (not per item), pooled and reused** → **0
+per-item heap** ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)).
+
+The footprint trade is **idle density**: this costs a whole ring per *in-flight*
+streaming ask (`cap × slot`, e.g. ~16 KB @ cap-256) where an ordinary ask needs only
+a **64 B scalar `ReplyCell`**. A fan-out of many concurrent short streaming replies
+is therefore heavy, bounded by three levers — a **small default cap** (022
+`credit_limit`), a **shard slab** the rings draw from, and an **admission cap on
+concurrent streaming asks**. Distinct from the inbound case, the callee's cold
+`task<>` frame is **1 alloc/ask** (conceded); an **optional pooled `promise_type`
+operator-new** (shard frame-slab) reaches the full 0 without touching the item path.
+
 ## Message context (ambient)
 
 Every message carries a `MessageContext`, available to the handler without lookup:

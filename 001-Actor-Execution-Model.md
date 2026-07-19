@@ -111,6 +111,16 @@ stream's split `disp`/`tail` cursors freeze at the parked frame until 015 re-adm
 giving exactly-once dispatch (proven: `concur_violations = 0`, no wedge). See
 [024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md).
 
+**Outbound reply streaming obeys it on both legs** (ADR-018). An `ask_stream`
+reply is the 024 ring flipped (callee = producer, caller = consumer), and
+single-executor (GATE-1) holds on **each** leg independently: neither the callee
+producing reply items nor the caller draining reply batches is ever entered
+concurrently with its own actor. A **suspended** handler on either leg advances
+nothing past the parked frame — the producing callee freezes `head`, the draining
+caller freezes its `disp`/`tail` — until 015 re-admits, exactly the
+single-executor-across-suspend rule ADR-014 proved for the inbound drain. See
+[decisions/ADR-018-outbound-streaming-replies.md](decisions/ADR-018-outbound-streaming-replies.md).
+
 ### Execution vehicle — passive + stackless core
 
 The engine's **core execution vehicle is passive + stackless run-to-completion**: an

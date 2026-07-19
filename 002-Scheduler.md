@@ -155,6 +155,19 @@ a stream-descriptor-aware continuation bound to `(StreamChannel*, disp)` — the
 activation is **transferred, not parked**, so the descriptor is not re-enqueued and
 the buffered window cannot be orphaned.
 
+## Reply-stream terminal edge (ADR-018)
+
+An outbound streaming reply runs the 024 ring **backward** (callee = producer,
+caller = consumer). Its terminal edge — **cancel, deadline (018), or close** —
+reuses the **`seq_cst` Dekker close-out verbatim**: the terminal CAS does a
+**two-part wake** in one shot — it **arms the caller's drain** (`notify_enqueued`,
+`Idle → Scheduled` on the consumer) **and** bumps `credit_gen + notify` so a callee
+stalled on a full credit window wakes to observe teardown. As on the inbound path
+(§Streaming activations), wakeup is **never keyed on ring/credit emptiness** — that
+emptiness is non-linearizable; both halves ride the exec-state / credit-generation
+machine. This is the 024 inbound arming rule run in reverse. See
+[ADR-018](decisions/ADR-018-outbound-streaming-replies.md).
+
 ## Blocking/fiber adapter completion — the `Parked` exec-state (ADR-015)
 
 The exec-state machine gains an explicit fourth state for off-hot-path

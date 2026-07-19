@@ -217,6 +217,14 @@ Rationale, in the required ranking order:
    pins its referenced RX buffer; on a shared provided-buffer pool one slow consumer
    can starve unrelated streams. 024 must cap per-stream pinned buffers or force a
    copy-out on suspend (adopted from C's F2 residual).
+7. **Ring now runs in both directions (extended by
+   [ADR-018](ADR-018-outbound-streaming-replies.md)).** The winning `StreamChannel` ring
+   is symmetrized for **outbound streaming replies** — the same ring flipped, allocated on
+   the **caller** shard (consumer owns the ring) with the producer arm-edge driven by the
+   **callee or the caller-node transport thread**. That caller-shard-owned ring + cross-shard
+   (callee/transport-thread) producer is a **new NUMA case** (remote-store penalty on the
+   producer's `head` arm) that these single-shard measurements did **not** cover — flag for
+   `perf c2c` on a 2-socket rig before the outbound footprint/latency numbers are stamped.
 
 ## Spec recommendations
 

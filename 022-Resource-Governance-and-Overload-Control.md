@@ -58,6 +58,7 @@ predictably. The rest of the spec is about **hitting bounds gracefully**.
 | Ingress request rate | token bucket per principal (020) | ingress boundary |
 | `ask` in-flight to a target | circuit breaker | send time |
 | Inbound stream memory (024) | per-stream **credit window** (`capacity × slot`) | producer credit check |
+| Outbound reply-stream memory (ADR-018) | per-stream reply **credit window** + concurrent-streaming-ask **admission cap** | callee (producer) credit check + `ask_stream` admission |
 
 **The stream credit window is the per-stream backpressure lever** (024). The ring
 bounds resident memory; a fast producer **stalls via credit depletion** — lossless,
@@ -67,6 +68,15 @@ shedding a stream mid-flight corrupts it (the per-item-`tell` baseline shed
 3.9–4.8M frames in the ADR-005 benchmark), so a stream is bounded by *stalling the
 producer*, not dropping frames. `credit_limit` may narrow the window with a relaxed
 store, never on the per-frame path.
+
+The **reply direction is symmetric** ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)):
+an outbound streaming reply is the 024 ring run backward (callee = producer, caller =
+consumer), so its backpressure is likewise the **credit window — a producer stall,
+never mid-stream shedding** (shedding a reply mid-flight corrupts it exactly as
+inbound). Two 022 numbers govern it: the **admission cap on concurrent streaming
+asks** (bounds the idle-density footprint of one whole ring per in-flight ask) and
+the **default reply-ring capacity**. Both inherit 024's adaptive-`credit_limit` open
+item — the default cap is static-and-roughly-right, adaptive tuning stays opt-in.
 
 ## Mechanisms
 
