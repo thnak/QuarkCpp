@@ -39,6 +39,10 @@ jobs:
   test:
     name: test (${{ matrix.config.name }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    # Safety net: the arm64 gcc/clang-release legs were observed to hang indefinitely (a real
+    # non-termination, not just "slow") and got silently killed only by GitHub's 6h job cap. A
+    # per-test ctest --timeout (below) is the primary fix; this is the backstop.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +83,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 cmake ninja-build
+          sudo apt-get install -y g++-14 cmake ninja-build gdb
           if [[ "${{ matrix.config.cxx }}" == clang++* ]]; then
             wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
             sudo apt-get install -y clang-20 libc++-20-dev libc++abi-20-dev || true
@@ -97,8 +101,36 @@ jobs:
       - name: Build
         run: cmake --build build -j ${{ matrix.config.build_jobs }}
 
+      # DIAGNOSTIC (temporary): arm64 gcc/clang-release hung indefinitely on
+      # topology_fifo_under_relay_test — ASan/TSan on the same arch complete it fine (slowly),
+      # which points at a real non-termination the sanitizers' instrumentation happens to mask,
+      # not mere arm64 slowness. Run the binary directly with a wall-clock cap and, if it is still
+      # alive past that cap, attach gdb and dump every thread's stack before killing it. Best
+      # effort: never fails the job, so the real ctest run below still gets a bounded, clean signal.
+      - name: Diagnose potential hang (arm64 release only)
+        if: matrix.arch == 'arm64' && matrix.config.sanitize == ''
+        run: |
+          BIN=build/tests/topology_fifo_under_relay_test
+          if [[ -x "$BIN" ]]; then
+            "$BIN" >/tmp/fifo_out.log 2>&1 &
+            pid=$!
+            for i in $(seq 1 60); do
+              if ! kill -0 "$pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "::warning::topology_fifo_under_relay_test still running after 60s on $(uname -m) — capturing thread backtraces"
+              sudo gdb -p "$pid" -batch -ex "set pagination off" -ex "thread apply all bt" -ex detach -ex quit 2>&1 || true
+              kill -9 "$pid" 2>/dev/null || true
+            else
+              echo "topology_fifo_under_relay_test exited on its own within 60s (exit $(wait "$pid"; echo $?))"
+            fi
+            echo "--- stdout/stderr ---"
+            cat /tmp/fifo_out.log
+          fi
+
       - name: Test
-        run: ${{ matrix.config.ctest_env }} ctest --test-dir build -j ${{ matrix.config.ctest_jobs }} --output-on-failure
+        run: ${{ matrix.config.ctest_env }} ctest --test-dir build -j ${{ matrix.config.ctest_jobs }} --output-on-failure --timeout 1800
 
       - name: Upload ctest logs on failure
         if: failure()
