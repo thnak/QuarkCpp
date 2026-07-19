@@ -154,6 +154,37 @@ degrades *itself*, not its neighbors. Per-shard local accounting keeps this
 contention-free (like 009's per-shard counters), reconciled approximately across
 shards rather than through a hot global atomic.
 
+### 5. Fan-out amplification governance — broadcast owns its own caps
+
+One `Topic<M>` publish (ADR-019) fans a single message to N subscribers — the
+sharpest internal-amplification source in the engine. Crucially, **broadcast
+governs itself: there is no shipped concurrent-outstanding-broadcast cap today**,
+and the fan-out path does **not** ride the ingress token-buckets above (those gate
+external → actor arrival, not internal fan-out). The caps here are new and
+broadcast-owned:
+
+- **Per-`(topic, subscriber)` outstanding-broadcast counter.** A relaxed
+  `fetch_add` on the broadcast leg, `fetch_sub` in the broadcast **reclaim** branch
+  — it touches no ordinary-tell code. A subscriber over its outstanding bound is
+  dropped (counted), not blocked. A **soft / approximate** bound is acceptable
+  here: best-effort delivery tolerates a slightly-late or slightly-loose count, and
+  the relaxed ordering keeps the publish leg off any cross-core RMW.
+- **Per-shard live-payload cap `L`.** Bounds the resident `SharedPayload<M>` cells
+  a shard holds in flight. On reaching `L`, publish **sheds — drops-all, counted**
+  (the whole publish for that shard is dropped) rather than allocate past `L`. This
+  is the drops-all-vs-allocate trade the bound-every-resource invariant demands,
+  applied to the fan-out lane.
+
+These two caps are **load-bearing, not optional** — ADR-019's firing control shows
+linear footprint growth with them disabled, and there is no 022 fallback cap to
+inherit. Both are best-effort *shedding* (drop-on-full, counted), the opposite of
+024's stream credit *stall*: shedding a broadcast is correct precisely because it
+is `AtMostOnce` (017), where stalling would violate GATE 1.
+
+Cross-node amplification is governed not by subscriber count but by the number of
+**distinct subscriber nodes** — one coalesced frame per node — bounded by 026's
+`relay_cap = ⌈log₂N⌉` when routed through the relay tree.
+
 ## Self-debate
 
 - **Central limiter vs. per-shard local?** A single global token bucket is a

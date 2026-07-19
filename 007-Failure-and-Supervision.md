@@ -160,6 +160,26 @@ Knob `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>`:
   suspension points inside the handler are unwound by normal C++ coroutine
   exception propagation.
 
+## Broadcast — dead-subscriber pruning (ADR-019)
+
+A `Topic<M>` best-effort broadcast
+([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)) delivers to
+subscribers as N ordinary tells sharing one payload — so a dead subscriber is a failure
+the *publisher* must never wait on (GATE 1: the publisher never blocks or stalls):
+
+- **Dead subscriber-node** — a copy addressed to a subscriber on a SWIM-`Suspect`/`Dead`
+  node (010/021) is **dropped immediately and counted** (`PublishReceipt.dropped_*`), never
+  retried and never back-pressured onto the publisher.
+- **Dead local subscriber** — resolves through `ActorRef` to the **dead-letter** sink like
+  any other tell; the topic does not special-case it.
+- **Optional SWIM-driven snapshot prune** — a membership transition may trigger a
+  copy-on-write rebuild of the subscriber table that drops entries for `Dead` nodes, keeping
+  the immutable snapshot from accumulating tombstones (cold path, off the publish hot path).
+
+The **subscriber mailbox's lifetime is not re-solved by the topic** — it stays governed by
+the existing `ActorRef` / 007 discipline above (supervision, dead-letter, restart budget). A
+topic is a fan-out addressing layer over `ActorRef`s, not a new lifecycle owner.
+
 ## Observability
 
 Every failure emits: `trace_id`, `ActorId`, message type, failure source, and

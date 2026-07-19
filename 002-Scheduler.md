@@ -141,6 +141,18 @@ x86 leak is small (~0.05–0.09%) but nonzero, so the fence is load-bearing and 
 guard is `lost == 0` vs `lost > 0`. See
 [ADR-004](decisions/ADR-004-mailbox-mpsc-hot-path-r4.md).
 
+## Broadcast schedules activations, not messages (ADR-019)
+
+Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))
+adds **no** new scheduler contract. A `publish(M)` lowers to **N ordinary ADR-002
+tells sharing one immutable refcounted payload**: each per-subscriber delivery is an
+ordinary mailbox enqueue that drives that subscriber's exec-state `Idle → Scheduled`
+wake through the **verbatim** targeted-wakeup + `seq_cst` Dekker close-out above —
+the fan-out schedules **activations, not messages**, and never a broadcast-specific
+scheduler entity. **At-most-one executor per subscriber is unchanged**: the shared
+payload is fanned as N thin descriptors onto N independent mailboxes, so each
+subscriber activates under its own exec-state CAS exactly as for a discrete tell.
+
 ## Streaming activations (024)
 
 An inbound stream (024) does **not** get a second scheduler. Its per-stream ring is

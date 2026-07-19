@@ -104,6 +104,17 @@ concurrent streaming asks**. Distinct from the inbound case, the callee's cold
 `task<>` frame is **1 alloc/ask** (conceded); an **optional pooled `promise_type`
 operator-new** (shard frame-slab) reaches the full 0 without touching the item path.
 
+### Broadcast payloads are pool-resolved (ADR-019)
+
+Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))
+introduces **no dynamic resource resolution on the publish path**. The single
+immutable refcounted `SharedPayload<M>` and the N thin per-subscriber descriptors
+that reference it are **pool-resolved from the shard's size-class pools** (003) —
+pre-warmed, `malloc/publish = 0` — exactly like an ordinary tell's payload and
+descriptor. A `publish` reads only already-resolved pool handles; it **never walks a
+container while a message is processed**, upholding the "no dynamic resolution while
+draining" rule above on both the fan-out and the drain side.
+
 ## Message context (ambient)
 
 Every message carries a `MessageContext`, available to the handler without lookup:

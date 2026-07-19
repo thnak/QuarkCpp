@@ -177,6 +177,28 @@ This is the reply-direction dual of, and **composes with**, the cross-node backp
 open question below (a remote full mailbox is a *producer stall* via the credit window,
 not head-of-line blocking on the shared connection).
 
+## Cross-node broadcast fan-out (Draft — ADR-019)
+
+A `Topic<M>` best-effort broadcast
+([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)) that spans nodes
+fans out over this seam by **coalescing remote subscribers by node**: the publisher emits
+**one fire-and-forget frame per distinct subscriber-node**, not one per remote subscriber, so
+amplification is bounded by **#nodes, not #remote-subs**. A `Suspect`/`Dead` or otherwise
+unreachable node is **dropped without stalling the publisher** — this composes with SWIM
+membership (above) and the stabilization window (021) exactly as an ordinary cross-node `tell`
+does.
+
+The bound is on *fan-out*, not on publisher work: the **synchronous per-node ADR-016 encode**
+is publisher CPU, so **publisher latency rises linearly in the number of distinct alive
+nodes**. That linear cost *is* the bounded amplification (one encode per node), **not** a
+stall — GATE 1 (publisher never blocks) still holds. Per-node coalescing also makes loss
+**coarse**: one dropped frame loses the publish for every subscriber on that node.
+
+**Status: Draft.** Amplification + dead-node no-stall are proven only on an in-process
+simulated transport (x86-TSO, ADR-019 GATE 7). Promotion is gated on a **real-transport**
+re-proof and the **ADR-011 path-pinned relay-tree FIFO** re-gate (the relay-tree variant is in
+026).
+
 ## Dependencies
 
 Std + the Platform Abstraction Layer's socket/event-loop backend (epoll·io_uring /

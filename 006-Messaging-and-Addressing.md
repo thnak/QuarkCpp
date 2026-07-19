@@ -154,6 +154,47 @@ handled-but-unlisted overload is itself a compile error, per 005 Validation).
 | Backpressure | Bounded mailbox → `tell` may block, fail, or shed per policy (open question). |
 | Cancellation | An `ask` observing a fired deadline/stop cancels the queued message (`001`). |
 
+## Publish/Subscribe (broadcast)
+
+**Status: Accepted (x86-64) for local fan-out · Draft for cross-node**
+([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)).
+
+`tell`/`ask` address ONE actor; routers and `Stateless<N>` fan to ONE group/pool
+member. `Topic<M>` is the **subscriber-agnostic one-to-many** verb: a publisher
+fires a message to MANY subscribers without knowing who or how many are listening.
+The semantic is **best-effort, at-most-once** — a slow/full/dead subscriber is
+**dropped (counted), never blocks the publisher**. It is the deliberate opposite of
+024's streaming reply, which HAS credit backpressure; broadcast has none.
+
+```cpp
+quark::Topic<Tick> ticks;
+ticks.subscribe(clockRef);              // ActorRef<A>, idempotent
+quark::PublishReceipt r = ticks.publish(Tick{ .seq = 42 });
+// r = { delivered, dropped_full, dropped_deadline, remote }
+ticks.unsubscribe(clockRef);           // no delivery after this returns
+```
+
+- `subscribe(ActorRef<A>)` / `unsubscribe(ActorRef<A>)` are **idempotent** with
+  `ActorId` **set-semantics dedup** — a double-subscribe of the same actor yields
+  **one** delivery (at-most-once at actor granularity).
+- `publish(M)` returns a `PublishReceipt{delivered, dropped_full, dropped_deadline,
+  remote}` — per-subscriber drops are **counted, not silent**. There is **no reply
+  channel and no `ReplyCell` binding**: broadcast is fire-and-forget.
+- **Publisher never blocks** (GATE 1): every leg is O(1); a full + dead-local +
+  dead-remote subscriber set does not raise publisher latency.
+- **Membership** is an `atomic<shared_ptr<const SubVec>>` immutable copy-on-write
+  snapshot; the publisher loads one snapshot and walks it. `unsubscribe` uses
+  **bounded quiescence** (mark inactive, wait `in_flight == 0`) so **no delivery
+  can occur after `unsubscribe()` returns** — it never delays the publisher.
+- **Delivery lowers to N ordinary `tell`s sharing ONE immutable refcounted payload**:
+  each subscriber gets a thin descriptor onto its **unchanged mailbox** (001/002),
+  dispatched through the existing `slot_of<A,M>` jump-table with `kind=Broadcast`
+  and no responder field. It composes with the `tell` path (ADR-002) and handler
+  dispatch (ADR-007) **verbatim** — enqueue/drain byte-identical, at-most-one
+  executor per subscriber, per-`(publisher, subscriber)` FIFO preserved.
+- Cross-node fan-out (coalesce one frame per distinct node) is **Draft** pending
+  real-transport amplification + dead-node proof (ADR-019 GATE 7).
+
 ## Resolved (ADR-007)
 
 - **`ask` from sync code** → forbidden. `ask` is async-only; off-lane bootstrap uses
@@ -167,6 +208,9 @@ handled-but-unlisted overload is itself a compile error, per 005 Validation).
 
 ## Open questions
 
+- **One-to-many / broadcast** → **Resolved** ([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)):
+  the missing subscriber-agnostic fan-out primitive is now `Topic<M>` best-effort
+  broadcast (see *Publish/Subscribe* above) — Accepted (x86-64) local, Draft cross-node.
 - **Backpressure**: what does `tell` do on a full bounded mailbox — block the
   sender, return `std::expected` failure, or drop with a policy? The per-actor
   `Overflow<Block|Fail|DropOldest>` policy is the leaning here, and it is the

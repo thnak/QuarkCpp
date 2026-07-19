@@ -159,3 +159,22 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_drain_rmw_test.cpp" AND NOT QUARK_
   add_test(NAME stream_drain_zero_rmw
            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/stream_drain_rmw_check.sh" $<TARGET_FILE:stream_drain_rmw_test>)
 endif()
+
+# 006 §Publish/Subscribe — ADR-019 GATE 6 bounded-quiescence FIRING CONTROL. -DQUARK_TOPIC_NO_QUIESCE
+# drops the `wait in_flight==0` barrier in Topic::unsubscribe, so the churn thread destroys an inbox a
+# publisher still references (it loaded the pre-unsubscribe snapshot) -> heap-use-after-free. Wired
+# ONLY under ASAN (where the freed-memory access reliably traps); WILL_FAIL means a non-zero exit (the
+# trap) == the control firing. In a plain build the UAF may not crash, so the control has value only
+# with ASan. The POSITIVE topic_subscribe_race_test (barrier present) is auto-discovered and runs under
+# every build + sanitizer.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/topic_subscribe_race_test.cpp" AND QUARK_SANITIZE MATCHES "address")
+  add_executable(topic_no_quiesce_control topic_subscribe_race_test.cpp)
+  target_link_libraries(topic_no_quiesce_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(topic_no_quiesce_control PRIVATE QUARK_TOPIC_NO_QUIESCE)
+  add_test(NAME topic_no_quiesce_control COMMAND topic_no_quiesce_control)
+  # ASan must exit with a clean non-zero code (not SIGABRT) so WILL_FAIL can invert it into a PASS;
+  # symbolize=0 avoids the missing-llvm-symbolizer hang. WILL_FAIL => the ASan trap == the control firing.
+  set_tests_properties(topic_no_quiesce_control PROPERTIES
+    WILL_FAIL TRUE
+    ENVIRONMENT "ASAN_OPTIONS=abort_on_error=0:symbolize=0:exitcode=1;UBSAN_OPTIONS=print_stacktrace=0")
+endif()

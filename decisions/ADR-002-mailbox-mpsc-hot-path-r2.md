@@ -241,3 +241,13 @@ See `specRecommendations` in the structured output. Summary:
 8. **Single-membership is a global lifecycle invariant** the mailbox cannot cheaply
    check on the hot path; a double-tell of one descriptor corrupts the intrusive
    chain. Guaranteed by descriptor allocation lifecycle + a debug assertion only.
+
+## Downstream reuse (back-reference)
+
+- **Best-effort broadcast reuses this mailbox verbatim.**
+  [ADR-019](ADR-019-best-effort-broadcast-publish-primitive.md) (`Topic<M>`) lowers a
+  `publish` to N ordinary tells sharing one immutable refcounted payload; each
+  per-subscriber delivery is a Design-A enqueue with **0 new drain RMW**. Proven
+  **objdump byte-identical WITH vs WITHOUT `Topic<M>`** (GATE 5), and 0 `Topic` symbols
+  when uninstantiated. **No change to ADR-002 itself** — broadcast is a pure consumer
+  of this decision.
