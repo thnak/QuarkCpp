@@ -2,7 +2,8 @@
 // histograms, aggregate-on-scrape. The measurement surface for the 023 macrobenchmarks.
 //
 // HOT-PATH MODEL (CONVENTIONS.md hot-path rules; 009 §Storage: per-shard, contention-free):
-//   * A shard is drained by ONE worker at a time (002), so its counters are single-writer.
+//   * A shard is DRAINED by ONE worker at a time (002), so the counters that only change on the
+//     drain-owner's lane (messages_processed, restarts, dead_letters, steals) are single-writer.
 //   * The spec calls for "plain (non-atomic) integers" written on the lane and read by a scraper
 //     "with a relaxed atomic snapshot". A plain non-atomic store racing an off-lane read is a data
 //     race (UB, and TSan flags it), so we store each counter as std::atomic<uint64_t> and INCREMENT
@@ -10,12 +11,20 @@
 //     `mov`/`mov` pair, NOT a `lock xadd`: there is no atomic RMW and no cross-core bus lock on the
 //     hot path (the CONVENTIONS.md "0 cross-core atomic RMW on the sequential drain path" rule),
 //     yet the access is well-defined and TSan-clean because it is a relaxed atomic, not a plain int.
+//   * NOT every counter is drain-owned, though: mailbox_enqueued/activations/wakeups fire on the
+//     PRODUCER side (Activation::post/notify_enqueued and Engine::schedule_and_wake), and more than
+//     one producer thread can target the same shard concurrently (many actors hash to one shard).
+//     `inc()`'s load+store pair is a lost-update race under concurrent writers there — no UB, no
+//     TSan report (each op is individually a well-defined atomic access), just silent undercounting.
+//     Those three use `inc_atomic()` (a real `fetch_add`) instead — precedented by the existing
+//     producer-side `fetch_add` governance accounting in activation.hpp (GovernanceCore::enqueued).
 //   * The scraper reads with a relaxed load and AGGREGATES across shards on read — the only
 //     cross-thread interaction, and it is off the hot path.
 //   * Every counter/histogram is a fixed-size member: 0 heap allocation on the record path.
 //
-// Because increments are NOT atomic RMWs, a Counter has exactly one writer (its shard's lane).
-// Concurrent producers each own a shard's counters and the scraper sums them (009 §aggregate-on-read).
+// Because drain-side increments are NOT atomic RMWs, those Counters have exactly one writer (the
+// shard's drain-owner lane). Producer-side counters use `inc_atomic()` and may have many writers.
+// The scraper sums across shards (009 §aggregate-on-read).
 #pragma once
 
 #include <array>
@@ -35,15 +44,21 @@ namespace quark {
 // the fixed-slot side so the record path never allocates or locks; names are bound cold at startup).
 inline constexpr std::size_t kUserCounterSlots = 16;
 
-// --- Counter: single-writer, relaxed. inc() is load+store (NOT an atomic RMW). ----------------
-class Counter {
+// --- MetricCounter: single-writer, relaxed. inc() is load+store (NOT an atomic RMW). -----------
+class MetricCounter {
 public:
-    Counter() noexcept = default;
-    Counter(const Counter&) = delete;
-    Counter& operator=(const Counter&) = delete;
+    MetricCounter() noexcept = default;
+    MetricCounter(const MetricCounter&) = delete;
+    MetricCounter& operator=(const MetricCounter&) = delete;
 
     QUARK_ALWAYS_INLINE void inc(std::uint64_t n = 1) noexcept {
         v_.store(v_.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+    }
+    // Genuinely atomic increment (fetch_add) for the rare PRODUCER-side counters that may have more
+    // than one concurrent writer on the same shard (mailbox_enqueued, activations, wakeups) — see the
+    // file banner. NOT for the drain-owner-exclusive counters; those stay on the faster inc() above.
+    QUARK_ALWAYS_INLINE void inc_atomic(std::uint64_t n = 1) noexcept {
+        v_.fetch_add(n, std::memory_order_relaxed);
     }
     [[nodiscard]] QUARK_ALWAYS_INLINE std::uint64_t load() const noexcept {
         return v_.load(std::memory_order_relaxed);
@@ -56,7 +71,7 @@ private:
 
 // --- Histogram: fixed base-2 buckets (HDR-style), no allocation, mergeable on scrape ----------
 // Bucket i counts values whose position of the highest set bit is i (bucket 0 == value 0). 64
-// buckets span the whole uint64 range; recording is single-writer relaxed like a Counter.
+// buckets span the whole uint64 range; recording is single-writer relaxed like a MetricCounter.
 struct HistogramSnapshot {
     static constexpr std::size_t kBuckets = 64;
     std::array<std::uint64_t, kBuckets> buckets{};
@@ -128,15 +143,15 @@ private:
 // never share a line (023 false-sharing avoidance). Named engine hot events + user slots + two
 // histograms. Non-copyable/non-movable (holds atomics) — owned in place, referenced by pointer.
 struct QUARK_CACHE_ALIGNED ShardCounters {
-    Counter messages_processed;  // 001/002 drain
-    Counter mailbox_enqueued;    // 003 producer post
-    Counter activations;         // 002 Idle->Scheduled edges
-    Counter restarts;            // 007 supervision restarts
-    Counter steals;              // 002 work-stealing
-    Counter wakeups;             // 002 worker wakeups
-    Counter dead_letters;        // 007/009 undeliverable messages
-    Counter deadline_misses;     // 011/018 overruns accounted by 009
-    Counter user[kUserCounterSlots];
+    MetricCounter messages_processed;  // 001/002 drain
+    MetricCounter mailbox_enqueued;    // 003 producer post
+    MetricCounter activations;         // 002 Idle->Scheduled edges
+    MetricCounter restarts;            // 007 supervision restarts
+    MetricCounter steals;              // 002 work-stealing
+    MetricCounter wakeups;             // 002 worker wakeups
+    MetricCounter dead_letters;        // 007/009 undeliverable messages
+    MetricCounter deadline_misses;     // 011/018 overruns accounted by 009
+    MetricCounter user[kUserCounterSlots];
 
     Histogram message_latency_ns;  // handler start->end latency
     Histogram mailbox_depth;       // observed mailbox depth at drain

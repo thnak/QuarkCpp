@@ -36,6 +36,7 @@
 #include "quark/core/hot_cell.hpp"        // 013/ADR-008: the Live operational-word (0-RMW hot read)
 #include "quark/core/ids.hpp"
 #include "quark/core/metadata.hpp"        // 008: compiled ActorMetadata, factories, typed spawn wiring
+#include "quark/core/metrics.hpp"         // 009: ShardCounters/MetricsRegistry — the metrics_snapshot() surface
 #include "quark/core/policies.hpp"        // 005: priority_band_of / drain_budget_of / max_concurrency_of
 #include "quark/core/resource.hpp"        // 004: ResourceScope for the cold activation wire pass
 #include "quark/core/run_queue.hpp"
@@ -100,6 +101,9 @@ public:
         shard_mask_ = cfg_.shard_count - 1;
         shards_ = std::make_unique<Shard[]>(cfg_.shard_count);
         workers_ = std::make_unique<Worker[]>(cfg_.worker_count);
+        // 009: register every shard's embedded ShardCounters (cold, one-time; register_shard just
+        // stores a pointer) so metrics_snapshot()/metrics_prometheus() aggregate across all shards.
+        for (std::uint32_t sh = 0; sh < cfg_.shard_count; ++sh) metrics_.register_shard(shards_[sh].metrics);
         // Seed the Live operational word (013/ADR-008) from the frozen config. This ctor is the
         // non-validating path (ConfigBuilder::build() is the validating one, 008), so it CLAMPS each
         // Live field into its packing ceiling rather than reject — the frozen `cfg_.drain_budget`
@@ -126,6 +130,7 @@ public:
         auto s = std::make_unique<Schedulable>();
         s->activation = &act;
         s->shard = shard_of(id);
+        act.set_metrics(&shards_[s->shard].metrics);  // 009: wire this activation to its shard's counters
         s->band = static_cast<std::uint16_t>(band < Policy::bands ? band : Policy::bands - 1);
         // Default drain budget = the FROZEN `EngineConfig::drain_budget` (013/ADR-008): a per-actor
         // `DrainBudget<N>` still wins (budget != 0), else the engine-wide frozen default. This is
@@ -320,6 +325,15 @@ public:
         return false;
     }
 
+    // --- 009 Observability — the consumer-facing metrics surface --------------------------
+    // Off the hot path (aggregates every shard's counters on read). `engine.metrics_snapshot()` is
+    // the exact name 009-Observability.md documents as the embedding/test surface.
+    [[nodiscard]] MetricsSnapshot metrics_snapshot() const { return metrics_.snapshot(); }
+    // Prometheus text exposition — pure string formatting, no client library (009 §Export).
+    [[nodiscard]] std::string metrics_prometheus() const { return metrics_.to_prometheus(); }
+    // Direct registry access (e.g. `set_user_counter_name` before/while the engine is running).
+    [[nodiscard]] MetricsRegistry& metrics_registry() noexcept { return metrics_; }
+
 private:
     // Courier wrappers (bound into PostCourier). Static so they are plain `.rodata` fn-ptr targets
     // — no virtual, no per-Policy indirection beyond the one already-typed call.
@@ -335,6 +349,7 @@ private:
     struct alignas(::quark::cache_line_size) Shard {
         RunQueue<Policy> run_queue;
         QUARK_CACHE_ALIGNED std::atomic<std::uint32_t> drain_owner{kNoOwner};  // null→self per session
+        ShardCounters metrics;  // 009: this shard's counter block (cold-allocated with the array)
     };
 
     struct alignas(::quark::cache_line_size) Worker {
@@ -359,13 +374,18 @@ private:
     QUARK_ALWAYS_INLINE void schedule_and_wake(Schedulable* s) noexcept {
         shards_[s->shard].run_queue.enqueue(s);  // carry the activation onto the shard run-queue
         producer_wake_fence();                    // Dekker: enqueue happens-before the idle_mask load
-        wake_one();
+        if (wake_one()) {
+            // 009: producer-side, possibly concurrent (many producers can post to the same shard) —
+            // the genuinely-atomic path, not the drain-owner-exclusive inc(). Counted only when a
+            // worker was ACTUALLY woken (not merely attempted — every worker busy is the common case).
+            shards_[s->shard].metrics.wakeups.inc_atomic();
+        }
     }
 
     // Wake EXACTLY ONE idle worker (targeted, never broadcast — 002 §Wakeup). If none is idle every
     // worker is busy and will re-scan on finishing its session (the park() Dekker rescan guarantees
-    // it observes this enqueue), so no wakeup is lost.
-    void wake_one() noexcept {
+    // it observes this enqueue), so no wakeup is lost. Returns true iff a worker was actually woken.
+    bool wake_one() noexcept {
         std::uint32_t m = idle_mask_.load(std::memory_order_acquire);
         while (m != 0) {
             const std::uint32_t id = static_cast<std::uint32_t>(std::countr_zero(m));
@@ -374,10 +394,11 @@ private:
                                                  std::memory_order_acquire)) {
                 workers_[id].wake_seq.fetch_add(1, std::memory_order_release);
                 workers_[id].wake_seq.notify_one();
-                return;
+                return true;
             }
             // m was reloaded by the failed CAS — retry with the fresh idle set.
         }
+        return false;  // every worker busy — no lost wakeup (the park() Dekker rescan catches it)
     }
 
     void wake_all() noexcept {  // cold, stop() only — shutdown broadcast, not the hot wake path.
@@ -440,6 +461,10 @@ private:
                                                         std::memory_order_relaxed))
                 break;
         }
+        // 009: a steal = this worker drained a shard it doesn't own AND actually moved work — winning
+        // an empty shard's CAS isn't a steal. Drain-owner-exclusive (only the CAS winner reaches here
+        // for this shard), so the plain non-atomic-RMW inc() is safe.
+        if (processed && home_worker(sid) != wid) sh.metrics.steals.inc();
         return processed;
     }
 
@@ -527,6 +552,7 @@ private:
     std::uint64_t shard_mask_ = 0;
     std::unique_ptr<Shard[]> shards_;
     std::unique_ptr<Worker[]> workers_;
+    MetricsRegistry metrics_;          // 009: aggregates every Shard's embedded ShardCounters
     std::vector<std::unique_ptr<Schedulable>> registry_;  // engine owns Schedulable lifetimes
     // 008 typed-spawn ownership: the engine owns actor instances + their Activations. Declared AFTER
     // registry_ so they outlive nothing that outlives them; all are torn down in ~Engine AFTER stop()

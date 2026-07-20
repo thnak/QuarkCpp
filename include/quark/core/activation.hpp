@@ -61,6 +61,7 @@
 #include "quark/core/hot_cell.hpp"  // 013/022 Overflow + the LIVE bound/overflow/shed word (0-RMW read)
 #include "quark/core/mailbox.hpp"
 #include "quark/core/message_context.hpp"
+#include "quark/core/metrics.hpp"  // 009: ShardCounters — engine-wired at registration (set_metrics)
 #include "quark/core/task.hpp"  // async_frame_faulted (007 handler-boundary guard, async channel)
 #include "pal/pal.hpp"          // pal::now() — the canonical suspend-counting clock (018/019)
 
@@ -224,6 +225,11 @@ public:
     void set_reconstruct(ReconstructSink r) noexcept { reconstruct_ = r; }
     void set_dead_letter_sink(DeadLetterSink s) noexcept { dead_letter_ = s; }
 
+    // 009-Observability wiring (cold, set at registration by the engine): the SHARED per-shard
+    // counter block this activation's shard owns. Null ⇒ unwired (standalone/test Activation usage
+    // outside an Engine), every increment site below is guarded — zero behavior change when unset.
+    void set_metrics(ShardCounters* sc) noexcept { metrics_ = sc; }
+
     // Injectable clock (014 §virtual clock). `fn(ctx)` returns "now" in ns on the SAME scale as
     // Descriptor::deadline_ns (pal::clock). The 014 SimEngine binds its virtual clock here so a
     // MaxRestarts<N,Within<W>> window + deadline shedding run deterministically under simulation
@@ -299,7 +305,10 @@ public:
         g.enqueued.fetch_add(1, std::memory_order_relaxed);  // producer-side depth++
         mailbox_.enqueue(d);
         Mailbox::producer_close_out_fence();
-        return {AdmitResult::Admitted, exec_.notify_enqueued()};
+        if (metrics_) metrics_->mailbox_enqueued.inc_atomic();  // producer-side, possibly concurrent
+        const bool wake = exec_.notify_enqueued();
+        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle->Scheduled edge (009)
+        return {AdmitResult::Admitted, wake};
     }
 
     // ---- Governance observers (009 — every shed/block is counted) --------------------------
@@ -320,11 +329,16 @@ public:
     QUARK_ALWAYS_INLINE bool post(Descriptor* d) noexcept {
         mailbox_.enqueue(d);
         Mailbox::producer_close_out_fence();  // elided on x86-TSO (the tail_.exchange fenced it)
-        return exec_.notify_enqueued();
+        if (metrics_) metrics_->mailbox_enqueued.inc_atomic();  // producer-side, possibly concurrent
+        const bool wake = exec_.notify_enqueued();
+        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle->Scheduled edge (009)
+        return wake;
     }
     QUARK_ALWAYS_INLINE bool notify_enqueued() noexcept {
         Mailbox::producer_close_out_fence();
-        return exec_.notify_enqueued();
+        const bool wake = exec_.notify_enqueued();
+        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle->Scheduled edge (009)
+        return wake;
     }
 
     // ---- Worker ownership seam (002) -----------------------------------------------------
@@ -390,6 +404,7 @@ public:
             if (o.kind == HandlerKind::Sync) {
                 d->complete();
                 reclaim_(d);
+                if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
 
@@ -404,6 +419,7 @@ public:
                 o.frame.destroy();
                 d->complete();
                 reclaim_(d);
+                if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
 
@@ -456,6 +472,7 @@ public:
         }
         d->complete();
         reclaim_(d);
+        if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive (engine-driven)
         return exec_.readmit_from_parked();
     }
     [[nodiscard]] bool is_parked() const noexcept { return parked_desc_ != nullptr; }
@@ -759,6 +776,7 @@ private:
             if (o.kind == HandlerKind::Sync) {
                 d->complete();
                 reclaim_(d);
+                if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
             if (o.frame.done()) {
@@ -770,6 +788,7 @@ private:
                 o.frame.destroy();
                 d->complete();
                 reclaim_(d);
+                if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
             parked_frame_ = o.frame;
@@ -939,6 +958,7 @@ private:
         if (f->h) f->h.destroy();  // null for a sync handler (no coroutine frame); valid for async
         f->desc->complete();
         reclaim_(f->desc);
+        if (metrics_) metrics_->messages_processed.inc();  // lane-only: the reentrant success join point
         remove_live(f);
         maybe_resume_waiter();
         finish_restart_if_drained();  // 007: the last cancelled sibling draining finishes a Restart
@@ -1073,6 +1093,7 @@ private:
     // so an unanswered `ask`'s Responder fails its reply cell (reply-before-teardown, ADR-009 S2).
     [[gnu::cold]] void dead_letter_and_reclaim(Descriptor* d, error e) noexcept {
         ++dead_letters_;
+        if (metrics_) metrics_->dead_letters.inc();  // lane-only (every call site is drain-owned)
         d->complete();
         dead_letter_(d, e);
         reclaim_(d);
@@ -1128,6 +1149,7 @@ private:
             return;
         }
         ++restarts_total_;
+        if (metrics_) metrics_->restarts.inc();  // lane-only (fault path is drain-owned)
         reconstruct_now();
     }
 
@@ -1143,6 +1165,7 @@ private:
             return;
         }
         ++restarts_total_;
+        if (metrics_) metrics_->restarts.inc();  // lane-only (fault path is drain-owned)
         rc_->restarting = true;
         rc_->seal.store(SealState::Cancelling, std::memory_order_release);  // seal: admit nothing (015)
         fire_cancel_all();                  // fire siblings' stop_tokens + move them to `ready`
@@ -1226,6 +1249,7 @@ private:
     ReconstructSink reconstruct_{};
     DeadLetterSink dead_letter_{};
     EscalationSink escalate_sink_{};
+    ShardCounters* metrics_ = nullptr;  // 009: this activation's shard block, wired by set_metrics()
     bool stopped_ = false;
     std::uint32_t restart_count_ = 0;     // restarts charged in the current MaxRestarts window
     std::int64_t window_start_ns_ = 0;    // start of the current window (valid iff window_open_)
