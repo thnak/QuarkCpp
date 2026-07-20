@@ -134,6 +134,14 @@ public:
         });
     }
 
+    // Marshal an arbitrary callback onto the I/O thread — the SAME thread on_receive() callbacks run
+    // on. SwimMembership (021 cluster.hpp) documents that tick() and inbound control-frame handling
+    // must share one driving thread (all its mutation is unsynchronized by design, matching the
+    // single-threaded LoopbackTransport test double it was proven against); a real caller driving it
+    // over this async transport has no other thread-safe way to invoke tick(). Thread-safe (same
+    // mutex-guarded post queue `send`/`close_peer` already use).
+    void post(std::function<void()> fn) { io_.post(std::move(fn)); }
+
     // --- diagnostic counters (atomic; read from a test thread after a sync point) ---------------
     [[nodiscard]] std::uint64_t frames_received() const noexcept { return frames_received_.load(); }
     [[nodiscard]] std::uint64_t frames_sent() const noexcept { return frames_sent_.load(); }
