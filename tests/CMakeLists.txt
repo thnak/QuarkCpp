@@ -145,7 +145,14 @@ endif()
 # control above, whose defect drops the RESCAN — a logic strand that fires under any memory model, so it
 # IS a valid TSan test.) The POSITIVE stream_close_out_dekker_test (fence present, lost==0) is auto-
 # discovered and DOES run under every sanitizer. The control's teeth are proven in the gcc/clang builds.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_close_out_dekker_test.cpp" AND NOT QUARK_SANITIZE)
+#
+# x86-64 ONLY: the litmus's premise IS the x86-TSO store-past-load reorder specifically (see above) —
+# there is no reason to expect the same removed-fence window reproduces at the same reliability (or at
+# all) under AArch64's weaker model within the same trial budget; that needs its own arm64-calibrated
+# litmus (see the TODO(arm64) notes in mailbox.hpp/engine.hpp/stream_channel.hpp), not a reuse of this
+# one. Observed: NOT-FIRED on arm64 gcc/clang-release. Gate to x86-64 until that re-gate lands.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_close_out_dekker_test.cpp" AND NOT QUARK_SANITIZE
+   AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"))
   add_executable(stream_close_out_dekker_control stream_close_out_dekker_test.cpp)
   target_link_libraries(stream_close_out_dekker_control PRIVATE quark::quark quark_warnings Threads::Threads)
   target_compile_definitions(stream_close_out_dekker_control PRIVATE QUARK_STREAM_NO_FENCE)

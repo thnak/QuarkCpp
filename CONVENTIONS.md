@@ -7,13 +7,20 @@ with the ADR that proved it), then the code — never silently diverge.
 
 ## Target & scope
 
-- **Primary target: Linux / x86-64.** This is the only supported, verified platform for now.
-- **Cross-platform by construction, but deferred.** All OS/arch specifics live behind the
-  **PAL** (`pal/`, spec 019). Only the `linux_x86_64` backend exists today. Windows/macOS and
-  ARM64 come later — do not add them speculatively, but never bake an OS/arch assumption into
-  the core; route it through a PAL seam. Anything proven only on x86-TSO (the `seq_cst` Dekker
-  close-out, producer-fence elision, fiber handshakes, big-endian serialization) carries a
-  deferred ARM64 weak-memory re-gate — leave a `// TODO(arm64):` marker at the seam.
+- **Primary target: Linux / x86-64.** This is the reference platform: the 023 perf budgets are
+  pinned to it, and it's where x86-TSO-specific fast paths (producer-fence elision, the Dekker
+  litmus controls) are proven.
+- **Linux / arm64 is CI-verified, not yet spec-Accepted.** GitHub-hosted arm64 runners run the
+  full correctness matrix (gcc/clang Release, ASan+UBSan, TSan — same 153-test suite as x86-64)
+  on real AArch64 hardware on every push/PR (`.github/workflows/ci.yml`). That's real, repeatable
+  evidence the engine builds and runs race-free on arm64 — but it is empirical CI coverage, not
+  the formal weak-memory-model proof (herd7/GenMC) the `TODO(arm64)` markers still call for on the
+  seams proven only on x86-TSO (the `seq_cst` Dekker close-out, producer-fence elision, fiber
+  handshakes, big-endian serialization), and the 023 perf budgets are not re-baselined for it. Do
+  not promote a spec's gate to "Accepted (arm64)" off CI-green alone.
+- **Cross-platform by construction otherwise.** All OS/arch specifics live behind the **PAL**
+  (`pal/`, spec 019); Windows/macOS come later — do not add them speculatively, but never bake an
+  OS/arch assumption into the core; route it through a PAL seam.
 
 ## Language & dependencies
 

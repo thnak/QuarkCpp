@@ -1,11 +1,17 @@
-# Quark Engine — RFC
+# Quark Engine
 
 Quark is a high-performance **C++ actor engine**. The runtime owns optimization;
-developers express only intent. This repository is the design RFC — a set of
-specification documents, not yet an implementation.
+developers express only intent. This repository holds **both** the design RFC (27
+specification documents) **and a working C++23 implementation of it** — a
+header-first core ([`include/quark/`](include/quark)), a Platform Abstraction Layer
+([`pal/`](pal)), a **153-test** correctness gate ([`tests/`](tests)) green under
+ASan/UBSan/TSan, a benchmark harness ([`bench/`](bench)), and **16 runnable
+samples** ([`samples/`](samples)). Verified on **Linux/x86-64**.
 
-> **Status:** the RFC is now mostly **Accepted for x86-64/Linux** — **25 of 27 specs**
-> plus the overview. The mailbox hot path (001, 002, 003, 015) is proven under
+> **Status:** **all 27 specs are implemented** and exercised by the test suite; the
+> RFC design gate is **Accepted for x86-64/Linux** on **25 of 27 specs** plus the
+> overview (the remaining two — 019/PAL and 023/budgets — are *hardware-blocked*, not
+> unimplemented; see below). The mailbox hot path (001, 002, 003, 015) is proven under
 > [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md); the developer-facing surface
 > (004, 005, 006, 008, 013) under
 > [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)/[008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md)/[010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md);
@@ -34,11 +40,72 @@ specification documents, not yet an implementation.
 > (re-measured from a clean build here) with zero committed-reminder loss across crash
 > ([`reminder_service.hpp`](include/quark/core/reminder_service.hpp) + test + bench + sample 14).
 >
+> **006 (Messaging)** grew two proven fan-out axes on top of point-to-point `tell`/`ask`:
+> **outbound streaming replies** — an `ask_stream` that returns a bounded, credit-controlled
+> reply stream (the 024 inbound ring with producer/consumer roles flipped, *no shared counter*)
+> via [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)
+> ([`reply_stream.hpp`](include/quark/core/reply_stream.hpp)); and a **best-effort at-most-once
+> broadcast** primitive `Topic<M>` — one immutable refcounted payload fanned as N thin descriptors
+> onto each subscriber's verbatim ADR-002 mailbox, publisher never stalls, slow/dead subscribers
+> dropped-and-counted — via [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)
+> ([`topic.hpp`](include/quark/core/topic.hpp), **Accepted (x86-64) for local fan-out**, cross-node
+> Draft on GATE 7).
+>
 > **Still Draft (2):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
 > whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
 > Zen4/SPR reference re-baseline and the ARM64 ratio. *Accepted (x86-64)* means the design is
 > settled and backed on the current support target; ARM64 promotion waits on the weak-memory
 > proof ([OpenQuestions.md](OpenQuestions.md)).
+
+## Repository layout
+
+```
+include/quark/core/     header-first engine core (hot path lives in headers)
+include/quark/net/      default TCP transport + wire codec (010/019/021)
+include/quark/adapters/ opt-in persistence/reminder backends (SQLite, RocksDB)
+include/quark/detail/   internals (message pool, reply cell, hashing)
+pal/                    Platform Abstraction Layer — the single OS seam (019)
+src/                    non-template translation units
+tests/                  144-test correctness gate (CTest)
+bench/                  benchmark harness — the 023 budget verdicts
+samples/                16 runnable programs over the public developer surface
+decisions/              ADRs — the design → red-team → prove → judge records
+NNN-*.md                the 27 RFC specification documents
+```
+
+The core is **std-only C++23** and **header-first** — the hot path (mailbox,
+scheduler, dispatch, streams) lives in [`include/quark/core/`](include/quark/core);
+`src/` holds only non-template units.
+
+## Build, test & run
+
+Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 20.1**).
+
+```bash
+# Build + run the full correctness gate (Release)
+cmake -S . -B build
+cmake --build build -j4                          # -j4, never -j$(nproc) — see note
+ctest --test-dir build -j4 --output-on-failure   # 153 / 153
+
+# Sanitizers (the same suite, minus by-design exclusions — counts in VERIFICATION.md)
+cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined"   # ASan + UBSan
+cmake -S . -B build-tsan -DQUARK_SANITIZE="thread"              # ThreadSanitizer (build -j1)
+
+# Benchmarks (default ON) and the runnable samples (default OFF)
+cmake -S . -B build -DQUARK_BUILD_SAMPLES=ON
+taskset -c 0-3 build/samples/01_hello_counter    # prints OK / exit 0
+
+# Opt-in persistence backends (off by default; std-only core needs neither)
+cmake -S . -B build -DQUARK_WITH_SQLITE=ON -DQUARK_WITH_ROCKSDB=ON
+```
+
+The run-and-result record for correctness (test counts, sanitizer deltas, reproduce
+steps) is **[VERIFICATION.md](VERIFICATION.md)**; measured speed against the 023
+budgets is **[PERFORMANCE.md](PERFORMANCE.md)**.
+
+> **Machine-safety note.** This dev box can hang or power off if a build/run
+> saturates all cores. Build with `-j4` (the TSan build with `-j1`), and run
+> binaries under `taskset -c 0-3` — **never** `-j$(nproc)`.
 
 ## Locked design decisions
 
@@ -76,7 +143,7 @@ on x86-64 to a weakly-ordered target without one in hand.
 | 003 | [003-Memory.md](003-Memory.md) | Descriptors, payloads, allocators, ownership | **Accepted** (x86-64) |
 | 004 | [004-Resources.md](004-Resources.md) | Resource lifetimes, resolution, message context | **Accepted** (x86-64) |
 | 005 | [005-Developer-Model.md](005-Developer-Model.md) | Actor API, CRTP policies, registration | **Accepted** (x86-64) |
-| 006 | [006-Messaging-and-Addressing.md](006-Messaging-and-Addressing.md) | `ActorRef`, `tell`/`ask`, identity | **Accepted** (x86-64) |
+| 006 | [006-Messaging-and-Addressing.md](006-Messaging-and-Addressing.md) | `ActorRef`, `tell`/`ask`, identity, streaming replies (`ask_stream`), best-effort broadcast (`Topic<M>`) | **Accepted** (x86-64; cross-node broadcast Draft) |
 | 007 | [007-Failure-and-Supervision.md](007-Failure-and-Supervision.md) | Error model, restart/resume/stop/escalate | **Accepted** (x86-64, core) |
 | 008 | [008-Metadata-and-Startup.md](008-Metadata-and-Startup.md) | Discovery, validation, type identity, metadata compilation | **Accepted** (x86-64) |
 | 009 | [009-Observability.md](009-Observability.md) | Metrics, tracing, deadline accounting, dead-letters | **Accepted** (x86-64) |
@@ -125,6 +192,9 @@ durable records live in [`decisions/`](decisions/):
 | [ADR-014](decisions/ADR-014-streaming-async-suspend-real-scheduler-gate.md) | Streaming async-suspend real-scheduler gate (024) | **Verification record — CORRECT.** 024's single named promotion gate: the async-suspend/resume seam wired to the **real 002 multi-threaded scheduler + 015 admission gate** (not the ADR-005 model resolver). At 10⁷ frames on g++ 14.2 + clang 20.1: `lost = dup = torn = fifo_violations = 0`, descriptor membership ≤1 (no double-enqueue/orphan), credit only for completed frames, **0** steady-drain heap allocs + **0** cross-core RMW/frame, TSan clean; the transfer path is genuinely taken (32282/32282 parked activations off all workers). All **three** mandatory controls fired non-vacuously — single-cursor (tears/loses + credits parked frames), re-enqueue (dup ≤602016, two executors, wedge), fence-removed (loses ~194K vs 0). → **024 Accepted (x86-64)**. Deferred: Hard absolute-latency (023 silicon) and the ARM64 weak-memory re-gate of the `seq_cst` Dekker close-out (TSO-proven only). |
 | [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md) | Actor execution vehicle: passive+stackless vs fibers | **Design decision** — a 4-vehicle debate-prove (32 CORRECT / 1 DISPROVEN, real C++ + sanitizers). **Core = passive + stackless run-to-completion**, unchanged: 192 B/idle-actor (5.59 M/GB, identical at 10⁶↔10⁷), depth-bounded suspended frame beating a fiber at every D≤8, sync p99 96.4 ns / 41.8 M/s drain, 0 ctx-switch, 0 hot-path alloc — the only vehicle passing the safety gate *and* winning the idle-economy+throughput axis. Every fiber-per-actor vehicle is disqualified as core (Fibra breaches the 250 ns HARD ceiling on cold resume 6853 ns p999 and hits a VMA wall at ~32 K actors; BorrowedFiber pins ~16 KiB/suspended-actor ≈120×). **The "pool green threads across idle actors" hypothesis is disproven** — a fiber pins bytes+VMA the moment it runs. But a fiber facility **earned a scoped place**: an opt-in, off-hot-path, per-blocking-invocation (never per-actor) **`BlockingHandler`** — thread-backed `quark::blocking<>` (asm-free default) + gated stackful `quark::fiber<>` — for the one axis stackless physically cannot serve (suspending an un-colorable foreign-C chain in place; +C4 multiplexing). Folded into 001/002/015/024/023. |
 | [ADR-016](decisions/ADR-016-serialization-wire-fast-path-encode-gate.md) | Serialization wire fast-path encode gate (016) | **Verification record — CORRECT.** 016's promotion gate: the negotiated **tagless packed** wire encode budget + negotiation/evolution correctness. In all 4 build cells ({g++ 14.2, clang 20.1} × {-O2, -O3}), tagless encode of a 24 B POD is **p99 25–28 ns** (~20× under the 500 ns Hard ceiling, inside the 200 ns goal), **near-memcpy** (0.85–1.06× of `memcpy`), **0 alloc** / 1.2×10⁶ encodes, **reflection-free** (`-fno-rtti`, 0 RTTI symbols in the codec TU); round-trip + additive evolution + v1→v2→v3 migration all pass under clean ASan/UBSan. All three mandatory controls fired — fingerprint-mismatch **corrupts** under forced-tagless (ASan heap-overflow + wrong value), endian/ABI-mismatch **corrupts** (byte-swapped id), tagged 1.67–1.83× slower than tagless. → **016 Accepted (x86-64)**. Deferred: the ≤200 ns *goal*-stamp to 023 reference silicon, and the ARM64/big-endian cross-peer re-gate (its fallback proven load-bearing). |
+| [ADR-017](decisions/ADR-017-durable-reminder-mass-due-scale-gate.md) | Durable reminder mass-due scale gate (027) | **CORRECT.** A `design → debate → prove` loop ran 3 competing durable-reminder designs through red-team + executed C++23. Winner **SEGSTREAM** models the due-wave as a stream: a due-segment binds to ONE bounded 024 StreamChannel drained under a 022 fire-rate token bucket — spread is the *drain rate*, peak in-flight is the *credit window*, not N. The 10⁶-at-9 PM wave flattens to `peak == fire_rate` (re-measured from a clean build), per-tick scan O(due-now), zero committed-reminder loss across crash, owner-sharded no-duplicate-fire. → **027 Accepted (x86-64)**. |
+| [ADR-018](decisions/ADR-018-outbound-streaming-replies.md) | Outbound streaming replies — an `ask` that returns a stream (006) | **Reply-Credit-Ring** (PUSH). `ask_stream<F>` returns a bounded, pre-allocated, credit-controlled SPSC ring = the **024 inbound ring with producer/consumer roles flipped** (callee = `head` producer, caller = `disp`/`tail` consumer); credit flows caller→callee for free through the same derived `capacity−(head−tail)` — **no shared counter**. Single-resolve `StreamReplyCell` + N-item ring + in-band EoS; caller drains one batch per activation turn via `StreamActivation<F>::drain` verbatim from ADR-014. Cancellation/deadline (018) teardown returns credit, leaks no ring, delivers nothing after teardown; exactly-once (017) per-item dedup watermark; reply-UAF gate extended to multi-resolve. **Accepted (design direction, x86-64)** for the mechanism; the 006 outbound-streaming *axis* stays Draft pending its named promotion gate. |
+| [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md) | Best-effort broadcast / publish primitive — `Topic<M>`, at-most-once fan-out (006) | **`Topic<M>`, D-A.** A subscriber-agnostic one-to-many primitive whose load-bearing semantic is **best-effort at-most-once**: the publisher **never blocks and never stalls** on any subscriber; a slow/full/dead subscriber is DROPPED (per-subscriber, counted) — the deliberate opposite of ADR-018's backpressure. Membership = `atomic<shared_ptr<const SubVec>>` copy-on-write snapshot + `active` flag + bounded-quiescence unsubscribe; ONE immutable refcounted `SharedPayload<M>` fanned as N thin descriptors onto each subscriber's **verbatim ADR-002 mailbox**; cross-node coalesced to one frame per node. 8/8 gates CORRECT for local fan-out (1 copy/pub amortized N×, publisher-never-stalls, exact at-most-once accounting, per-(pub,sub) FIFO, ASan/UBSan/TSan clean). D-B's hand-rolled refcount-through-mutable-pointer took a **heap-UAF on clean build** (GATE 6), proving the `atomic<shared_ptr>` SMR load-bearing. → **006 broadcast Accepted (x86-64) for LOCAL fan-out**; cross-node fan-out **Draft on GATE 7**; ARM/weak-memory deferred. |
 
 ## Performance (measured)
 

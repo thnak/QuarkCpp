@@ -72,6 +72,16 @@ int count_insns(const std::string& dis) {
 }  // namespace
 
 int main() {
+#if !defined(__x86_64__) && !defined(_M_X64)
+    // The forbidden/required-instruction checks below assert on x86-64 AT&T mnemonics and register
+    // names (`(%rdi)`, `%rbp`, `mov`, `and $0x3fff`) — they do not apply to another ISA's disassembly
+    // (e.g. AArch64 uses x0/ldr/and with different operand syntax entirely). This gate's claim (0
+    // cross-core RMW / no fence / a tiny leaf) is compiler-codegen-independent of architecture, but
+    // asserting it on a new ISA needs that ISA's own disassembly vocabulary, not a reuse of x86's.
+    // SKIP rather than false-fail; see the TODO(arm64) note in hot_cell.hpp for the wider re-gate.
+    std::printf("SKIP: operational-read asm gate is x86-64-specific (see TODO(arm64) in hot_cell.hpp)\n");
+    return 0;
+#endif
     // Touch the symbol so it is definitely emitted and not GC'd, and sanity-check correctness.
     HotCell cell{pack_operational(OperationalConfig{.drain_budget = 12345})};
     if (quark_read_drain_budget(&cell) != 12345) {
