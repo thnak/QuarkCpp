@@ -1,8 +1,13 @@
-// Implements 019-Platform-Abstraction-Layer (the OS/arch seam) — Linux/x86-64 backend only.
+// Implements 019-Platform-Abstraction-Layer (the OS/arch seam) — Linux backend (the directory is
+// named linux_x86_64 for history; its contents — clock_gettime, atomic_thread_fence — are arch-
+// generic Linux code, not x86-specific, and this seam is exercised on real arm64 hardware in CI:
+// .github/workflows/ci.yml runs the full correctness matrix on GitHub-hosted arm64 runners).
 // Everything OS- or arch-specific in the engine routes through this header so the core stays
-// portable by construction. 019 is Draft/hardware-blocked for non-x86-64; the wider surface
-// (event loop, sockets, NUMA affinity, durable flush) lands with that spec. What the *core*
-// hot path needs today is the memory-ordering seam and a monotonic clock, provided here.
+// portable by construction. 019 is Draft/hardware-blocked for non-x86-64 in the sense that its
+// WIDER surface (event loop, sockets, NUMA affinity, durable flush) hasn't landed; the *core* hot
+// path needs only the memory-ordering seam and a monotonic clock, provided here, and that much is
+// now CI-verified race-free on arm64 too — see CONVENTIONS.md for what "CI-verified" does and does
+// not cover (a formal weak-memory re-gate of the elided-fence seams is still open).
 #pragma once
 
 #include <atomic>
@@ -12,9 +17,9 @@
 #include "pal/linux_x86_64/clock.hpp"  // BootClock — the canonical suspend-counting monotonic clock
 #include "quark/core/config.hpp"
 
-#if !defined(__x86_64__) && !defined(_M_X64)
-#warning "Quark PAL: only the x86-64 backend exists. Other arches need a store_load_barrier() \
-review and an ARM64 weak-memory re-gate (see decisions/ADR-002, ADR-004, ADR-015)."
+#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__aarch64__) && !defined(_M_ARM64)
+#warning "Quark PAL: only the x86-64 and arm64 backends are covered by CI. Other arches need a \
+store_load_barrier() review and their own weak-memory re-gate (see decisions/ADR-002, ADR-004, ADR-015)."
 #endif
 
 namespace quark::pal {
