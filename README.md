@@ -1,17 +1,52 @@
 # Quark Engine
 
-Quark is a high-performance **C++ actor engine**. The runtime owns optimization;
-developers express only intent. This repository holds **both** the design RFC (27
-specification documents) **and a working C++23 implementation of it** — a
-header-first core ([`include/quark/`](include/quark)), a Platform Abstraction Layer
-([`pal/`](pal)), a **153-test** correctness gate ([`tests/`](tests)) green under
-ASan/UBSan/TSan, a benchmark harness ([`bench/`](bench)), and **16 runnable
-samples** ([`samples/`](samples)). Verified on **Linux/x86-64**.
+**A high-performance C++23 actor engine for building highly concurrent, distributed systems.**
+The runtime owns optimization; developers express only intent.
 
-> **Status:** **all 27 specs are implemented** and exercised by the test suite; the
-> RFC design gate is **Accepted for x86-64/Linux** on **25 of 27 specs** plus the
-> overview (the remaining two — 019/PAL and 023/budgets — are *hardware-blocked*, not
-> unimplemented; see below). The mailbox hot path (001, 002, 003, 015) is proven under
+[![CI](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg)](CONVENTIONS.md#target--scope)
+
+Quark gives you actors — units of state and sequential behavior addressed by id — with a
+zero-cost, header-first C++23 core ([`include/quark/`](include/quark)): a work-stealing
+scheduler, hybrid sync/async handlers, point-to-point and streaming messaging, cluster
+distribution to 10³–10⁴ nodes, durable persistence, and failure supervision, all expressed
+through compile-time CRTP policies instead of runtime configuration.
+
+It's backed by a **153-test** correctness suite ([`tests/`](tests)) verified clean under
+ASan/UBSan/TSan, a benchmark harness ([`bench/`](bench)) that turns every hot-path performance
+claim into a pass/fail gate, and **16 runnable samples** ([`samples/`](samples)) from a single
+local actor to multi-node TCP clusters. Every subsystem is backed by a written design and, where
+it's hot-path or safety-critical, by an executed proof — see
+[Design & verification docs](#design--verification-docs).
+
+## Table of contents
+
+- [Status](#status)
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [Performance](#performance-measured)
+- [Repository layout](#repository-layout)
+- [Design & verification docs](#design--verification-docs)
+- [Dependency posture](#dependency-posture)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Status
+
+Every subsystem — actors, scheduler, messaging, streaming, clustering, persistence,
+supervision, security — is **implemented and covered by the test suite**, and the whole engine
+is **verified clean under ASan, UBSan, and TSan** on every push. **Linux/x86-64 is the primary
+supported and verified target today**; ARM64 already runs the full correctness matrix in CI on
+real hardware, and Windows/macOS are designed-for behind the existing Platform Abstraction Layer
+seam — extending support means filling in a PAL backend, not redesigning the engine.
+
+<details>
+<summary>Full status detail (per-subsystem gating, ADR references)</summary>
+
+> The mailbox hot path (001, 002, 003, 015) is proven under
 > [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md); the developer-facing surface
 > (004, 005, 006, 008, 013) under
 > [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)/[008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md)/[010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md);
@@ -57,27 +92,35 @@ samples** ([`samples/`](samples)). Verified on **Linux/x86-64**.
 > settled and backed on the current support target; ARM64 promotion waits on the weak-memory
 > proof ([OpenQuestions.md](OpenQuestions.md)).
 
-## Repository layout
+</details>
 
-```
-include/quark/core/     header-first engine core (hot path lives in headers)
-include/quark/net/      default TCP transport + wire codec (010/019/021)
-include/quark/adapters/ opt-in persistence/reminder backends (SQLite, RocksDB)
-include/quark/detail/   internals (message pool, reply cell, hashing)
-pal/                    Platform Abstraction Layer — the single OS seam (019)
-src/                    non-template translation units
-tests/                  144-test correctness gate (CTest)
-bench/                  benchmark harness — the 023 budget verdicts
-samples/                16 runnable programs over the public developer surface
-decisions/              ADRs — the design → red-team → prove → judge records
-NNN-*.md                the 27 RFC specification documents
-```
+## Features
 
-The core is **std-only C++23** and **header-first** — the hot path (mailbox,
-scheduler, dispatch, streams) lives in [`include/quark/core/`](include/quark/core);
-`src/` holds only non-template units.
+- **Header-first, std-only C++23 core** — `std::expected` results, coroutine async handlers,
+  `std::stop_token` cancellation, `std::pmr` shard allocators, concepts + deducing-this. No
+  RTTI/reflection on the hot path.
+- **Hybrid handler execution** — synchronous by default (zero-cost, drained inline); an actor
+  opts into coroutine handlers (`quark::task<>`) per message type for async I/O.
+- **Zero-cost intent declaration** — CRTP policy types (`Sequential`, `Priority<P>`,
+  `Placement<…>`, …) as template parameters, resolved to metadata at startup. No attributes, no
+  reflection.
+- **Work-stealing scheduler** with priority bands and per-actor mailbox FIFO ordering.
+- **Point-to-point and fan-out messaging** — `tell`/`ask`, credit-controlled streaming replies
+  (`ask_stream`), best-effort at-most-once broadcast (`Topic<M>`).
+- **Inbound stream ingestion** — per-stream credit-ring, zero-copy, backpressure instead of
+  shedding.
+- **Cluster distribution at scale** — HRW/VirtualBins placement, SWIM membership, bounded
+  partial-view + DHT-relay for 10³–10⁴-node topologies.
+- **Durable persistence and reminders** — snapshot & event-sourced durability, at-least-once
+  wall-clock scheduled wake-ups that flatten mass-due waves to a steady drain rate.
+- **Failure supervision** — zero-cost guarded handler core, restart/resume/stop/escalate
+  policies.
+- **Resource governance** — rate limiting, deadline-aware load shedding, circuit breaking.
+- **Deterministic simulation testing** (014) for fault injection without real time or threads.
+- **Cross-platform by design** via a thin Platform Abstraction Layer (PAL); verified today on
+  Linux/x86-64, CI-covered on Linux/ARM64.
 
-## Build, test & run
+## Quick start
 
 Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 20.1**).
 
@@ -99,41 +142,131 @@ taskset -c 0-3 build/samples/01_hello_counter    # prints OK / exit 0
 cmake -S . -B build -DQUARK_WITH_SQLITE=ON -DQUARK_WITH_ROCKSDB=ON
 ```
 
-The run-and-result record for correctness (test counts, sanitizer deltas, reproduce
-steps) is **[VERIFICATION.md](VERIFICATION.md)**; measured speed against the 023
-budgets is **[PERFORMANCE.md](PERFORMANCE.md)**.
+The run-and-result record for correctness (test counts, sanitizer deltas, reproduce steps) is
+**[VERIFICATION.md](VERIFICATION.md)**; measured speed against the 023 budgets is
+**[PERFORMANCE.md](PERFORMANCE.md)**.
 
-> **Machine-safety note.** This dev box can hang or power off if a build/run
-> saturates all cores. Build with `-j4` (the TSan build with `-j1`), and run
-> binaries under `taskset -c 0-3` — **never** `-j$(nproc)`.
+> **Machine-safety note.** A build/run that saturates all cores can hang or power off a
+> constrained dev box. Build with `-j4` (the TSan build with `-j1`), and run binaries under
+> `taskset -c 0-3` — **never** `-j$(nproc)`.
 
-## Locked design decisions
+## Usage
 
-These are settled and every spec is written against them:
+The smallest complete Quark program: one actor, driven by `tell` (fire-and-forget) and `ask`
+(request/reply) over the real engine. See [`samples/01_hello_counter`](samples/01_hello_counter)
+for the full, buildable version.
 
-| Decision | Choice | Consequence |
-|---|---|---|
-| **Language standard** | C++23 | `std::expected` for validation results, coroutines for async handlers, `std::stop_token` for cancellation, `std::pmr` for shard-owned allocators, concepts + deducing-this for the actor API. No RTTI/reflection on the hot path. |
-| **Handler execution** | Hybrid | Handlers are **synchronous by default** (zero-cost, drained inline). An actor opts into **coroutine handlers** (`quark::task<>`) per message type when it does async I/O. |
-| **Intent declaration** | CRTP policy types | Policies are template parameters on the `Actor<Derived, Policies...>` base. Zero-cost, visible at the declaration site, resolved to metadata at startup. **No attributes, no reflection.** |
-| **Portability** | Cross-platform target | Linux, Windows, macOS on x86-64 + ARM64. The core is portable C++23; OS-specific facilities (sockets/event loop, durable file flush, thread affinity/NUMA) sit behind a thin **Platform Abstraction Layer (PAL)** with a per-OS backend. No POSIX-only assumptions leak into subsystem logic. |
+```cpp
+#include "quark/core/actor.hpp"
+#include "quark/core/actor_ref.hpp"
+#include "quark/core/engine.hpp"
+#include "quark/core/spawn.hpp"
 
-There is **no .NET / managed-runtime vocabulary** anywhere in this RFC. Concepts
-that originated in that lineage (attributes, DI containers, service scopes,
-cancellation tokens) are expressed in idiomatic C++ instead — see the glossary.
+using namespace quark;
 
-**Current support phase.** Cross-platform remains the *design* target and the PAL
-keeps OS/arch specifics abstracted — no subsystem logic assumes an OS or a memory
-model. But the hardware on hand is **Linux/x86-64**, so that is the **primary
-supported and verified target for now**. Windows/macOS and ARM64 stay
-*designed-for* behind the PAL and are promoted as hardware — and the weak-memory
-proofs they need ([OpenQuestions.md](OpenQuestions.md)) — become available.
-**Abstract/formal models are how confidence reaches those targets once the Linux
-baseline is stable**, rather than blocking on the hardware: the deterministic
-simulation backend (014) and weak-memory litmus (herd7/GenMC) extend a proof made
-on x86-64 to a weakly-ordered target without one in hand.
+struct Add { int amount; };
+struct GetTotal {};
 
-## Reading order
+// Policies in the CRTP base ARE the actor's metadata (band, budget, reentrancy).
+struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    using protocol = Protocol<Add, Ask<GetTotal, int>>;
+
+    void handle(const Add& a) noexcept { total_ += a.amount; }
+    void handle(const Ask<GetTotal, int>& m) noexcept { m.respond(total_); }
+
+private:
+    int total_ = 0;
+};
+
+int main() {
+    detail::MessagePool pool(1024);
+    Counter counter;
+    auto activation = std::make_unique<Activation>(&counter, Counter::dispatch_table(), pool.sink());
+
+    Engine<PriorityBands<2>> eng(EngineConfig{/*workers*/ 1, /*shards*/ 1, /*budget*/ 64, 64});
+    register_actor<Counter>(eng, /*key*/ 42, *activation);
+
+    LocalRouter router(eng.post_courier(), pool);
+    ActorRef<Counter> counter_ref = router.get<Counter>(42);
+    eng.start();
+
+    for (int i = 1; i <= 100; ++i) counter_ref.tell(Add{i});         // fire-and-forget
+    result<int> total = block_on(counter_ref.ask<int>(GetTotal{}));  // request/reply
+
+    eng.stop();
+}
+```
+
+## Performance (measured)
+
+Every hot-path performance claim is a **verdict a benchmark prints**, not an assertion —
+[`bench/`](bench/) checks each one against the 023 budget table, and the full code-and-result
+report lives in **[PERFORMANCE.md](PERFORMANCE.md)** (machine-of-record, per-feature code +
+numbers, reproduce steps). Headline figures — **release + `-march=native`, single core pinned**
+on a *virtualized Xeon Silver 4208 @ 2.1 GHz* (a modest reference machine, so these are
+regression tripwires, not a best-case stamp):
+
+| Feature (spec) | Metric | Measured | 023 budget | |
+|---|---|---|---|---|
+| `tell` — mailbox (003) | enqueue→dequeue p50 | **59 ns** | ≤ 100 ns | `[goal]` |
+| `tell` — scheduler (002) | full-lifecycle throughput | **11.0 M/s** | ≥ 10 M/s | `[goal]` |
+| priority (002) | `UniformFIFO` vs raw MPSC | **+0.45 ns** | within noise | `[free]` |
+| `ask` (006) | engine-overhead p50 / p99 | **147 / 226 ns** | p50 ≤ 1 µs | `[goal]` |
+| streaming (024) | sustained ingest / per-frame | **140.8 M/s / 7.1 ns** | ≥ 10 M/s / ≤ 100 ns | `[goal]` |
+| streaming (024) | ingest vs discrete `tell` | **5.0× cheaper** | ≥ 3× | `[goal]` |
+| activate/deactivate (001) | cold activation p50 / cycle | **111 ns / 14.8 M/s** | ≤ 10 µs / ≥ 10 M/s | `[goal]` |
+| idle density (003) | activations / GB | **1.95 M/GB** | ≥ 1 M/GB | `[goal]` |
+| serialize (016) | tagless wire encode p99 | **50 ns** | ≤ 200 ns | `[goal]` |
+| placement (010/026) | VirtualBins lookup, N-indep. | **12.5 ns (0.99×)** | ≤ 20 ns | `[goal]` |
+| supervision (007) | guarded vs no-guard success path | **~1.0×** | ≤ noise | `[free]` |
+
+The machine-independent **invariant** gates — descriptor ≤ 64 B, **0 hot-path allocations**,
+**0 cross-core RMW on the drain path**, and the objdump zero-cost parity checks — are pass/fail
+CTest gates in [`tests/`](tests/), not noise-sensitive benchmarks; see PERFORMANCE.md
+§"What this document is not".
+
+## Repository layout
+
+```
+include/quark/core/     header-first engine core (hot path lives in headers)
+include/quark/net/      default TCP transport + wire codec (010/019/021)
+include/quark/adapters/ opt-in persistence/reminder backends (SQLite, RocksDB)
+include/quark/detail/   internals (message pool, reply cell, hashing)
+pal/                    Platform Abstraction Layer — the single OS seam (019)
+src/                    non-template translation units
+tests/                  153-test correctness gate (CTest)
+bench/                  benchmark harness — the 023 budget verdicts
+samples/                16 runnable programs over the public developer surface
+decisions/              ADRs — the design → red-team → prove → judge records
+NNN-*.md                the 27 RFC specification documents
+```
+
+The core is **std-only C++23** and **header-first** — the hot path (mailbox, scheduler,
+dispatch, streams) lives in [`include/quark/core/`](include/quark/core); `src/` holds only
+non-template units.
+
+## Design & verification docs
+
+Quark's implementation is backed by a full written design and, for every hot-path or
+safety-critical choice, an executed proof rather than argument. Start here if you want the
+rationale behind an API or a guarantee:
+
+- **[ActorEngineSpecification.md](ActorEngineSpecification.md)** — vision, principles, core
+  invariants, glossary.
+- **[CONVENTIONS.md](CONVENTIONS.md)** — the coding contract every change must follow.
+- **[VERIFICATION.md](VERIFICATION.md)** — correctness record (test counts, sanitizer deltas).
+- **[PERFORMANCE.md](PERFORMANCE.md)** — full benchmark report and reproduce steps.
+- **[OpenQuestions.md](OpenQuestions.md)** — remaining cross-cutting design questions.
+
+A few decisions are locked project-wide: **C++23** (no RTTI/reflection on the hot path), a
+**hybrid handler model** (sync by default, opt-in `quark::task<>` coroutines for async I/O),
+**CRTP policy types** for zero-cost intent declaration (no attributes, no reflection), and a
+**cross-platform target** (Linux/Windows/macOS, x86-64 + ARM64) behind the PAL — with
+**Linux/x86-64 as the currently supported and verified target**. There is no .NET /
+managed-runtime vocabulary anywhere in the design — see the glossary below.
+
+<details>
+<summary><strong>Reading order — the 27 RFC specification documents</strong></summary>
 
 | # | Document | Covers | Maturity |
 |---|---|---|---|
@@ -166,13 +299,15 @@ on x86-64 to a weakly-ordered target without one in hand.
 | 026 | [026-Large-Scale-Cluster-Topology.md](026-Large-Scale-Cluster-Topology.md) | Scaling to 10³–10⁴ nodes: VirtualBins O(1) placement, bounded partial-view, DHT-relay; configurable topology/connection/cache axes (cross-cutting) | **Accepted** (x86-64) |
 | 027 | [027-Reminders.md](027-Reminders.md) | Durable, wall-clock, at-least-once scheduled wake-ups on the 012 `Store` seam; SEGSTREAM token-bucket drain flattens mass-due (10⁶-at-9PM) to `peak == fire_rate` (cross-cutting) | **Accepted** (x86-64) |
 
-## Proven decisions (ADRs)
+</details>
 
-Where a hot-path or safety-critical design choice needs more than argument, it is
-settled by the **design → red-team → prove → judge** loop: competing designs are
-implemented in real C++23, compiled under GCC + Clang, run under ASan/UBSan/TSan,
-and benchmarked (percentiles, not means) before a judge picks a winner. The
-durable records live in [`decisions/`](decisions/):
+<details>
+<summary><strong>Proven decisions — the ADR record</strong></summary>
+
+Where a hot-path or safety-critical design choice needs more than argument, it is settled by the
+**design → red-team → prove → judge** loop: competing designs are implemented in real C++23,
+compiled under GCC + Clang, run under ASan/UBSan/TSan, and benchmarked (percentiles, not means)
+before a judge picks a winner. The durable records live in [`decisions/`](decisions/):
 
 | ADR | Question | Outcome |
 |---|---|---|
@@ -196,59 +331,10 @@ durable records live in [`decisions/`](decisions/):
 | [ADR-018](decisions/ADR-018-outbound-streaming-replies.md) | Outbound streaming replies — an `ask` that returns a stream (006) | **Reply-Credit-Ring** (PUSH). `ask_stream<F>` returns a bounded, pre-allocated, credit-controlled SPSC ring = the **024 inbound ring with producer/consumer roles flipped** (callee = `head` producer, caller = `disp`/`tail` consumer); credit flows caller→callee for free through the same derived `capacity−(head−tail)` — **no shared counter**. Single-resolve `StreamReplyCell` + N-item ring + in-band EoS; caller drains one batch per activation turn via `StreamActivation<F>::drain` verbatim from ADR-014. Cancellation/deadline (018) teardown returns credit, leaks no ring, delivers nothing after teardown; exactly-once (017) per-item dedup watermark; reply-UAF gate extended to multi-resolve. **Accepted (design direction, x86-64)** for the mechanism; the 006 outbound-streaming *axis* stays Draft pending its named promotion gate. |
 | [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md) | Best-effort broadcast / publish primitive — `Topic<M>`, at-most-once fan-out (006) | **`Topic<M>`, D-A.** A subscriber-agnostic one-to-many primitive whose load-bearing semantic is **best-effort at-most-once**: the publisher **never blocks and never stalls** on any subscriber; a slow/full/dead subscriber is DROPPED (per-subscriber, counted) — the deliberate opposite of ADR-018's backpressure. Membership = `atomic<shared_ptr<const SubVec>>` copy-on-write snapshot + `active` flag + bounded-quiescence unsubscribe; ONE immutable refcounted `SharedPayload<M>` fanned as N thin descriptors onto each subscriber's **verbatim ADR-002 mailbox**; cross-node coalesced to one frame per node. 8/8 gates CORRECT for local fan-out (1 copy/pub amortized N×, publisher-never-stalls, exact at-most-once accounting, per-(pub,sub) FIFO, ASan/UBSan/TSan clean). D-B's hand-rolled refcount-through-mutable-pointer took a **heap-UAF on clean build** (GATE 6), proving the `atomic<shared_ptr>` SMR load-bearing. → **006 broadcast Accepted (x86-64) for LOCAL fan-out**; cross-node fan-out **Draft on GATE 7**; ARM/weak-memory deferred. |
 
-## Performance (measured)
+</details>
 
-The 023 budgets are not assertions — they are gates a benchmark passes or fails. [`bench/`](bench/) turns each
-hot-path claim into a **verdict a benchmark prints** against the 023 budget table, and the full code-and-result
-report lives in **[PERFORMANCE.md](PERFORMANCE.md)** (machine-of-record, per-feature code + numbers, reproduce
-steps). Headline figures — **release + `-march=native`, single core pinned** on a *virtualized Xeon Silver 4208
-@ 2.1 GHz* (deliberately **not** the 023 Zen4/SPR reference core, so these are regression tripwires, not the
-canonical stamp — the reference numbers live in the ADRs):
-
-| Feature (spec) | Metric | Measured | 023 budget | |
-|---|---|---|---|---|
-| `tell` — mailbox (003) | enqueue→dequeue p50 | **59 ns** | ≤ 100 ns | `[goal]` |
-| `tell` — scheduler (002) | full-lifecycle throughput | **11.0 M/s** | ≥ 10 M/s | `[goal]` |
-| priority (002) | `UniformFIFO` vs raw MPSC | **+0.45 ns** | within noise | `[free]` |
-| `ask` (006) | engine-overhead p50 / p99 | **147 / 226 ns** | p50 ≤ 1 µs | `[goal]` |
-| streaming (024) | sustained ingest / per-frame | **140.8 M/s / 7.1 ns** | ≥ 10 M/s / ≤ 100 ns | `[goal]` |
-| streaming (024) | ingest vs discrete `tell` | **5.0× cheaper** | ≥ 3× | `[goal]` |
-| activate/deactivate (001) | cold activation p50 / cycle | **111 ns / 14.8 M/s** | ≤ 10 µs / ≥ 10 M/s | `[goal]` |
-| idle density (003) | activations / GB | **1.95 M/GB** | ≥ 1 M/GB | `[goal]` |
-| serialize (016) | tagless wire encode p99 | **50 ns** | ≤ 200 ns | `[goal]` |
-| placement (010/026) | VirtualBins lookup, N-indep. | **12.5 ns (0.99×)** | ≤ 20 ns | `[goal]` |
-| supervision (007) | guarded vs no-guard success path | **~1.0×** | ≤ noise | `[free]` |
-
-The machine-independent **invariant** gates — descriptor ≤ 64 B, **0 hot-path allocations**, **0 cross-core RMW on
-the drain path**, and the objdump zero-cost parity checks — are pass/fail CTest gates in [`tests/`](tests/), not
-noise-sensitive benchmarks; see PERFORMANCE.md §"What this document is not".
-
-## Dependency posture
-
-The engine **core is std-only** (C++23), with all OS-specific facilities behind a
-thin **Platform Abstraction Layer** (Linux/Windows/macOS backends — sockets +
-event loop, durable file flush, thread affinity/NUMA). Every subsystem that would
-otherwise pull a heavy dependency is expressed as a **seam** with a self-contained
-default, and heavier backends are optional adapters that are never linked into a
-minimal build:
-
-| Subsystem | Std-only default | Optional adapter (behind a seam) |
-|---|---|---|
-| Transport (010) | TCP + length-prefixed frames; per-OS event loop (epoll/io_uring · kqueue · IOCP) via the PAL | gRPC/QUIC/RDMA |
-| Serialization (016) | canonical tagged TLV from one `QUARK_SERIALIZE` per type + negotiated tagless wire fast path | protobuf / FlatBuffers / Cap'n Proto |
-| Membership (010) | in-house SWIM gossip | etcd / Consul |
-| Persistence (012) | `InMemoryStore` (reference) + `FileStore` (append-only WAL + `fdatasync`, crash-durable) — see [PersistenceAdapters.md](PersistenceAdapters.md) | `SqliteStore` / `RocksStore` (opt-in: `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`); Postgres/object-store behind the same `Store` seam |
-| Metrics/Trace (009) | snapshot API + Prometheus text | OpenTelemetry / OTLP |
-| Config (013) | programmatic `EngineConfig` + env vars | TOML/JSON file loader |
-| Governance (022) | per-node token-bucket rate limits + bounded queues + circuit breakers | distributed exact-limit coordinator (Redis/etcd) |
-| Benchmark harness (023) | in-house timing loop over the PAL clock (dev tooling) | google-benchmark (dev-only, never linked) |
-| Inbound streaming (024) | pre-allocated per-stream SPSC credit-ring + shard-`pmr` arena; copy into inline slots | transport-registered zero-copy RX buffers (io_uring/RDMA) via the PAL |
-| Large-scale topology (026) | in-house VirtualBins + bounded partial-view (SWIM) + Kademlia relay, coordinator-free | external coordinator (etcd/Consul) behind the `Membership` seam |
-
-Remaining cross-cutting design questions are tracked in
-[OpenQuestions.md](OpenQuestions.md).
-
-## Glossary — the vocabulary this RFC uses
+<details>
+<summary><strong>Glossary — the vocabulary this project uses</strong></summary>
 
 | Term | Meaning | (Replaces the managed-runtime notion of) |
 |---|---|---|
@@ -263,3 +349,42 @@ Remaining cross-cutting design questions are tracked in
 | **MessageContext** | Ambient per-message values: `std::stop_token`, deadline, trace id, headers | cancellation token / ambient scope |
 | **`quark::task<>`** | The coroutine return type for async handlers | `Task` |
 | **`ActorRef<A>`** | Typed handle used to `tell`/`ask` an actor | typed grain reference |
+
+</details>
+
+## Dependency posture
+
+The engine **core is std-only** (C++23), with all OS-specific facilities behind a thin
+**Platform Abstraction Layer** (Linux/Windows/macOS backends — sockets + event loop, durable
+file flush, thread affinity/NUMA). Every subsystem that would otherwise pull a heavy dependency
+is expressed as a **seam** with a self-contained default, and heavier backends are optional
+adapters that are never linked into a minimal build:
+
+| Subsystem | Std-only default | Optional adapter (behind a seam) |
+|---|---|---|
+| Transport (010) | TCP + length-prefixed frames; per-OS event loop (epoll/io_uring · kqueue · IOCP) via the PAL | gRPC/QUIC/RDMA |
+| Serialization (016) | canonical tagged TLV from one `QUARK_SERIALIZE` per type + negotiated tagless wire fast path | protobuf / FlatBuffers / Cap'n Proto |
+| Membership (010) | in-house SWIM gossip | etcd / Consul |
+| Persistence (012) | `InMemoryStore` (reference) + `FileStore` (append-only WAL + `fdatasync`, crash-durable) — see [PersistenceAdapters.md](PersistenceAdapters.md) | `SqliteStore` / `RocksStore` (opt-in: `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`); Postgres/object-store behind the same `Store` seam |
+| Metrics/Trace (009) | snapshot API + Prometheus text | OpenTelemetry / OTLP |
+| Config (013) | programmatic `EngineConfig` + env vars | TOML/JSON file loader |
+| Governance (022) | per-node token-bucket rate limits + bounded queues + circuit breakers | distributed exact-limit coordinator (Redis/etcd) |
+| Benchmark harness (023) | in-house timing loop over the PAL clock (dev tooling) | google-benchmark (dev-only, never linked) |
+| Inbound streaming (024) | pre-allocated per-stream SPSC credit-ring + shard-`pmr` arena; copy into inline slots | transport-registered zero-copy RX buffers (io_uring/RDMA) via the PAL |
+| Large-scale topology (026) | in-house VirtualBins + bounded partial-view (SWIM) + Kademlia relay, coordinator-free | external coordinator (etcd/Consul) behind the `Membership` seam |
+
+Remaining cross-cutting design questions are tracked in [OpenQuestions.md](OpenQuestions.md).
+
+## Contributing
+
+Every change must follow the RFC specs (`001`–`027`) and the proven decisions
+(`decisions/ADR-*`) — when code and a spec disagree, the spec wins; if the spec is genuinely
+wrong, fix the spec first (RFC-style, backed by an ADR), then the code. Read
+**[CONVENTIONS.md](CONVENTIONS.md)** before opening a PR — it covers target/scope, language and
+dependency rules, and the hot-path rules that are tested, not trusted. CI (`.github/workflows/ci.yml`)
+runs the full correctness matrix (gcc/clang Release, ASan+UBSan, TSan) on both x86-64 and arm64
+and the 023 performance gate on every push and pull request.
+
+## License
+
+[MIT](LICENSE)
