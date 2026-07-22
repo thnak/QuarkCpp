@@ -1,8 +1,8 @@
 // Implements 019-Platform-Abstraction-Layer §Randomness + 020-Security §"Randomness — a PAL concern".
 // The ONE canonical cryptographically-secure RNG entry point, so no subsystem (nonces, session keys,
 // tokens) reaches for a non-cryptographic `std::mt19937` by accident (020 §Randomness). It is an OS
-// service, hence a PAL primitive: `getrandom` on Linux (the only verified backend). Windows
-// `BCryptGenRandom` / macOS `getentropy` are DEFERRED PAL backends, not implemented here.
+// service, hence a PAL primitive: `getrandom` on Linux, `BCryptGenRandom` on Windows. macOS
+// `getentropy` is a DEFERRED PAL backend, not implemented here.
 //
 // The SIMULATION backend (014) needs REPRODUCIBILITY, so it must NOT read real OS entropy: install a
 // DETERMINISTIC stub via `set_csprng_override` (a seeded splitmix64 stream). This is the ONLY place
@@ -18,6 +18,15 @@
 #if defined(__linux__)
 #include <sys/random.h>  // getrandom(2)
 #include <cerrno>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>  // BCryptGenRandom — link bcrypt.lib
 #endif
 
 namespace quark::pal {
@@ -60,10 +69,18 @@ inline void set_csprng_override(CsprngOverride ov) noexcept { csprng_override() 
         off += static_cast<std::size_t>(n);
     }
     return true;
+#elif defined(_WIN32)
+    // BCRYPT_USE_SYSTEM_PREFERRED_RNG: let CNG pick the system RNG rather than opening/managing an
+    // algorithm provider handle for a call this infrequent (cold key/nonce path only). Returns an
+    // NTSTATUS; success is a non-negative value (the usual NT_SUCCESS test).
+    const NTSTATUS st = ::BCryptGenRandom(
+        nullptr, reinterpret_cast<PUCHAR>(out.data()), static_cast<ULONG>(out.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return st >= 0;
 #else
-    // No verified OS entropy backend on this platform (only linux_x86_64 is live). A non-Linux build
-    // MUST install a CSPRNG override or it cannot obtain secure randomness. // TODO(win/macos): add
-    // BCryptGenRandom / getentropy PAL backends behind this same entry point.
+    // No verified OS entropy backend on this platform (only linux_x86_64/windows_x86_64 are live). A
+    // build for any other OS MUST install a CSPRNG override or it cannot obtain secure randomness.
+    // TODO(macos): add a getentropy PAL backend behind this same entry point.
     (void)out;
     return false;
 #endif
