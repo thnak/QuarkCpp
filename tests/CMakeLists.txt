@@ -165,6 +165,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_close_out_dekker_test.cpp" AND NOT
   target_link_libraries(stream_close_out_dekker_control PRIVATE quark::quark quark_warnings Threads::Threads)
   target_compile_definitions(stream_close_out_dekker_control PRIVATE QUARK_STREAM_NO_FENCE)
   add_test(NAME stream_close_out_dekker_control COMMAND stream_close_out_dekker_control)
+  # Exclusive CPU access: CI's `ctest -j2` on a 2-vCPU runner can co-schedule another test's threads
+  # alongside this litmus's own 2 racing threads, adding enough scheduling noise to suppress the very
+  # store-buffer reorder it's trying to expose (same class of false-negative as the ASan exclusion
+  # above, different source). RUN_SERIAL keeps it from ever sharing the runner with another test.
+  set_tests_properties(stream_close_out_dekker_control PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # ADR-028 Phase 1 CONTROL-1 (fence removed): -DQUARK_ACTIVATION_DEACTIVATE_NO_FENCE drops the seq_cst
@@ -178,6 +183,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/activation_deactivate_close_out_dekker_te
   target_link_libraries(activation_deactivate_close_out_dekker_control PRIVATE quark::quark quark_warnings Threads::Threads)
   target_compile_definitions(activation_deactivate_close_out_dekker_control PRIVATE QUARK_ACTIVATION_DEACTIVATE_NO_FENCE)
   add_test(NAME activation_deactivate_close_out_dekker_control COMMAND activation_deactivate_close_out_dekker_control)
+  # Exclusive CPU access — same rationale as stream_close_out_dekker_control's RUN_SERIAL above.
+  set_tests_properties(activation_deactivate_close_out_dekker_control PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # 024-Streaming §0-cross-core-RMW-on-drain — objdump proof (ADR-005 S1 method). Disassemble the
