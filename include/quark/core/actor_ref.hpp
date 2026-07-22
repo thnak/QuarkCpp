@@ -139,7 +139,7 @@ public:
         using Msg = std::remove_cvref_t<M>;
         static_assert(Handles<A, Msg>, "tell: message type is not in the actor's protocol (unhandled)");
         Schedulable* s = courier_.resolve(id);
-        post_message<A, Msg>(s, std::forward<M>(m));
+        post_message<A, Msg>(id, s, std::forward<M>(m));
     }
 
     // --- deliver_from_wire (010 §Distribution): post a message that arrived off the network. -----
@@ -176,7 +176,7 @@ public:
         typename detail::ReplyCellPool<R>::Lease lease = cp.acquire();
         Schedulable* s = courier_.resolve(id);
         Envelope env{std::forward<Q>(q), Responder<R>{lease.cell, lease.gen}};
-        post_message<A, Envelope>(s, std::move(env));
+        post_message<A, Envelope>(id, s, std::move(env));
         return AskFuture<R>{lease.cell, &cp};
     }
 
@@ -204,10 +204,14 @@ private:
     }
 
     // Build the descriptor + inline payload and post it to the target activation. If the id does
-    // not resolve (unregistered / remote — a 010 seam), reclaim immediately: for an ask that runs
-    // the Responder destructor, failing the cell so the caller gets an error, never a hang.
+    // not resolve, try the ADR-028 Phase 4 lazy-activation hand-off first (`courier_.activate`) — if
+    // the target's type was never `declare_lazy`'d (or this courier predates Phase 4, e.g. a
+    // hand-rolled test/TestKit/SimEngine courier), `activate` returns false immediately and this
+    // falls through to the ORIGINAL synchronous dead-letter (unregistered / remote — a 010 seam): for
+    // an ask that runs the Responder destructor, failing the cell so the caller gets an error, never
+    // a hang.
     template <class A, class Msg, class T>
-    void post_message(Schedulable* s, T&& msg) {
+    void post_message(ActorId id, Schedulable* s, T&& msg) {
         // Ambient propagation (#12): a tell/ask issued FROM a running handler inherits that message's
         // trace correlation id (009) and — same node, same monotonic clock — its absolute deadline
         // (018 inheritance: a child call cannot outlive its parent). Outside a handler the ambient is
@@ -220,7 +224,7 @@ private:
         }
         Descriptor* d = make_descriptor<A, Msg>(std::forward<T>(msg), trace_id, deadline_ns);
         if (s == nullptr) {
-            pool_->reclaim(d);  // not_found: runs the payload dtor → an ask's cell is failed
+            if (!courier_.activate(id, d, pool_->sink())) pool_->reclaim(d);
             return;
         }
         (void)courier_.post(s, d);  // the wake-edge bool is the scheduler's; the sender ignores it

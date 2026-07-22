@@ -353,6 +353,12 @@ struct policy_traits<PolicyList<Ps...>> {
 
     // --- Delivery (017): the (at most one) Delivery level + whether the actor is persistent. --------
     static constexpr bool has_persistent = (as_persistent<Ps>::present || ...);
+    // ADR-028 Phase 5: "persistent AND NOT event-sourced" ⟺ "declares Persistent<Snapshot,...>",
+    // since `Persistent<Model,Mode>` only ever admits Model ∈ {Snapshot, EventSourced} (its own
+    // static_assert, persistence.hpp). Deliberately avoids naming `Snapshot` itself in this header —
+    // a forward declaration of `quark::Snapshot` here would collide with unrelated file-local
+    // `Snapshot` types some tests already declare under `using namespace quark;` (found the hard way).
+    static constexpr bool has_snapshot_persist = has_persistent && !has_event_sourced_persist;
     static constexpr std::size_t delivery_count = (std::size_t{0} + ... + (as_delivery<Ps>::present ? 1 : 0));
     // Sum-fold the underlying value: AtMostOnce == 0 is the additive identity, so an actor with no
     // `Delivery<>` folds to AtMostOnce (the free default); with exactly one it folds to that level
@@ -452,6 +458,11 @@ template <class A>
 template <class A>
 inline constexpr bool is_persistent_v = policy_traits_of<A>::has_persistent;
 
+// True iff `A` declares `Persistent<Snapshot, Mode>` specifically (ADR-028 Phase 5): gates the
+// broker's one-time lazy-construction recover step (`metadata.hpp`'s `make_recover_fn<A,S>()`).
+template <class A>
+inline constexpr bool is_snapshot_persistent_v = policy_traits_of<A>::has_snapshot_persist;
+
 // Validation CONDITION as a constexpr predicate (so tests assert the rule WITHOUT tripping the hard
 // static_assert in validate_actor_policies): true iff `A` violates "EffectivelyOnce requires a
 // Persistent actor" (017 §"The three levels"). `AtMostOnce`/`AtLeastOnce` never violate it.
@@ -537,6 +548,16 @@ consteval bool validate_actor_policies() noexcept {
     // idle_ticks==0 sentinel; an explicit timeout contradicts it).
     static_assert(!(T::has_keepalive && T::idle_present),
                   "conflicting lifecycle policies: KeepAlive + IdleTimeout<Ms> (005 §Validation)");
+
+    // IdleTimeout<Ms> is Sequential-only for now (ADR-028 Phase 2): the wheel-driven eviction races
+    // the close-out Dekker fence against exactly one in-flight drain (proven for Sequential only,
+    // ADR-028). A Reentrant/MaxConcurrency<N>>1 actor can have multiple frames in flight, which this
+    // protocol has never been proven against — forbid it at compile time rather than allow an
+    // unproven race, mirroring the Persistent<EventSourced> Sequential-only rule above.
+    static_assert(!(T::idle_present && (T::has_reentrant || (T::maxconc_present && T::maxconc > 1))),
+                  "IdleTimeout<Ms> is Sequential-only for now: idle-timeout eviction (ADR-028 Phase 2) "
+                  "races the close-out Dekker fence against exactly one in-flight drain, proven for "
+                  "Sequential only. Reentrant/MaxConcurrency<N> support is deferred.");
 
     // At most one of each value-carrying scheduling policy (a second one would silently sum).
     static_assert(T::priority_count <= 1, "at most one Priority<P> per actor (005 §Validation)");

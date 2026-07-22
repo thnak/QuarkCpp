@@ -100,6 +100,16 @@ private:
     std::vector<Entry> entries_{};
 };
 
+// The one-time COLD wire pass, type-erased over the actor (`ADR-028` Phase 4's broker construction
+// path and `Engine::spawn<A>()` both compile/call this). Also reused by `Activation::reconstruct_now()`
+// (007 `OnFailure<Restart>`, "Phase 6" redirected) to re-wire a freshly-placement-newed instance
+// against the SAME already-resolved `ResourceScope` — `resolve()` above is a plain scan over an
+// immutable table, so re-running `wire()` re-copies already-resolved pointers, never re-resolves
+// anything (ADR-021: no re-resolution). Lives here (not `metadata.hpp`) because it depends only on
+// `result`/`ResourceScope` — `Activation` (activation.hpp) needs the type too, and `metadata.hpp`
+// already includes `activation.hpp`, so this can't live downstream of `Activation` without a cycle.
+using WireFn = result<void> (*)(void* self, const ResourceScope& scope);
+
 // ---- Cached<T> (004) — an Activation/Node/Shard/Singleton resource, resolved ONCE -------------
 // Declared as an actor member. `wire()` runs once at activation (cold) and copies the resolved
 // pointer in; every subsequent access (`get()`, `operator->`, `operator*`) is a single pointer

@@ -62,8 +62,13 @@
 #include "quark/core/mailbox.hpp"
 #include "quark/core/message_context.hpp"
 #include "quark/core/metrics.hpp"  // 009: ShardCounters — engine-wired at registration (set_metrics)
+#include "quark/core/resource.hpp"  // WireFn/ResourceScope (007 Restart re-wire, "Phase 6" redirected)
 #include "quark/core/task.hpp"  // async_frame_faulted (007 handler-boundary guard, async channel)
 #include "pal/pal.hpp"          // pal::now() — the canonical suspend-counting clock (018/019)
+
+namespace quark::detail {
+struct TimerEntry;  // timer_wheel.hpp — forward-declared: Activation only ever holds a bare pointer
+}  // namespace quark::detail
 
 namespace quark {
 
@@ -224,11 +229,32 @@ public:
     void set_supervision(SupervisionPolicy sup) noexcept { sup_ = sup; }
     void set_reconstruct(ReconstructSink r) noexcept { reconstruct_ = r; }
     void set_dead_letter_sink(DeadLetterSink s) noexcept { dead_letter_ = s; }
+    // 007 Restart re-wire ("Phase 6" redirected): remember the SAME `wire()`/`ResourceScope*` the
+    // caller (Engine::spawn<A> / ActivationBroker::handle_wake) already used for the one-time cold
+    // wire, so `reconstruct_now()` can re-run it after every Restart. Either arg null (no `wire()`
+    // declared, or a caller that never wires at all) ⇒ reconstruct_now() skips the re-wire entirely —
+    // byte-for-byte today's behavior.
+    void set_resource_wire(WireFn fn, const ResourceScope* scope) noexcept {
+        wire_ = fn;
+        wire_scope_ = scope;
+    }
 
     // 009-Observability wiring (cold, set at registration by the engine): the SHARED per-shard
     // counter block this activation's shard owns. Null ⇒ unwired (standalone/test Activation usage
     // outside an Engine), every increment site below is guarded — zero behavior change when unset.
     void set_metrics(ShardCounters* sc) noexcept { metrics_ = sc; }
+
+    // ADR-028 Phase 2 wiring (cold, set at registration by Engine::spawn<A>()/register_activation):
+    // the actor's declared `IdleTimeout<Ms>` converted to a wheel-tick count. 0 = KeepAlive/no timeout
+    // (default) — Engine::run_activation only arms a Deactivate entry when this is non-zero.
+    void set_idle_ticks(std::uint32_t ticks) noexcept { idle_ticks_ = ticks; }
+    [[nodiscard]] std::uint32_t idle_ticks() const noexcept { return idle_ticks_; }
+    // The dedicated, permanently-owned Deactivate control descriptor (never pool-managed — see the
+    // member comment). Engine::on_deactivate_fire resets and re-posts it through this pointer.
+    [[nodiscard]] Descriptor* deactivate_descriptor() noexcept { return &deactivate_descriptor_; }
+    // The currently-armed wheel token, or null if none is outstanding (evicted/cancelled/never armed).
+    [[nodiscard]] detail::TimerEntry* armed_deactivate_entry() const noexcept { return deactivate_entry_; }
+    void set_armed_deactivate_entry(detail::TimerEntry* e) noexcept { deactivate_entry_ = e; }
 
     // Injectable clock (014 §virtual clock). `fn(ctx)` returns "now" in ns on the SAME scale as
     // Descriptor::deadline_ns (pal::clock). The 014 SimEngine binds its virtual clock here so a
@@ -306,8 +332,8 @@ public:
         mailbox_.enqueue(d);
         Mailbox::producer_close_out_fence();
         if (metrics_) metrics_->mailbox_enqueued.inc_atomic();  // producer-side, possibly concurrent
-        const bool wake = exec_.notify_enqueued();
-        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle->Scheduled edge (009)
+        const bool wake = wake_after_enqueue();  // ADR-028 Phase 2: Idle/Dormant->Scheduled (see below)
+        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle/Dormant->Scheduled edge (009)
         return {AdmitResult::Admitted, wake};
     }
 
@@ -326,18 +352,32 @@ public:
     Activation& operator=(Activation&&) = delete;
 
     // ---- Producer / wake seam (002) ------------------------------------------------------
+    // ADR-028 Phase 2: the wake-edge CAS, extended with the Dormant→Scheduled fallback. The Idle CAS
+    // already fails cleanly (returns false, no side effect) when the state is anything else, so
+    // trying it first costs the ordinary Idle producer NOTHING extra — the Dormant check/CAS below
+    // only runs on that (cold) miss. This is NOT a new fence: the SAME producer_close_out_fence()
+    // StoreLoad above already orders the enqueue before both CAS attempts, so an evicted activation
+    // that races a real message in is re-admitted exactly like the close-out abort race is aborted —
+    // reusing the Phase 1 Dekker rendezvous, never re-deriving it.
+    QUARK_ALWAYS_INLINE bool wake_after_enqueue() noexcept {
+        bool wake = exec_.notify_enqueued();
+        if (!wake && QUARK_UNLIKELY(exec_.state() == ExecState::Dormant))
+            wake = exec_.readmit_from_dormant();
+        return wake;
+    }
+
     QUARK_ALWAYS_INLINE bool post(Descriptor* d) noexcept {
         mailbox_.enqueue(d);
         Mailbox::producer_close_out_fence();  // elided on x86-TSO (the tail_.exchange fenced it)
         if (metrics_) metrics_->mailbox_enqueued.inc_atomic();  // producer-side, possibly concurrent
-        const bool wake = exec_.notify_enqueued();
-        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle->Scheduled edge (009)
+        const bool wake = wake_after_enqueue();
+        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle/Dormant->Scheduled edge (009)
         return wake;
     }
     QUARK_ALWAYS_INLINE bool notify_enqueued() noexcept {
         Mailbox::producer_close_out_fence();
-        const bool wake = exec_.notify_enqueued();
-        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle->Scheduled edge (009)
+        const bool wake = wake_after_enqueue();
+        if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle/Dormant->Scheduled edge (009)
         return wake;
     }
 
@@ -363,10 +403,28 @@ public:
             --remaining;
             Descriptor* d = r.desc;
 
-            if (!d->try_claim()) {
+            std::uint16_t claim_flags = 0;
+            if (!d->try_claim(&claim_flags)) {
                 reclaim_(d);
                 continue;
             }
+
+            // ADR-028 Phase 1: a control descriptor (e.g. Deactivate) never reaches the dispatch
+            // table — no handler runs, no metrics increment. Recognized off the SAME flags word
+            // try_claim() already loaded (no new memory load).
+            if (QUARK_UNLIKELY(claim_flags & kControlFlagDeactivate)) {
+                retire_requested_ = true;
+                // ADR-028 Phase 2: this descriptor is `deactivate_descriptor_` — a dedicated, never-
+                // pool-owned control descriptor (see the member comment) — NOT `reclaim_`'d like a
+                // real pooled message would be; Engine::on_deactivate_fire resets it in place before
+                // its next re-post.
+                continue;
+            }
+
+            // ADR-028 Phase 2: the busy edge. A real message claimed here means the activation is
+            // demonstrably not idle — stale-tag any outstanding Deactivate token (lazy cancel; the
+            // wheel later fires the abandoned entry as a harmless no-op, 011 §"re-arm-with-cancel").
+            if (QUARK_UNLIKELY(deactivate_entry_ != nullptr)) deactivate_entry_ = nullptr;
 
             // 007 §Stop: a Stopped actor dispatches nothing — its survivors drain to dead-letter.
             if (QUARK_UNLIKELY(stopped_)) {
@@ -432,10 +490,27 @@ public:
 
     // ---- Close-out seam (002): DrainedEmpty → relinquish via the seq_cst Dekker rendezvous ----
     [[nodiscard]] bool close_out() noexcept {
+        if (QUARK_UNLIKELY(retire_requested_)) return close_out_retire();
         exec_.release_to_idle();
         Mailbox::consumer_close_out_fence();
         if (!mailbox_.probe_has_work()) return false;
         return exec_.reacquire_from_idle();
+    }
+
+    // ---- Deactivate close-out (ADR-028 Phase 1): DrainedEmpty + a Deactivate control descriptor
+    // was claimed this drain → tentatively retire to Dormant, reusing the EXACT SAME release→fence→
+    // probe→reacquire Dekker sequence as the Idle close-out above, byte-for-byte, never re-derived.
+    // A message racing in between the release and the probe aborts the eviction (this returns true,
+    // the caller keeps draining — the racing message dispatches normally); a clean probe commits the
+    // eviction (returns false; the caller — nothing does this yet in this pass — would free the
+    // actor instance and mark the activation cold for a future reactivation path, Phase 4).
+    [[gnu::cold]] bool close_out_retire() noexcept {
+        retire_requested_ = false;
+        exec_.retire_to_dormant();            // Running -> Dormant (release)
+        Mailbox::consumer_close_out_fence();  // SAME seq_cst StoreLoad as every other close-out
+        if (!mailbox_.probe_has_work()) return false;        // clean evict
+        if (exec_.reacquire_from_dormant()) return true;     // aborted: a message raced in, keep draining
+        return false;  // lost the race to a reactivation path (Phase 4 seam; unreachable in this pass)
     }
 
     // ---- Fairness seam (002): BudgetExhausted / Busy → Running→Scheduled -------------------
@@ -582,6 +657,10 @@ public:
 
     // ---- Observers ------------------------------------------------------------------------
     [[nodiscard]] ExecState state() const noexcept { return exec_.state(); }
+    // ADR-028 Phase 1: distinguishes "genuinely idle" from "evicted" after close_out() returns
+    // false — a cheap post-hoc observer, not consulted by any hot-path decision. No caller is wired
+    // in this pass (added now so Phase 2's engine-side wiring doesn't need to reopen this file).
+    [[nodiscard]] bool went_dormant() const noexcept { return exec_.state() == ExecState::Dormant; }
     [[nodiscard]] Mailbox& mailbox() noexcept { return mailbox_; }
     [[nodiscard]] const MessageContext& current_context() const noexcept { return current_ctx_; }
     [[nodiscard]] bool is_reentrant() const noexcept { return rc_ != nullptr; }
@@ -729,10 +808,20 @@ private:
                                            g.drained.load(std::memory_order_relaxed);
             g.drained.store(g.drained.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 
-            if (!d->try_claim()) {
+            std::uint16_t claim_flags = 0;
+            if (!d->try_claim(&claim_flags)) {
                 reclaim_(d);  // late-cancel tombstone
                 continue;
             }
+            // ADR-028 Phase 1: see drain_step()'s identical check — a control descriptor never
+            // reaches the dispatch table, no handler runs, no governance shed/metric bookkeeping.
+            // Phase 2: never `reclaim_`'d — see drain_step()'s identical comment.
+            if (QUARK_UNLIKELY(claim_flags & kControlFlagDeactivate)) {
+                retire_requested_ = true;
+                continue;
+            }
+            // ADR-028 Phase 2: busy edge — see drain_step()'s identical comment.
+            if (QUARK_UNLIKELY(deactivate_entry_ != nullptr)) deactivate_entry_ = nullptr;
             if (QUARK_UNLIKELY(stopped_)) {
                 dead_letter_and_reclaim(d, error{errc::supervised_stop, "actor_stopped"});
                 continue;
@@ -1227,7 +1316,24 @@ private:
     }
 
     // Reconstruct actor state in place via the engine-supplied factory (null ⇒ assert-intact no-op).
-    [[gnu::cold]] void reconstruct_now() noexcept { reconstruct_(self_); }
+    // 007 Restart re-wire ("Phase 6" redirected, ADR-028 roadmap slot): a fresh instance from
+    // `reconstruct_` (placement-new) has default-constructed `Cached<>`/`PerMessage<>` members —
+    // null, unwired. Re-run the SAME `wire()` this actor was originally wired with, against the SAME
+    // `ResourceScope*` (set once via `set_resource_wire`, cold, at registration): `resolve()` is a
+    // scan over an already-immutable table, so this re-copies already-resolved pointers, never
+    // re-resolves anything (004/ADR-021). Both null ⇒ no `wire()` declared, or a caller (SimEngine/
+    // TestKit) that never wires at all — skip entirely, byte-for-byte today's behavior.
+    [[gnu::cold]] void reconstruct_now() noexcept {
+        reconstruct_(self_);
+        if (wire_ != nullptr && wire_scope_ != nullptr) {
+            if (result<void> r = wire_(self_, *wire_scope_); !r) {
+                // Structurally shouldn't happen (the SAME immutable scope already succeeded once, at
+                // first construction) — but a fresh instance that can't be wired can't safely run:
+                // escalate rather than dispatch into a half-wired actor.
+                do_escalate();
+            }
+        }
+    }
 
     void* self_;
     DispatchTable table_;
@@ -1249,8 +1355,28 @@ private:
     ReconstructSink reconstruct_{};
     DeadLetterSink dead_letter_{};
     EscalationSink escalate_sink_{};
+    // 007 Restart re-wire ("Phase 6" redirected) — set once, cold, via set_resource_wire(); both null
+    // ⇒ reconstruct_now() skips the re-wire entirely.
+    WireFn wire_ = nullptr;
+    const ResourceScope* wire_scope_ = nullptr;
     ShardCounters* metrics_ = nullptr;  // 009: this activation's shard block, wired by set_metrics()
     bool stopped_ = false;
+    // ADR-028 Phase 1: lane-only (non-atomic — set only by the drain-owning worker, read only by
+    // close_out() which runs on the same lane immediately after). Set when a Deactivate control
+    // descriptor was claimed during this drain; consumed by close_out_retire().
+    bool retire_requested_ = false;
+    // ADR-028 Phase 2: idle-timeout eviction state, all lane-only / shard-drain-owner-only (never
+    // touched off the owning shard's drain session — see engine.hpp Engine::arm_deactivate /
+    // on_deactivate_fire). `idle_ticks_` is resolved ONCE at `spawn<A>()` (0 = KeepAlive/no timeout,
+    // the 013 sentinel). `deactivate_entry_` is the currently-armed wheel token, or null; the busy
+    // edge (a real message claimed in drain_step) nulls it out as a lazy stale-tag — the wheel later
+    // fires the abandoned entry as a harmless no-op (011 §"re-arm-with-cancel", "O(1) under flap").
+    // `deactivate_descriptor_` is a dedicated, permanently-owned control descriptor — NEVER handed to
+    // `reclaim_` (which may be wired to the shard's real DescriptorPool; posting a non-pool pointer
+    // into that free-list would corrupt it) — reset via Descriptor::release()+set_flags() in place.
+    std::uint32_t idle_ticks_ = 0;
+    detail::TimerEntry* deactivate_entry_ = nullptr;
+    Descriptor deactivate_descriptor_{};
     std::uint32_t restart_count_ = 0;     // restarts charged in the current MaxRestarts window
     std::int64_t window_start_ns_ = 0;    // start of the current window (valid iff window_open_)
     bool window_open_ = false;            // a window has been started (0 is a real timestamp, not a sentinel)

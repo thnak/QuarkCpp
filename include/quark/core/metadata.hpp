@@ -33,8 +33,10 @@
 #include "quark/core/engine_config.hpp"  // Validation mode (Strict/Permissive)
 #include "quark/core/error.hpp"
 #include "quark/core/ids.hpp"
+#include "quark/core/persistence.hpp"  // Store, PersistMode, Persistent<> (ADR-028 Phase 5 recover seam)
 #include "quark/core/policies.hpp"     // is_actor, priority_band_of, drain_budget_of, max_concurrency_of, ...
 #include "quark/core/resource.hpp"     // ResourceScope (004 cold wire pass)
+#include "quark/core/snapshot.hpp"     // recover_snapshot<State> (ADR-028 Phase 5 recover seam)
 #include "quark/core/supervision.hpp"  // supervision_of<A>()
 #include "quark/detail/hash.hpp"       // hash_combine (folds the protocol keys)
 
@@ -138,6 +140,27 @@ template <class A>
 using ConstructFn = void* (*)();
 using DestroyFn = void (*)(void*) noexcept;
 
+// ADR-028 Phase 4: the type-erased resource wire pass — `A::wire(scope)` through a `void* self`, so
+// the broker's lazy first-construction can wire `Cached<>`/`PerMessage<>` members exactly like
+// `spawn<A>()` does today (004 §Rules). Null iff `A` declares no `wire()` (has_resource_wire<A> below
+// is false) — a pure function of `A`, compiled unconditionally by `compile_actor_metadata<A>()`.
+// `WireFn` itself now lives in `resource.hpp` ("Phase 6" redirected — `Activation` needs the type too
+// to re-wire after a 007 Restart, and can't depend on this header without a cycle).
+
+template <class A>
+[[nodiscard]] WireFn make_wire_fn() noexcept;  // defined after has_resource_wire<A> below
+
+// ADR-028 Phase 5: the type-erased persistence-recovery thunk — erases BOTH `A` (via `void* self`)
+// AND the concrete `Store` type `S` (via `void* store`), closing over both as template parameters at
+// the one call site that knows them concretely (`TypeRegistry::register_type<A,S>`). Null iff `A`
+// declares no `Persistent<Snapshot,...>` policy (`is_snapshot_persistent_v<A>` below is false). Called
+// at most once per `ActorId`, from the broker's one-time construction (ADR-028 Phase 4 `handle_wake`)
+// — a cold path, same cost profile as `WireFn`, no virtual dispatch anywhere.
+using RecoverFn = result<void> (*)(void* self, void* store, ActorId id);
+
+template <class A, class S>
+[[nodiscard]] RecoverFn make_recover_fn() noexcept;  // defined after has_persist_state<A> below
+
 // The RECONSTRUCT factory (007/ADR-009 §Restart): destroy the actor's state in place and
 // placement-new a FRESH instance at the same address, so `Restart` produces genuinely fresh state
 // (not assert-intact). Wired into `Activation::set_reconstruct`. Requires `A` default-constructible.
@@ -181,6 +204,22 @@ struct ActorMetadata {
     ConstructFn construct = nullptr;     // 008 factory: build a fresh actor
     DestroyFn destroy = nullptr;         // 008 factory: free it
     ReconstructSink reconstruct{};       // 007 factory: fresh-state Restart
+    // ADR-028 Phase 4 — the lazy-activation broker's construct_and_wire seam. `wire` is a pure
+    // function of `A` (null iff `A` declares no `wire()`), compiled unconditionally below; `scope`/
+    // `reclaim` are set at REGISTRATION (not compile) time by `TypeRegistry::register_type` — the
+    // same `ResourceScope`/`ReclaimSink` a `spawn<A>()` caller would pass, stored so the broker's
+    // first real construction can wire resources exactly once (004 §Rules; ADR-021 no re-resolution).
+    WireFn wire = nullptr;
+    const ResourceScope* scope = nullptr;
+    ReclaimSink reclaim{};
+    // ADR-028 Phase 5 — the lazy-activation broker's one-time persistence-recovery seam. `recover` is
+    // a pure function of `<A, S>` (S = the concrete Store type; null iff `A` declares no
+    // `Persistent<Snapshot,...>` policy), compiled by `TypeRegistry::register_type<A,S>` (NOT by
+    // `compile_actor_metadata<A>()` — exactly like `wire` above, an eagerly-`spawn`'d Persistent<Snapshot>
+    // actor is untouched unless it goes through the new store-taking registration overload). `store` is
+    // the type-erased pointer to the caller's concrete Store instance, set at the same registration call.
+    RecoverFn recover = nullptr;
+    void* store = nullptr;
 };
 
 // Compile-time gather (008 §Metadata compilation). All fields are pure functions of `A`'s policy
@@ -203,6 +242,7 @@ template <class A>
     m.construct = make_construct_fn<A>();
     m.destroy = make_destroy_fn<A>();
     m.reconstruct = make_reconstruct_sink<A>();
+    m.wire = make_wire_fn<A>();  // ADR-028 Phase 4: null iff A has no wire() (has_resource_wire<A>)
     return m;
 }
 
@@ -213,6 +253,58 @@ template <class A>
 concept has_resource_wire = requires(A& a, const ResourceScope& s) {
     { a.wire(s) } -> std::same_as<result<void>>;
 };
+
+// ADR-028 Phase 4: the type-erased wire thunk (forward-declared above `ActorMetadata`, defined here
+// now that `has_resource_wire<A>` exists). Null for an A with no `wire()` — the broker's construct
+// path skips wiring entirely for such actors, exactly like `spawn<A>()`'s existing `if constexpr`.
+template <class A>
+[[nodiscard]] WireFn make_wire_fn() noexcept {
+    if constexpr (has_resource_wire<A>) {
+        return +[](void* self, const ResourceScope& scope) -> result<void> {
+            return static_cast<A*>(self)->wire(scope);
+        };
+    } else {
+        return nullptr;
+    }
+}
+
+// ADR-028 Phase 5: an actor opts into lazy persistence-recovery via a member `PersistState` alias
+// (must satisfy `Described` — 016 `QUARK_SERIALIZE`'d, so it can round-trip through `recover_snapshot`)
+// plus `snapshot_state()` (capture current state; also the "seed" default when no snapshot exists yet)
+// and `restore_state(PersistState)` (apply recovered/seeded state right after construction, before any
+// message is dispatched). Mirrors `has_resource_wire<A>` exactly: opt-in, member-detected, no virtual.
+template <class A>
+concept has_persist_state = requires(A& a, typename A::PersistState st) {
+    typename A::PersistState;
+    { a.snapshot_state() } -> std::same_as<typename A::PersistState>;
+    { a.restore_state(std::move(st)) } -> std::same_as<void>;
+} && Described<typename A::PersistState>;
+
+// ADR-028 Phase 5: the type-erased recover thunk (forward-declared above `ActorMetadata`, defined here
+// now that `has_persist_state<A>` exists). Null unless `A` declares `Persistent<Snapshot,...>` — a
+// pure function of `<A, S>`, compiled by `TypeRegistry::register_type<A,S>` (never by
+// `compile_actor_metadata<A>()`, so an eagerly-`spawn`'d Persistent<Snapshot> actor with no
+// `PersistState` contract, e.g. the 07_persistence sample, is entirely unaffected).
+template <class A, class S>
+[[nodiscard]] RecoverFn make_recover_fn() noexcept {
+    if constexpr (is_snapshot_persistent_v<A>) {
+        static_assert(has_persist_state<A>,
+                      "declare_lazy<A>(store, ...): A declares Persistent<Snapshot,...> but is missing "
+                      "the PersistState alias + snapshot_state()/restore_state() contract (ADR-028 "
+                      "Phase 5)");
+        static_assert(Store<S>, "declare_lazy<A>(store, ...): store must model the 012 Store concept");
+        return +[](void* self, void* store, ActorId id) -> result<void> {
+            A* a = static_cast<A*>(self);
+            S& s = *static_cast<S*>(store);
+            auto rec = recover_snapshot<typename A::PersistState>(s, id, a->snapshot_state());
+            if (!rec) return std::unexpected(rec.error());
+            a->restore_state(std::move(rec->state));
+            return {};
+        };
+    } else {
+        return nullptr;
+    }
+}
 
 // ============================================================================================
 // 008 §Validation — the startup ValidationReport (fail-fast in Strict, warn+continue in Relaxed).
@@ -257,14 +349,38 @@ public:
     // undeclared resource fails registration with `errc::validation` (008 §Validation "Startup").
     // Strict: any error returns `unexpected` and publishes nothing. Relaxed: the error is downgraded
     // to a warning and the type is registered (quarantined).
+    // ADR-028 Phase 4: `scope`/`reclaim` are stored into the published record (not just validated
+    // against) so a LATER real construction — the broker's first-touch activation — can wire
+    // resources exactly like `spawn<A>()` does today. Both default to inert (no scope, default
+    // reclaim), matching every pre-Phase-4 call site's behavior byte-for-byte.
     template <class A, class WireCheck>
-    [[nodiscard]] result<std::uint16_t> register_type(WireCheck&& check) {
+    [[nodiscard]] result<std::uint16_t> register_type(WireCheck&& check,
+                                                      const ResourceScope* scope = nullptr,
+                                                      ReclaimSink reclaim = {}) {
         return register_metadata(compile_actor_metadata<A>(), detail::canonical_type_name<A>(),
-                                 std::forward<WireCheck>(check));
+                                 std::forward<WireCheck>(check), scope, reclaim);
     }
     template <class A>
-    [[nodiscard]] result<std::uint16_t> register_type() {
-        return register_type<A>([] { return result<void>{}; });
+    [[nodiscard]] result<std::uint16_t> register_type(const ResourceScope* scope = nullptr,
+                                                      ReclaimSink reclaim = {}) {
+        return register_type<A>([] { return result<void>{}; }, scope, reclaim);
+    }
+
+    // ADR-028 Phase 5: register `A` against a concrete `Store` `store` so the broker's one-time lazy
+    // construction (Phase 4 `handle_wake`) generically recovers persisted state via `recover_snapshot`
+    // (`A` must declare `Persistent<Snapshot,...>` — enforced by the caller, `Engine::declare_lazy`, via
+    // `static_assert(is_snapshot_persistent_v<A>)`, so a misuse fails to compile at the call site rather
+    // than silently registering an inert `recover`). `store` must outlive every activation of `A` (the
+    // SAME lifetime contract `ResourceScope*`/`ReclaimSink` already carry for `scope`/`reclaim`).
+    template <class A, class S>
+        requires Store<S>
+    [[nodiscard]] result<std::uint16_t> register_type(S& store, const ResourceScope* scope = nullptr,
+                                                      ReclaimSink reclaim = {}) {
+        ActorMetadata m = compile_actor_metadata<A>();
+        m.recover = make_recover_fn<A, S>();
+        m.store = static_cast<void*>(&store);
+        return register_metadata(std::move(m), detail::canonical_type_name<A>(),
+                                 [] { return result<void>{}; }, scope, reclaim);
     }
 
     // Low-level publish of a compiled record (008 §Metadata compilation; ADR-008 add-type). Runs the
@@ -272,8 +388,12 @@ public:
     // caller's `check()`. `subject` is a borrowed name for diagnostics.
     template <class WireCheck>
     [[nodiscard]] result<std::uint16_t> register_metadata(ActorMetadata m, std::string_view subject,
-                                                          WireCheck&& check) {
+                                                          WireCheck&& check,
+                                                          const ResourceScope* scope = nullptr,
+                                                          ReclaimSink reclaim = {}) {
         (void)subject;
+        m.scope = scope;
+        m.reclaim = reclaim;
         // --- type_key collision (008 §Type identity: distinct types hashing equal is a Strict fail).
         if (const auto it = by_key_.find(m.key); it != by_key_.end()) {
             report_.entries.push_back(

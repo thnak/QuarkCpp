@@ -21,6 +21,25 @@ Longer-lived scopes are strictly cheaper: a Singleton is a pointer read; an
 Activation resource is resolved once and cached on the activation for the actor's
 whole lifetime.
 
+**Node/Shard resolution ordering (ADR-021, proven).** Node and Shard resources
+are resolved eagerly, for every configured shard, synchronously inside the
+Engine's construction/`build()` cold phase (008) — strictly before any worker
+thread is created. There is no "cold shard" case to reason about at activation
+time: by the moment a worker thread is spawned, every shard's Node/Shard
+resource table is already complete and immutable. A Node-scoped resource
+shared by many shards is therefore constructed exactly once, by a single
+thread, with no CAS, lock, or `std::call_once` — the multi-shard race is
+dissolved by ordering, not resolved by synchronization. `Cached<T>::wire()`
+for Node/Shard lifetimes is a plain pointer-copy loop with zero atomics,
+identical in cost/shape to the Activation-scope wiring. The accepted
+trade-off: Engine construction time scales linearly with
+`shard_count × resource_count`, including for shards that host no actor — an
+amortized, cold-path-only cost, parallelizable across build-time-only helper
+threads (joined before `start()`) if it ever becomes operationally
+significant at large shard counts (013/026); such helpers must be a
+distinct, clearly-marked build-only type never reachable from a worker
+thread.
+
 ## Rules
 
 - **Heavy dependencies resolve at activation**, not per message. A handle to a
@@ -45,6 +64,26 @@ whole lifetime.
   directly; they are not looked up.
 - **No dynamic resolution while draining.** The hot path only reads already-cached
   handles and calls factories — never walks a container.
+- **A supervised `OnFailure<Restart>` re-wires resources, not just state (007, ADR-028).**
+  Restart reconstructs the actor in place (a fresh default-constructed instance at the same
+  storage), which leaves any `Cached<T>`/`PerMessage<T>` member unwired. The engine re-runs the
+  SAME `wire(const ResourceScope&)` the actor was originally wired with, against the SAME
+  `ResourceScope`, immediately after reconstruction — this is not a new resolution: the scope's
+  entries are already immutable/eager (ADR-021), so re-wiring re-copies already-resolved pointers,
+  never re-invokes a Node/Shard factory. An actor with no `wire()` is unaffected. Idle-timeout
+  eviction/reactivation (ADR-028) needs no equivalent step: it never destroys the actor instance,
+  so its resources are never unwired in the first place.
+- **Node/Shard resource storage outlives owned actors/activations (ADR-021).**
+  The Engine's Node/Shard resource storage must be declared — and therefore
+  destroyed — after every container of owned actors/activations. Actor
+  destructors that touch a `Cached<>` resource (e.g. a pool-checkout RAII
+  guard) must never run after the resource they reference has already been
+  torn down. Any resource storage backed by a bump/arena allocator
+  (`std::pmr::monotonic_buffer_resource` or equivalent) must carry an explicit
+  destructor-thunk list — bulk-reclaiming arena memory does not, by itself,
+  invoke placement-constructed destructors. (Both failure modes were proven
+  with ASan/LeakSanitizer during ADR-021's design debate and are covered by
+  permanent regression tests.)
 
 ## Declaring resources
 
@@ -157,4 +196,10 @@ generation-gated `gen_state` CAS (001/003), not a `stop_source` at all.
 - *(Factory error handling: resolved — a `PerMessage<T>` factory failure **fails the
   message** via the 007 boundary, checked before the handler body; degrade is the explicit
   `OnResourceFailure<Degrade>` opt-in. See the factory rule above, ADR-009.)*
-- Node/Shard resource resolution ordering vs. actor activation on a cold shard.
+- *(Node/Shard resolution ordering: resolved — Node- and Shard-scoped resources
+  are resolved eagerly, for every configured shard, synchronously inside the
+  Engine's construction/`build()` cold phase (008), strictly before any worker
+  thread is created. A Node-scoped resource shared by many shards is therefore
+  constructed exactly once by a single thread with no CAS, lock, or
+  `std::call_once` — the multi-shard race is dissolved by ordering, not
+  resolved by synchronization. See ADR-021.)*

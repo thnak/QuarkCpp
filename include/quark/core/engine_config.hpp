@@ -61,6 +61,12 @@ struct EngineConfig {
     Numa numa = Numa::Auto;             // NUMA arena placement intent (019 seam)
     Validation validation = Validation::Strict;  // startup Validation mode (008)
     SecurityMode security_mode = SecurityMode::Off;  // 013/020 posture; Off = plaintext dev default
+    // Per-shard `IdleTimeout<Ms>` wheel granularity (011/ADR-028 Phase 2): the wall-clock ms one
+    // wheel tick represents. BuildOnly — the packed HotCell `idle_ticks` field (013) is already a
+    // full 16 bits (ADR-008 §Consequences), so the tick's real-time SCALE cannot ride the same Live
+    // word and lives here instead. `idle_timeout_ms_of<A>() / idle_tick_ms` (rounded up, min 1) is
+    // resolved once per `spawn<A>()` into the actor's `idle_ticks` count.
+    std::uint32_t idle_tick_ms = 100;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -92,6 +98,7 @@ struct EngineConfig {
     if (c.band_count == 0 || c.band_count > 8)
         return fail(errc::validation, "band_count must be in [1,8] (ADR-010)");
     if (c.max_types == 0)     return fail(errc::validation, "max_types must be > 0");
+    if (c.idle_tick_ms == 0)  return fail(errc::validation, "idle_tick_ms must be > 0");
     return validate_operational(c.operational_seed());  // seeds the Live read-set; ceilings enforced
 }
 
@@ -112,6 +119,7 @@ public:
     ConfigBuilder& validation(Validation v) noexcept { cfg_.validation = v; return *this; }
     ConfigBuilder& security_mode(SecurityMode v) noexcept { cfg_.security_mode = v; return *this; }
     ConfigBuilder& busy_spin_limit(unsigned n) noexcept { cfg_.busy_spin_limit = n; return *this; }
+    ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }
 
     // HOT-LEAF SEED setters (these set the INITIAL Live word).
     ConfigBuilder& default_drain_budget(std::uint32_t n) noexcept { cfg_.drain_budget = n; return *this; }

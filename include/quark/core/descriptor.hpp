@@ -82,6 +82,13 @@ struct GenState {
     }
 };
 
+// --- Control flags (the 12-bit `flags` field of gen_state) -------------------------------------
+// Reserved bits for engine-internal control descriptors — never set by user `tell`/`ask` traffic.
+// Bit 0: this descriptor is a Deactivate control message (ADR-028 Phase 1). `drain_step` recognizes
+// it via the SAME flags word already captured by try_claim()'s CAS (no extra memory load) and
+// converts it into a private `retire_requested_` flag instead of dispatching to the handler table.
+inline constexpr std::uint16_t kControlFlagDeactivate = 1u << 0;
+
 // The fixed-size, pooled message metadata block. Payload lives SEPARATELY (003): the descriptor
 // only references it. One cache line max — enforced by the static_assert at the bottom.
 struct Descriptor {
@@ -118,16 +125,24 @@ struct Descriptor {
     // Called by the draining worker when it reaches this descriptor. Returns true if the claim
     // won; false means a late cancel flipped Queued -> Cancelled first (the caller then reclaims
     // it as a tombstone — one free, no handler runs). ADR-004 C2: exactly one clean reclamation.
-    [[nodiscard]] bool try_claim() noexcept {
+    //
+    // The `observed_flags` overload (ADR-028 Phase 1) additionally reports the packed `flags` word
+    // as it stood at the winning CAS — the SAME load the claim already performs, so a caller that
+    // wants to recognize a control descriptor (e.g. kControlFlagDeactivate) pays no extra memory
+    // load to do so.
+    [[nodiscard]] bool try_claim(std::uint16_t* observed_flags) noexcept {
         std::uint64_t cur = gen_state.load(std::memory_order_acquire);
         for (;;) {
             if (GenState::state_of(cur) != MsgState::Queued) return false;  // cancelled under us
             const std::uint64_t desired = GenState::with_state(cur, MsgState::Running);
             if (gen_state.compare_exchange_weak(cur, desired, std::memory_order_acq_rel,
-                                                std::memory_order_acquire))
+                                                std::memory_order_acquire)) {
+                if (observed_flags) *observed_flags = GenState::flags_of(cur);
                 return true;
+            }
         }
     }
+    [[nodiscard]] bool try_claim() noexcept { return try_claim(nullptr); }
 
     // --- Cancel (producer/external side, generation-gated): Queued -> Cancelled ------------
     // Writes the Cancelled tombstone ONLY IF handle_generation matches AND the state is still
@@ -151,6 +166,18 @@ struct Descriptor {
     void complete() noexcept {
         std::uint64_t cur = gen_state.load(std::memory_order_relaxed);
         gen_state.store(GenState::with_state(cur, MsgState::Completed), std::memory_order_release);
+    }
+
+    // --- Set the control flags (single-writer only) -----------------------------------------
+    // NEVER call on a descriptor that is enqueued/reachable by another thread — this is a cold,
+    // pre-post setup step (building a control descriptor like a Deactivate) or a test-harness hook,
+    // not a hot-path or concurrent-write operation. A plain relaxed load+store is correct because
+    // the caller is required to own the descriptor exclusively at the point of the call.
+    void set_flags(std::uint16_t flags) noexcept {
+        const std::uint64_t cur = gen_state.load(std::memory_order_relaxed);
+        const std::uint64_t masked = cur & ~GenState::flags_mask;
+        gen_state.store(masked | (static_cast<std::uint64_t>(flags) & GenState::flags_mask),
+                        std::memory_order_relaxed);
     }
 
     // --- Release (cold path, pool return): bump generation, reset to Queued ----------------

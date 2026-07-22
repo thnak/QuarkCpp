@@ -159,6 +159,19 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_close_out_dekker_test.cpp" AND NOT
   add_test(NAME stream_close_out_dekker_control COMMAND stream_close_out_dekker_control)
 endif()
 
+# ADR-028 Phase 1 CONTROL-1 (fence removed): -DQUARK_ACTIVATION_DEACTIVATE_NO_FENCE drops the seq_cst
+# close-out fence in the isolating Dekker litmus, so a message racing the retire is LOST (lost>0). The
+# control exits 0 iff it stranded. Same rationale/exclusions as stream_close_out_dekker_control above
+# (pure store-buffer-reorder litmus: not meaningful under TSan/ASan, x86-64 only) — see that entry's
+# comment for the full explanation; it applies identically here.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/activation_deactivate_close_out_dekker_test.cpp" AND NOT QUARK_SANITIZE
+   AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"))
+  add_executable(activation_deactivate_close_out_dekker_control activation_deactivate_close_out_dekker_test.cpp)
+  target_link_libraries(activation_deactivate_close_out_dekker_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(activation_deactivate_close_out_dekker_control PRIVATE QUARK_ACTIVATION_DEACTIVATE_NO_FENCE)
+  add_test(NAME activation_deactivate_close_out_dekker_control COMMAND activation_deactivate_close_out_dekker_control)
+endif()
+
 # 024-Streaming §0-cross-core-RMW-on-drain — objdump proof (ADR-005 S1 method). Disassemble the
 # `quark_stream_drain_probe` symbol and grep for lock/cmpxchg/xadd/xchg-mem/mfence. Gated to
 # NON-sanitizer builds (ASan/TSan/UBSan instrumentation injects lock ops that are not the drain's).
