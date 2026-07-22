@@ -58,6 +58,16 @@ struct OverlapGate {
         if (++arrived >= need) {
             tripped = true;
             cv.notify_all();
+            lk.unlock();
+            // The trip-winner never blocks, but the thread(s) it just woke DO need to actually get
+            // scheduled and reacquire `m` before they reach the shared critical section right after
+            // arrive() returns. On a loaded/virtualized CI host that OS wake latency can exceed the
+            // winner's own remaining work, so without this it can race ahead and finish its own
+            // critical section before the other side ever wakes — no real overlap, no torn state,
+            // and (observed in CI) the shared-state CONTROL's tearing silently fails to fire. A short
+            // real-time sleep — not a spin, whose duration is hardware-speed-dependent — gives the
+            // woken side a generous, host-independent window to catch up first.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             return;
         }
         cv.wait_for(lk, std::chrono::seconds(5), [&] { return tripped; });
@@ -117,9 +127,10 @@ struct Worker : Actor<Worker, Sequential> {
 
 #ifdef QUARK_STATELESS_SHARED_STATE_CONTROL
         // Shared plain accumulator RMW'd by ≥2 activations concurrently → data race + lost updates. The
-        // spin widens the read-modify-write window so the tearing is reliable even without TSan.
+        // spin widens the read-modify-write window so the tearing is reliable even without TSan (bumped
+        // from 64: observed NOT-FIRED, torn=0, on a noisy shared CI runner at the smaller width).
         long tmp = g_ctrl_count;
-        for (volatile int s = 0; s < 64; ++s) {
+        for (volatile int s = 0; s < 4096; ++s) {
         }
         g_ctrl_count = tmp + 1;
         g_ctrl_xor ^= j.token;
