@@ -44,12 +44,7 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(__linux__)
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
+#include "pal/file_io.hpp"
 #include "pal/pal.hpp"
 #include "quark/core/error.hpp"
 #include "quark/core/ids.hpp"
@@ -189,7 +184,7 @@ public:
     enum class Kind : std::uint8_t { kPut = 1, kRemove = 2, kCheckpoint = 3 };
 
     explicit FileReminderStore(std::string path) : path_(std::move(path)) { replay(); open_append(); }
-    ~FileReminderStore() { if (fd_ >= 0) ::close(fd_); }
+    ~FileReminderStore() { pal::file_close(fd_); }
     FileReminderStore(const FileReminderStore&) = delete;
     FileReminderStore& operator=(const FileReminderStore&) = delete;
 
@@ -221,17 +216,17 @@ public:
     // Rewrite the log to only the live rows + the current checkpoint — bounds rebuild to O(live).
     // (ADR-017 residual #3: 10⁴ re-arms of one reminder ⇒ 1 live row, not 10⁴ log records.)
     [[nodiscard]] result<void> compact() {
-        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        if (fd_ != pal::invalid_file) { pal::file_close(fd_); fd_ = pal::invalid_file; }
         const std::string tmp = path_ + ".compact";
-        int t = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (t < 0) return fail(errc::internal, "reminder compact: open tmp failed");
+        pal::file_t t = pal::file_open(tmp, pal::FileOpenMode::kWriteCreateTrunc);
+        if (t == pal::invalid_file) return fail(errc::internal, "reminder compact: open tmp failed");
         for (const auto& [k, r] : rows_)
-            if (auto e = frame_write(t, Kind::kPut, encode_put(r)); !e) { ::close(t); return e; }
+            if (auto e = frame_write(t, Kind::kPut, encode_put(r)); !e) { pal::file_close(t); return e; }
         { std::array<std::byte, 8> b{}; put_i64(b.data(), checkpoint_);
-          if (auto e = frame_write(t, Kind::kCheckpoint, {b.data(), b.size()}); !e) { ::close(t); return e; } }
-        sync_data(t);
-        ::close(t);
-        if (::rename(tmp.c_str(), path_.c_str()) != 0) return fail(errc::internal, "reminder compact: rename failed");
+          if (auto e = frame_write(t, Kind::kCheckpoint, {b.data(), b.size()}); !e) { pal::file_close(t); return e; } }
+        (void)pal::durable_flush(t);
+        pal::file_close(t);
+        if (!pal::file_rename(tmp, path_)) return fail(errc::internal, "reminder compact: rename failed");
         open_append();
         return {};
     }
@@ -321,15 +316,7 @@ private:
         return k;
     }
 
-    static void sync_data(int fd) noexcept {
-#if defined(__linux__)
-        ::fdatasync(fd);
-#else
-        (void)fd;
-#endif
-    }
-
-    [[nodiscard]] result<void> frame_write(int fd, Kind kind, std::span<const std::byte> body) {
+    [[nodiscard]] result<void> frame_write(pal::file_t fd, Kind kind, std::span<const std::byte> body) {
         std::vector<std::byte> framed;
         std::array<std::byte, 4> h{};
         const std::uint32_t len = static_cast<std::uint32_t>(1 + body.size());  // kind byte + body
@@ -343,43 +330,38 @@ private:
         framed.insert(framed.end(), kb.begin(), kb.end());
         std::size_t off = 0;
         while (off < framed.size()) {
-            ssize_t w = ::write(fd, framed.data() + off, framed.size() - off);
+            std::int64_t w = pal::file_write(fd, framed.data() + off, framed.size() - off);
             if (w < 0) return fail(errc::internal, "reminder store: write failed");
             off += static_cast<std::size_t>(w);
         }
         return {};
     }
     [[nodiscard]] result<void> durable_append(Kind kind, std::span<const std::byte> body) {
-        if (fd_ < 0) return fail(errc::internal, "reminder store: not open");
+        if (fd_ == pal::invalid_file) return fail(errc::internal, "reminder store: not open");
         if (auto e = frame_write(fd_, kind, body); !e) return e;
-        sync_data(fd_);  // ADR-017 F1p: exactly one fdatasync per durable op
+        (void)pal::durable_flush(fd_);  // ADR-017 F1p: exactly one durable_flush per durable op
         return {};
     }
 
-    void open_append() {
-#if defined(__linux__)
-        fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-#endif
-    }
+    void open_append() { fd_ = pal::file_open(path_, pal::FileOpenMode::kWriteCreateAppend); }
 
     // Replay the log into the live-row map; a torn trailing record (bad len/crc from a crash
     // mid-write) is detected and the file is truncated to the last good record.
     void replay() {
-#if defined(__linux__)
-        int fd = ::open(path_.c_str(), O_RDONLY, 0644);
-        if (fd < 0) return;
+        pal::file_t fd = pal::file_open(path_, pal::FileOpenMode::kReadOnly);
+        if (fd == pal::invalid_file) return;
         std::vector<std::byte> buf;
-        { struct ::stat st{}; if (::fstat(fd, &st) == 0 && st.st_size > 0) {
-            buf.resize(static_cast<std::size_t>(st.st_size));
+        if (auto sz = pal::file_size(fd); sz && *sz > 0) {
+            buf.resize(static_cast<std::size_t>(*sz));
             std::size_t off = 0;
             while (off < buf.size()) {
-                ssize_t r = ::read(fd, buf.data() + off, buf.size() - off);
+                std::int64_t r = pal::file_read(fd, buf.data() + off, buf.size() - off);
                 if (r <= 0) break;
                 off += static_cast<std::size_t>(r);
             }
             buf.resize(off);
-        } }
-        ::close(fd);
+        }
+        pal::file_close(fd);
 
         std::size_t pos = 0, good = 0;
         while (pos + 8 <= buf.size()) {
@@ -397,14 +379,13 @@ private:
             good = pos;
         }
         if (good < buf.size()) {  // torn tail — truncate so future appends start clean
-            int t = ::open(path_.c_str(), O_WRONLY, 0644);
-            if (t >= 0) { if (::ftruncate(t, static_cast<off_t>(good)) != 0) { /* best-effort */ } ::close(t); }
+            pal::file_t t = pal::file_open(path_, pal::FileOpenMode::kWriteExisting);
+            if (t != pal::invalid_file) { (void)pal::file_truncate(t, good); pal::file_close(t); }
         }
-#endif
     }
 
     std::string path_;
-    int fd_ = -1;
+    pal::file_t fd_ = pal::invalid_file;
     std::unordered_map<ReminderKey, ReminderRow> rows_;
     std::int64_t checkpoint_ = -1;
 };

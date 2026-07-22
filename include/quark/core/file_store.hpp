@@ -20,13 +20,14 @@
 // superseded (stale-token) writer stays fenced out ACROSS a restart, not just within one process —
 // the split-brain guarantee is durable.
 //
-// SCOPE / PORTABILITY. POSIX-backed (`open`/`pwrite`/`fdatasync`/`ftruncate`), the concrete
-// Linux/x86-64 backing of the 019 PAL durable-flush seam (mirrors pal/linux_x86_64/clock.hpp being
-// the first concrete PAL clock unit). The durable byte format is host-endian — correct on the
-// x86-64 target; a portable version byte-swaps the fixed-width integers, a noted seam. On non-Linux
-// POSIX it falls back to `fsync`. Compaction (truncating the log prefix a snapshot subsumes) is a
-// documented future optimization — correctness never depends on it (recovery reads snapshot +
-// tail-from-through_seq), only file size does.
+// SCOPE / PORTABILITY. Backed by the 019 PAL durable-file seam (pal/file_io.hpp: `file_open`/
+// `file_pwrite`/`file_pread`/`file_truncate`/`durable_flush`) — POSIX (`pwrite`/`fdatasync`/
+// `ftruncate`) on Linux, Win32 (`WriteFile`/`FlushFileBuffers`/`SetEndOfFile`) on Windows, both
+// behind the identical `pal::file_*` surface (019 §"The one rule"). The durable byte format is
+// host-endian — correct on the x86-64 target; a portable version byte-swaps the fixed-width
+// integers, a noted seam. Compaction (truncating the log prefix a snapshot subsumes) is a documented
+// future optimization — correctness never depends on it (recovery reads snapshot + tail-from-
+// through_seq), only file size does.
 #pragma once
 
 #include <array>
@@ -41,10 +42,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <fcntl.h>     // ::open, O_RDWR, O_CREAT
-#include <sys/stat.h>  // ::mkdir, mode bits
-#include <unistd.h>    // ::pwrite, ::ftruncate, ::close, ::fdatasync/::fsync
-
+#include "pal/file_io.hpp"
 #include "quark/core/error.hpp"
 #include "quark/core/ids.hpp"
 #include "quark/core/persistence.hpp"
@@ -60,7 +58,7 @@ public:
     // on first touch of each ActorId (not eagerly here), so opening a store with a million actors is
     // O(1); each actor pays its own one-time replay on first use.
     explicit FileStore(std::string dir) : root_(std::move(dir)) {
-        ::mkdir(root_.c_str(), 0755);  // idempotent; ignore EEXIST — a missing dir surfaces at open()
+        pal::make_dir(root_);  // idempotent — a missing/unwritable dir surfaces at open() instead
     }
     FileStore(const FileStore&) = delete;
     FileStore& operator=(const FileStore&) = delete;
@@ -151,13 +149,13 @@ private:
     static constexpr std::uint8_t kBatch = 3;
 
     struct Entry {
-        int fd = -1;
+        pal::file_t fd = pal::invalid_file;
         std::uint64_t write_off = 0;         // append offset (also the truncation point after replay)
         FenceToken owner{};
         SeqNo last_seq = 0;
         std::optional<SnapshotRecord> snapshot;
         std::vector<EventRecord> log;
-        ~Entry() { if (fd >= 0) ::close(fd); }
+        ~Entry() { pal::file_close(fd); }
     };
 
     // Lazy open + replay of `id`'s WAL into an in-RAM Entry (one-time per actor).
@@ -166,8 +164,8 @@ private:
         if (it != table_.end()) return *it->second;
         auto e = std::make_unique<Entry>();
         const std::string path = path_for(id);
-        e->fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
-        if (e->fd >= 0) replay(*e);
+        e->fd = pal::file_open(path, pal::FileOpenMode::kReadWriteCreate);
+        if (e->fd != pal::invalid_file) replay(*e);
         Entry& ref = *e;
         table_.emplace(id, std::move(e));
         return ref;
@@ -191,7 +189,7 @@ private:
             apply_record(e, body);
             off = body_off + len;                                   // advance past this good record
         }
-        if (off != n) (void)::ftruncate(e.fd, static_cast<off_t>(off));  // drop a torn tail
+        if (off != n) (void)pal::file_truncate(e.fd, off);  // drop a torn tail
         e.write_off = off;
     }
 
@@ -228,9 +226,9 @@ private:
         put_u32(frame, static_cast<std::uint32_t>(body.size()));
         put_u32(frame, crc32(std::span<const std::byte>(body)));
         frame.insert(frame.end(), body.begin(), body.end());
-        const ssize_t w = ::pwrite(e.fd, frame.data(), frame.size(), static_cast<off_t>(e.write_off));
-        if (w != static_cast<ssize_t>(frame.size())) return false;  // short/failed write
-        if (sync_data(e.fd) != 0) return false;                     // durability barrier failed
+        const std::int64_t w = pal::file_pwrite(e.fd, frame.data(), frame.size(), e.write_off);
+        if (w != static_cast<std::int64_t>(frame.size())) return false;  // short/failed write
+        if (!pal::durable_flush(e.fd)) return false;                     // durability barrier failed
         e.write_off += frame.size();
         return true;
     }
@@ -248,26 +246,17 @@ private:
         return root_ + name;
     }
 
-    static std::vector<std::byte> read_all(int fd) {
+    static std::vector<std::byte> read_all(pal::file_t fd) {
         std::vector<std::byte> out;
         std::byte buf[65536];
-        off_t off = 0;
+        std::uint64_t off = 0;
         for (;;) {
-            const ssize_t r = ::pread(fd, buf, sizeof(buf), off);
+            const std::int64_t r = pal::file_pread(fd, buf, sizeof(buf), off);
             if (r <= 0) break;
             out.insert(out.end(), buf, buf + r);
-            off += r;
+            off += static_cast<std::uint64_t>(r);
         }
         return out;
-    }
-
-    // The durable-flush barrier: fdatasync on Linux (skips inode-metadata-only flushes), fsync else.
-    static int sync_data(int fd) noexcept {
-#if defined(__linux__)
-        return ::fdatasync(fd);
-#else
-        return ::fsync(fd);
-#endif
     }
 
     // ---- fixed-width host-endian (LE on x86-64) put/get helpers over a byte buffer ----------
