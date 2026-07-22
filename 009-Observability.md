@@ -25,9 +25,23 @@ struct ShardCounters {
     uint64_t wakeups;          // 002
     uint64_t dead_letters;     // 007
     uint64_t deadline_misses;  // 011
+    uint64_t broker_wakes_enqueued;  // ADR-028: lazy-activation Wake control messages posted
+    uint64_t broker_wakes_handled;   // ADR-028: Wake messages the shard's broker has processed
     // + user-defined counters, indexed by a registered slot
 };
 ```
+
+### Broker convoy observability (ADR-028)
+
+The per-shard `ActivationBroker` (lazy first-touch activation, ADR-028) is a single
+Sequential lane per shard, so a burst of first-touches/reactivations exceeding what it
+can drain immediately — or one pathologically slow reload — queues later requests
+behind it (ADR-028 residual risk #2). This is observable, not just bounded in theory:
+`broker_wakes_enqueued`/`broker_wakes_handled` give live per-shard broker queue depth as
+`enqueued − handled` (the producer/drain-owner split mirrors `mailbox_enqueued`/
+`messages_processed`), and a `broker_stall_ns` histogram (alongside `message_latency_ns`/
+`mailbox_depth`) records Wake-enqueue-to-dispatch-start latency, so a convoy shows up as
+a widening stall distribution before it becomes an outage.
 
 ### Alternatives considered
 

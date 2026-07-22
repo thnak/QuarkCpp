@@ -626,11 +626,21 @@ private:
     // The broker's own control message: the target id, the ORIGINAL first-touch descriptor, and the
     // origin caller's reclaim sink (used ONLY if construction never starts/fails before any Activation
     // exists to own the message — see `handle_wake`). Engine-internal only, never a user-facing type.
+    // `enqueued_ns` (ADR-028 Phase 7 §009 broker convoy observability, residual risk #2) is stamped in
+    // `activate()` and read back at the top of `handle_wake` to record `broker_stall_ns`.
     struct Wake {
         ActorId id;
         Descriptor* first = nullptr;
         ReclaimSink first_reclaim{};
+        std::int64_t enqueued_ns = 0;
     };
+
+    // Real wall-clock nanoseconds (pal::BootClock — CLOCK_BOOTTIME-class, see pal/pal.hpp), used ONLY
+    // for the broker's own stall observability (009). Not injectable via Activation::set_clock — the
+    // broker is engine-internal plumbing, not a simulated actor's deadline/restart-window clock.
+    [[nodiscard]] static std::int64_t wall_now_ns() noexcept {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(pal::now().time_since_epoch()).count();
+    }
 
     // The per-shard lazy-activation broker (ADR-028 Phase 4): an ORDINARY internal actor that reuses
     // the engine's own single-executor guarantee to arbitrate first-touch construction — the ADR's
@@ -642,7 +652,15 @@ private:
     // the same id is even LOOKED AT until the first one's id-table publish has already committed).
     // Revisit if/when Phase 5 makes construction genuinely async. Never addressed via `ActorId`/
     // `resolve()`/`ActorRef` — a pure engine-internal implementation detail, stored on `Shard`.
-    class ActivationBroker : public Actor<ActivationBroker, Sequential> {
+    //
+    // ADR-028 Phase 7 (residual risk #5 — "a dedicated SupervisionPolicy, not inherited defaults"):
+    // `OnFailure<Restart>` is declared EXPLICITLY here rather than left to `supervision_of<A>()`'s
+    // implicit spec-default (which already computes to the same Restart/unbounded value) — a
+    // deliberate, documented choice, not an accident of what the default happens to be today.
+    // Structurally unreachable as of this phase: `handle_wake` below is now exception-safe (its own
+    // try/catch converts any construct/wire/recover fault into a synchronous dead-letter, never an
+    // escaping exception), so this policy is a regression guard, not a currently-exercised path.
+    class ActivationBroker : public Actor<ActivationBroker, Sequential, OnFailure<Restart>> {
     public:
         using protocol = Protocol<Wake>;
         ActivationBroker(Engine* eng, std::uint32_t shard_id) noexcept
@@ -688,12 +706,16 @@ private:
         Shard& sh = shards_[sid];
         detail::MessagePool::Slot slot = broker_pool_.acquire(&detail::destroy_payload<Wake>);
         Descriptor* wd = slot.desc;
-        ::new (slot.payload) Wake{id, first, origin_reclaim};
+        ::new (slot.payload) Wake{id, first, origin_reclaim, wall_now_ns()};
         wd->payload = slot.payload;
         wd->payload_size = static_cast<std::uint32_t>(sizeof(Wake));
         wd->trace_id = 0;
         wd->deadline_ns = 0;
         stamp<ActivationBroker, Wake>(*wd);
+        // ADR-028 Phase 7 (009 broker convoy observability, residual risk #2): producer side — many
+        // threads may call `activate()` concurrently (for the same or different cold ids), so this
+        // mirrors the existing `mailbox_enqueued` convention (`inc_atomic()`, a real fetch_add).
+        sh.metrics.broker_wakes_enqueued.inc_atomic();
         // `post()`'s return is the WAKE-EDGE bool (did THIS call need to wake a worker for the
         // broker?) — false the vast majority of the time under any concurrency (the broker is
         // already Scheduled/Running), NOT "did the hand-off fail". The enqueue itself always
@@ -707,58 +729,88 @@ private:
 
     // The broker's own handler (runs on `ActivationBroker`'s Sequential lane — see its class comment
     // for why that fully serializes every Wake for this shard, sidestepping the ADR's bug (b)).
+    //
+    // ADR-028 Phase 7 exception safety: `handle()` (the caller) is `noexcept`, so ANY exception that
+    // would otherwise escape this function terminates the whole process, not just this activation
+    // (confirmed: `make_construct_fn<A>()` compiles a plain `new A()`, which can throw — a user's
+    // actor constructor throwing, or a bare `bad_alloc`, used to crash the entire engine on its first
+    // lazy touch). The try/catch below converts any such fault into the SAME dead-letter-and-return
+    // shape the pre-existing wire-failure/recover-failure blocks already use. Ownership is tracked via
+    // `owned`: `sh.lazy_owned.emplace_back(...)` runs BEFORE `sh.id_table.insert(...)` (swapped from
+    // the original insert-then-emplace order — safe, since bug (b) only requires the id-table publish
+    // to happen before `post()`/the next `handle_wake` call, not before this purely-local bookkeeping),
+    // so a throw from `ShardIdTable::insert()` (not noexcept — does `new Entry{...}`) after ownership
+    // already transferred never double-frees `actor` via the catch block's `m->destroy(actor)`.
     void handle_wake(std::uint32_t sid, const Wake& w) noexcept {
         Shard& sh = shards_[sid];
+        // ADR-028 Phase 7 (009 broker convoy observability, residual risk #2): counted for EVERY Wake,
+        // including the duplicate/racing-first-touch fast path below — both are "handled" by the broker.
+        sh.metrics.broker_wakes_handled.inc();
+        const std::int64_t stall_ns = wall_now_ns() - w.enqueued_ns;
+        sh.metrics.broker_stall_ns.record(static_cast<std::uint64_t>(stall_ns > 0 ? stall_ns : 0));
         if (Schedulable* existing = sh.id_table.find(w.id)) {
             (void)post(existing, w.first);  // a duplicate/racing first-touch — already live, deliver
             return;
         }
         const ActorMetadata* m = type_registry_.find(w.id.type);  // guaranteed present (see activate())
-        void* actor = m->construct();
-        if (m->wire != nullptr) {  // A declared resources (has_resource_wire<A>)
-            // `declare_lazy<A>(&scope)` already validated THIS SAME scope in Strict mode, so this is
-            // structurally unreachable in the intended (Strict + matching scope) usage — defensive
-            // only. `m->scope == nullptr` (a resource-bearing A declared without a scope) hits this
-            // same path deterministically, by design (dead-letter, never a null-pointer hot-path hit).
-            bool ok = false;
-            if (m->scope != nullptr) {
-                if (result<void> wired = m->wire(actor, *m->scope); wired) ok = true;
+        void* actor = nullptr;
+        bool owned = false;
+        try {
+            actor = m->construct();
+            if (m->wire != nullptr) {  // A declared resources (has_resource_wire<A>)
+                // `declare_lazy<A>(&scope)` already validated THIS SAME scope in Strict mode, so this
+                // is structurally unreachable in the intended (Strict + matching scope) usage —
+                // defensive only. `m->scope == nullptr` (a resource-bearing A declared without a
+                // scope) hits this same path deterministically, by design (dead-letter, never a
+                // null-pointer hot-path hit).
+                bool ok = false;
+                if (m->scope != nullptr) {
+                    if (result<void> wired = m->wire(actor, *m->scope); wired) ok = true;
+                }
+                if (!ok) {
+                    m->destroy(actor);
+                    w.first_reclaim(w.first);
+                    return;
+                }
             }
-            if (!ok) {
-                m->destroy(actor);
-                w.first_reclaim(w.first);
-                return;
+            // ADR-028 Phase 5: A declared Persistent<Snapshot,...> via declare_lazy<A>(store, ...) —
+            // recover its persisted state (or seed from its own default via snapshot_state()) exactly
+            // once, before the actor's first message dispatches. A failure dead-letters `first`
+            // through the SAME construct/destroy/reclaim shape as a wire failure above — never a
+            // half-constructed actor.
+            if (m->recover != nullptr) {
+                if (result<void> rec = m->recover(actor, m->store, w.id); !rec) {
+                    m->destroy(actor);
+                    w.first_reclaim(w.first);
+                    return;
+                }
             }
+            auto act = std::make_unique<Activation>(actor, m->dispatch, m->reclaim, m->max_concurrency,
+                                                    m->supervision);
+            act->set_reconstruct(m->reconstruct);
+            // 007 Restart re-wire ("Phase 6" redirected): a lazily-broker-constructed actor gets the
+            // same re-wire-on-Restart coverage a spawn<A>()'d one does — m->wire/m->scope are null
+            // unless the actor declared resources (matching the guard above), so this is a no-op
+            // otherwise.
+            act->set_resource_wire(m->wire, m->scope);
+            const std::uint32_t idle_ticks =
+                m->idle_timeout_ms == 0
+                    ? 0
+                    : static_cast<std::uint32_t>(
+                          std::max<std::uint64_t>(1, m->idle_timeout_ms / cfg_.idle_tick_ms));
+            std::unique_ptr<Schedulable> s =
+                build_schedulable(sid, *act, m->band, m->drain_budget, idle_ticks);
+            Schedulable* raw = s.get();
+            // Per-shard ONLY (bug (a) fix) — never registry_/an Engine-wide container; see
+            // build_schedulable's comment for the concurrent-multi-shard use-after-free this replaced.
+            sh.lazy_owned.emplace_back(actor, m->destroy, std::move(act), std::move(s));
+            owned = true;  // ownership now belongs to sh.lazy_owned's LazyOwned destructor
+            sh.id_table.insert(w.id, raw);  // publish — BEFORE delivering `first` (bug (b) ordering)
+            post(raw, w.first);  // deliver the ORIGINAL message through the ordinary, proven post() path
+        } catch (...) {
+            if (!owned && actor != nullptr) m->destroy(actor);
+            w.first_reclaim(w.first);
         }
-        // ADR-028 Phase 5: A declared Persistent<Snapshot,...> via declare_lazy<A>(store, ...) — recover
-        // its persisted state (or seed from its own default via snapshot_state()) exactly once, before
-        // the actor's first message dispatches. A failure dead-letters `first` through the SAME
-        // construct/destroy/reclaim shape as a wire failure above — never a half-constructed actor.
-        if (m->recover != nullptr) {
-            if (result<void> rec = m->recover(actor, m->store, w.id); !rec) {
-                m->destroy(actor);
-                w.first_reclaim(w.first);
-                return;
-            }
-        }
-        auto act = std::make_unique<Activation>(actor, m->dispatch, m->reclaim, m->max_concurrency,
-                                                m->supervision);
-        act->set_reconstruct(m->reconstruct);
-        // 007 Restart re-wire ("Phase 6" redirected): a lazily-broker-constructed actor gets the same
-        // re-wire-on-Restart coverage a spawn<A>()'d one does — m->wire/m->scope are null unless the
-        // actor declared resources (matching the guard above), so this is a no-op otherwise.
-        act->set_resource_wire(m->wire, m->scope);
-        const std::uint32_t idle_ticks =
-            m->idle_timeout_ms == 0
-                ? 0
-                : static_cast<std::uint32_t>(std::max<std::uint64_t>(1, m->idle_timeout_ms / cfg_.idle_tick_ms));
-        std::unique_ptr<Schedulable> s = build_schedulable(sid, *act, m->band, m->drain_budget, idle_ticks);
-        Schedulable* raw = s.get();
-        sh.id_table.insert(w.id, raw);  // publish — BEFORE delivering `first`, per bug (b)'s ordering
-        // Per-shard ONLY (bug (a) fix) — never registry_/an Engine-wide container; see
-        // build_schedulable's comment for the concurrent-multi-shard use-after-free this replaced.
-        sh.lazy_owned.emplace_back(actor, m->destroy, std::move(act), std::move(s));
-        post(raw, w.first);  // deliver the ORIGINAL message through the ordinary, proven post() path
     }
 
     struct alignas(::quark::cache_line_size) Worker {

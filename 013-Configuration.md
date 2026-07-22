@@ -61,6 +61,31 @@ Validation (008) enforces `B ≥ 16·max_nodes`, `active_view ≈ c·log(max_nod
 present iff distribution is enabled, and — critically — **config may not override an
 invariant**: no non-deterministic placement for stateful actors, no FIFO removal.
 
+### Lazy-activation broker concurrency (ADR-028)
+
+[ADR-028](decisions/ADR-028-lazy-activation-idle-timeout-eviction.md)'s per-shard
+`ActivationBroker` (the lazy first-touch construction seam) is **permanently
+Sequential — not a `MaxConcurrency<K>`/`broker_concurrency` config knob.** The ADR's
+own Spec Recommendations named `broker_concurrency` as a documented BuildOnly
+tunable, but that assumed a Reentrant broker; the actual implementation
+(ADR-028 Phase 4) deliberately kept it Sequential because `construct_and_wire` is
+fully synchronous end to end (Phase 5's Snapshot-model persistence recovery is a
+direct, non-`co_await` `Store` call, not a suspend point) — a Reentrant broker would
+buy no throughput while re-importing the exact `activating_`-set erase-ordering
+concurrency bug the ADR's proving run found and fixed. **There is deliberately no
+config knob here**: exposing `broker_concurrency` would control nothing real, which
+this project treats as worse than no knob at all. If a future phase makes
+construction genuinely asynchronous (e.g. EventSourced lazy-recovery), a real
+`MaxConcurrency<K>` broker — and the knob to bound it — is the seam to revisit then.
+
+The ADR's residual risk #2 ("broker convoy risk... needs a 009 counter") is resolved
+via observability instead of a knob: `broker_wakes_enqueued`/`broker_wakes_handled`
+(`ShardCounters`, 009) let a consumer derive live per-shard broker queue depth as
+`enqueued − handled` (the same idiom as `GovernanceCore::depth()`), and
+`broker_stall_ns` (a histogram) measures Wake-enqueue-to-dispatch latency — the
+observable symptom of a convoy, without needing to change the broker's concurrency
+model to detect one.
+
 ### Alternatives considered
 
 - **A built-in YAML/JSON/TOML file format in the core**: pulls a parser

@@ -11,13 +11,15 @@
 //     `mov`/`mov` pair, NOT a `lock xadd`: there is no atomic RMW and no cross-core bus lock on the
 //     hot path (the CONVENTIONS.md "0 cross-core atomic RMW on the sequential drain path" rule),
 //     yet the access is well-defined and TSan-clean because it is a relaxed atomic, not a plain int.
-//   * NOT every counter is drain-owned, though: mailbox_enqueued/activations/wakeups fire on the
-//     PRODUCER side (Activation::post/notify_enqueued and Engine::schedule_and_wake), and more than
-//     one producer thread can target the same shard concurrently (many actors hash to one shard).
-//     `inc()`'s load+store pair is a lost-update race under concurrent writers there — no UB, no
-//     TSan report (each op is individually a well-defined atomic access), just silent undercounting.
-//     Those three use `inc_atomic()` (a real `fetch_add`) instead — precedented by the existing
-//     producer-side `fetch_add` governance accounting in activation.hpp (GovernanceCore::enqueued).
+//   * NOT every counter is drain-owned, though: mailbox_enqueued/activations/wakeups/broker_wakes_
+//     enqueued fire on the PRODUCER side (Activation::post/notify_enqueued, Engine::schedule_and_wake,
+//     Engine::activate — ADR-028 Phase 7), and more than one producer thread can target the same
+//     shard concurrently (many actors hash to one shard). `inc()`'s load+store pair is a lost-update
+//     race under concurrent writers there — no UB, no TSan report (each op is individually a
+//     well-defined atomic access), just silent undercounting. Those use `inc_atomic()` (a real
+//     `fetch_add`) instead — precedented by the existing producer-side `fetch_add` governance
+//     accounting in activation.hpp (GovernanceCore::enqueued). `broker_wakes_handled`/`broker_stall_ns`
+//     are drain-owned (the broker's own Sequential lane), like `messages_processed`.
 //   * The scraper reads with a relaxed load and AGGREGATES across shards on read — the only
 //     cross-thread interaction, and it is off the hot path.
 //   * Every counter/histogram is a fixed-size member: 0 heap allocation on the record path.
@@ -151,10 +153,16 @@ struct QUARK_CACHE_ALIGNED ShardCounters {
     MetricCounter wakeups;             // 002 worker wakeups
     MetricCounter dead_letters;        // 007/009 undeliverable messages
     MetricCounter deadline_misses;     // 011/018 overruns accounted by 009
+    // ADR-028 Phase 7 — broker convoy observability (residual risk #2). Live queue depth is derived
+    // as `broker_wakes_enqueued - broker_wakes_handled` (the same enqueued-minus-drained idiom as
+    // GovernanceCore::depth()), not stored as a separate gauge.
+    MetricCounter broker_wakes_enqueued;  // Wake control messages posted to this shard's broker
+    MetricCounter broker_wakes_handled;   // Wake messages the broker has finished processing
     MetricCounter user[kUserCounterSlots];
 
     Histogram message_latency_ns;  // handler start->end latency
     Histogram mailbox_depth;       // observed mailbox depth at drain
+    Histogram broker_stall_ns;     // ADR-028 Phase 7: Wake enqueue -> handle_wake dispatch-start latency
 
     ShardCounters() = default;
     ShardCounters(const ShardCounters&) = delete;
@@ -171,9 +179,12 @@ struct MetricsSnapshot {
     std::uint64_t wakeups = 0;
     std::uint64_t dead_letters = 0;
     std::uint64_t deadline_misses = 0;
+    std::uint64_t broker_wakes_enqueued = 0;  // ADR-028 Phase 7
+    std::uint64_t broker_wakes_handled = 0;   // ADR-028 Phase 7
     std::array<std::uint64_t, kUserCounterSlots> user{};
     HistogramSnapshot message_latency_ns{};
     HistogramSnapshot mailbox_depth{};
+    HistogramSnapshot broker_stall_ns{};  // ADR-028 Phase 7
 };
 
 // --- MetricsSink seam (009 §Export). The default is the in-memory snapshot below; heavy backends
@@ -222,9 +233,12 @@ public:
             s.wakeups += sc->wakeups.load();
             s.dead_letters += sc->dead_letters.load();
             s.deadline_misses += sc->deadline_misses.load();
+            s.broker_wakes_enqueued += sc->broker_wakes_enqueued.load();
+            s.broker_wakes_handled += sc->broker_wakes_handled.load();
             for (std::size_t i = 0; i < kUserCounterSlots; ++i) s.user[i] += sc->user[i].load();
             s.message_latency_ns.merge(sc->message_latency_ns.snapshot());
             s.mailbox_depth.merge(sc->mailbox_depth.snapshot());
+            s.broker_stall_ns.merge(sc->broker_stall_ns.snapshot());
         }
         return s;
     }
@@ -251,6 +265,8 @@ public:
         counter("wakeups_total", s.wakeups);
         counter("dead_letters_total", s.dead_letters);
         counter("deadline_misses_total", s.deadline_misses);
+        counter("broker_wakes_enqueued_total", s.broker_wakes_enqueued);
+        counter("broker_wakes_handled_total", s.broker_wakes_handled);
         for (std::size_t i = 0; i < kUserCounterSlots; ++i) {
             if (s.user[i] == 0 && user_names_[i].empty()) continue;
             const std::string& nm = user_names_[i];
@@ -266,6 +282,7 @@ public:
         }
         histogram(out, "message_latency_ns", s.message_latency_ns);
         histogram(out, "mailbox_depth", s.mailbox_depth);
+        histogram(out, "broker_stall_ns", s.broker_stall_ns);
         return out;
     }
 
