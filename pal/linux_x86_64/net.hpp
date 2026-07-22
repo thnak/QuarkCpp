@@ -54,6 +54,12 @@ other OSes need their own backend (kqueue/IOCP). Do not include it elsewhere."
 
 namespace quark::pal {
 
+// Portable fd handle type (019 §"The one rule") — `int` here, `SOCKET` on the Windows backend.
+// tcp_transport.hpp is written against this alias (not a raw POSIX `int`) so the same source compiles
+// against either backend; on Linux it is a zero-cost alias, no call site needs to change.
+using fd_t = int;
+inline constexpr fd_t invalid_fd = -1;
+
 // The canonical PAL monotonic instant in ns (018 CLOCK_BOOTTIME class) — the clock the event-loop timer
 // queue schedules against, the same domain as every engine deadline.
 [[nodiscard]] inline std::int64_t mono_ns() noexcept {

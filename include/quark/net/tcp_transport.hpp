@@ -14,7 +14,9 @@
 //     over real racing sockets); jittered exponential RECONNECT; teardown hook (`close_peer`) SWIM calls
 //     when it declares a peer dead. Keepalive is NOT a separate heartbeat here — 021 §"Liveness" reuses
 //     SWIM's pings (they flow as Control frames over this same connection), so the transport adds none.
-//   * 019: every OS call goes through pal/linux_x86_64/net.hpp; NO <sys/*> here.
+//   * 019: every OS call goes through pal/net.hpp (per-OS backend selected at compile time); NO
+//     <sys/*>/<netinet/*>/<winsock2.h> here. Written against `pal::fd_t` (not a raw POSIX `int`), so
+//     this file is unchanged between the Linux (epoll) and Windows (WSAPoll) backends.
 //
 // THREADING: one dedicated I/O thread runs the IoContext loop; ALL connection state lives on it. `send()`
 // is thread-safe (marshals the frame onto the loop via IoContext::post); the inbound `on_receive` sink is
@@ -35,7 +37,7 @@
 #include <utility>
 #include <vector>
 
-#include "pal/linux_x86_64/net.hpp"
+#include "pal/net.hpp"
 #include "quark/core/cluster.hpp"    // Endpoint, dial_winner, keep_local_dial (021 §2 — the dedup RULE)
 #include "quark/core/transport.hpp"  // Transport seam + MessageFrame
 #include "quark/detail/hash.hpp"     // splitmix64 (deterministic reconnect jitter — no random_device)
@@ -99,7 +101,7 @@ public:
         for (auto& [id, c] : conns_) pal::close_fd(c->fd);
         for (auto& [fd, c] : pending_in_) pal::close_fd(c->fd);
         pal::close_fd(listener_);
-        listener_ = -1;
+        listener_ = pal::invalid_fd;
         conns_.clear();
         pending_in_.clear();
         by_fd_.clear();
@@ -159,7 +161,7 @@ private:
 
     struct Conn {
         NodeId peer{};
-        int fd = -1;
+        pal::fd_t fd = pal::invalid_fd;
         St st = St::Connecting;
         bool initiated_by_self = false;  // did WE dial? (the dedup discriminant, 021 §2)
         bool identified = false;         // peer NodeId confirmed via hello (accept side learns it here)
@@ -268,7 +270,7 @@ private:
     }
 
     // ---- per-connection readiness (loop thread) -------------------------------------------------
-    void on_conn(int fd, std::uint32_t ev) {
+    void on_conn(pal::fd_t fd, std::uint32_t ev) {
         const auto it = by_fd_.find(fd);
         if (it == by_fd_.end()) return;
         Conn* c = it->second;
@@ -477,7 +479,7 @@ private:
         if (it == conns_.end()) return;
         Conn* c = it->second.get();
         c->st = St::Backoff;
-        c->fd = -1;
+        c->fd = pal::invalid_fd;
         c->hello_sent = 0;
         c->peer_hello_read = false;
         c->confirmed = false;  // the new socket must re-exchange hello + re-confirm before frames flow
@@ -560,7 +562,7 @@ private:
     }
 
     void update_interest(Conn* c) {
-        if (c->fd < 0) return;  // a Backoff husk has no socket to arm
+        if (c->fd == pal::invalid_fd) return;  // a Backoff husk has no socket to arm
         std::uint32_t want = EPOLLIN;
         if (c->st == St::Connecting) want |= EPOLLOUT;  // connect completion
         // Arm EPOLLOUT for pending hello, or for pending frames ONLY once confirmed — otherwise an
@@ -610,7 +612,7 @@ private:
     NodeId self_;
     std::uint64_t bind_addr_;
     std::uint16_t bind_port_;
-    int listener_ = -1;
+    pal::fd_t listener_ = pal::invalid_fd;
 
     pal::IoContext io_;
     std::thread io_thread_;
@@ -621,8 +623,8 @@ private:
     // Connection state — all loop-thread-owned. conns_: identified peers (keyed by NodeId). pending_in_:
     // accepted connections whose peer NodeId is not yet known (keyed by fd). by_fd_: raw handler lookup.
     std::unordered_map<std::uint64_t, std::unique_ptr<Conn>> conns_;
-    std::unordered_map<int, std::unique_ptr<Conn>> pending_in_;
-    std::unordered_map<int, Conn*> by_fd_;
+    std::unordered_map<pal::fd_t, std::unique_ptr<Conn>> pending_in_;
+    std::unordered_map<pal::fd_t, Conn*> by_fd_;
     std::unordered_map<std::uint64_t, Endpoint> peers_;  // NodeId → where it listens (for dial/reconnect)
     std::unordered_map<std::uint64_t, std::vector<std::byte>> outq_;  // per-peer pending frames (survives
                                                                       // connection churn — see send_on_loop)
