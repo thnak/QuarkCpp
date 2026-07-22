@@ -10,6 +10,10 @@
 #include <memory>
 #include <new>
 
+#if defined(_MSC_VER)
+#include <malloc.h>  // _aligned_malloc/_aligned_free
+#endif
+
 #include "quark/core/actor.hpp"
 #include "quark/core/actor_ref.hpp"
 #include "quark/core/engine.hpp"
@@ -17,6 +21,23 @@
 
 namespace {
 std::atomic<std::size_t> g_allocs{0};
+
+// MSVC's CRT has no std::aligned_alloc (a long-standing gap) and requires the mismatched
+// _aligned_malloc/_aligned_free pair instead of malloc/free for over-aligned allocations.
+inline void* aligned_alloc_compat(std::size_t alignment, std::size_t size) noexcept {
+#if defined(_MSC_VER)
+    return ::_aligned_malloc(size, alignment);
+#else
+    return std::aligned_alloc(alignment, size);
+#endif
+}
+inline void aligned_free_compat(void* p) noexcept {
+#if defined(_MSC_VER)
+    ::_aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
 }
 
 // --- Hooked allocator (counts every global allocation on any thread) ---------------------------
@@ -34,7 +55,7 @@ void* operator new(std::size_t n) {
 void* operator new[](std::size_t n) { return ::operator new(n); }
 void* operator new(std::size_t n, std::align_val_t a) {
     g_allocs.fetch_add(1, std::memory_order_relaxed);
-    void* p = std::aligned_alloc(static_cast<std::size_t>(a), n != 0 ? n : static_cast<std::size_t>(a));
+    void* p = aligned_alloc_compat(static_cast<std::size_t>(a), n != 0 ? n : static_cast<std::size_t>(a));
     if (p == nullptr) throw std::bad_alloc();
     return p;
 }
@@ -43,10 +64,10 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { aligned_free_compat(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { aligned_free_compat(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { aligned_free_compat(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { aligned_free_compat(p); }
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop

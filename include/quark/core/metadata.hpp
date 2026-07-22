@@ -66,13 +66,6 @@ template <class T>
 #if defined(__clang__)
     constexpr std::string_view fn = __PRETTY_FUNCTION__;
     constexpr std::string_view lead = "[T = ";
-#elif defined(__GNUC__)
-    constexpr std::string_view fn = __PRETTY_FUNCTION__;
-    constexpr std::string_view lead = "[with T = ";
-#else
-    constexpr std::string_view fn = __func__;
-    constexpr std::string_view lead = "";
-#endif
     const std::size_t at = fn.find(lead);
     if (at == std::string_view::npos) return fn;
     const std::size_t start = at + lead.size();
@@ -80,6 +73,36 @@ template <class T>
     std::size_t end = fn.find_first_of(";]", start);
     if (end == std::string_view::npos) end = fn.size();
     return fn.substr(start, end - start);
+#elif defined(__GNUC__)
+    constexpr std::string_view fn = __PRETTY_FUNCTION__;
+    constexpr std::string_view lead = "[with T = ";
+    const std::size_t at = fn.find(lead);
+    if (at == std::string_view::npos) return fn;
+    const std::size_t start = at + lead.size();
+    std::size_t end = fn.find_first_of(";]", start);
+    if (end == std::string_view::npos) end = fn.size();
+    return fn.substr(start, end - start);
+#elif defined(_MSC_VER)
+    // __FUNCSIG__ has none of GCC/Clang's reflection-friendly `[with T = …]` bracket syntax — the
+    // template argument sits between "canonical_type_name<" and the trailing "(void)". rfind the
+    // tail (not find) so a nested-template T (e.g. T = Foo<Bar>) doesn't truncate the slice at T's
+    // OWN closing '>' — MSVC has no matching-bracket search, so anchoring on the outermost/last
+    // "(void)" is the robust end marker regardless of how many '<'/'>' pairs T itself contains.
+    constexpr std::string_view fn = __FUNCSIG__;
+    constexpr std::string_view lead = "canonical_type_name<";
+    constexpr std::string_view tail = ">(void)";
+    const std::size_t at = fn.find(lead);
+    if (at == std::string_view::npos) return fn;
+    const std::size_t start = at + lead.size();
+    const std::size_t end = fn.rfind(tail);
+    if (end == std::string_view::npos || end < start) return fn;
+    return fn.substr(start, end - start);
+#else
+    // No reflection-friendly compiler macro known here: T cannot be distinguished by name at all,
+    // so every instantiation collides (008's documented cross-toolchain open question, at its worst).
+    constexpr std::string_view fn = __func__;
+    return fn;
+#endif
 }
 
 // The key of a single (non-actor) type: a Described type folds to its 016 fingerprint (toolchain-

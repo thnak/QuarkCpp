@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include "tmp_dir_util.hpp"
+
 #include "quark/core/error.hpp"
 #include "quark/core/event_log.hpp"
 #include "quark/core/file_store.hpp"
@@ -61,13 +63,7 @@ QUARK_SERIALIZE(Sum, (1, total))
 int main() {
     bool ok = true;
 
-    char tmpl[] = "/tmp/quark_filestore_XXXXXX";
-    const char* dir = ::mkdtemp(tmpl);
-    if (dir == nullptr) {
-        std::perror("mkdtemp");
-        return 1;
-    }
-    const std::string root = dir;
+    const std::string root = quark::test::make_temp_dir("quark_filestore_");
     const ActorId id{TypeKey{0xF11E}, 7};
 
     // ---- 1) write, "crash" (destroy), reopen, verify everything is durable --------------------

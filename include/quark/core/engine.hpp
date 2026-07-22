@@ -36,6 +36,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>  // _mm_pause (detail::cpu_relax) — MSVC has no __builtin_ia32_pause
+#endif
+
 #include "quark/core/activation.hpp"
 #include "quark/core/actor.hpp"           // ADR-028 Phase 4: Actor<> CRTP base for the internal broker
 #include "quark/core/config.hpp"
@@ -95,7 +99,9 @@ struct DrainBudget {
 
 namespace detail {
 QUARK_ALWAYS_INLINE void cpu_relax() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();  // MSVC has no __builtin_ia32_pause; this is its PAUSE-instruction intrinsic
+#elif defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
 #else
     std::atomic_signal_fence(std::memory_order_seq_cst);

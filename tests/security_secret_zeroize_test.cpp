@@ -8,6 +8,19 @@
 // and assert it is all-zero (proving the destructor wiped it BEFORE the free). This replaces global
 // operator new, so the CMake content rule auto-excludes it from the TSan build (expected).
 //
+// WATCHING BY "the first allocation AT LEAST kWatchSize while armed", not an EXACT size match: a
+// vector's backing allocation is not guaranteed to be exactly `count * sizeof(T)` bytes, AND the
+// pointer `operator new` returns is not guaranteed to equal `vector::data()` either — on this MSVC
+// STL, observed empirically: a 4099-byte vector<byte> allocates 4138 bytes, with `data()` sitting 32
+// bytes INSIDE that block (a container-proxy-shaped header occupies the front; std::vector never
+// exposes that header OR the trailing slack via data()/size()). `operator delete` only ever receives
+// the RAW allocation pointer (never `data()`), so the watch must key off that raw pointer — but the
+// SCAN must target the actual data region, not assume it starts at offset 0. `g_watch_offset` is
+// measured at RUNTIME (data() − raw pointer) right after construction, so this is portable to any
+// allocator's header layout — present or future — on any platform, not a hardcoded magic number.
+// The arm window brackets exactly one allocation (the vector under test, nothing else runs while
+// armed), so ">=" cannot accidentally catch an unrelated smaller allocation instead.
+//
 // CONTROL (adversarial): a plain std::vector<std::byte> of the SAME distinctive size is freed WITHOUT
 // wiping — the probe sees its non-zero bytes at delete time. That the Secret's block is zero and the
 // plain vector's is not proves the wipe is Secret's doing, not an allocator artifact.
@@ -31,13 +44,19 @@ constexpr std::size_t kWatchSize = 4099;
 
 std::atomic<bool> g_armed{false};
 std::atomic<void*> g_watch{nullptr};
+std::atomic<std::ptrdiff_t> g_watch_offset{0};  // data() − raw pointer; measured at runtime, see banner
 std::atomic<int> g_result{-1};  // -1 = not observed, 1 = was all-zero at free, 0 = had nonzero bytes
 }  // namespace
 
 void* operator new(std::size_t n) {
     void* p = std::malloc(n ? n : 1);
     if (!p) throw std::bad_alloc();
-    if (n == kWatchSize && g_armed.load(std::memory_order_relaxed) &&
+    // >= (not ==): MSVC's allocator may round a vector<byte>(kWatchSize) request UP (observed: a
+    // 4099-byte request allocates 4138 bytes) — trailing allocator slack std::vector never exposes
+    // via data()/size() and Secret has no business touching. The trigger only needs to be "big
+    // enough to be this allocation, not some unrelated one"; the SCAN below stays bounded to the
+    // logical kWatchSize bytes Secret actually owns (data()[0, size())), never the raw slack.
+    if (n >= kWatchSize && g_armed.load(std::memory_order_relaxed) &&
         g_watch.load(std::memory_order_relaxed) == nullptr) {
         g_watch.store(p, std::memory_order_relaxed);
     }
@@ -46,11 +65,15 @@ void* operator new(std::size_t n) {
 void* operator new[](std::size_t n) { return operator new(n); }
 void operator delete(void* p) noexcept {
     if (p != nullptr && p == g_watch.load(std::memory_order_relaxed)) {
-        // The block is still allocated here — scanning it is well-defined. All-zero ⇒ wiped.
-        const auto* b = static_cast<const unsigned char*>(p);
+        // The block is still allocated here — scanning it is well-defined. All-zero ⇒ wiped. Scan
+        // exactly the logical kWatchSize bytes (what Secret actually owns via data()/size()), starting
+        // at the measured data offset (NOT byte 0 of the raw block — see g_watch_offset's banner note),
+        // never any allocator slack beyond it.
+        const auto* base = static_cast<const unsigned char*>(p) +
+                            g_watch_offset.load(std::memory_order_relaxed);
         int any_nonzero = 0;
         for (std::size_t i = 0; i < kWatchSize; ++i)
-            if (b[i] != 0) { any_nonzero = 1; break; }
+            if (base[i] != 0) { any_nonzero = 1; break; }
         g_result.store(any_nonzero ? 0 : 1, std::memory_order_relaxed);
         g_watch.store(nullptr, std::memory_order_relaxed);
     }
@@ -90,6 +113,10 @@ int main() {
         g_armed.store(true, std::memory_order_relaxed);
         std::vector<std::byte> bytes(kWatchSize, std::byte{0xAB});  // captured: this buffer backs the Secret
         g_armed.store(false, std::memory_order_relaxed);
+        // Measure data() − raw pointer NOW, while both are known and the block is still bytes' (see
+        // g_watch_offset's banner note) — before the move into Secret and its eventual free.
+        if (const auto* raw = static_cast<const std::byte*>(g_watch.load(std::memory_order_relaxed)))
+            g_watch_offset.store(bytes.data() - raw, std::memory_order_relaxed);
         {
             Secret s(std::move(bytes));  // moves the captured buffer into the Secret (no new alloc)
             check(s.size() == kWatchSize, "secret holds the material", ok);
@@ -110,6 +137,8 @@ int main() {
             std::vector<std::byte> plain(kWatchSize, std::byte{0xCD});
             g_armed.store(false, std::memory_order_relaxed);
             check(g_watch.load() != nullptr, "watched the plain vector's buffer", ok);
+            if (const auto* raw = static_cast<const std::byte*>(g_watch.load(std::memory_order_relaxed)))
+                g_watch_offset.store(plain.data() - raw, std::memory_order_relaxed);
             // touch so the fill is not optimized away
             check(static_cast<unsigned char>(plain[0]) == 0xCD, "plain material present", ok);
         }  // <- plain vector free: no wipe.

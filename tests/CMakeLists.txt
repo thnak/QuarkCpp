@@ -27,6 +27,14 @@ endif()
 
 foreach(src ${QUARK_TEST_SOURCES})
   get_filename_component(name "${src}" NAME_WE)
+  # config_hotcell_read_asm_test disassembles ITS OWN BINARY via objdump against /proc/self/exe (ADR-008
+  # F1) — a GNU-toolchain/Linux-only static-analysis gate the test's own banner scopes to "g++ and
+  # clang++"; it neither compiles (no <unistd.h>/objdump on MSVC) nor would mean anything against
+  # MSVC-generated PE/COFF codegen. Skip it on Windows; the invariant stays fully gated on Linux/arm64.
+  if(WIN32 AND name STREQUAL "config_hotcell_read_asm_test")
+    message(STATUS "Quark: skipping ${name} on Windows (objdump/proc-self-exe gate is Linux/GNU-only)")
+    continue()
+  endif()
   if(_quark_tsan)
     file(READ "${src}" _src_text)
     # Match a global replacement definition: `void* operator new(` / `void operator delete(` at
@@ -175,7 +183,10 @@ endif()
 # 024-Streaming §0-cross-core-RMW-on-drain — objdump proof (ADR-005 S1 method). Disassemble the
 # `quark_stream_drain_probe` symbol and grep for lock/cmpxchg/xadd/xchg-mem/mfence. Gated to
 # NON-sanitizer builds (ASan/TSan/UBSan instrumentation injects lock ops that are not the drain's).
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_drain_rmw_test.cpp" AND NOT QUARK_SANITIZE)
+# NOT WIN32: objdump/bash are not part of the MSVC toolchain (the underlying stream_drain_rmw_test
+# binary still builds and runs as a normal auto-discovered test above — only this extra disassembly
+# proof is Linux/GNU-only).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_drain_rmw_test.cpp" AND NOT QUARK_SANITIZE AND NOT WIN32)
   add_test(NAME stream_drain_zero_rmw
            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/stream_drain_rmw_check.sh" $<TARGET_FILE:stream_drain_rmw_test>)
 endif()

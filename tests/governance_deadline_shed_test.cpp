@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "pal/pal.hpp"
 #include "quark/core/activation.hpp"
 #include "quark/core/actor.hpp"
 #include "quark/core/dead_letter.hpp"
@@ -32,10 +33,13 @@ struct Worker : Actor<Worker, Sequential> {
     void handle(const Job& m) { ran.push_back(m.id); }
 };
 
+// Descriptor::deadline_ns lives in the pal::clock domain (activation.hpp's shed check compares it
+// against pal::now(), NOT std::chrono::steady_clock) — using steady_clock here would silently compare
+// two unrelated epochs. On Linux, CLOCK_MONOTONIC (steady_clock) and CLOCK_BOOTTIME (pal::clock)
+// happen to share a near-boot origin so that mismatch is invisible; on Windows, steady_clock (QPC) and
+// pal::clock (QueryUnbiasedInterruptTimePrecise) do NOT share an epoch at all, so it must be pal::now().
 std::int64_t steady_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(pal::now().time_since_epoch()).count();
 }
 
 void drain_all(Activation& act) {

@@ -9,6 +9,8 @@
 #include <span>
 #include <string>
 
+#include "tmp_dir_util.hpp"
+
 #include "quark/core/secret.hpp"
 
 using namespace quark;
@@ -23,6 +25,15 @@ void check(bool c, const char* what, bool& ok) {
 bool bytes_equal(std::span<const std::byte> b, std::string_view s) {
     return b.size() == s.size() && std::memcmp(b.data(), s.data(), s.size()) == 0;
 }
+// MSVC's CRT has no POSIX setenv; _putenv_s is its equivalent (always-overwrite, matching every call
+// site in this file passing setenv's overwrite=1).
+void set_env(const char* name, const char* value) {
+#if defined(_MSC_VER)
+    ::_putenv_s(name, value);
+#else
+    ::setenv(name, value, 1);
+#endif
+}
 }  // namespace
 
 int main() {
@@ -30,7 +41,7 @@ int main() {
 
     // --- Environment adapter: QUARK_SECRET_<name>. -------------------------------------------------
     {
-        ::setenv("QUARK_SECRET_cluster_key", "s3kr1t-cluster", 1);
+        set_env("QUARK_SECRET_cluster_key", "s3kr1t-cluster");
         EnvSecretSource env;
         auto s = env.get("cluster_key");
         check(s.has_value(), "env: resolves QUARK_SECRET_cluster_key", ok);
@@ -42,8 +53,7 @@ int main() {
 
     // --- File adapter: <dir>/<name>, trailing newline stripped. ------------------------------------
     {
-        const char* dir = std::getenv("TMPDIR");
-        std::string base = dir ? dir : "/tmp";
+        const std::string base = quark::test::make_temp_dir("quark_sec_test_");
         const std::string path = base + "/quark_sec_test_at_rest_key";
         {
             std::ofstream f(path, std::ios::binary);
@@ -61,8 +71,8 @@ int main() {
 
     // --- resolve_secrets over a SecurityConfig's references (013 config surface, 020 §4). ----------
     {
-        ::setenv("QUARK_SECRET_ck", "CK", 1);
-        ::setenv("QUARK_SECRET_tk", "TK", 1);
+        set_env("QUARK_SECRET_ck", "CK");
+        set_env("QUARK_SECRET_tk", "TK");
         EnvSecretSource env;
 
         SecurityConfig cfg;

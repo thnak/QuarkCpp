@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "tmp_dir_util.hpp"
+
 #include "pal/pal.hpp"
 #include "quark/core/ids.hpp"
 #include "quark/core/reminder_service.hpp"
@@ -139,10 +141,8 @@ int main() {
     // === 3. DURABLE + AT-LEAST-ONCE, ZERO LOSS across a crash =================================
     {
         namespace fs = std::filesystem;
-        char tmpl[] = "/tmp/quark_reminder_XXXXXX";
-        const char* dir = ::mkdtemp(tmpl);
-        check(dir != nullptr, "durable: mkdtemp", ok);
-        const std::string path = std::string(dir) + "/reminders.qrem";
+        const std::string dir = quark::test::make_temp_dir("quark_reminder_");
+        const std::string path = dir + "/reminders.qrem";
 
         constexpr std::size_t N = 2'000;
         const std::int64_t due = 100'000 * kSec;
