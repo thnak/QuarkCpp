@@ -3,6 +3,7 @@
 // placed on shards whose HOME worker is worker 0; workers 1 and 2 have entirely empty home shards, so
 // ANY message they dispatch was necessarily stolen. Asserts both non-home lanes steal work and every
 // message is dispatched.
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
@@ -22,6 +23,7 @@ constexpr std::uint32_t kShards = 9;                 // home(shard)=shard%3 ⇒ 
 constexpr std::uint32_t kTargetShards[] = {0, 3, 6};  // all homed to worker 0
 constexpr std::uint32_t kActorsPerShard = 4;
 constexpr std::uint64_t kPerActor = 20'000;
+constexpr std::uint64_t kStall = 40'000'000'000ULL;
 
 struct Job {
     std::uint32_t dummy;
@@ -80,6 +82,60 @@ int main() {
         sched[a] = eng.register_activation(ids[a], *acts.back());
     }
 
+    // One warm-up actor on a shard homed to worker 1 and one homed to worker 2 (worker 0's liveness
+    // is proven below via sched[0], already on shard 0 — home worker 0).
+    ActorId warmup_ids[2];
+    for (std::uint32_t wi = 0; wi < 2; ++wi) {
+        const std::uint32_t want = wi + 1;  // shard 1 (home worker 1), shard 2 (home worker 2)
+        for (std::uint64_t k = 0;; ++k) {
+            const ActorId id{TypeKey{42}, k};
+            if (eng.shard_of(id) == want) {
+                warmup_ids[wi] = id;
+                break;
+            }
+        }
+    }
+    std::vector<Sink> warmup_actors(2);
+    std::array<std::unique_ptr<Activation>, 2> warmup_acts;
+    std::array<Schedulable*, 2> warmup_sched{};
+    for (std::uint32_t wi = 0; wi < 2; ++wi) {
+        warmup_actors[wi].by_worker = by_worker;
+        warmup_actors[wi].total = &total;
+        warmup_acts[wi] = std::make_unique<Activation>(&warmup_actors[wi], Sink::dispatch_table());
+        warmup_sched[wi] = eng.register_activation(warmup_ids[wi], *warmup_acts[wi]);
+    }
+
+    eng.start();
+
+    // Confirm all 3 worker OS threads are alive and have actually run before racing the real,
+    // heavily-biased backlog below. Windows CI (2-core windows-latest runners, higher thread-start
+    // latency than Linux pthreads) can let workers 0/1 fully drain a small backlog before worker 2's
+    // thread ever gets its first scheduling quantum — worker 2 then legitimately steals nothing, not
+    // because stealing is broken but because it was never scheduled in time to compete for it. One
+    // real message per worker, waited on to completion, rules that out deterministically.
+    std::array<Job, 3> warmup_jobs{};
+    std::array<Descriptor, 3> warmup_descs{};
+    for (auto& d : warmup_descs) stamp<Sink, Job>(d);
+    warmup_descs[0].payload = &warmup_jobs[0];
+    warmup_descs[1].payload = &warmup_jobs[1];
+    warmup_descs[2].payload = &warmup_jobs[2];
+    eng.post(sched[0], &warmup_descs[0]);
+    eng.post(warmup_sched[0], &warmup_descs[1]);
+    eng.post(warmup_sched[1], &warmup_descs[2]);
+    {
+        std::uint64_t spins = 0;
+        while (total.load(std::memory_order_acquire) < 3) {
+            if (++spins > kStall) {
+                std::fprintf(stderr, "STALL: warm-up did not complete (total=%" PRIu64 "/3)\n",
+                              total.load());
+                eng.stop();
+                return 1;
+            }
+        }
+    }
+    for (auto& c : by_worker) c.store(0);
+    total.store(0);
+
     const std::uint64_t grand_total = static_cast<std::uint64_t>(n_actors) * kPerActor;
     std::vector<Job> msgs(grand_total);
     std::vector<Descriptor> descs(grand_total);
@@ -88,13 +144,11 @@ int main() {
         stamp<Sink, Job>(descs[i]);
     }
 
-    // Pre-load all shards, then start the lanes so all three begin scanning against a full backlog.
+    // Load the full backlog now that all 3 lanes are confirmed running — they race to steal it.
     std::uint64_t di = 0;
     for (std::uint64_t r = 0; r < kPerActor; ++r)
         for (std::uint32_t a = 0; a < n_actors; ++a) eng.post(sched[a], &descs[di++]);
 
-    eng.start();
-    constexpr std::uint64_t kStall = 40'000'000'000ULL;
     std::uint64_t spins = 0;
     while (total.load(std::memory_order_acquire) < grand_total) {
         if (++spins > kStall) {
