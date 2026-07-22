@@ -14,7 +14,12 @@
 #include <thread>
 
 namespace {
-constexpr std::uint64_t kTrials = 1'000'000;  // BOUNDED isolating Dekker trials (ADR-014 used 5M)
+// ADR-014's own reference run needed the full 5M trials to reliably fire (lost 194 537/192 402 vs 0
+// with the fence). 1M was trimmed in for CI runtime but is not reliably enough exposure on GH Actions'
+// shared/virtualized x86_64 runners — observed NOT-FIRED (lost=0) on both clang-release and gcc-release
+// x86_64 CI legs even with the control given exclusive CPU access (RUN_SERIAL), which rules out
+// scheduling contention and points at trial count / hit-rate instead. Back to the proven count.
+constexpr std::uint64_t kTrials = 5'000'000;
 
 // The two close-out flags, each on its own cache line (isolate the StoreLoad — like armed_ vs the ring
 // cursors). Reset every trial; the racing store/load pair runs under a sense-reversing barrier.

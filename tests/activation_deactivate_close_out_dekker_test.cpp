@@ -20,7 +20,10 @@
 #include <thread>
 
 namespace {
-constexpr std::uint64_t kTrials = 1'000'000;  // BOUNDED isolating Dekker trials
+// See stream_close_out_dekker_test.cpp's kTrials comment: ADR-014's reference run needed 5M trials to
+// reliably fire; 1M proved insufficient on GH Actions' shared x86_64 runners even under RUN_SERIAL
+// exclusive scheduling (observed NOT-FIRED, lost=0, on both clang-release and gcc-release x86_64 CI).
+constexpr std::uint64_t kTrials = 5'000'000;
 
 // ax = the consumer's "retire_to_dormant" store; ay = the producer's "message enqueued" store. Each
 // on its own cache line (isolate the StoreLoad, like the real retire_to_dormant/mailbox pair).
