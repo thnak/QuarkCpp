@@ -1,6 +1,6 @@
 # Quark CI — the correctness + performance gate.
 #
-#  * test:      builds and runs the full ctest suite across the four verified configurations
+#  * test:         builds and runs the full ctest suite across the four verified configurations
 #               (gcc Release, clang Release, ASan+UBSan, TSan), each crossed against BOTH x86-64
 #               and arm64 hosted runners — the same clean-from-scratch matrix used locally, now
 #               also on real AArch64 hardware. A red test here blocks the merge on either arch.
@@ -10,6 +10,15 @@
 #               `store_load_barrier()` Dekker close-outs those specs flag as x86-TSO-proven only.
 #               GitHub's Linux arm64 hosted runners (`ubuntu-24.04-arm`) are free for public repos
 #               (GA since 2025-08) — no self-hosted runner or QEMU emulation needed.
+#  * test-windows: the Windows/x86-64 PAL backend (pal/windows_x86_64/) correctness leg, on
+#               `windows-latest` (MSVC). `msvc-release` blocks the merge, same as the Linux/arm64
+#               legs. `msvc-asan` is continue-on-error: MSVC's `/fsanitize=address` is real but has
+#               not yet been proven clean against this codebase the way the Linux ASan+UBSan leg has
+#               — it collects real signal without gating merges until that's established. TSan/UBSan
+#               have no MSVC equivalent, so Windows carries no analogue of those legs; that gap stays
+#               Linux/arm64-only. No perf-gate on Windows: 023's Hard budgets are pinned to the
+#               x86-64 Linux reference machine (023 §"The reference machine"), same reasoning that
+#               already keeps arm64's perf-gate informational-only.
 #  * perf-gate: builds the 023 microbenchmarks and runs bench/ci_bench_gate.sh, which FAILS the job
 #               on a Hard-budget violation ([MISS]) and only WARNS on a Goal regression
 #               ([hard]/[floor]) — 023 §"Regression gating": "fails when a Hard budget is violated,
@@ -24,6 +33,10 @@
 # Toolchain: Quark is C++23 and is verified on g++-14.2 + clang-20.1 (CONVENTIONS.md). The setup step
 # installs g++-14 and LLVM 20; bump these together with the locally-verified compilers. Both are
 # available from the same apt sources on arm64 Ubuntu 24.04 — no per-arch toolchain substitution.
+# Windows uses whatever MSVC ships on `windows-latest` (no pinned version); QuarkWarnings.cmake asks
+# for `/std:c++latest` rather than a fixed `/std:c++NN`, so it tracks whatever C++23 support that
+# toolset has, the same way the bring-up box (a newer/preview MSVC lacking a literal `/std:c++23`
+# flag) was verified.
 name: CI
 
 on:
@@ -137,6 +150,51 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ctest-${{ matrix.config.name }}-${{ matrix.arch }}
+          path: build/Testing/**/*.log
+          if-no-files-found: ignore
+
+  test-windows:
+    name: test-windows (${{ matrix.config.name }})
+    runs-on: windows-latest
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.config.informational }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: msvc-release
+            sanitize: ""
+            informational: false
+          - name: msvc-asan
+            sanitize: "address"
+            # Not yet a proven-clean gate the way the Linux ASan+UBSan leg is (019 bring-up used
+            # msvc-release only) — collects real signal without blocking merges until established.
+            informational: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # The default CMake generator on windows-latest is the installed Visual Studio toolset
+      # (MSBuild-driven) — no vcvarsall/Developer-Prompt setup needed, unlike a manual Ninja build.
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B build -A x64 -DQUARK_BUILD_BENCH=OFF ^
+            ${{ matrix.config.sanitize != '' && format('-DQUARK_SANITIZE={0}', matrix.config.sanitize) || '' }}
+
+      # Multi-config generator (VS/MSBuild): --config is required on both build and ctest below.
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config Release -j 4
+
+      - name: Test
+        shell: cmd
+        run: ctest --test-dir build -C Release -j 4 --output-on-failure --timeout 1800
+
+      - name: Upload ctest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-${{ matrix.config.name }}-windows
           path: build/Testing/**/*.log
           if-no-files-found: ignore
 
