@@ -9,6 +9,7 @@
 // actors on a single-shard engine, driven by concurrent producer threads) and asserts the EXACT
 // expected mailbox_enqueued count, which only holds if every producer's `inc_atomic()` landed.
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -86,6 +87,14 @@ int main() {
         std::vector<ActorRef<Sink>> refs;
         for (std::uint32_t a = 0; a < kActors; ++a) refs.push_back(router.get<Sink>(a));
         eng.start();
+        // Let the 3 workers reach park() while the run-queue is still empty, so the FIRST Tick any
+        // producer posts below is guaranteed to find an idle worker in idle_mask_ (engine.hpp
+        // wake_one()) and snap.wakeups below is deterministically >= 1. Without this, thread-startup
+        // scheduling can race the producers ahead of the workers' first scan_and_run(), in which case
+        // workers never park at all ("every worker busy" — engine.hpp's own documented common case)
+        // and wakeups legitimately stays 0. Observed as a genuine flake on the msvc-release Windows CI
+        // leg (run 29901602862): not an engine bug, just an unsynchronized race in this test.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
         std::vector<std::thread> producers;
         producers.reserve(kProducers);
