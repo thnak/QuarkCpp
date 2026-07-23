@@ -23,7 +23,12 @@ namespace {
 // See stream_close_out_dekker_test.cpp's kTrials comment: ADR-014's reference run needed 5M trials to
 // reliably fire; 1M proved insufficient on GH Actions' shared x86_64 runners even under RUN_SERIAL
 // exclusive scheduling (observed NOT-FIRED, lost=0, on both clang-release and gcc-release x86_64 CI).
-constexpr std::uint64_t kTrials = 5'000'000;
+// 5M itself then ALSO reported NOT-FIRED (lost=0) on a later gcc-release x86_64 CI run, fully
+// RUN_SERIAL-isolated with zero other tests sharing the runner — ruling out scheduling contention a
+// second time and pointing at the trial count's margin against the runner's own (likely virtualized,
+// possibly time-sliced-vCPU) hit rate for this few-nanosecond store-buffer-drain window. 10x again,
+// matching topic_no_quiesce_control's precedent for the identical symptom.
+constexpr std::uint64_t kTrials = 50'000'000;
 
 // ax = the consumer's "retire_to_dormant" store; ay = the producer's "message enqueued" store. Each
 // on its own cache line (isolate the StoreLoad, like the real retire_to_dormant/mailbox pair).

@@ -18,8 +18,18 @@ namespace {
 // with the fence). 1M was trimmed in for CI runtime but is not reliably enough exposure on GH Actions'
 // shared/virtualized x86_64 runners — observed NOT-FIRED (lost=0) on both clang-release and gcc-release
 // x86_64 CI legs even with the control given exclusive CPU access (RUN_SERIAL), which rules out
-// scheduling contention and points at trial count / hit-rate instead. Back to the proven count.
-constexpr std::uint64_t kTrials = 5'000'000;
+// scheduling contention and points at trial count / hit-rate instead. 5M was bumped back in for that,
+// but activation_deactivate_close_out_dekker_control (same litmus shape, same file's sibling) STILL
+// reported NOT-FIRED at 5M on a later gcc-release x86_64 CI run — RUN_SERIAL'd, fully CPU-isolated, no
+// contention explanation left. The remaining suspect is the runner's virtualized CPU itself: a vCPU
+// that is itself time-sliced across physical cores (or has high steal time) can leave the two racing
+// threads without genuine cross-core parallelism during the few-nanosecond store-buffer-drain window
+// this litmus depends on, which lowers the per-trial hit rate versus dedicated reference hardware — not
+// a claim that the fence is wrong, a claim that 5M trials' margin against an all-zero run isn't enough
+// on THIS hardware. 10x the trials (matching the same fix applied to topic_no_quiesce_control after an
+// identical symptom — see topic_subscribe_race_test.cpp) for a much lower false-negative rate; runtime
+// stays well inside ctest's per-test timeout (~100s at this count, measured).
+constexpr std::uint64_t kTrials = 50'000'000;
 
 // The two close-out flags, each on its own cache line (isolate the StoreLoad — like armed_ vs the ring
 // cursors). Reset every trial; the racing store/load pair runs under a sense-reversing barrier.
