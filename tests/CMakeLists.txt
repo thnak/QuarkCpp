@@ -216,3 +216,26 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/topic_subscribe_race_test.cpp" AND QUARK_
     WILL_FAIL TRUE
     ENVIRONMENT "ASAN_OPTIONS=abort_on_error=0:symbolize=0:exitcode=1;UBSAN_OPTIONS=print_stacktrace=0")
 endif()
+
+# Busy-spin scheduling fragility. A real-hardware contention experiment (ctest -j4 pinned to ~2 cores,
+# approximating a hosted CI runner's core count) showed these specific tests blow up 10-70x — a few
+# seconds unconstrained to 60-170s pinned — while the rest of the ~160-file suite stayed roughly
+# proportionate. Each synchronizes via a hand-rolled busy-spin barrier (std::this_thread::yield() in a
+# loop, not a blocking wait) across millions of trials/rounds: if another test's threads share the same
+# core, the rendezvous doesn't just slow down proportionally, it starves for the other side to even get
+# scheduled. This is the same class of risk already called out for the Dekker *_control variants above
+# (their RUN_SERIAL comment), but those are gated NOT QUARK_SANITIZE (they don't build at all under
+# ASan/TSan) — these are the POSITIVE variants that run under every build+sanitizer combination,
+# including the ASan leg that was observed timing out at 90 minutes on Windows CI with no other symptom
+# pointing at a genuine hang. RUN_SERIAL keeps ctest from ever co-scheduling another test's threads onto
+# the same cores as these, regardless of the runner's -j setting.
+foreach(_quark_serial_test
+        stream_close_out_dekker_test
+        activation_deactivate_close_out_dekker_test
+        topic_subscribe_race_test
+        stream_single_cursor_control
+        stream_reenqueue_control)
+  if(TARGET ${_quark_serial_test})
+    set_tests_properties(${_quark_serial_test} PROPERTIES RUN_SERIAL TRUE)
+  endif()
+endforeach()

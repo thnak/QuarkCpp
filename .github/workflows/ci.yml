@@ -188,7 +188,12 @@ jobs:
 
       - name: Test
         shell: cmd
-        run: ctest --test-dir build -C Release -j 4 --output-on-failure --timeout 1800
+        # -j 2, not 4: matches the Linux legs' ctest_jobs (also sized to the runner's real core count,
+        # not saturated) — a real-hardware contention experiment (pinning ctest -j4 to ~2 cores) showed
+        # ctest's own process-level -j undercounts true concurrency here, since several tests are
+        # themselves multi-threaded; RUN_SERIAL on the specific busy-spin tests (tests/CMakeLists.txt)
+        # is the primary fix, this just avoids adding MORE process-level contention on top of that.
+        run: ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 1800
 
       - name: Upload ctest logs on failure
         if: failure()
