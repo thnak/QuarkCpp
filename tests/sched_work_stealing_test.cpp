@@ -22,7 +22,13 @@ constexpr std::uint32_t kWorkers = 3;
 constexpr std::uint32_t kShards = 9;                 // home(shard)=shard%3 ⇒ {0,3,6} are worker 0's
 constexpr std::uint32_t kTargetShards[] = {0, 3, 6};  // all homed to worker 0
 constexpr std::uint32_t kActorsPerShard = 4;
-constexpr std::uint64_t kPerActor = 20'000;
+// 20,000/actor (240,000 total) drained in ~130ms on Windows CI with the per-message busy-loop below at
+// 64 iterations — short enough that worker 2's wake-from-park latency (a real OS thread wake, not a
+// spin) can exceed the ENTIRE drain window, so it legitimately never gets a turn: observed FAIL
+// (stolen-by-w2=0) on msvc-release TWICE, even with the below-warmup phase proving all 3 threads alive
+// at start (that only rules out the startup race; it says nothing about worker 2 getting re-scheduled
+// once it parks again after warmup). 10x the per-actor count for a much wider drain window.
+constexpr std::uint64_t kPerActor = 200'000;
 constexpr std::uint64_t kStall = 40'000'000'000ULL;
 
 struct Job {
@@ -37,9 +43,10 @@ struct Sink : Actor<Sink, Sequential> {
     void handle(const Job&) noexcept {
         const std::uint32_t w = current_worker_id();
         if (w < kWorkers) by_worker[w].fetch_add(1, std::memory_order_relaxed);
-        // A little work so an initial cross-shard drain assignment holds long enough to be observed.
+        // Real per-message work so the drain window (see kPerActor above) stays wide relative to a
+        // worker's OS wake-from-park latency, not just relative to raw message count.
         volatile std::uint32_t sink = 0;
-        for (int i = 0; i < 64; ++i) sink += static_cast<std::uint32_t>(i);
+        for (int i = 0; i < 512; ++i) sink += static_cast<std::uint32_t>(i);
         (void)sink;
         total->fetch_add(1, std::memory_order_release);
     }

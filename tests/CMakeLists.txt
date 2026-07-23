@@ -234,7 +234,12 @@ foreach(_quark_serial_test
         activation_deactivate_close_out_dekker_test
         topic_subscribe_race_test
         stream_single_cursor_control
-        stream_reenqueue_control)
+        stream_reenqueue_control
+        # Not a spin-barrier test itself, but the same class of wake-latency-vs-window race: worker 2's
+        # OS wake-from-park can outlast its whole drain window on a loaded runner (observed FAIL twice
+        # on msvc-release, stolen-by-w2=0 both times) — RUN_SERIAL removes any OTHER test's threads as
+        # an extra source of scheduling delay on top of that already-tight margin.
+        sched_work_stealing_test)
   if(TARGET ${_quark_serial_test})
     set_tests_properties(${_quark_serial_test} PROPERTIES RUN_SERIAL TRUE)
   endif()
