@@ -131,7 +131,7 @@ Periodic timers stop rescheduling once cancelled.
 
 Activation-lifecycle deactivation (`IdleTimeout<Ms>` / `KeepAlive`, 005) is driven by the
 per-shard wheel, resolved by
-[ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md):
+[ADR-008](ADR-008-engine-actor-configuration-and-activation-lifecycle-policy):
 
 - On a drain **Empty** edge, the worker reads `idle_ticks` from the packed operational word
   (013) and **arms a per-activation `Deactivate` entry** (single-writer, lock-free);
@@ -162,7 +162,7 @@ a deadline-carrying message within its actor's mailbox.
 
 A **deadline-unified `EdfBanded` policy** (folding these deadlines into a scheduling band
 key) was **evaluated and deferred** by
-[ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md): under overload,
+[ADR-010](ADR-010-priority-and-fairness-scheduling-policy): under overload,
 deadline-banding can degrade **below** plain FIFO (the EDF-domino effect — proven). The
 scheduler's `band_of()` is the extension point if a future opt-in EDF policy is pursued,
 and it **must preserve per-actor FIFO**.

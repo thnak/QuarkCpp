@@ -39,7 +39,7 @@ Mailbox → MessageHandle → Descriptor → Payload
 
 ## Mailbox structure — intrusive Vyukov MPSC
 
-> Pinned by **[ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md)** — the
+> Pinned by **[ADR-002](ADR-002-mailbox-mpsc-hot-path-r2)** — the
 > only design of three that swept its safety, correctness, and speed claims under
 > executed C++ (GCC 14.2 + Clang 20.1, TSan/ASan/UBSan, percentile benchmarks).
 
@@ -109,7 +109,7 @@ cheaply on the hot path.
 The queue is **unbounded** — it provides no backpressure of its own. A runaway
 producer that outruns the drain exhausts the shard's descriptor pool. Bounding
 that is **out of mailbox scope**: admission and overload control are a companion
-policy in [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md).
+policy in [022-Resource-Governance-and-Overload-Control](022-Resource-Governance-and-Overload-Control).
 
 ## Allocators
 
@@ -235,7 +235,7 @@ one `fetch_add` per admitted enqueue and never waits for a decrement).
 
 An outbound streaming reply carries **0 per-item steady-state heap on both legs** —
 the callee's produce leg and the caller's drain leg
-([ADR-018](decisions/ADR-018-outbound-streaming-replies.md), the 024 ring run
+([ADR-018](ADR-018-outbound-streaming-replies), the 024 ring run
 backward). The one acknowledged non-zero is the callee's **cold `task<>` frame at 1
 alloc/ask**; it is eliminable by an **optional pooled `promise_type` operator new**
 (a shard frame-slab) that **does not touch the item path**.

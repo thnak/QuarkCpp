@@ -113,7 +113,7 @@ before any worker thread exists to race), not resolved by synchronization.
 
 ### Dispatch table
 
-Resolved by [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)
+Resolved by [ADR-007](ADR-007-actor-authoring-and-handler-dispatch-api)
 (D1 JumpTable-Dispatch). There are **two** structures, materialized at metadata
 compilation, chosen by whether the message type is statically known at the send site:
 
@@ -162,7 +162,7 @@ send resolves `type_index → ActorMetadata → dispatch`, all array indexing.
 
 ## Dynamic registration (guarded) — ADR-008
 
-Resolved by [ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md):
+Resolved by [ADR-008](ADR-008-engine-actor-configuration-and-activation-lifecycle-policy):
 a **guarded `add_actor_type<T>()`** is permitted after `build()`. The actor *type set* is
 a BuildOnly knob for **sizing** (arrays are pre-sized to a `max_types` cap), but a new
 type may be added within that cap:

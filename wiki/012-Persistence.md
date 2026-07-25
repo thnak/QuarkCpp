@@ -178,7 +178,7 @@ cannot corrupt state after re-placement.
 ## Encryption at rest (optional)
 
 Durable records may hold sensitive state. **At-rest encryption is optional
-envelope encryption** ([020-Security.md](020-Security.md)): 016's canonical tagged
+envelope encryption** ([020-Security](020-Security)): 016's canonical tagged
 bytes are produced first (so schema evolution/migration is unchanged), then sealed
 with a per-actor/per-shard data key wrapped by a `Keyring` seam before hitting the
 disk record. The fencing token above is integrity-relevant and is covered by the

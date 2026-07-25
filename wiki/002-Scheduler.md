@@ -80,7 +80,7 @@ producer:  tail_.exchange(desc, acq_rel);    atomic_thread_fence(seq_cst);  exec
 > **lost and leaked a message**. ADR-002 proved it: the broken close-out dropped
 > **200k/200k** nodes; the read-only-probe + reacquire-before-mutate form dropped
 > **0/200k**. Keep this as a permanent regression test. See
-> [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md).
+> [ADR-002](ADR-002-mailbox-mpsc-hot-path-r2).
 
 ## Mailbox hot-path baseline (ADR-029, r7 judgment)
 
@@ -159,11 +159,11 @@ did not isolate the Dekker StoreLoad window; ADR-003 built the isolating control
 ADR-004 refined the magnitude — with the producer's `acq_rel` exchange retained the
 x86 leak is small (~0.05–0.09%) but nonzero, so the fence is load-bearing and the CI
 guard is `lost == 0` vs `lost > 0`. See
-[ADR-004](decisions/ADR-004-mailbox-mpsc-hot-path-r4.md).
+[ADR-004](ADR-004-mailbox-mpsc-hot-path-r4).
 
 ## Broadcast schedules activations, not messages (ADR-019)
 
-Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))
+Best-effort broadcast (`Topic<M>`, [ADR-019](ADR-019-best-effort-broadcast-publish-primitive))
 adds **no** new scheduler contract. A `publish(M)` lowers to **N ordinary ADR-002
 tells sharing one immutable refcounted payload**: each per-subscriber delivery is an
 ordinary mailbox enqueue that drives that subscriber's exec-state `Idle → Scheduled`
@@ -198,7 +198,7 @@ stalled on a full credit window wakes to observe teardown. As on the inbound pat
 (§Streaming activations), wakeup is **never keyed on ring/credit emptiness** — that
 emptiness is non-linearizable; both halves ride the exec-state / credit-generation
 machine. This is the 024 inbound arming rule run in reverse. See
-[ADR-018](decisions/ADR-018-outbound-streaming-replies.md).
+[ADR-018](ADR-018-outbound-streaming-replies).
 
 ## Blocking/fiber adapter completion — the `Parked` exec-state (ADR-015)
 
@@ -252,7 +252,7 @@ they are not.
 
 ## Priority scheduling — K-band per-shard run-queue (ADR-010)
 
-Resolved by [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md)
+Resolved by [ADR-010](ADR-010-priority-and-fairness-scheduling-policy)
 (D1, proven 7/7): `Priority<P>` (005) is an **engine-level compile-time scheduling
 policy**, not a change to the mailbox.
 

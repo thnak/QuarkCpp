@@ -157,7 +157,7 @@ ring and exposes it via the snapshot API.
 ## Audit
 
 Security-relevant events (authn failures, authz denials, cluster admission
-outcomes — see [020-Security.md](020-Security.md)) flow to a sibling **`AuditSink`**
+outcomes — see [020-Security](020-Security)) flow to a sibling **`AuditSink`**
 seam, and authorization *denials* land in a **distinct security dead-letter**
 stream so they are never conflated with ordinary poison-message dead-letters
 (007). The default `AuditSink` writes structured records to stderr/file; SIEM/OTLP
@@ -171,7 +171,7 @@ linked unless the host opts in.
 
 > The per-shard counters and latency histograms here double as the **measurement
 > surface for the macrobenchmarks** of
-> [023-Performance-Targets-and-Budgets.md](023-Performance-Targets-and-Budgets.md) —
+> [023-Performance-Targets-and-Budgets](023-Performance-Targets-and-Budgets) —
 > the observability layer *is* the perf instrument, so whole-engine benchmarks need
 > no separate plumbing.
 

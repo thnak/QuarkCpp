@@ -169,6 +169,6 @@ non-hot-path cost by this RFC's own definition of the hot path.
   multi-process integration tier.
 - Performance-regression testing: deterministic sim gives correctness, not
   throughput. *(Resolved: the benchmark harness + quantified budgets are
-  [023-Performance-Targets-and-Budgets.md](023-Performance-Targets-and-Budgets.md),
+  [023-Performance-Targets-and-Budgets](023-Performance-Targets-and-Budgets),
   which runs on the **native** PAL backend — the perf counterpart to this spec's
   **sim** backend. A design must pass both: right here, fast there.)*

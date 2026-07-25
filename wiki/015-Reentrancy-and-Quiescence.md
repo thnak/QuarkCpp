@@ -65,7 +65,7 @@ completes, it **re-schedules the activation through the admission gate** — it 
 becomes a second executor of the actor: it hands the actor back to the scheduler
 (002), which acquires ownership afresh via the exec-state CAS. This is what makes
 the mailbox's consumer-private `head_` safe to leave un-atomic across the
-suspension (001, [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md)).
+suspension (001, [ADR-002](ADR-002-mailbox-mpsc-hot-path-r2)).
 
 The `Paused` seal also **ties into the mailbox `Busy`/bounded-spin park path**
 (002): when a drain step reports `Busy` (a producer mid-publish) or the budget

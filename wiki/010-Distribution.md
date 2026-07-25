@@ -1,0 +1,228 @@
+# 010 — Distribution
+
+Extends the single-node engine across a cluster **without dragging a networking or
+serialization framework into the core**. The engine core has *zero* networking
+dependencies; distribution is a layer built on three seams — `Transport`,
+`Serializer`, and `Membership` — each with a std-only default implementation.
+
+> If distribution is not configured, none of this compiles into the hot path. A
+> single-node engine pays nothing for the cluster machinery.
+
+## Placement across nodes
+
+Placement (002) extends by one level:
+
+```
+ActorId → node → shard
+```
+
+Node selection uses **Rendezvous (Highest-Random-Weight) hashing**:
+
+```
+node(ActorId) = argmax over live nodes n of  hash(n.id, ActorId)
+```
+
+### Alternatives considered
+
+- **Consistent-hashing ring with virtual nodes**: standard, but requires
+  vnode bookkeeping and rebalancing logic, and disruption on membership change is
+  larger and less uniform without many vnodes.
+- **Decision: Rendezvous/HRW hashing.** No ring state to maintain, provably
+  minimal reassignment on membership change (only the affected keys move), and
+  every node computes placement independently from the membership set — no
+  coordinator. Cost is O(nodes) per placement for a small cluster; at scale the
+  **`VirtualBins` cache of [026](026-Large-Scale-Cluster-Topology) makes it O(1)
+  (proven 5–6 ns, N-independent)**, and beyond ~10⁴ nodes the D2 `Partitioned` tier
+  applies. The connections axis is likewise a policy: default one-per-peer is
+  `FullMesh`; 026 adds `BoundedPartialView`/`Gateway` to break the O(N²)
+  cluster-wide socket count.
+
+Placement stays **stable** (core invariant 4): given the same membership, every
+node maps an `ActorId` to the same node deterministically.
+
+**Capability-constrained placement** rides this without breaking determinism. Nodes
+advertise **static capabilities** (labels, flags, a capacity `weight`) in the SWIM
+join payload, gossiped with membership. A placement policy (005) may restrict HRW to
+the **eligible subset** (`Require<Gpu>`), bias it (`Prefer<SameZone>`, `LocalFirst`,
+`Affinity`), or weight it (`Weighted`) — all still pure functions of the gossiped
+membership+capability set, so every node agrees and the coordinator-free property
+holds. Load-aware (non-deterministic) selection is confined to **stateless pools**,
+which have no identity to pin. The full model is
+[025-Placement-Policies-and-Stateless-Workers](025-Placement-Policies-and-Stateless-Workers).
+
+## Membership
+
+Cluster membership + failure detection uses an in-house **SWIM**-style protocol
+over the `Transport`:
+
+- Gossip-disseminated membership list.
+- Randomized ping / indirect-ping failure detection with a suspicion timeout.
+- Incarnation numbers to refute false suspicions.
+- The smoothed round-trip time these pings already measure is **reused** as the
+  transit estimate for cross-node deadline accounting (018) — no separate clock
+  handshake.
+
+The membership **view** a node publishes — the *live node set* HRW places over —
+is the **non-`Dead`** set: both `Alive` and `Suspect` nodes are placement
+candidates. Suspicion is provisional (a suspected node is probably still up and
+still routable), so a node is removed from placement only when SWIM declares it
+`Dead` after the suspicion timeout lapses with no refutation — **not** on mere
+suspicion. Excluding on suspicion would migrate actors off a node on every
+transient blip, the very thrash the stabilization window (021) exists to damp.
+A `Dead` node is excluded; a refuted node (higher incarnation) stays.
+
+### Alternatives considered
+
+- **External coordinator (etcd / Consul / ZooKeeper)**: strong consistency, but a
+  heavy operational + binary dependency and a single bottleneck for placement.
+  Rejected for the default; can be layered behind the `Membership` seam if a
+  deployment already runs one.
+- **Decision: in-house SWIM.** Fully decentralized, no external service,
+  implementable over the same `Transport`. Membership changes trigger
+  re-placement; convergence is eventual and observable (009).
+
+A membership change **re-places** affected actors: their `ActorId → node` mapping
+moves. In-flight `ask`s to a departed node fail and escalate (007); state
+migration is a persistence concern (012). The *orchestration* of a change — the
+staged join FSM (placement recomputes only once a node can host work), fenced
+hand-off of live actors, a **stabilization window** that damps flap-induced
+thrash, and graceful drain vs. crash — is
+[021-Cluster-Formation-and-Lifecycle](021-Cluster-Formation-and-Lifecycle).
+
+## Transport seam
+
+```cpp
+struct Transport {
+    virtual void send(NodeId to, MessageFrame frame) = 0;   // fire-and-forget
+    virtual void on_receive(std::function<void(MessageFrame)>) = 0;
+    // connection lifecycle, backpressure signalling…
+};
+```
+
+Default implementation: **plain TCP** with length-prefixed frames, one multiplexed
+connection per peer, over a **per-OS event loop supplied by the Platform
+Abstraction Layer** (019) — epoll/`io_uring` (Linux), `kqueue` (macOS/BSD), IOCP
+(Windows). The transport logic is written against the PAL's readiness/completion
+interface, not against a specific OS API. No asio, no gRPC.
+
+The **mechanics** that make "one connection per peer" hold — lazy establishment on
+first cross-node send, deterministic dial deduplication (lower `NodeId` wins),
+SWIM-ping-reused keepalive, and jittered reconnect/teardown — are specified in
+[021-Cluster-Formation-and-Lifecycle](021-Cluster-Formation-and-Lifecycle),
+along with the `Discovery` seam a fresh node uses to find a first contact before
+gossip can take over.
+
+For a cluster crossing an untrusted network, this transport is wrapped by the
+mutually-authenticated, encrypted `SecureTransport` of
+[020-Security](020-Security) — the handshake is paid once per peer (one
+connection per peer), and node identity established there also gates SWIM
+admission and HRW placement, so an unauthenticated node can never be placed onto.
+
+### Alternatives considered
+
+- **gRPC / HTTP2**: rich but pulls protobuf + a large runtime; overkill for
+  intra-cluster actor traffic. Optional adapter only.
+- **Decision:** minimal length-prefixed framing over TCP in the default transport;
+  QUIC/RDMA/io_uring transports can be swapped in behind the seam.
+
+## Serialization seam
+
+Cross-node `tell`/`ask` must turn a message into bytes. The mechanism is the
+**single serialization story defined in `016-Serialization.md`** — one
+reflection-free `describe`/`QUARK_SERIALIZE` per type, shared with persistence
+(012). The core does **not** mandate a serialization library:
+
+```cpp
+template<class M> struct Serializer;   // seam; default drives 016's codec
+```
+
+- Wire uses 016's **canonical tagged encoding**, with a **transparent tagless fast
+  path** negotiated per type at connect: peers exchange schema fingerprints, and
+  identical fingerprints unlock a near-memcpy packed encoding; a mismatch (rolling
+  upgrade) falls back to the tagged form automatically (see 016).
+- Optional adapters (protobuf, FlatBuffers, Cap'n Proto) plug in behind
+  `Serializer` for teams that already use them.
+
+Only **remotely-sent** message types need a `Serializer`; a purely local,
+never-persisted actor's messages never require one, checked at Validation (008).
+
+## Delivery semantics across the network
+
+| Property | Local (006) | Cross-node |
+|---|---|---|
+| Ordering | FIFO per (sender, receiver) | FIFO per (sender, receiver) over one connection. Under 026 relay topologies, preserved by deterministic per-digest **path pinning** + drain-boundary promotion — **proven** ([ADR-011](ADR-011-cluster-relay-and-placement-gate-verification): 0 inversions / 100 trials × 10⁶ arrivals, unpinned control inverts 88–96%). |
+| Duplication | At-most-once | Per-actor `Delivery` level (017): at-most-once, at-least-once (retry + dedup by `MessageId`), or effectively-once |
+| Failure | Dead-letter / `ask` error | Peer down → `ask` fails & escalates (007); `tell` dead-lettered locally |
+
+Exactly-once is **not** offered as a transport property; where it matters it is
+built from at-least-once + idempotent handlers + fenced persistence — the full
+mechanism and its partition proof are in `017-Delivery-Guarantees.md`.
+
+## Cross-node reply-stream credit-return (ADR-018)
+
+An `ask` that returns a **stream** across nodes runs the 024 credit-ring backward
+(callee = producer, caller = consumer; ADR-018). Reply-direction credit is returned to
+the remote callee by an **edge-triggered** `CreditReturn{stream_id, tail}` frame carrying
+the **absolute** caller `tail`, applied `shadow_tail = max(shadow_tail, tail)`:
+
+- **Monotone max-merge** makes the return **reorder- and duplicate-safe** — a stale or
+  replayed `CreditReturn` can never retract credit (an *additive* delta could). A low-rate
+  **tail heartbeat** carries the same absolute tail so a dropped *final* `CreditReturn`
+  never wedges the callee with a full window.
+- `stream_id` is a **process-monotonic nonce** (not a reused index), so the transport's
+  `stream_id → ring*` map has **no ABA**. The receive path **gen-gates before any write**
+  to ring memory: a frame for a torn-down or reincarnated stream is dropped, never applied.
+
+This is the reply-direction dual of, and **composes with**, the cross-node backpressure
+open question below (a remote full mailbox is a *producer stall* via the credit window,
+not head-of-line blocking on the shared connection).
+
+## Cross-node broadcast fan-out (Draft — ADR-019)
+
+A `Topic<M>` best-effort broadcast
+([ADR-019](ADR-019-best-effort-broadcast-publish-primitive)) that spans nodes
+fans out over this seam by **coalescing remote subscribers by node**: the publisher emits
+**one fire-and-forget frame per distinct subscriber-node**, not one per remote subscriber, so
+amplification is bounded by **#nodes, not #remote-subs**. A `Suspect`/`Dead` or otherwise
+unreachable node is **dropped without stalling the publisher** — this composes with SWIM
+membership (above) and the stabilization window (021) exactly as an ordinary cross-node `tell`
+does.
+
+The bound is on *fan-out*, not on publisher work: the **synchronous per-node ADR-016 encode**
+is publisher CPU, so **publisher latency rises linearly in the number of distinct alive
+nodes**. That linear cost *is* the bounded amplification (one encode per node), **not** a
+stall — GATE 1 (publisher never blocks) still holds. Per-node coalescing also makes loss
+**coarse**: one dropped frame loses the publish for every subscriber on that node.
+
+**Status: Draft.** Amplification + dead-node no-stall are proven only on an in-process
+simulated transport (x86-TSO, ADR-019 GATE 7). Promotion is gated on a **real-transport**
+re-proof and the **ADR-011 path-pinned relay-tree FIFO** re-gate (the relay-tree variant is in
+026).
+
+## Dependencies
+
+Std + the Platform Abstraction Layer's socket/event-loop backend (epoll·io_uring /
+kqueue / IOCP) for the default transport. Everything heavier (gRPC, protobuf,
+external coordinators) is an opt-in adapter behind a seam and never linked into a
+single-node build.
+
+## Status
+
+**Accepted (x86-64, core)** — the placement + cross-node **FIFO data path** is proven
+(HRW/VirtualBins by ADR-006; FIFO-under-relay by ADR-011). The one remaining item that keeps
+010 from *full* Accepted is the **cross-node backpressure** design question below — it is a
+data-plane flow-control design, not a defect in the proven placement/FIFO core.
+
+## Open questions
+
+- **Cross-node backpressure (the named residual for full acceptance)**: how a remote full
+  mailbox (006) signals the sender without head-of-line blocking the shared connection. Needs
+  its own gate before 010's backpressure path promotes.
+- Split-brain policy under network partition — HRW gives deterministic placement,
+  but two partitions may each activate the "same" actor; reconcile via persistence
+  fencing tokens (012)?
+- Node-identity / certificate revocation propagation in a coordinator-free cluster
+  — gossip a revocation list over SWIM vs. short-lived certs (020).
+- Whether shard-granularity or actor-granularity is the unit of re-placement on
+  membership change. *(Addressed by 026: the **virtual bin** is the re-placement unit
+  at scale — a join/leave moves ~1/N bins, quantized and cache-friendly.)*
