@@ -95,8 +95,8 @@ int main() {
 
     std::printf(
         "  aff_colocated=%llu/%llu  anti_on_target=%llu  bin==target=%llu  anti!=bin(there)=%llu\n",
-        (unsigned long long)aff_colocated, (unsigned long long)M, (unsigned long long)anti_on_target,
-        (unsigned long long)bin_eq_target, (unsigned long long)anti_bin_disagree);
+        static_cast<unsigned long long>(aff_colocated), static_cast<unsigned long long>(M), static_cast<unsigned long long>(anti_on_target),
+        static_cast<unsigned long long>(bin_eq_target), static_cast<unsigned long long>(anti_bin_disagree));
     std::printf("placement_affinity_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

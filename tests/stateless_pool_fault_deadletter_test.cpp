@@ -87,8 +87,8 @@ int main() {
     check(!pool.activation(1).is_stopped(), "the healthy activation keeps running", ok);
 
     std::printf("  dead_letters=%llu  slot0.stopped=%d  slot1.handled=%llu\n",
-                (unsigned long long)g_dead_letters, pool.activation(0).is_stopped(),
-                (unsigned long long)pool.actor(1).handled);
+                static_cast<unsigned long long>(g_dead_letters), pool.activation(0).is_stopped(),
+                static_cast<unsigned long long>(pool.actor(1).handled));
     std::printf("stateless_pool_fault_deadletter_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

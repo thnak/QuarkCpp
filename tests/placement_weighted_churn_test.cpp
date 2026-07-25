@@ -82,8 +82,8 @@ int main() {
     }
     const double moved_frac = static_cast<double>(moved) / M;
     std::printf("  log-WRH: moved=%.5f  intended_delta=%.5f  to_bumped=%llu  between_unchanged=%llu\n",
-                moved_frac, intended_delta, (unsigned long long)to_bumped,
-                (unsigned long long)between_unchanged);
+                moved_frac, intended_delta, static_cast<unsigned long long>(to_bumped),
+                static_cast<unsigned long long>(between_unchanged));
     check(between_unchanged == 0,
           "0 keys move between two UNCHANGED-weight nodes (perfect cross-node minimal disruption)", ok);
     check(to_bumped == moved, "every moved key now maps to the bumped node", ok);
@@ -108,7 +108,7 @@ int main() {
         }
         const double cfrac = static_cast<double>(cmoved) / M;
         std::printf("  CONTROL modulo re-shard on identical Δ: moved=%.5f  between_unchanged=%llu\n",
-                    cfrac, (unsigned long long)cbetween);
+                    cfrac, static_cast<unsigned long long>(cbetween));
         check(cfrac >= 0.50,
               "CONTROL: modulo re-shard moves ≥ 0.5 on the same Δ (near-global reshuffle) — teeth fire",
               ok);

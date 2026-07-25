@@ -98,7 +98,7 @@ void bench_cold_activation() {
         a->drain_step(64);           // dispatch the first message
         (void)a->close_out();        // deactivate: Running → Idle
         const auto t1 = pal::clock::now();
-        checksum += a->state() == ExecState::Idle ? 1 : 0;
+        checksum += a->state() == ExecState::Idle ? 1u : 0u;
         ns.push_back(bench::ns_between(t0, t1));
     }
 

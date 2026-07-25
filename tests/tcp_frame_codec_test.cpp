@@ -118,7 +118,7 @@ int main() {
     {
         std::vector<std::byte> bad(4);
         const std::uint32_t huge = max_frame_body + 1;
-        for (int i = 0; i < 4; ++i) bad[i] = static_cast<std::byte>((huge >> (8 * i)) & 0xFF);
+        for (std::size_t i = 0; i < 4; ++i) bad[i] = static_cast<std::byte>((huge >> (8 * i)) & 0xFF);
         FrameStream fs;
         const bool r = fs.feed(bad.data(), bad.size(), [&](MessageFrame) {});
         check(!r, "an oversized length prefix is a protocol error (feed returns false)", ok);

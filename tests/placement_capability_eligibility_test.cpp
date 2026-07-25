@@ -62,8 +62,8 @@ int main() {
         check(hit[1] > 0 && hit[3] > 0 && hit[5] > 0, "Require<Gpu>: all 3 gpu nodes are used", ok);
         check(hit[2] == 0 && hit[4] == 0, "Require<Gpu>: non-gpu nodes 2,4 never used", ok);
         std::printf("  Require<Gpu>: n1=%llu n3=%llu n5=%llu (off_gpu=%llu)\n",
-                    (unsigned long long)hit[1], (unsigned long long)hit[3],
-                    (unsigned long long)hit[5], (unsigned long long)off_gpu);
+                    static_cast<unsigned long long>(hit[1]), static_cast<unsigned long long>(hit[3]),
+                    static_cast<unsigned long long>(hit[5]), static_cast<unsigned long long>(off_gpu));
     }
 
     // ---- (2) Empty eligible set → a 007 result ERROR (not UB). ----------------------------------
@@ -92,8 +92,8 @@ int main() {
         check(on_eu == M, "Prefer<ZoneEU>: ranks eu nodes first — all placements land on {1,2}", ok);
         check(off_eu == 0, "Prefer<ZoneEU>: no placement escapes the preferred set when it is non-empty",
               ok);
-        std::printf("  Prefer<ZoneEU>: on_eu=%llu off_eu=%llu\n", (unsigned long long)on_eu,
-                    (unsigned long long)off_eu);
+        std::printf("  Prefer<ZoneEU>: on_eu=%llu off_eu=%llu\n", static_cast<unsigned long long>(on_eu),
+                    static_cast<unsigned long long>(off_eu));
     }
 
     // ---- (4) Prefer FALLBACK: no node qualifies → fall back to the full eligible set. -----------
@@ -111,7 +111,7 @@ int main() {
             if (hit[i] > 0) ++used;
         check(used == 5, "Prefer<unmatchable>: falls back to ALL eligible nodes (all 5 used)", ok);
         std::printf("  Prefer fallback: distinct nodes used=%llu (expect 5)\n",
-                    (unsigned long long)used);
+                    static_cast<unsigned long long>(used));
     }
 
     // ---- (4b) LocalFirst: the calling node wins when it is eligible; else fall through to HRW. ---
@@ -136,8 +136,8 @@ int main() {
         }
         check(caller_leak == 0, "LocalFirst falls through when the caller is ineligible (Require wins)",
               ok);
-        std::printf("  LocalFirst: on_caller=%llu caller_leak=%llu\n", (unsigned long long)on_caller,
-                    (unsigned long long)caller_leak);
+        std::printf("  LocalFirst: on_caller=%llu caller_leak=%llu\n", static_cast<unsigned long long>(on_caller),
+                    static_cast<unsigned long long>(caller_leak));
     }
 
     // ---- (5) Determinism: a HashById placement over eligible == place_hash over the same subset. -

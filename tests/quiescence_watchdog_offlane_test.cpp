@@ -11,6 +11,7 @@
 // (a data race aborts the process ⇒ CTest fails on the build-tsan config).
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -62,11 +63,11 @@ int main() {
     Activation act{&actor, Service::dispatch_table(), {}, max_concurrency_of<Service>()};
     actor.lane = &act;
 
-    constexpr int kStuck = 6;
+    constexpr std::size_t kStuck = 6;
     std::vector<Stuck> s(kStuck);
     std::vector<Descriptor> ds(kStuck);
-    for (int i = 0; i < kStuck; ++i) {
-        s[i].id = i;
+    for (std::size_t i = 0; i < kStuck; ++i) {
+        s[i].id = static_cast<int>(i);
         ds[i].payload = &s[i];
         stamp<Service, Stuck>(ds[i]);
         act.post(&ds[i]);
@@ -109,6 +110,6 @@ int main() {
     check(act.in_flight() == 0, "fully quiescent — in-flight set drained to 0", ok);
 
     std::printf("quiescence_watchdog_offlane_test: %s  (guard=%d unwound=%d/%d)\n", ok ? "OK" : "FAIL",
-                actor.guard_obtained.load(), actor.unwound.load(), kStuck);
+                actor.guard_obtained.load(), actor.unwound.load(), static_cast<int>(kStuck));
     return ok ? 0 : 1;
 }

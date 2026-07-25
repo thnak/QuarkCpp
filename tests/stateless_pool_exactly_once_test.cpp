@@ -130,7 +130,8 @@ struct Worker : Actor<Worker, Sequential> {
         // spin widens the read-modify-write window so the tearing is reliable even without TSan (bumped
         // from 64: observed NOT-FIRED, torn=0, on a noisy shared CI runner at the smaller width).
         long tmp = g_ctrl_count;
-        for (volatile int s = 0; s < 4096; ++s) {
+        for (int s = 0; s < 4096; ++s) {
+            std::atomic_signal_fence(std::memory_order_seq_cst);  // compiler barrier: widen the RMW window
         }
         g_ctrl_count = tmp + 1;
         g_ctrl_xor ^= j.token;
@@ -145,17 +146,21 @@ struct Worker : Actor<Worker, Sequential> {
     }
 };
 
+#ifndef QUARK_STATELESS_SHARED_STATE_CONTROL
 void check(bool c, const char* what, bool& ok) {
     if (!c) {
         std::fprintf(stderr, "  CHECK FAILED: %s\n", what);
         ok = false;
     }
 }
+#endif
 
 }  // namespace
 
 int main() {
+#ifndef QUARK_STATELESS_SHARED_STATE_CONTROL
     bool ok = true;
+#endif
 
     Oracle oracle;
     std::vector<std::atomic<std::uint8_t>> seen(kM);

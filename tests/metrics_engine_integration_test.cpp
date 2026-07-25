@@ -99,7 +99,7 @@ int main() {
         std::vector<std::thread> producers;
         producers.reserve(kProducers);
         for (std::uint32_t p = 0; p < kProducers; ++p) {
-            producers.emplace_back([&refs, p, kActors] {
+            producers.emplace_back([&refs, p] {
                 for (std::uint64_t i = 0; i < kPerProducer; ++i)
                     refs[(p + i) % kActors].tell(Tick{});
             });

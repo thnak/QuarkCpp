@@ -32,7 +32,20 @@ inline constexpr std::uint32_t max_frame_body = 64u * 1024u * 1024u;
 
 namespace detail {
 
+// GCC's inliner sometimes loses track of std::vector<std::byte>'s growth-reallocation pointer
+// through push_back and misattributes the old buffer's free() as a mismatched/non-heap free — a
+// known false positive (the buffer is always the vector's own prior heap allocation). Silenced
+// locally rather than restructured: there is no allocation pattern here that avoids the warning,
+// since it fires on the flow-insensitive growth branch regardless of whether it's ever taken.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 inline void put_u8(std::vector<std::byte>& b, std::uint8_t v) { b.push_back(std::byte{v}); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 inline void put_u32(std::vector<std::byte>& b, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) put_u8(b, static_cast<std::uint8_t>(v >> (8 * i)));
 }

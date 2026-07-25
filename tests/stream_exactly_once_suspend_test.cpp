@@ -94,12 +94,6 @@ struct Oracle {
     }
 };
 
-void check(bool c, const char* what, bool& ok) {
-    if (!c) {
-        std::fprintf(stderr, "  CHECK FAILED: %s\n", what);
-        ok = false;
-    }
-}
 }  // namespace
 
 int main() {

@@ -54,16 +54,16 @@ int main() {
     {
         ReplyDedup idx_gate;  // pretend seq == ring index, which restarts each activation window
         std::uint64_t delivered = 0;
-        for (std::uint64_t i = 0; i < 5; ++i) delivered += idx_gate.accept(i) ? 1 : 0;  // window A: 0..4
+        for (std::uint64_t i = 0; i < 5; ++i) delivered += idx_gate.accept(i) ? 1u : 0u;  // window A: 0..4
         // re-activation: the SAME 5 logical items arrive again as indices 0..4 — but the gate already
         // advanced past 4, so it (correctly) drops them. The DEFECT the control demonstrates is that
         // WITHOUT a stable producer_seq the two windows are indistinguishable; here we show that reusing
         // low indices after a watermark reset WOULD double-deliver:
         ReplyDedup reset_gate;
         std::uint64_t dbl = 0;
-        for (std::uint64_t i = 0; i < 5; ++i) dbl += reset_gate.accept(i) ? 1 : 0;  // window A
+        for (std::uint64_t i = 0; i < 5; ++i) dbl += reset_gate.accept(i) ? 1u : 0u;  // window A
         ReplyDedup reset_gate2;  // a fresh window-local gate (index restarts) — the mis-design
-        for (std::uint64_t i = 0; i < 5; ++i) dbl += reset_gate2.accept(i) ? 1 : 0;  // window B: DUPS
+        for (std::uint64_t i = 0; i < 5; ++i) dbl += reset_gate2.accept(i) ? 1u : 0u;  // window B: DUPS
         check(delivered == 5, "control: in-order window delivers 5", ok);
         check(dbl == 10, "control fires: window-local index identity double-delivers on replay (10)", ok);
     }

@@ -3,18 +3,15 @@
 #pragma once
 
 #include <cstddef>
-#include <new>
 
 namespace quark {
 
 // Cache-line size for alignment / false-sharing avoidance (003, 023).
-// x86-64 is 64 B; std::hardware_destructive_interference_size is the portable source
-// but is not guaranteed present, so we pin the verified value for the primary target.
-#if defined(__cpp_lib_hardware_interference_size)
-inline constexpr std::size_t cache_line_size = std::hardware_destructive_interference_size;
-#else
+// std::hardware_destructive_interference_size is the portable source, but its value can vary
+// with the ABI/-mtune flags of each translation unit (GCC -Winterference-size), which would
+// break the layout guarantees this constant backs (alignas, static_assert on struct size). We
+// pin the verified value for the primary target (x86-64: 64 B) instead.
 inline constexpr std::size_t cache_line_size = 64;
-#endif
 
 // Descriptor + handle hard ceiling (003): one cache line.
 inline constexpr std::size_t max_descriptor_size = 64;

@@ -82,6 +82,6 @@ int main() {
     check(plain_same, "unconstrained HashById placement is order-independent", ok);
 
     std::printf("placement_determinism_test: %s (req=%d weighted=%d plain=%d, M=%llu)\n",
-                ok ? "OK" : "FAIL", req_same, w_same, plain_same, (unsigned long long)M);
+                ok ? "OK" : "FAIL", req_same, w_same, plain_same, static_cast<unsigned long long>(M));
     return ok ? 0 : 1;
 }

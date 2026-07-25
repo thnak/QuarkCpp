@@ -80,8 +80,18 @@ void operator delete(void* p) noexcept {
     std::free(p);
 }
 void operator delete[](void* p) noexcept { operator delete(p); }
+// GCC's inliner sometimes can't verify these sized/array overloads route to the same replaced
+// operator delete(void*) above (a known false positive when globally replacing new/delete) —
+// they always do, by construction; silenced locally rather than restructured.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
 void operator delete[](void* p, std::size_t) noexcept { operator delete(p); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 void check(bool c, const char* what, bool& ok) {
