@@ -45,6 +45,7 @@ other OSes need their own backend (kqueue/IOCP). Do not include it elsewhere."
 #include <functional>
 #include <mutex>
 #include <map>
+#include <span>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -217,6 +218,59 @@ inline void close_fd(int fd) noexcept {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return std::unexpected(would_block());
         return std::unexpected(last_error());
     }
+    return static_cast<std::size_t>(r);
+}
+
+// --- UDP primitives (ADDITIVE — voice_channel.hpp, non-blocking, SOCK_CLOEXEC, same errno
+// normalization discipline as the tcp_* functions above; no existing declaration touched) ----------
+
+// Open a non-blocking, close-on-exec UDP socket (unbound).
+[[nodiscard]] inline std::expected<int, std::error_code> udp_socket() noexcept {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return std::unexpected(last_error());
+    if (auto r = set_nonblocking(fd); !r) {
+        close_fd(fd);
+        return std::unexpected(r.error());
+    }
+    return fd;
+}
+
+// Bind a UDP socket to (addr,port). port==0 -> ephemeral (read back via local_port).
+[[nodiscard]] inline std::expected<void, std::error_code> udp_bind(int fd, std::uint64_t addr,
+                                                                    std::uint16_t port) noexcept {
+    const ::sockaddr_in sa = to_sockaddr_in(addr, port);
+    if (::bind(fd, reinterpret_cast<const ::sockaddr*>(&sa), sizeof(sa)) < 0)
+        return std::unexpected(last_error());
+    return {};
+}
+
+// Non-blocking sendto. Ok(n) = bytes accepted; would_block() = kernel send buffer full (caller drops,
+// never retries — 010/voice best-effort contract). MSG_NOSIGNAL mirrors send_some's discipline.
+[[nodiscard]] inline std::expected<std::size_t, std::error_code> udp_send_to(
+    int fd, std::uint64_t addr, std::uint16_t port, std::span<const std::byte> buf) noexcept {
+    const ::sockaddr_in sa = to_sockaddr_in(addr, port);
+    const ::ssize_t r = ::sendto(fd, buf.data(), buf.size(), MSG_NOSIGNAL,
+                                 reinterpret_cast<const ::sockaddr*>(&sa), sizeof(sa));
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return std::unexpected(would_block());
+        return std::unexpected(last_error());
+    }
+    return static_cast<std::size_t>(r);
+}
+
+// Non-blocking recvfrom. Ok(n) = bytes read + sender written to from_addr/from_port; would_block() =
+// nothing ready now (the normal on_readable() loop-exit condition).
+[[nodiscard]] inline std::expected<std::size_t, std::error_code> udp_recv_from(
+    int fd, std::byte* buf, std::size_t n, std::uint64_t& from_addr, std::uint16_t& from_port) noexcept {
+    ::sockaddr_in sa{};
+    ::socklen_t sl = sizeof(sa);
+    const ::ssize_t r = ::recvfrom(fd, buf, n, 0, reinterpret_cast<::sockaddr*>(&sa), &sl);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return std::unexpected(would_block());
+        return std::unexpected(last_error());
+    }
+    from_addr = static_cast<std::uint64_t>(::ntohl(sa.sin_addr.s_addr));
+    from_port = ::ntohs(sa.sin_port);
     return static_cast<std::size_t>(r);
 }
 

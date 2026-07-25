@@ -125,6 +125,25 @@ admission and HRW placement, so an unauthenticated node can never be placed onto
 - **Decision:** minimal length-prefixed framing over TCP in the default transport;
   QUIC/RDMA/io_uring transports can be swapped in behind the seam.
 
+### Sibling seams
+
+Not every byte a node moves is a `Transport` frame. `VoiceChannel`
+([028-Voice-Datagram-Channel.md](028-Voice-Datagram-Channel.md)) — best-effort,
+unordered, unreliable UDP for real-time voice/media — is a **NEW, PARALLEL seam**,
+not a `MessageFrame`/`FrameKind` variant and not a `Transport` decorator. It shares
+**no** code path with `Transport`/`MessageFrame`, and it is never reachable through
+the actor mailbox/`GovernanceCore` (003) — a deployment that doesn't use voice pays
+nothing for it. Do not assume voice traffic is "just another frame kind" flowing
+through this seam; it deliberately opts out of the ordering guarantee this section
+exists to provide.
+
+What it **does** share: the node's I/O reactor. `TcpTransport::event_loop()` is the
+**one sanctioned extension point** for a sibling seam that needs to share the
+node's already-open `pal::IoContext` instead of standing up a second thread/loop/
+fd-set — `VoiceChannel` is its first (and, by design, only intended) consumer. No
+other public surface should be added to `TcpTransport` for this purpose; a future
+sibling seam should extend `event_loop()`'s usage, not grow a second accessor.
+
 ## Serialization seam
 
 Cross-node `tell`/`ask` must turn a message into bytes. The mechanism is the

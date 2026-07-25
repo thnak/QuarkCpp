@@ -215,6 +215,28 @@ When placement moves actor `X` from old node O to new node N:
    N, per the actor's policy. No store, so no fencing needed — worst case is lost
    volatile state, which an in-memory actor already tolerates on node loss (010).
 
+### Capability gossip beyond placement (025, 028)
+
+Node capabilities (025 Part A: `Flag`/`Label`/`Scalar`) ride the same gossiped
+membership content this section specifies, disseminated at ANNOUNCE alongside the
+roster. Every consumer to date has been a **placement** input (025's
+`Require`/`Prefer`/`Weighted`). `Flag{"voice-relay"}` (028) is the first consumer
+that is **not** placement in the mailbox-routed sense — a node's own `VoiceChannel`
+reads it locally to build its voice-relay-eligible `VirtualBins` subset, entirely
+off the actor path. No new gossip mechanism is added; this is the same static,
+rejoin-only capability content 025 already specifies, read by one more consumer.
+
+**Mid-session handoff across a capability change.** Capabilities are static for a
+node's lifetime (025) — advertising or withdrawing `Flag{"voice-relay"}` is a
+rejoin, never a live mutation. When a relay's eligibility changes, there is
+deliberately **no** hand-off procedure like the actor hand-off above: each node's
+`VoiceChannel` picks up the new eligible set on its own next
+`on_capability_view_changed` rebuild (bounded by ordinary gossip convergence,
+same as any other membership change), and in-flight datagrams addressed to the
+now-stale relay are simply lost under voice's ordinary best-effort contract. No
+fencing token, no `PathPin` (026) — those exist to protect an ordering/consistency
+guarantee that 028 explicitly does not make.
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping

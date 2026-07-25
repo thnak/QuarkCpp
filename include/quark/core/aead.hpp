@@ -46,6 +46,22 @@ public:
                                     std::vector<std::byte>& out) const = 0;
 
     [[nodiscard]] virtual std::size_t tag_size() const noexcept = 0;
+
+    // ADDITIVE (voice_channel.hpp / ADR-030, claim F1): fixed-buffer, non-allocating seal/open. `out`
+    // must be caller-owned (stack/thread_local) and at least `plaintext.size() + tag_size()` bytes;
+    // writes {ciphertext||tag} into it and returns the length written. Same authentication semantics as
+    // `seal`/`open` above — this ONLY changes where the bytes land (no std::vector growth on the
+    // datagram hot path), never the framing/security contract.
+    [[nodiscard]] virtual std::size_t seal_into(std::uint64_t nonce, std::span<const std::byte> aad,
+                                                std::span<const std::byte> plaintext,
+                                                std::span<std::byte> out) const = 0;
+
+    // Fixed-buffer `open`: on success writes the recovered plaintext into `out` (must be >=
+    // sealed.size() - tag_size()) and sets `out_len`; returns true. On tamper/wrong-key returns false
+    // and leaves `out_len` untouched.
+    [[nodiscard]] virtual bool open_into(std::uint64_t nonce, std::span<const std::byte> aad,
+                                         std::span<const std::byte> sealed, std::span<std::byte> out,
+                                         std::size_t& out_len) const = 0;
 };
 
 // ============================================================================================
@@ -91,6 +107,37 @@ public:
     }
 
     [[nodiscard]] std::size_t tag_size() const noexcept override { return kTagSize; }
+
+    // ADDITIVE fixed-buffer forms (F1): identical algorithm to seal()/open() above, writing directly
+    // into caller-supplied storage instead of growing a std::vector. Zero heap allocation.
+    [[nodiscard]] std::size_t seal_into(std::uint64_t nonce, std::span<const std::byte> aad,
+                                        std::span<const std::byte> plaintext,
+                                        std::span<std::byte> out) const override {
+        for (std::size_t i = 0; i < plaintext.size(); ++i)
+            out[i] = plaintext[i] ^ keystream_byte(nonce, i);
+        const std::uint64_t tag =
+            compute_tag(nonce, aad, std::span<const std::byte>(out.data(), plaintext.size()));
+        for (std::size_t b = 0; b < kTagSize; ++b)
+            out[plaintext.size() + b] = static_cast<std::byte>((tag >> (b * 8)) & 0xFF);
+        return plaintext.size() + kTagSize;
+    }
+
+    [[nodiscard]] bool open_into(std::uint64_t nonce, std::span<const std::byte> aad,
+                                 std::span<const std::byte> sealed, std::span<std::byte> out,
+                                 std::size_t& out_len) const override {
+        if (sealed.size() < kTagSize) return false;
+        const std::size_t ct_len = sealed.size() - kTagSize;
+        if (out.size() < ct_len) return false;
+        const std::span<const std::byte> ct(sealed.data(), ct_len);
+        const std::uint64_t want = compute_tag(nonce, aad, ct);
+        std::uint64_t got = 0;
+        for (std::size_t b = 0; b < kTagSize; ++b)
+            got |= static_cast<std::uint64_t>(static_cast<unsigned char>(sealed[ct_len + b])) << (b * 8);
+        if (got != want) return false;
+        for (std::size_t i = 0; i < ct_len; ++i) out[i] = ct[i] ^ keystream_byte(nonce, i);
+        out_len = ct_len;
+        return true;
+    }
 
 private:
     [[nodiscard]] std::byte keystream_byte(std::uint64_t nonce, std::size_t i) const noexcept {

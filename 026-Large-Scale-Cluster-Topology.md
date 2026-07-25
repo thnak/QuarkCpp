@@ -62,7 +62,19 @@ owner    = bin_table[bin];                        // one load — 5–6 ns, N-in
   bins/node and min:max ≥ 8 weights. Under `Weighted` (025), the target is restated on
   load-per-weight terms (ρ = realized/weight, matched to the proportional-multinomial floor
   `√((W/(N·B))·Σ 1/wᵢ)`); a weighted deployment that wants tight absolute balance must size
-  **B larger** (bins/node ≫ 16). See 025 and ADR-011.
+  **B larger** (bins/node ≫ 16). See 025 and ADR-011. **This floor recurs for any
+  bins-shaped construction, not just this one**: `VoiceChannel`'s room→relay bin
+  table (028), built over a small voice-relay-eligible subset, independently hit
+  the same CoV floor at a 16×-bins operating point (ADR-030's `C2`, measured
+  CoV 0.28–0.29 against the ≤0.2 target) and needed the same fix — oversampling
+  bins/node well past 16×. Any future bins-shaped placement should budget for this
+  from the start rather than rediscover it.
+- **Topology knobs are validated at startup (008), not discovered at runtime.**
+  `B ≥ 16·max_nodes` above is one instance of this rule; 028's relay-ratio check
+  (`voice_relay_ratio_ok`, rejecting a cluster whose voice-relay-eligible fraction
+  is too close to its total node count) is a second, independent instance — both
+  exist so a topology misconfiguration that would silently degrade an O(log N)
+  bound toward O(N) is caught at config time, not discovered under load.
 - **Determinism is literal and content-addressed:** the bin table's identity is a
   **roster content-digest**, not a bare epoch counter — every node with the same
   membership *content* computes a byte-identical table (proven over 4096 bins × 10⁵
@@ -88,6 +100,17 @@ A node no longer holds the full membership or a socket per peer:
   (021); an optional **connectionless-datagram SWIM control plane** is a distinct
   opt-in that must re-supply 018 RTT, keepalive, and **per-datagram AEAD** (020) — not
   free.
+
+**Worked example — `BoundedPartialView` over a restricted subset, not the full
+roster.** `VoiceChannel`'s relay↔relay mesh (028, `K > 1` future work) constructs
+`BoundedPartialView` over `std::span<const NodeId>` restricted to the
+voice-relay-eligible subset (`Flag{"voice-relay"}` nodes only), not the full
+cluster roster this section otherwise assumes. This is a **supported, tested
+usage pattern**, not a novel extension: the class only ever reads the node span
+and `self`'s membership in it, so a caller-restricted subset behaves identically
+to a full-roster call with a smaller `max_nodes` — the point being to avoid
+O(N²) relay-mesh connections when the eligible-relay set `R` is far smaller than
+`N`, the same way the full-roster case avoids O(N²) at cluster scale.
 - Cluster sockets drop from O(N²) to **O(N log N)**.
 
 ## DHT-Relay — reaching a non-peer

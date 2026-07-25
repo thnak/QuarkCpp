@@ -113,6 +113,14 @@ public:
     [[nodiscard]] std::uint16_t listen_port() const noexcept { return bind_port_; }
     [[nodiscard]] NodeId self() const noexcept { return self_; }
 
+    // ADDITIVE (voice_channel.hpp claim C4, ADR-030): the ONLY touch this file needs to let VoiceChannel
+    // share this node's already-open, already-scheduled epoll reactor instead of standing up a second
+    // thread/loop/fd-set. Returns a reference to the private `io_` member that already exists; changes
+    // no existing method, field, or behavior. This is the ONE sanctioned extension point for a sibling
+    // seam (010's "Sibling seams" note) that needs to share the node's I/O reactor — do not add any
+    // other public surface to TcpTransport for that purpose.
+    [[nodiscard]] pal::IoContext& event_loop() noexcept { return io_; }
+
     // --- Transport seam -------------------------------------------------------------------------
     void send(NodeId to, MessageFrame frame) override {
         if (to == self_) return;  // never dial ourselves; a self-addressed frame is a local concern

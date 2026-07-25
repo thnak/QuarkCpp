@@ -293,3 +293,15 @@ resolve against a **per-eligibility-class bin table** or fall back to O(eligible
 **`AntiAffinity` and per-actor spread must bypass the bin cache** and compute exact
 per-actor HRW, because bins *quantize* placement and would collapse a deliberate
 spread.
+
+**A second worked example of the per-eligibility-class bin table pattern**:
+`VoiceChannel`'s room→relay placement
+([028-Voice-Datagram-Channel.md](028-Voice-Datagram-Channel.md)) is exactly this —
+a `VirtualBins` table built over the `Require<HasFlag<"voice-relay">>`-eligible
+subset rather than the full roster, giving O(1)/N-independent room→relay lookup
+the same way `Require`/`Prefer` above resolve against their own eligibility-class
+table. It is not `Stateless` placement (Part C): a room's relay is a stable,
+deterministic function of the eligible set, not load-balanced across it — same
+determinism invariant as constrained *stateful* placement, just consumed off the
+actor path entirely (021 §"Capability gossip beyond placement"). See 028 for the
+full mechanism; this file is the pattern it instantiates, not a duplicate of it.
