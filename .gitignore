@@ -1,6 +1,6 @@
 # Build
-/build/
-/build-*/
+build/
+build-*/
 *.o
 *.a
 *.so
