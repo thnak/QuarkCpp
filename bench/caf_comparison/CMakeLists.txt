@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.24)
+project(quark_caf_comparison LANGUAGES CXX)
+
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_BUILD_TYPE Release)
+
+find_package(Threads REQUIRED)
+
+# --- Quark (requires C++23) -------------------------------------------------
+set(QUARK_ROOT "D:/GitSrc/QuarkCpp")
+set(QUARK_BUILD "${QUARK_ROOT}/build")
+set(QUARK_LIB "${QUARK_BUILD}/quark.lib")
+
+# --- CAF (C++20) -----------------------------------------------------------
+set(CAF_DIR "C:/Users/thanh/AppData/Local/Temp/actor-framework")
+set(CAF_CORE_DIR "${CAF_DIR}/libcaf_core")
+set(CAF_LIB "${CAF_DIR}/build/libcaf_core/caf_core.lib")
+
+# --- Quark bench (C++23) ----------------------------------------------------
+add_executable(quark_bench quark_bench.cpp)
+set_target_properties(quark_bench PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(quark_bench PRIVATE
+    "${QUARK_ROOT}"
+    "${QUARK_ROOT}/include"
+)
+target_link_libraries(quark_bench PRIVATE "${QUARK_LIB}" Threads::Threads)
+if(WIN32)
+    target_link_libraries(quark_bench PRIVATE ws2_32 bcrypt mincore)
+    target_compile_definitions(quark_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# --- CAF bench (C++20) ------------------------------------------------------
+add_executable(caf_bench caf_bench.cpp)
+set_target_properties(caf_bench PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(caf_bench PRIVATE
+    "${CAF_CORE_DIR}"
+    "${CAF_DIR}/build/libcaf_core"  # generated headers (core_export.hpp)
+)
+target_link_libraries(caf_bench PRIVATE "${CAF_LIB}" Threads::Threads)
+if(WIN32)
+    target_compile_definitions(caf_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
