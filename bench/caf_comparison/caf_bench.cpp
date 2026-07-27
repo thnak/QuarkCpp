@@ -1,8 +1,10 @@
 // CAF benchmark: message latency & throughput comparison vs Quark
 // Uses built-in int types to avoid custom type registration complexity.
 //
+// Runs at max-threads=1 (1:1 fair) or auto (all cores).
+//
 // Build: see CMakeLists.txt
-// Run:   caf_bench.exe
+// Run:   caf_bench.exe [workers]
 
 #include "caf/actor_system.hpp"
 #include "caf/actor_system_config.hpp"
@@ -15,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -55,7 +58,6 @@ static void print_stats(const char* label, const Stats& s) {
 }
 
 // ---- Ping actor (event-based, fire-and-forget) -------------------------
-// Uses built-in int as message type (no custom type registration needed).
 
 static behavior ping_actor(event_based_actor* self) {
     return {
@@ -66,7 +68,6 @@ static behavior ping_actor(event_based_actor* self) {
 }
 
 // ---- Echo actor (event-based, responds to requests) --------------------
-// Uses built-in int as message type.
 
 static behavior echo_actor(event_based_actor* self) {
     return {
@@ -181,8 +182,14 @@ static double bench_spawn(actor_system& sys) {
 // ---- Main ----------------------------------------------------------------
 
 void caf_main(actor_system& sys) {
+    // Detect thread count from config
+    size_t threads = get_or(sys.config(), "caf.scheduler.max-threads", size_t{1});
+
+    unsigned max_workers = static_cast<unsigned>(std::thread::hardware_concurrency());
+
     std::printf("=== CAF v1.1.0 Benchmarks (Ryzen 5 4600H, Windows) ===\n");
-    std::printf("Compiler: clang++ 22.1.5\n\n");
+    std::printf("Compiler: clang++ 22.1.5\n");
+    std::printf("Workers:  %zu (max %u)\n\n", threads, max_workers);
 
     bench_spawn(sys);
     std::printf("\n");
@@ -193,4 +200,42 @@ void caf_main(actor_system& sys) {
     bench_throughput(sys);
 }
 
-CAF_MAIN()
+int main(int argc, char** argv) {
+    // Parse worker count from CLI
+    size_t workers = 1;
+    if (argc > 1) {
+        int w = std::atoi(argv[1]);
+        if (w > 0)
+            workers = static_cast<size_t>(w);
+        else
+            workers = std::thread::hardware_concurrency();
+    }
+
+    actor_system_config cfg;
+    cfg.set("caf.scheduler.max-threads", workers);
+    cfg.set("caf.scheduler.policy", "stealing");
+
+    // Init host system for CAF_MAIN-less mode
+    caf::core::init_global_meta_objects();
+
+    actor_system sys{cfg};
+
+    // Detect thread count from config
+    size_t actual_threads = get_or(sys.config(), "caf.scheduler.max-threads", workers);
+
+    unsigned max_workers = static_cast<unsigned>(std::thread::hardware_concurrency());
+
+    std::printf("=== CAF v1.1.0 Benchmarks (Ryzen 5 4600H, Windows) ===\n");
+    std::printf("Compiler: clang++ 22.1.5\n");
+    std::printf("Workers:  %zu (max %u)\n\n", actual_threads, max_workers);
+
+    bench_spawn(sys);
+    std::printf("\n");
+    bench_tell_latency(sys);
+    std::printf("\n");
+    bench_ask_latency(sys);
+    std::printf("\n");
+    bench_throughput(sys);
+
+    return 0;
+}

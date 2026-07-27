@@ -1,5 +1,9 @@
 // Quark benchmark: message latency & throughput (mirrors caf_bench.cpp exactly)
-// Measures: tell latency, ask latency, throughput
+// Measures: spawn overhead, tell latency, ask latency, bulk throughput
+// Runs at 1 worker (1:1 fair) and max workers (all cores).
+//
+// Build: see CMakeLists.txt
+// Run:   quark_bench.exe [workers]
 
 #include "quark/core/actor.hpp"
 #include "quark/core/actor_ref.hpp"
@@ -11,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace quark;
@@ -65,14 +71,32 @@ struct EchoActor : Actor<EchoActor, Sequential> {
     }
 };
 
+// ---- Spawn overhead ----------------------------------------------------
+
+double bench_spawn(unsigned workers) {
+    constexpr std::uint64_t kSpawns = 10'000;
+
+    Engine eng(EngineConfig{workers, workers, 64, 1024});
+    auto t0 = pal::clock::now();
+    for (std::uint64_t i = 0; i < kSpawns; ++i) {
+        auto aid = eng.spawn<PingActor>(i).value();
+    }
+    auto t1 = pal::clock::now();
+    double per = std::chrono::duration<double, std::nano>(t1 - t0).count() / kSpawns;
+    std::printf("spawn overhead (%llu spawns):\n",
+                static_cast<unsigned long long>(kSpawns));
+    std::printf("  %8.1f ns/spawn\n", per);
+    return per;
+}
+
 // ---- Tell latency: ActorRef -> Actor, fire-and-forget -------------------
 
-double bench_tell_latency() {
+double bench_tell_latency(unsigned workers) {
     constexpr std::uint64_t kWarmup = 10'000;
     constexpr std::uint64_t kSamples = 100'000;
 
     detail::MessagePool pool{256};
-    Engine eng(EngineConfig{1, 1, 64, 1024});
+    Engine eng(EngineConfig{workers, workers, 64, 1024});
     auto aid = eng.spawn<PingActor>(42).value();
     LocalRouter router(eng.post_courier(), pool);
     ActorRef<PingActor> ref = router.get<PingActor>(42);
@@ -97,12 +121,12 @@ double bench_tell_latency() {
 
 // ---- Ask latency: ActorRef -> Actor, request-response ------------------
 
-double bench_ask_latency() {
+double bench_ask_latency(unsigned workers) {
     constexpr std::uint64_t kWarmup = 5'000;
     constexpr std::uint64_t kSamples = 50'000;
 
     detail::MessagePool ask_pool{256};
-    Engine eng2(EngineConfig{1, 1, 64, 1024});
+    Engine eng2(EngineConfig{workers, workers, 64, 1024});
     auto aid2 = eng2.spawn<EchoActor>(42).value();
     LocalRouter router2(eng2.post_courier(), ask_pool);
     ActorRef<EchoActor> ref2 = router2.get<EchoActor>(42);
@@ -136,11 +160,11 @@ double bench_ask_latency() {
 
 // ---- Throughput: fire-and-forget, bulk ---------------------------------
 
-double bench_throughput() {
+double bench_throughput(unsigned workers) {
     constexpr std::uint64_t kOps = 1'000'000;
 
     detail::MessagePool thr_pool{256};
-    Engine eng3(EngineConfig{1, 1, 64, 1024});
+    Engine eng3(EngineConfig{workers, workers, 64, 1024});
     auto aid3 = eng3.spawn<PingActor>(42).value();
     LocalRouter router3(eng3.post_courier(), thr_pool);
     ActorRef<PingActor> ref3 = router3.get<PingActor>(42);
@@ -161,37 +185,30 @@ double bench_throughput() {
     return mps;
 }
 
-// ---- Spawn overhead ----------------------------------------------------
-
-double bench_spawn() {
-    constexpr std::uint64_t kSpawns = 10'000;
-
-    Engine eng(EngineConfig{1, 1, 64, 1024});
-    auto t0 = pal::clock::now();
-    for (std::uint64_t i = 0; i < kSpawns; ++i) {
-        auto aid = eng.spawn<PingActor>(i).value();
-    }
-    auto t1 = pal::clock::now();
-    double per = std::chrono::duration<double, std::nano>(t1 - t0).count() / kSpawns;
-    std::printf("spawn overhead (%llu spawns):\n",
-                static_cast<unsigned long long>(kSpawns));
-    std::printf("  %8.1f ns/spawn\n", per);
-    return per;
-}
-
 }  // namespace
 
-int main() {
-    std::printf("=== Quark v0.1.0 Benchmarks (Ryzen 5 4600H, Windows) ===\n");
-    std::printf("Compiler: clang++ 22.1.5\n\n");
+int main(int argc, char** argv) {
+    unsigned workers = 1;
+    if (argc > 1)
+        workers = static_cast<unsigned>(std::atoi(argv[1]));
+    if (workers == 0)
+        workers = static_cast<unsigned>(std::thread::hardware_concurrency());
 
-    bench_spawn();
+    unsigned max_workers = static_cast<unsigned>(std::thread::hardware_concurrency());
+
+    std::printf("=== Quark v0.1.0 Benchmarks (Ryzen 5 4600H, Windows) ===\n");
+    std::printf("Compiler: clang++ 22.1.5\n");
+    std::printf("Workers:  %u (max %u)\n\n", workers, max_workers);
+
+    // Spawn is single-threaded by nature (happens before start)
+    bench_spawn(workers);
     std::printf("\n");
-    bench_tell_latency();
+
+    bench_tell_latency(workers);
     std::printf("\n");
-    bench_ask_latency();
+    bench_ask_latency(workers);
     std::printf("\n");
-    bench_throughput();
+    bench_throughput(workers);
 
     return 0;
 }
