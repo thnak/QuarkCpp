@@ -125,7 +125,8 @@ conditions, so all are recorded rather than treated as one canonical figure:
   still needs a materially different producer-side design; ADR-032 flags
   pairing SEG-REX's bounded-segment reversal (which *did* achieve flat p999
   independent of backlog depth) with real hazard-pointer/RCU reclamation as
-  the most promising untried direction. See ADR-031, ADR-032.
+  the most promising untried direction. See ADR-031, ADR-032, and
+  [TAIL-CONTENTION.md](TAIL-CONTENTION.md) for the mechanism walkthrough.
 - **Busy/Empty/mid-publish tri-state contract validated as the reference
   correctness property for future designs (ADR-032).** SBR-v5's C2 claim
   (paused-producer correctly reports Busy, never folded into Empty) passed
