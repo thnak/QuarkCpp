@@ -6,6 +6,7 @@
 //    (023 sustained goal >= 10 M/s / floor >= 4 M; peak tight-loop goal >= 50 M / floor >= 20 M).
 //
 // Pin it: `taskset -c 0 build/bench/mailbox_bench` (latency) — never saturate the machine.
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -84,11 +85,60 @@ void bench_throughput() {
     std::printf("  (checksum=%llu)\n", static_cast<unsigned long long>(checksum));
 }
 
+// Dimension 19 ("Micro Benchmark") — isolated single-operation cost, nothing else in the loop:
+// enqueue-only (a tight loop of ONLY mb.enqueue() calls, no dequeue interleaved) and dequeue-only
+// (a pre-built cold backlog, then a tight loop of ONLY mb.try_dequeue() calls). Reported as simple
+// ns/op (this file's existing style — cf. bench_throughput/bench_latency above), NOT a full
+// percentile distribution: bench/mailbox_enqueue_latency_bench.cpp is the dedicated p50/p99/p999
+// deep-dive (occupancy-1 AND contended) for the producer side; bench/mailbox_backlog_queue_depth_
+// bench.cpp's dim-14 section is the dedicated per-depth dequeue-latency deep-dive. This is the
+// single-number microbenchmark companion to both, in the spirit of this file's existing two.
+void bench_micro_enqueue_only() {
+    constexpr std::uint64_t kOps = 20'000'000;
+    std::vector<Descriptor> descs(kOps);
+    for (std::uint64_t i = 0; i < kOps; ++i) descs[i].message_id = MessageId{i};
+
+    Mailbox mb;
+    const auto t0 = pal::clock::now();
+    for (std::uint64_t i = 0; i < kOps; ++i) mb.enqueue(&descs[i]);
+    const auto t1 = pal::clock::now();
+
+    const double ns_per_op =
+        std::chrono::duration<double, std::nano>(t1 - t0).count() / static_cast<double>(kOps);
+    std::printf("micro: enqueue-only (tight loop, no dequeue interleaved):\n");
+    std::printf("  %6.2f ns/op   (%" PRIu64 " ops)\n", ns_per_op, kOps);
+}
+
+void bench_micro_dequeue_only() {
+    constexpr std::uint64_t kOps = 20'000'000;
+    std::vector<Descriptor> descs(kOps);
+    for (std::uint64_t i = 0; i < kOps; ++i) descs[i].message_id = MessageId{i};
+
+    Mailbox mb;
+    for (std::uint64_t i = 0; i < kOps; ++i) mb.enqueue(&descs[i]);  // cold backlog, untimed
+
+    std::uint64_t checksum = 0;
+    const auto t0 = pal::clock::now();
+    for (std::uint64_t i = 0; i < kOps; ++i) {
+        DrainResult r = mb.try_dequeue();
+        if (r.status != DrainStatus::Message) { std::fprintf(stderr, "micro dequeue miss\n"); return; }
+        checksum += r.desc->message_id.value;
+    }
+    const auto t1 = pal::clock::now();
+
+    const double ns_per_op =
+        std::chrono::duration<double, std::nano>(t1 - t0).count() / static_cast<double>(kOps);
+    std::printf("micro: dequeue-only (tight loop over a pre-built cold backlog):\n");
+    std::printf("  %6.2f ns/op   (%" PRIu64 " ops, checksum=%" PRIu64 ")\n", ns_per_op, kOps, checksum);
+}
+
 }  // namespace
 
 int main() {
     std::printf("== Quark 003 Mailbox bench (pin with taskset -c 0) ==\n");
     bench_throughput();
     bench_latency();
+    bench_micro_enqueue_only();
+    bench_micro_dequeue_only();
     return 0;
 }

@@ -1,0 +1,186 @@
+{
+  "captured_at": "2026-07-28 10:06:43 UTC",
+  "metrics": {
+    "10) Consumer/shard scaling :: shards=workers=1": {
+      "unit": "M msg/s",
+      "value": 3.18
+    },
+    "10) Consumer/shard scaling :: shards=workers=2": {
+      "unit": "M msg/s",
+      "value": 4.15
+    },
+    "10) Consumer/shard scaling :: shards=workers=4": {
+      "unit": "M msg/s",
+      "value": 4.04
+    },
+    "11) Mixed workload (tell+ask, varying payload) :: ask p50 (concurrent w/ tell traffic)": {
+      "unit": "ns",
+      "value": 2226.0
+    },
+    "11) Mixed workload (tell+ask, varying payload) :: tell aggregate (mixed payloads, concurrent w/ ask)": {
+      "unit": "M msg/s",
+      "value": 2.68
+    },
+    "12) Enqueue latency :: contended (P=4) pooled p50": {
+      "unit": "ns",
+      "value": 157.0
+    },
+    "12) Enqueue latency :: occupancy-1 p50": {
+      "unit": "ns",
+      "value": 42.0
+    },
+    "13) End-to-end latency (real Engine) :: 1-worker e2e p50": {
+      "unit": "ns",
+      "value": 1552.0
+    },
+    "13) End-to-end latency (real Engine) :: 2-worker e2e p50": {
+      "unit": "ns",
+      "value": 1428.0
+    },
+    "14) Tail latency vs backlog depth :: depth=1024 p999": {
+      "unit": "ns",
+      "value": 78.0
+    },
+    "14) Tail latency vs backlog depth :: depth=16384 p999": {
+      "unit": "ns",
+      "value": 121.0
+    },
+    "14) Tail latency vs backlog depth :: depth=262144 p999": {
+      "unit": "ns",
+      "value": 133.0
+    },
+    "14) Tail latency vs backlog depth :: depth=64 p999": {
+      "unit": "ns",
+      "value": 83.0
+    },
+    "15) Contention isolation :: P=1 contended": {
+      "unit": "M msg/s",
+      "value": 25.44
+    },
+    "15) Contention isolation :: P=1 uncontended": {
+      "unit": "M msg/s",
+      "value": 22.04
+    },
+    "15) Contention isolation :: P=2 contended": {
+      "unit": "M msg/s",
+      "value": 11.13
+    },
+    "15) Contention isolation :: P=2 uncontended": {
+      "unit": "M msg/s",
+      "value": 34.93
+    },
+    "15) Contention isolation :: P=4 contended": {
+      "unit": "M msg/s",
+      "value": 10.23
+    },
+    "15) Contention isolation :: P=4 uncontended": {
+      "unit": "M msg/s",
+      "value": 33.96
+    },
+    "16/17) NUMA same vs cross socket :: 16) same-socket": {
+      "unit": "M msg/s",
+      "value": 13.48
+    },
+    "16/17) NUMA same vs cross socket :: 17) cross-socket": {
+      "unit": "M msg/s",
+      "value": 13.48
+    },
+    "18) False sharing :: padded/false-shared speedup": {
+      "unit": "x",
+      "value": 9.16
+    },
+    "19) Micro benchmark (enqueue/dequeue-only) :: dequeue-only": {
+      "unit": "ns/op",
+      "value": 8.26
+    },
+    "19) Micro benchmark (enqueue/dequeue-only) :: enqueue-only": {
+      "unit": "ns/op",
+      "value": 17.11
+    },
+    "20) Cache locality :: cold/hot ratio": {
+      "unit": "x",
+      "value": 5.38
+    },
+    "21) Memory footprint :: fixed per-partition overhead": {
+      "unit": "B",
+      "value": 128.0
+    },
+    "21) Memory footprint :: sizeof(Descriptor)": {
+      "unit": "B",
+      "value": 56.0
+    },
+    "21) Memory footprint :: sizeof(Mailbox)": {
+      "unit": "B",
+      "value": 192.0
+    },
+    "22) Queue depth (steady-state) :: depth=1 throughput": {
+      "unit": "M msg/s",
+      "value": 10.16
+    },
+    "22) Queue depth (steady-state) :: depth=1024 throughput": {
+      "unit": "M msg/s",
+      "value": 12.08
+    },
+    "22) Queue depth (steady-state) :: depth=16384 throughput": {
+      "unit": "M msg/s",
+      "value": 12.12
+    },
+    "22) Queue depth (steady-state) :: depth=64 throughput": {
+      "unit": "M msg/s",
+      "value": 11.11
+    },
+    "23) Scheduler (existing sched_bench.cpp) :: full-lifecycle throughput": {
+      "unit": "M msg/s",
+      "value": 11.4
+    },
+    "24) Ping-pong round trip :: cross-shard p50": {
+      "unit": "ns",
+      "value": 2427.0
+    },
+    "24) Ping-pong round trip :: same-shard p50": {
+      "unit": "ns",
+      "value": 391.0
+    },
+    "25) Fairness (per-producer latency spread) :: p50 spread": {
+      "unit": "%",
+      "value": 23.2
+    },
+    "25) Fairness (per-producer latency spread) :: p99 spread": {
+      "unit": "%",
+      "value": 1.1
+    },
+    "8) Throughput (P=1 aggregate) :: mailbox_bench peak (single-thread tight loop)": {
+      "unit": "M msg/s",
+      "value": 41.79
+    },
+    "8) Throughput (P=1 aggregate) :: msg/s": {
+      "unit": "M msg/s",
+      "value": 22.83
+    },
+    "9) Producer scaling :: P=1 aggregate": {
+      "unit": "M msg/s",
+      "value": 22.83
+    },
+    "9) Producer scaling :: P=1 per-producer avg": {
+      "unit": "M msg/s",
+      "value": 25.93
+    },
+    "9) Producer scaling :: P=2 aggregate": {
+      "unit": "M msg/s",
+      "value": 35.49
+    },
+    "9) Producer scaling :: P=2 per-producer avg": {
+      "unit": "M msg/s",
+      "value": 31.65
+    },
+    "9) Producer scaling :: P=4 aggregate": {
+      "unit": "M msg/s",
+      "value": 13.04
+    },
+    "9) Producer scaling :: P=4 per-producer avg": {
+      "unit": "M msg/s",
+      "value": 4.54
+    }
+  },
+  "note": "Baseline for the CURRENT shipped Vyukov mailbox (include/quark/core/mailbox.hpp), pre round-9 redesign. Re-run with --update-baseline after a future mailbox redesign lands to compare, or diff this file directly."
+}

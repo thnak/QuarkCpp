@@ -15,9 +15,11 @@ all cores saturate. Run latency/throughput micros as:
 taskset -c 0 build/bench/<name>
 ```
 
-Never run a bench without `taskset`, never pin to more than the 4 permitted cores (`-c 0-3`), and there
-is deliberately **no N-core aggregate-scaling bench** here (023's `≥0.8·N` line needs a quiesced
-many-core CI box, not this machine). Build with `-j4`, never `-j$(nproc)`.
+Never run a bench without `taskset`, never pin to more than the 4 permitted cores (`-c 0-3`) by
+default. Build with `-j4`, never `-j$(nproc)`. (023's `≥0.8·N` line needs a quiesced many-core CI
+box this dev box is not — the mailbox scaling/contention suite below DOES sweep small producer
+counts (P<=4 by default) specifically to characterize the mailbox's own P-scaling shape, capped and
+documented per-file; it is not a substitute for a dedicated many-core reference run.)
 
 ## The reference machine (023 §"The reference machine")
 
@@ -99,3 +101,33 @@ slow). Enable a `perf`-labelled CTest entry with `-DQUARK_BENCH_CI_GATE=ON` then
 skipped entirely under a sanitizer build (ASan/TSan make ns numbers meaningless). CI wires it in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) alongside the four-config correctness matrix.
 Benches are pinned to ≤4 cores (repo machine-safety rule), auto-narrowed to the CPUs actually present.
+
+## Mailbox 25-dimension benchmark/test suite
+
+A dedicated, permanent suite evaluating the mailbox subsystem (`include/quark/core/mailbox.hpp`)
+across 25 named dimensions, built to reproduce the known sub-linear producer-scaling shape
+(decisions/ADR-031-mailbox-mpsc-hot-path-r8-judgment.md) against the CURRENT shipped mailbox and to
+be reused unchanged against any future redesign. Correctness (FIFO-per-sender, exactly-once, ABA
+stress) lives under `tests/mailbox_*`/`mailbox_engine_fifo_exactly_once_test`/
+`mailbox_pool_aba_stress_test` — auto-discovered, sanitizer-covered like every other test. The
+performance half:
+
+| Bench | Dimensions covered |
+|---|---|
+| `mailbox_bench` (extended) | 8 throughput, 12 occ-1 latency, 19 micro enqueue/dequeue-only |
+| `mailbox_scaling_bench` | 9 producer scaling, 15 contention isolation, 16/17 NUMA same/cross socket, 25 fairness |
+| `mailbox_backlog_queue_depth_bench` | 14 tail latency vs backlog depth, 22 steady-state queue depth |
+| `mailbox_enqueue_latency_bench` | 12 pure enqueue latency, solo + contended |
+| `mailbox_e2e_engine_bench` | 13 end-to-end latency through a real Engine (spawn/tell) |
+| `mailbox_mixed_workload_bench` | 11 mixed tell+ask, varying payload sizes |
+| `mailbox_consumer_scaling_bench` | 10 consumer/shard/worker scaling (many actors, not one mailbox) |
+| `false_sharing_bench` | 18 false sharing (cites mailbox.hpp's existing layout `static_assert`) |
+| `mailbox_cache_locality_bench` | 20 hot vs cold descriptor-pool cache locality |
+| `mailbox_memory_footprint_bench` | 21 memory (per-idle-mailbox bytes, MessagePool per-partition tradeoff) |
+| `ping_pong_bench` | 24 two-actor `tell()`-based round trip (distinct from `ask_bench`'s ReplyCell round trip) |
+| `sched_bench` (existing) | 23 full Engine lifecycle — cited, not duplicated |
+
+`mailbox_regression_dashboard.py` (stdlib-only Python3) runs the whole suite plus the correctness
+tests, renders one consolidated table, and diffs against the checked-in `mailbox_baseline_r8.json`
+(captured against the current shipped mailbox) — re-run after any future mailbox redesign to compare
+side by side: `python3 bench/mailbox_regression_dashboard.py [--update-baseline] [--html out.html]`.
