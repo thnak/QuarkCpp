@@ -39,7 +39,7 @@ Mailbox → MessageHandle → Descriptor → Payload
 
 ## Mailbox structure — intrusive Vyukov MPSC
 
-> Pinned by **[ADR-002](ADR-002-mailbox-mpsc-hot-path-r2)** — the
+> Pinned by **[ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md)** — the
 > only design of three that swept its safety, correctness, and speed claims under
 > executed C++ (GCC 14.2 + Clang 20.1, TSan/ASan/UBSan, percentile benchmarks).
 
@@ -109,7 +109,7 @@ cheaply on the hot path.
 The queue is **unbounded** — it provides no backpressure of its own. A runaway
 producer that outruns the drain exhausts the shard's descriptor pool. Bounding
 that is **out of mailbox scope**: admission and overload control are a companion
-policy in [022-Resource-Governance-and-Overload-Control](022-Resource-Governance-and-Overload-Control).
+policy in [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md).
 
 ## Allocators
 
@@ -185,29 +185,63 @@ requirement**: the bit must be **shifted into the flags subfield** (e.g. via
 the whole 64-bit word — a real bit-shift bug of exactly this kind was found and
 fixed during ADR-029's proof (S6).
 
-## Close-out ordering — Dekker fence proven necessary; `ExecStateCell`'s own ordering open (ADR-031, r8 judgment)
+## Close-out ordering — Dekker fence proven necessary; `ExecStateCell`'s own ordering now independently proven load-bearing (ADR-031 r8, closed by ADR-032 r9)
 
 Two distinct ordering claims in the exec-state close-out path were previously
-bundled together; ADR-031 separated them and proved only one:
+bundled together; ADR-031 separated them and proved only one; ADR-032 closed
+the other:
 
 - **The seq_cst Dekker fence in `Mailbox::producer_close_out_fence` /
   `consumer_close_out_fence` is proven load-bearing.** Removing it reproduces
   a real lost-wakeup: 0 lost/50M messages fenced vs. 366k–618k lost/50M
-  unfenced. This fence stays in the shipped design and is not a candidate for
-  removal or relaxation.
-- **`ExecStateCell`'s own release/acquire ordering, independent of that
-  fence, is NOT yet independently demonstrated necessary.** A mutant that
-  relaxed `ExecStateCell`'s ordering to `memory_order_relaxed` passed clean
-  under TSan on a real 3-worker `sched_no_lost_wakeup_test` workload (0
-  reports, `lost == 0`) — most plausibly because `run_queue.hpp`'s own,
-  untouched, Vyukov-style MPSC already transitively publishes the same data
-  via its own `acq_rel` exchange whenever an activation crosses threads on
-  that particular workload/topology. **This is an open question, not a
-  license to relax the ordering in shipped code**: the negative TSan result
-  covers one workload/topology, not a proof that the redundancy holds
-  generally. Closing this properly needs a dedicated, adversarial cross-
-  thread-handoff litmus that does not rely on `run_queue.hpp`'s incidental
-  publication before any downgrade is considered.
+  unfenced (ADR-031 F5, reconfirmed ADR-032: 0/50M fenced vs 441,292–576,097
+  lost/50M unfenced). This fence stays in the shipped design and is not a
+  candidate for removal or relaxation.
+- **`ExecStateCell`'s own release/acquire ordering is now independently
+  proven load-bearing (ADR-032 F4-revised), closing the question ADR-031
+  left open.** ADR-031's mutant test was inconclusive because it ran the
+  full `sched_no_lost_wakeup_test` workload, where `run_queue.hpp`'s own,
+  untouched, Vyukov-style MPSC transitively republishes the same data via
+  its own `acq_rel` exchange — masking whether `ExecStateCell`'s ordering
+  does anything on its own. ADR-032 isolated the claim with a dedicated
+  two-thread litmus that has no `run_queue.hpp` hop at all
+  (`tests/exec_state_cell_isolated_litmus_test.cpp`): at acquire/release, 0
+  TSan reports over 5M trials on both GCC and Clang; downgraded to
+  `memory_order_relaxed`, TSan fires a real race every time. The ordering is
+  independently necessary, not merely redundant with `run_queue.hpp`'s
+  incidental republication — this closes the open question definitively.
+- **Methodological caveat (ADR-032, applies to any future ordering-strength
+  claim on this mailbox): TSan cannot detect a race between two accesses to
+  the *same* atomic object, regardless of memory_order.** ADR-032's own
+  standard "downgrade release→relaxed and expect TSan to fire" control did
+  not fire on either `link_push`'s next-store or the producer's
+  `tail_.exchange` when tested this way. Any future claim that a given
+  memory_order is load-bearing on this mailbox must be verified via a
+  dedicated *isolated* litmus test (as `exec_state_cell_isolated_litmus_test`
+  now is) — never via a downgrade-and-rerun-TSan control on the shipped
+  multi-producer test, which cannot distinguish "genuinely redundant" from
+  "TSan structurally can't see this class of bug."
+- **New permanent regression coverage from ADR-032**: `F3b` (cancel racing
+  concurrent release/recycle — 1,000,000 iterations, 0 UAF/double-free, 0
+  TSan/ASan reports) and `C2b` (48-bit generation wraps correctly at the
+  boundary: seeded at gen_max, `release()` → `generation()==0`, stale
+  gen_max handles safely rejected post-wrap).
+
+### Rejected designs (round 9, ADR-032)
+
+- **SBR-v5** (resident sequence-numbered ring + proven-mailbox overflow
+  valve) — disqualified: its own stated global-ticket-order guarantee across
+  the ring/overflow seam is violated once ≥2 producers concurrently engage
+  overflow (up to 858,983 out-of-order deliveries per run). Do not re-attempt
+  this specific ring/overflow handoff protocol without first fixing that
+  ordering seam.
+- **SEG-REX** (segmented Treiber-push / bounded-batch-reversal mailbox) —
+  disqualified: its segment-seal/reclamation protocol has a reproducible
+  unsigned-underflow-then-deadlock, sanitizer-invisible (a logical/ABA bug,
+  not a data race), that persisted after an in-round repair attempt. Do not
+  re-attempt this specific announce/revalidate/quiesce reclamation mechanism
+  without first replacing it with real hazard-pointer/RCU-style deferred
+  reclamation — see 015's residual-risk note on this same design.
 
 ## Shared-payload reclamation (broadcast)
 
@@ -259,7 +293,7 @@ one `fetch_add` per admitted enqueue and never waits for a decrement).
 
 An outbound streaming reply carries **0 per-item steady-state heap on both legs** —
 the callee's produce leg and the caller's drain leg
-([ADR-018](ADR-018-outbound-streaming-replies), the 024 ring run
+([ADR-018](decisions/ADR-018-outbound-streaming-replies.md), the 024 ring run
 backward). The one acknowledged non-zero is the callee's **cold `task<>` frame at 1
 alloc/ask**; it is eliminable by an **optional pooled `promise_type` operator new**
 (a shard frame-slab) that **does not touch the item path**.

@@ -82,14 +82,16 @@ producer:  tail_.exchange(desc, acq_rel);    atomic_thread_fence(seq_cst);  exec
 > **0/200k**. Keep this as a permanent regression test. See
 > [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md).
 
-## Mailbox hot-path baseline (ADR-029 r7, ADR-031 r8 judgment)
+## Mailbox hot-path baseline (ADR-029 r7, ADR-031 r8, ADR-032 r9 judgment)
 
 The intrusive Vyukov mailbox (003) won its 7th consecutive design round in
 ADR-029, then successfully defended against two fresh challengers (a
 segmented-ring/epoch-gated design and a 4th-generation Treiber-push/batch-
-reversal design) in ADR-031 r8 — neither dislodged it. Measured numbers from
-both rounds are real data points on different hosts/load conditions, so both
-are recorded rather than treated as one canonical figure:
+reversal design) in ADR-031 r8, then again in ADR-032 r9 against a resident
+sequence-numbered ring with overflow valve (SBR-v5) and a segmented Treiber-
+push/bounded-batch-reversal design (SEG-REX) — neither dislodged it. Measured
+numbers from all rounds are real data points on different hosts/load
+conditions, so all are recorded rather than treated as one canonical figure:
 
 - **F2 — steady-state zero-RMW dequeue**: 0 cross-core RMW on the steady
   multi-node dequeue path; the one unavoidable RMW is confined to the
@@ -104,15 +106,32 @@ are recorded rather than treated as one canonical figure:
   250ns/50µs hard budgets on that host. Both are real, host-dependent
   measurements; the budget-compliance verdict (pass) is what carries across
   hosts, not either single number.
-- **P=4 scaling gap — mechanism isolated (ADR-031), still open as a fix.**
-  The gap between single-producer and P≥4 aggregate throughput is caused by
-  shared `tail_` cache-line contention: a same-shape independent-cache-line
-  control measured contended P3/P1 = 0.73–0.88× versus uncontended P3/P1 =
-  2.5–2.6× (near-linear), isolating the mechanism rather than leaving it a
-  profiled-but-unexplained hypothesis. Closing it — not just diagnosing it —
-  would need a materially different producer-side design (e.g. sharded tails,
-  per-producer batching), which is a fresh design round, not a tuning change
-  to the current mailbox. See ADR-031.
+- **P=4 scaling gap — mechanism isolated (ADR-031), reconfirmed and both
+  fresh fixes rejected (ADR-032 r9), still open.** The gap between
+  single-producer and P≥4 aggregate throughput is caused by shared `tail_`
+  cache-line contention: a same-shape independent-cache-line control measured
+  contended P3/P1 = 0.73–0.88× versus uncontended P3/P1 = 2.5–2.6×
+  (near-linear), isolating the mechanism rather than leaving it a
+  profiled-but-unexplained hypothesis. ADR-032 r9 measured the same effect
+  directly on the incumbent (P=1→4 aggregate enqueue throughput degrading
+  ~24–29%: 28.97→21.93 Mops/s gcc, 24.81→17.62 Mops/s clang) and tried two
+  purpose-built fixes: SBR-v5's ring valve engaged its overflow path at a
+  small fraction of peak load and then ran *slower* than the incumbent alone
+  (8.1M vs 13.5M ops/s at P=4), and also broke its own stated global-ticket-
+  order guarantee (up to 858,983 out-of-order deliveries/run); SEG-REX's
+  segmented push lost to the incumbent by 3–4× at every producer count and
+  had a sanitizer-invisible reclamation deadlock. Both were disqualified, not
+  merely slower-by-preference. Closing the gap — not just diagnosing it —
+  still needs a materially different producer-side design; ADR-032 flags
+  pairing SEG-REX's bounded-segment reversal (which *did* achieve flat p999
+  independent of backlog depth) with real hazard-pointer/RCU reclamation as
+  the most promising untried direction. See ADR-031, ADR-032.
+- **Busy/Empty/mid-publish tri-state contract validated as the reference
+  correctness property for future designs (ADR-032).** SBR-v5's C2 claim
+  (paused-producer correctly reports Busy, never folded into Empty) passed
+  cleanly under 300+ trials specifically because it reused this contract
+  unmodified — any future segmented/ring redesign of the mailbox must
+  reproduce this same tri-state handling, not just match throughput.
 
 ## Sharding
 

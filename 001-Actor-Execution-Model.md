@@ -81,6 +81,14 @@ reversal mailbox); neither dislodged it, and the single-executor invariant
 held (proven CORRECT, S1/S3-equivalent) under both fresh attempts. See
 ADR-031.
 
+**Reconfirmed a third time (ADR-032, r9 judgment), independently on both the
+incumbent and its challenger.** C3 (incumbent, max_concurrent_drainers=1 over
+100k–300k cycles, 3 workers) and SEG-REX's own S3 (same invariant, over 4M
+cycles) both held clean, on both GCC and Clang. The invariant is orthogonal
+to mailbox internals: any future mailbox redesign inherits this proof for
+free only if it leaves `ExecStateCell`'s transitions untouched, exactly as
+both r9 challengers correctly did. See ADR-032.
+
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
 contract (a worker requeuing an activation via work-steal, and a different

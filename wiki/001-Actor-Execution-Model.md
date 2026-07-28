@@ -53,7 +53,7 @@ does not execute, it just ensures the actor is (re)scheduled.
      **release** on `Running → Idle` release-ownership and **acquire** on
      `Idle → Running` acquire-ownership. The dequeue side does no atomic RMW of its
      own (003, 023). Downgrading either to `relaxed` reintroduces a data race on
-     `head_`: [ADR-002](ADR-002-mailbox-mpsc-hot-path-r2) proves it
+     `head_`: [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md) proves it
      with a positive control (relaxing the CAS makes TSan report a `head_` race
      every run).
   2. **Wakeup rendezvous** with producers — the release-ownership `store(exec_state)`
@@ -80,6 +80,14 @@ segmented-ring/epoch-gated mailbox and a 4th-generation Treiber-push/batch-
 reversal mailbox); neither dislodged it, and the single-executor invariant
 held (proven CORRECT, S1/S3-equivalent) under both fresh attempts. See
 ADR-031.
+
+**Reconfirmed a third time (ADR-032, r9 judgment), independently on both the
+incumbent and its challenger.** C3 (incumbent, max_concurrent_drainers=1 over
+100k–300k cycles, 3 workers) and SEG-REX's own S3 (same invariant, over 4M
+cycles) both held clean, on both GCC and Clang. The invariant is orthogonal
+to mailbox internals: any future mailbox redesign inherits this proof for
+free only if it leaves `ExecStateCell`'s transitions untouched, exactly as
+both r9 challengers correctly did. See ADR-032.
 
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
@@ -118,7 +126,7 @@ public:
   For a `Sequential` actor this is normative: a drain step dispatches one message
   and returns **`Completed`** or **`Suspended`**; on `Suspended` the worker
   **parks the drain** — it must **not advance the mailbox** to the next message.
-  [ADR-002](ADR-002-mailbox-mpsc-hot-path-r2) caught a competing
+  [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md) caught a competing
   design whose drain loop advanced past a suspended handler, breaking
   single-executor; the loop must park, not proceed. When the suspended task
   completes it **re-schedules through the admission gate** (015) rather than
@@ -133,7 +141,7 @@ heavy async I/O naturally serializes its own messages. Use `Reentrant` /
 invariant; a **suspended** stream handler does **not** advance the drain — the
 stream's split `disp`/`tail` cursors freeze at the parked frame until 015 re-admits,
 giving exactly-once dispatch (proven: `concur_violations = 0`, no wedge). See
-[024-Streaming-and-Inbound-Streams](024-Streaming-and-Inbound-Streams).
+[024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md).
 
 **Outbound reply streaming obeys it on both legs** (ADR-018). An `ask_stream`
 reply is the 024 ring flipped (callee = producer, caller = consumer), and
@@ -143,7 +151,7 @@ concurrently with its own actor. A **suspended** handler on either leg advances
 nothing past the parked frame — the producing callee freezes `head`, the draining
 caller freezes its `disp`/`tail` — until 015 re-admits, exactly the
 single-executor-across-suspend rule ADR-014 proved for the inbound drain. See
-[ADR-018-outbound-streaming-replies](ADR-018-outbound-streaming-replies).
+[decisions/ADR-018-outbound-streaming-replies.md](decisions/ADR-018-outbound-streaming-replies.md).
 
 ### Execution vehicle — passive + stackless core
 
@@ -152,7 +160,7 @@ actor is a passive object (state + mailbox) scheduled onto one of N worker lanes
 when it has messages; **it owns no stack of its own.** A sync handler runs inline on the
 worker's own stack; an async handler suspends the *activation*, not the thread, pinning
 only its live coroutine frame. This is normative and was proven the best vehicle by
-[ADR-015](ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers)
+[ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)
 against pooled/​per-actor stackful-fiber alternatives: **192 B per idle actor** (identical
 at 10⁶ and 10⁷ actors, ~28× under the 023 footprint ceiling), a depth-bounded suspended
 frame (656 B–2.9 KB for nesting depth ≤ 8) that beats a fiber at every such depth with no
@@ -215,7 +223,7 @@ reclamation (003) all build on, is defined in `015-Reentrancy-and-Quiescence.md`
 
 ## Reply ordering for concurrent `ask`s
 
-Resolved by [ADR-007](ADR-007-actor-authoring-and-handler-dispatch-api):
+Resolved by [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md):
 
 - **Requests** always stay **mailbox-FIFO** — concurrency never reorders what the actor
   *receives*.

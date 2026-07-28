@@ -65,7 +65,7 @@ completes, it **re-schedules the activation through the admission gate** — it 
 becomes a second executor of the actor: it hands the actor back to the scheduler
 (002), which acquires ownership afresh via the exec-state CAS. This is what makes
 the mailbox's consumer-private `head_` safe to leave un-atomic across the
-suspension (001, [ADR-002](ADR-002-mailbox-mpsc-hot-path-r2)).
+suspension (001, [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md)).
 
 The `Paused` seal also **ties into the mailbox `Busy`/bounded-spin park path**
 (002): when a drain step reports `Busy` (a producer mid-publish) or the budget
@@ -110,6 +110,33 @@ oversubscription. Admission control and the scheduler's park path are the same
 > again unless it brings a genuinely new **O(1) oldest-message-discovery
 > mechanism** — the property every design in this lineage has lacked across
 > all four rounds.
+>
+> **Update (ADR-032, r9 judgment) — the O(1) oldest-message-discovery gap was
+> partially cleared, then immediately disqualified on a separate ground.**
+> SEG-REX (segmented Treiber-push / bounded-batch-reversal, `SEG_CAP=256`) is
+> the first design in five rounds (REX/REX-BIR/REX-CAS/B/REX-CAS/C/SEG-REX) to
+> achieve a flat, bounded p999 reversal-walk latency independent of backlog
+> depth: 1.3–17.9µs across B∈{4096..262144}, with a SEG_CAP sweep confirming
+> SEG_CAP=4096 breaches the 50µs budget while SEG_CAP=256 stays under it. This
+> is a real, reusable finding, not a reason to re-adopt SEG-REX itself: the
+> same design's segment-seal/reclamation protocol (S2/S4) has a reproducible,
+> sanitizer-invisible unsigned-underflow-then-deadlock that survived an
+> in-round repair attempt, and its raw throughput lost to Vyukov by 3–4× at
+> every producer count — both independently disqualifying. A future round
+> should pair SEG-REX's bounded-segment-reversal mechanism with a *correct*
+> hazard-pointer/RCU-style deferred reclamation scheme (not the ad hoc
+> announce/revalidate/quiesce hybrid tried here) rather than re-attempting
+> SEG-REX as specified. See ADR-032.
+>
+> **Standing methodological requirement (ADR-032) — sanitizers are necessary
+> but not sufficient for this class of lock-free-queue bug.** Both r9
+> challengers failed on properties TSan/ASan/UBSan could not see: SBR-v5's
+> ticket-order-inversion (a logical ordering bug, no data race) and SEG-REX's
+> underflow/deadlock (an ABA-class bug, also no data race). Any future
+> mailbox-adjacent proof round must pair sanitizers with explicit
+> sequence/order assertions in the test harness itself (as this round's C1v2/
+> C3v2 and S2/S4 checks were) — "0 sanitizer reports" alone is not evidence of
+> correctness for this design space.
 >
 > **Methodology warning (ADR-031) — unsound cross-producer FIFO verification.**
 > ADR-031's cross-examination of REX-CAS/C found that a shared monotonic
