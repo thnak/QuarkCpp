@@ -74,6 +74,13 @@ debate's 7th round re-tested this exact acquire/release handoff and found it
 load-bearing and sufficient exactly as specified above — no change required to
 the single-executor / exec-state-CAS contract.
 
+**Reconfirmed again against fresh adversarial designs (ADR-031, r8
+judgment).** Round 8 pitted the incumbent against two new challengers (a
+segmented-ring/epoch-gated mailbox and a 4th-generation Treiber-push/batch-
+reversal mailbox); neither dislodged it, and the single-executor invariant
+held (proven CORRECT, S1/S3-equivalent) under both fresh attempts. See
+ADR-031.
+
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
 contract (a worker requeuing an activation via work-steal, and a different

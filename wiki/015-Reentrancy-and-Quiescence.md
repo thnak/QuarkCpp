@@ -92,19 +92,37 @@ oversubscription. Admission control and the scheduler's park path are the same
 > `Busy` result + 002 bounded-spin-then-reschedule (and 022 admission). Preserve the
 > `Busy`/bounded-spin path in any future mailbox change.
 
-> **Permanent negative example (ADR-020, reconfirmed ADR-029) — no unbounded
-> actor stalls.** REX-BIR and its round-7 revival REX-CAS/B (both
+> **Permanent negative example (ADR-020, reconfirmed ADR-029, reconfirmed a
+> 4th time in ADR-031) — no unbounded actor stalls.** REX-BIR, its round-7
+> revival REX-CAS/B, and its round-8 revival REX-CAS/C (all
 > LIFO-push-with-batch-reversal mailbox designs, offered as Vyukov challengers)
-> measured detach-to-first-dispatch **p999 latency at 10×–600× over 023's 50µs
-> hard ceiling**, at every backlog depth tested (`B ∈ {1024, 16384, 262144}`),
-> **including zero cross-actor contention** — reproduced twice now, in two
-> independent design rounds. REX-CAS/B's own stated mitigation (a
-> resumable/budget-charged reversal) was conceded fatal in its own debate. Cite
-> this as a permanent, citable negative example under this spec's no-unbounded-
-> stall rule: a future mailbox proposal from this lineage (LIFO-push +
-> batch-reversal) should not be entertained again unless it brings a genuinely
-> new **O(1) oldest-message-discovery mechanism** — the property every design in
-> this lineage has lacked.
+> measured detach-to-first-dispatch **p999 latency breaching 023's 50µs hard
+> ceiling at backlog depths as low as B=4096**, with reversal cost flat at
+> 2–10ns/node and **no cache-capacity knee up to B=262144** — reproduced a
+> 4th time now, in a 4th independent design round. This holds even though
+> ADR-031's REX-CAS/C variant genuinely *won* on raw throughput against Vyukov
+> at P∈{2,4} (55–60M vs 24–29M msg/s, attributable to its push touching only
+> a thread-local node versus Vyukov's cross-core `link_push`) — the tail-
+> latency ceiling breach disqualifies the lineage regardless of a throughput
+> win at a specific producer count. Cite this as a permanent, citable negative
+> example under this spec's no-unbounded-stall rule: a future mailbox proposal
+> from this lineage (LIFO-push + batch-reversal) should not be entertained
+> again unless it brings a genuinely new **O(1) oldest-message-discovery
+> mechanism** — the property every design in this lineage has lacked across
+> all four rounds.
+>
+> **Methodology warning (ADR-031) — unsound cross-producer FIFO verification.**
+> ADR-031's cross-examination of REX-CAS/C found that a shared monotonic
+> counter sampled to tag messages, when sampled **outside** the actual publish
+> operation (both tag-before-CAS and tag-after-CAS variants were tried),
+> produces real, reproducible ordering "inversions" (2.9%–7.3% of 20M
+> messages) that are an artifact of the verification method itself, not a
+> mailbox bug — the claim came back INCONCLUSIVE rather than CORRECT or WRONG
+> because the check as specified could not distinguish a real defect from a
+> methodology gap. A future design that needs to prove cross-producer total
+> ordering must not reuse this exact tagging approach as ground truth; a sound
+> methodology should be worked out *before* a future round budgets proof time
+> against it.
 
 ## The quiescence primitive
 

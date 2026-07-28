@@ -185,6 +185,30 @@ requirement**: the bit must be **shifted into the flags subfield** (e.g. via
 the whole 64-bit word — a real bit-shift bug of exactly this kind was found and
 fixed during ADR-029's proof (S6).
 
+## Close-out ordering — Dekker fence proven necessary; `ExecStateCell`'s own ordering open (ADR-031, r8 judgment)
+
+Two distinct ordering claims in the exec-state close-out path were previously
+bundled together; ADR-031 separated them and proved only one:
+
+- **The seq_cst Dekker fence in `Mailbox::producer_close_out_fence` /
+  `consumer_close_out_fence` is proven load-bearing.** Removing it reproduces
+  a real lost-wakeup: 0 lost/50M messages fenced vs. 366k–618k lost/50M
+  unfenced. This fence stays in the shipped design and is not a candidate for
+  removal or relaxation.
+- **`ExecStateCell`'s own release/acquire ordering, independent of that
+  fence, is NOT yet independently demonstrated necessary.** A mutant that
+  relaxed `ExecStateCell`'s ordering to `memory_order_relaxed` passed clean
+  under TSan on a real 3-worker `sched_no_lost_wakeup_test` workload (0
+  reports, `lost == 0`) — most plausibly because `run_queue.hpp`'s own,
+  untouched, Vyukov-style MPSC already transitively publishes the same data
+  via its own `acq_rel` exchange whenever an activation crosses threads on
+  that particular workload/topology. **This is an open question, not a
+  license to relax the ordering in shipped code**: the negative TSan result
+  covers one workload/topology, not a proof that the redundancy holds
+  generally. Closing this properly needs a dedicated, adversarial cross-
+  thread-handoff litmus that does not rely on `run_queue.hpp`'s incidental
+  publication before any downgrade is considered.
+
 ## Shared-payload reclamation (broadcast)
 
 A `Topic<M>` publish (ADR-019) allocates **one** immutable, pool-allocated

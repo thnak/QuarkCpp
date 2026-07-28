@@ -82,25 +82,37 @@ producer:  tail_.exchange(desc, acq_rel);    atomic_thread_fence(seq_cst);  exec
 > **0/200k**. Keep this as a permanent regression test. See
 > [ADR-002](ADR-002-mailbox-mpsc-hot-path-r2).
 
-## Mailbox hot-path baseline (ADR-029, r7 judgment)
+## Mailbox hot-path baseline (ADR-029 r7, ADR-031 r8 judgment)
 
 The intrusive Vyukov mailbox (003) won its 7th consecutive design round in
-ADR-029. Its measured numbers supersede prior rounds' as the current baseline:
+ADR-029, then successfully defended against two fresh challengers (a
+segmented-ring/epoch-gated design and a 4th-generation Treiber-push/batch-
+reversal design) in ADR-031 r8 — neither dislodged it. Measured numbers from
+both rounds are real data points on different hosts/load conditions, so both
+are recorded rather than treated as one canonical figure:
 
 - **F2 — steady-state zero-RMW dequeue**: 0 cross-core RMW on the steady
   multi-node dequeue path; the one unavoidable RMW is confined to the
-  boundary/stub re-arm.
-- **F3 — throughput/latency**: measured p50 374–434ns, single-producer
-  throughput 6.8–7.9M msg/s, aggregate P=4 throughput 15.4–17.3M msg/s. This
-  fell short of a claimed floor (≤100ns / ≥10M msg/s) and is recorded as a
-  weighed loss on that specific number — not dismissed as noise — though the
-  reference host was under heavy, unrelated multi-tenant contention (load
-  average ~17 on a 32-core box) during the run, a real but non-dismissing
-  confound.
-- **P=4 scaling gap — tracked, not closed.** The gap between single-producer
-  and P=4 aggregate throughput is still undiagnosed. This is an open item
-  against the mailbox, not a regression to chase blindly in a future round
-  without first instrumenting *why* it doesn't scale linearly.
+  boundary/stub re-arm. Reconfirmed in ADR-031.
+- **F3 — throughput/latency**: ADR-029 measured p50 374–434ns, single-producer
+  throughput 6.8–7.9M msg/s, aggregate P=4 throughput 15.4–17.3M msg/s — this
+  fell short of a claimed floor (≤100ns / ≥10M msg/s), recorded as a weighed
+  loss on that specific number (the reference host was under heavy, unrelated
+  multi-tenant contention, load average ~17 on a 32-core box, a real but
+  non-dismissing confound). ADR-031, on different hardware, measured
+  occupancy-1 latency p50=60.0ns / p999=129–178ns — comfortably inside the
+  250ns/50µs hard budgets on that host. Both are real, host-dependent
+  measurements; the budget-compliance verdict (pass) is what carries across
+  hosts, not either single number.
+- **P=4 scaling gap — mechanism isolated (ADR-031), still open as a fix.**
+  The gap between single-producer and P≥4 aggregate throughput is caused by
+  shared `tail_` cache-line contention: a same-shape independent-cache-line
+  control measured contended P3/P1 = 0.73–0.88× versus uncontended P3/P1 =
+  2.5–2.6× (near-linear), isolating the mechanism rather than leaving it a
+  profiled-but-unexplained hypothesis. Closing it — not just diagnosing it —
+  would need a materially different producer-side design (e.g. sharded tails,
+  per-producer batching), which is a fresh design round, not a tuning change
+  to the current mailbox. See ADR-031.
 
 ## Sharding
 
