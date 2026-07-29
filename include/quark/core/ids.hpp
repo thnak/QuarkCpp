@@ -36,6 +36,18 @@ struct ActorId {
     friend constexpr bool operator==(const ActorId&, const ActorId&) = default;
 };
 
+// The FENCING token (012 §"Placement, mobility, and fencing"). Each activation acquires a
+// monotonically increasing token, persisted with the state; the store REJECTS writes carrying a
+// stale token, so a partitioned/superseded old activation cannot corrupt state after a newer one
+// takes over. The bump happens on reconstruct (ADR-009 Restart-reload rule). Lives here (not
+// persistence.hpp) so lightweight consumers (activation.hpp's ADR-028 Phase 8 DeactivateFlushSink)
+// can get it without pulling in the full Store/Snapshot persistence surface.
+struct FenceToken {
+    std::uint64_t value = 0;
+    friend constexpr bool operator==(FenceToken, FenceToken) = default;
+    friend constexpr bool operator<(FenceToken a, FenceToken b) noexcept { return a.value < b.value; }
+};
+
 }  // namespace quark
 
 // Standard hashing so these keys drop into unordered containers off the hot path.

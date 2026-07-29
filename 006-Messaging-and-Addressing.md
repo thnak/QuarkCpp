@@ -44,6 +44,25 @@ order.tell(Ship{ .id = 42 });
 - Returns immediately; no reply channel is allocated.
 - The payload is moved into shard-owned payload storage (`003`).
 
+### `passivate` — on-demand, soft teardown (ADR-028 Phase 8)
+
+```cpp
+bool accepted = order.passivate();
+```
+
+- Fire-and-forget, like `tell` — posts the same `Deactivate` control descriptor the automatic
+  idle-timeout wheel posts (011), through the same shared interlock, so the actor drains every
+  message already queued/in-flight and retires at the next genuinely-idle instant. Never a hard
+  mid-handler interrupt.
+- Returns `false` iff the target never resolves to a live activation (nothing to passivate);
+  `true` means accepted/already-pending, **not** "has retired yet."
+- **Sequential-only** — a compile error on a `Reentrant`/`MaxConcurrency<N>` actor, same
+  restriction as `IdleTimeout<Ms>` (011), since it reuses the same Dekker close-out sequence,
+  proven only for exactly one in-flight drain.
+- The `on_deactivate()` lifecycle hook (005) and the deactivation-time persistence flush (012)
+  fire identically whether retirement was triggered by the wheel or by `passivate()` — one call
+  site serves both.
+
 ### `ask` — request/response
 
 ```cpp

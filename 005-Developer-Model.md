@@ -30,6 +30,22 @@ public:
   actor's **protocol**, enumerated in `using protocol = quark::Protocol<…>` (see
   `006` and the dispatch section below).
 
+## Lifecycle hooks (opt-in, member-detected, no virtual)
+
+An actor may declare any of the following members; each is detected at compile time
+(`requires{}` + `if constexpr`, never RTTI/virtual) and simply omitted from the compiled
+metadata record when absent — zero cost for an actor that declares none of them:
+
+- `void on_deactivate()` — fires once, from the same call site, whether the actor was
+  retired by the automatic idle-timeout wheel (011) or an explicit `passivate()` call
+  (006, ADR-028 Phase 8). Runs while the worker still holds `Running`, strictly before
+  the actor is marked `Dormant`.
+- `result<void> wire(const ResourceScope&)` — the one-time cold resource-wiring pass (004).
+- `PersistState` + `snapshot_state()`/`restore_state(PersistState)` — the `Persistent<Snapshot>`
+  contract (012): `restore_state` runs at recovery (before the first message); `snapshot_state`
+  is read both to seed a fresh actor with no prior snapshot, and — for actors registered via
+  `Engine::declare_lazy<A>(store,...)` — to persist the latest state on deactivation.
+
 ## Policy catalog
 
 Every policy is a type. Defaults in **bold**.

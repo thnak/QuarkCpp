@@ -30,6 +30,22 @@ public:
   actor's **protocol**, enumerated in `using protocol = quark::Protocol<…>` (see
   `006` and the dispatch section below).
 
+## Lifecycle hooks (opt-in, member-detected, no virtual)
+
+An actor may declare any of the following members; each is detected at compile time
+(`requires{}` + `if constexpr`, never RTTI/virtual) and simply omitted from the compiled
+metadata record when absent — zero cost for an actor that declares none of them:
+
+- `void on_deactivate()` — fires once, from the same call site, whether the actor was
+  retired by the automatic idle-timeout wheel (011) or an explicit `passivate()` call
+  (006, ADR-028 Phase 8). Runs while the worker still holds `Running`, strictly before
+  the actor is marked `Dormant`.
+- `result<void> wire(const ResourceScope&)` — the one-time cold resource-wiring pass (004).
+- `PersistState` + `snapshot_state()`/`restore_state(PersistState)` — the `Persistent<Snapshot>`
+  contract (012): `restore_state` runs at recovery (before the first message); `snapshot_state`
+  is read both to seed a fresh actor with no prior snapshot, and — for actors registered via
+  `Engine::declare_lazy<A>(store,...)` — to persist the latest state on deactivation.
+
 ## Policy catalog
 
 Every policy is a type. Defaults in **bold**.
@@ -41,7 +57,7 @@ Every policy is a type. Defaults in **bold**.
 | **`Sequential`** | One message at a time (default). |
 | `Reentrant` | Begin the next message while an async handler is suspended. |
 | `MaxConcurrency<N>` | Cap in-flight handlers at `N`. |
-| `Stateless<N>` | **Pool** of up to `N` local activations, load-routed, no identity, no per-key FIFO, non-durable — opts out of single-activation for stateless workers (see [025](025-Placement-Policies-and-Stateless-Workers)). |
+| `Stateless<N>` | **Pool** of up to `N` local activations, load-routed, no identity, no per-key FIFO, non-durable — opts out of single-activation for stateless workers (see [025](025-Placement-Policies-and-Stateless-Workers.md)). |
 
 ### Placement
 
@@ -49,7 +65,7 @@ A placement policy is a **strategy** plus optional **modifiers** that narrow/bia
 candidate nodes — the developer's levers to optimize for capability, capacity,
 locality, or affinity. Modifiers resolve against the gossiped membership+capability
 set, so they stay **deterministic** (010, 025). Full model in
-[025-Placement-Policies-and-Stateless-Workers](025-Placement-Policies-and-Stateless-Workers).
+[025-Placement-Policies-and-Stateless-Workers.md](025-Placement-Policies-and-Stateless-Workers.md).
 
 | Strategy | Meaning |
 |---|---|
@@ -69,7 +85,7 @@ set, so they stay **deterministic** (010, 025). Full model in
 
 | Policy | Meaning |
 |---|---|
-| `Priority<P>` | Names a compile-time priority **class** consumed by the engine-level `PriorityBands<K, Anti>` scheduling policy (default `UniformFIFO`, [ADR-010](ADR-010-priority-and-fairness-scheduling-policy)). Priority orders activations **across** actors and **never** reorders an actor's own mailbox. Band is constant per actor type (startup-resolved, no per-message recompute). |
+| `Priority<P>` | Names a compile-time priority **class** consumed by the engine-level `PriorityBands<K, Anti>` scheduling policy (default `UniformFIFO`, [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md)). Priority orders activations **across** actors and **never** reorders an actor's own mailbox. Band is constant per actor type (startup-resolved, no per-message recompute). |
 | `DrainBudget<N>` | Max messages drained before yielding the lane. |
 
 ### Lifecycle
@@ -80,7 +96,7 @@ set, so they stay **deterministic** (010, 025). Full model in
 | `IdleTimeout<Ms>` | Deactivate after `Ms` idle. |
 
 `KeepAlive` / `IdleTimeout<Ms>` compile into per-type `LifecyclePolicy` fields that are
-**Live-reconfigurable operational knobs** ([ADR-008](ADR-008-engine-actor-configuration-and-activation-lifecycle-policy)):
+**Live-reconfigurable operational knobs** ([ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md)):
 the idle timeout is encoded as **coarse wheel ticks** in the packed operational word (013),
 with `idle_ticks == 0` the **`KeepAlive` sentinel**. A live `IdleTimeout` change is applied
 to the **existing idle population** by a shard-local **reconcile sweep** on the 011 wheel
@@ -93,7 +109,7 @@ per-instance overrides of `drain_budget` / `idle_timeout` are honored on the hot
 
 Resource *lifetimes* (`Cached<T>`, `PerMessage<T>`, `Ambient<T>`) are declared as
 **member fields** on the actor (`Cached<Logger> log_;`), as shown in `004`. This is
-the decided ergonomics ([ADR-007](ADR-007-actor-authoring-and-handler-dispatch-api)) —
+the decided ergonomics ([ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)) —
 the `using resources = ResourceSet<…>` type-list alternative was dropped; member
 fields read better and couple the declaration to its storage, which is what the
 metadata-compilation wiring needs anyway. They are lifetime declarations, not
@@ -101,7 +117,7 @@ scheduling policies.
 
 ## Handler dispatch
 
-Resolved by [ADR-007](ADR-007-actor-authoring-and-handler-dispatch-api)
+Resolved by [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)
 (D1 JumpTable-Dispatch, proven): dispatch is a **dense per-actor jump-table**, not a
 runtime type-id scan and not a virtual call.
 

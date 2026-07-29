@@ -180,6 +180,12 @@ public:
         return AskFuture<R>{lease.cell, &cp};
     }
 
+    // --- passivate (ADR-028 Phase 8; 006 §passivate): on-demand, SOFT actor teardown. ------------
+    // Fire-and-forget, matching tell's async nature. Delegates straight to the courier — returns
+    // false iff `id` never resolves to a live activation (nothing to passivate); true otherwise
+    // (accepted/already-pending, not a promise the actor has retired yet).
+    [[nodiscard]] bool request_passivate(ActorId id) noexcept { return courier_.passivate(id); }
+
 private:
     // Build the pooled descriptor + inline payload for `msg`, stamping the ADR-007 dense dispatch
     // slot and the {trace_id, deadline_ns} the caller resolved. Shared by the local `tell`/`ask`
@@ -277,6 +283,25 @@ public:
     template <class R, class Q>
     [[nodiscard]] AskFuture<R> ask(Q&& q) const {
         return router_->template ask<A, R>(id_, std::forward<Q>(q));
+    }
+
+    // passivate() — on-demand, SOFT actor teardown (ADR-028 Phase 8; 006 §passivate). Fire-and-
+    // forget: posts the SAME Deactivate control descriptor the automatic idle-timeout wheel posts,
+    // through the SAME shared interlock, so the actor drains every message already queued/in-flight
+    // and retires to Dormant at the next genuinely-idle instant — never a hard mid-handler interrupt.
+    // Sequential-only (mirrors IdleTimeout<Ms>'s existing restriction, policies.hpp): idle-timeout
+    // eviction's Dekker close-out — which this reuses verbatim — is proven only for exactly one
+    // in-flight drain; calling .passivate() on a Reentrant/MaxConcurrency<N> actor is a COMPILE
+    // ERROR, never a silent no-op or an unproven race.
+    // Returns false iff `id_` does not currently resolve to a live activation (never spawned, or a
+    // lazily-declared type never yet touched) — nothing to passivate. Returns true otherwise,
+    // meaning "accepted / already pending" — NOT "has retired yet".
+    bool passivate() const {
+        static_assert(max_concurrency_of<A>() == 1,
+                      "ActorRef<A>::passivate(): A must be Sequential -- reuses idle-timeout "
+                      "eviction's Dekker close-out, proven only for exactly one in-flight drain "
+                      "(ADR-028 Phase 2); Reentrant/MaxConcurrency<N> passivation is out of scope");
+        return router_->request_passivate(id_);
     }
 
     // Identity/equality (006): the same (type, key) denotes the same logical actor. Two refs are

@@ -145,6 +145,15 @@ per-shard wheel, resolved by
   on fire).
 - A **live** `IdleTimeout` change reconciles the existing idle population by a shard-local
   sweep (see 005) rather than waiting for the next arm.
+- **On-demand passivation (ADR-028 Phase 8).** `ActorRef<A>::passivate()` posts the SAME
+  `Deactivate` control descriptor through the SAME shared interlock (a CAS guarding the
+  activation's one dedicated control descriptor against a double-post from the two independent
+  triggers) — equally soft/advisory as the wheel: the actor drains every message already
+  queued/in-flight and retires at the next genuinely-idle instant, never a hard mid-handler
+  interrupt. Sequential-only, same restriction as `IdleTimeout<Ms>` above. The
+  `on_deactivate()` lifecycle hook and the deactivation-time persistence flush (012) fire from
+  the same `close_out_retire()` call site regardless of which trigger fired — automatic and
+  on-demand retirement are byte-identical from the actor's point of view.
 
 The `idle_ticks` encoding ceiling is tied to the **build-only wheel granularity**;
 far-future arming rides the heap overflow tier.

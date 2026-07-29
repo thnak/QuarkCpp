@@ -59,6 +59,7 @@
 #include "quark/core/error.hpp"
 #include "quark/core/exec_state.hpp"
 #include "quark/core/hot_cell.hpp"  // 013/022 Overflow + the LIVE bound/overflow/shed word (0-RMW read)
+#include "quark/core/ids.hpp"       // ActorId, FenceToken (ADR-028 Phase 8 DeactivateFlushSink)
 #include "quark/core/mailbox.hpp"
 #include "quark/core/message_context.hpp"
 #include "quark/core/metrics.hpp"  // 009: ShardCounters — engine-wired at registration (set_metrics)
@@ -130,6 +131,32 @@ struct DeadLetterSink {
     void operator()(Descriptor* d, error e) const noexcept {
         if (fn) fn(d, e, ctx);
     }
+};
+
+// ADR-028 Phase 8: the on_deactivate() lifecycle hook seam. Member-detected (has_on_deactivate<A>,
+// metadata.hpp) — opt-in, no virtual. Fires from exactly one call site (close_out_retire() below),
+// identically whether retirement was triggered by the automatic idle-timeout wheel or the on-demand
+// passivate() API. Default (null) ⇒ no-op — zero cost for an actor with no on_deactivate().
+struct DeactivateHookSink {
+    void (*fn)(void* self) noexcept = nullptr;
+    void operator()(void* self) const noexcept {
+        if (fn) fn(self);
+    }
+};
+
+// ADR-028 Phase 8: the type-erased deactivation-time persistence-flush thunk. Set ONLY for actors
+// registered through Engine::declare_lazy<A>(store,...) + broker-constructed — the only existing
+// mechanism establishing a {Store, FenceToken} relationship for an actor at all today (an eagerly-
+// `spawn<A>()`'d actor gets no store regardless of persistence policy; this is a documented
+// limitation, not a regression). `id`/`fence` are baked in once, cold, at construction (permanent
+// for this activation's life) — the SAME pattern as `wire_scope_`. May return an error (a failed
+// write is counted, never fatal — see close_out_retire()).
+struct DeactivateFlushSink {
+    result<void> (*fn)(void* self, void* store, ActorId id, FenceToken fence) = nullptr;
+    void* store = nullptr;
+    ActorId id{};
+    FenceToken fence{};
+    [[nodiscard]] bool active() const noexcept { return fn != nullptr && store != nullptr; }
 };
 
 // Escalation seam (007 §Escalation; ADR-009 `Supervision<Node|PerType|Tree<…>>`). `Escalate` (or a
@@ -239,6 +266,12 @@ public:
         wire_scope_ = scope;
     }
 
+    // ADR-028 Phase 8 wiring (cold, set at registration by Engine::spawn<A>()/ActivationBroker):
+    // the on_deactivate() lifecycle hook and the deactivation-time persistence flush. Both default
+    // (null) ⇒ no-op, zero cost — see close_out_retire().
+    void set_deactivate_hook(DeactivateHookSink h) noexcept { deactivate_hook_ = h; }
+    void set_deactivate_flush(DeactivateFlushSink f) noexcept { deactivate_flush_ = f; }
+
     // 009-Observability wiring (cold, set at registration by the engine): the SHARED per-shard
     // counter block this activation's shard owns. Null ⇒ unwired (standalone/test Activation usage
     // outside an Engine), every increment site below is guarded — zero behavior change when unset.
@@ -255,6 +288,25 @@ public:
     // The currently-armed wheel token, or null if none is outstanding (evicted/cancelled/never armed).
     [[nodiscard]] detail::TimerEntry* armed_deactivate_entry() const noexcept { return deactivate_entry_; }
     void set_armed_deactivate_entry(detail::TimerEntry* e) noexcept { deactivate_entry_ = e; }
+
+    // ADR-028 Phase 8: the interlock that makes `deactivate_descriptor_` safe to post from TWO
+    // independent triggers — the automatic idle-timeout wheel (single-writer, shard-drain-owner
+    // only) and the on-demand passivate() API (callable from ANY producer thread). The Vyukov
+    // intrusive mailbox requires a descriptor never be enqueued a second time while still linked
+    // from a prior enqueue; both triggers MUST win this CAS before touching the shared descriptor.
+    // The loser is a no-op — a passivation is already pending, never a correctness issue.
+    [[nodiscard]] bool try_claim_deactivate_token() noexcept {
+        DeactivateToken expected = DeactivateToken::Idle;
+        return deactivate_token_.compare_exchange_strong(expected, DeactivateToken::Posted,
+                                                           std::memory_order_acq_rel,
+                                                           std::memory_order_relaxed);
+    }
+    // Cleared the instant drain_step()/drain_step_governed_seq() claims the control descriptor off
+    // the mailbox (it is dequeued/unlinked by then) — safe to post again from that point on, even
+    // before close_out_retire() actually runs.
+    void clear_deactivate_token() noexcept {
+        deactivate_token_.store(DeactivateToken::Idle, std::memory_order_release);
+    }
 
     // Injectable clock (014 §virtual clock). `fn(ctx)` returns "now" in ns on the SAME scale as
     // Descriptor::deadline_ns (pal::clock). The 014 SimEngine binds its virtual clock here so a
@@ -418,6 +470,9 @@ public:
                 // pool-owned control descriptor (see the member comment) — NOT `reclaim_`'d like a
                 // real pooled message would be; Engine::on_deactivate_fire resets it in place before
                 // its next re-post.
+                // ADR-028 Phase 8: it is now dequeued/unlinked — safe to post again (by either
+                // trigger) from this point on, even before close_out_retire() actually runs.
+                clear_deactivate_token();
                 continue;
             }
 
@@ -506,6 +561,37 @@ public:
     // actor instance and mark the activation cold for a future reactivation path, Phase 4).
     [[gnu::cold]] bool close_out_retire() noexcept {
         retire_requested_ = false;
+        // ADR-028 Phase 8: on_deactivate() + the persistence flush run HERE, strictly BEFORE
+        // retire_to_dormant()'s release-store below — while this worker still unambiguously holds
+        // Running. This ordering is load-bearing, not stylistic: once that store + the Dekker fence
+        // below have passed, a concurrent producer can hand a DIFFERENT worker ownership of this
+        // SAME activation (the proven abort-eviction path) — touching `self_` after that point would
+        // be a genuine second-executor race that doesn't exist anywhere else in this file. Accepted
+        // trade-off: on the rare abort-eviction race, the hook/flush may fire once on an attempt that
+        // turns out not to be a real retirement — mirrors the wheel's own accepted "a stale fire is a
+        // harmless no-op" looseness (011 §"re-arm-with-cancel"). Both calls run inside the SAME D1
+        // handler-boundary-guard shape as the dispatch loop above, so user code (on_deactivate() /
+        // snapshot_state()) can never terminate this `noexcept` close-out path; a flush error is
+        // counted and never blocks retirement — there is nothing left to retry against once the
+        // mailbox is empty.
+#ifndef QUARK_SUPERVISION_NO_GUARD
+        try {
+            deactivate_hook_(self_);
+            if (deactivate_flush_.active()) {
+                result<void> r =
+                    deactivate_flush_.fn(self_, deactivate_flush_.store, deactivate_flush_.id,
+                                         deactivate_flush_.fence);
+                if (!r && metrics_) metrics_->deactivate_flush_failures.inc();
+            }
+        } catch (...) {
+            if (metrics_) metrics_->deactivate_flush_failures.inc();
+        }
+#else
+        deactivate_hook_(self_);
+        if (deactivate_flush_.active())
+            (void)deactivate_flush_.fn(self_, deactivate_flush_.store, deactivate_flush_.id,
+                                       deactivate_flush_.fence);
+#endif
         exec_.retire_to_dormant();            // Running -> Dormant (release)
         Mailbox::consumer_close_out_fence();  // SAME seq_cst StoreLoad as every other close-out
         if (!mailbox_.probe_has_work()) return false;        // clean evict
@@ -818,6 +904,7 @@ private:
             // Phase 2: never `reclaim_`'d — see drain_step()'s identical comment.
             if (QUARK_UNLIKELY(claim_flags & kControlFlagDeactivate)) {
                 retire_requested_ = true;
+                clear_deactivate_token();  // ADR-028 Phase 8 — see drain_step()'s identical comment.
                 continue;
             }
             // ADR-028 Phase 2: busy edge — see drain_step()'s identical comment.
@@ -1360,6 +1447,9 @@ private:
     WireFn wire_ = nullptr;
     const ResourceScope* wire_scope_ = nullptr;
     ShardCounters* metrics_ = nullptr;  // 009: this activation's shard block, wired by set_metrics()
+    // ADR-028 Phase 8: both default-null (no-op, zero cost) — see close_out_retire().
+    DeactivateHookSink deactivate_hook_{};
+    DeactivateFlushSink deactivate_flush_{};
     bool stopped_ = false;
     // ADR-028 Phase 1: lane-only (non-atomic — set only by the drain-owning worker, read only by
     // close_out() which runs on the same lane immediately after). Set when a Deactivate control
@@ -1377,6 +1467,13 @@ private:
     std::uint32_t idle_ticks_ = 0;
     detail::TimerEntry* deactivate_entry_ = nullptr;
     Descriptor deactivate_descriptor_{};
+    // ADR-028 Phase 8: guards `deactivate_descriptor_` against a double-post race now that TWO
+    // independent triggers can reach it (the wheel, shard-drain-owner-only; and passivate(),
+    // callable from any producer thread) — see try_claim_deactivate_token()/clear_deactivate_token()
+    // above. Atomic (unlike everything else in this block): the wheel's own trigger is still
+    // lane-only, but passivate() is not.
+    enum class DeactivateToken : std::uint8_t { Idle = 0, Posted = 1 };
+    std::atomic<DeactivateToken> deactivate_token_{DeactivateToken::Idle};
     std::uint32_t restart_count_ = 0;     // restarts charged in the current MaxRestarts window
     std::int64_t window_start_ns_ = 0;    // start of the current window (valid iff window_open_)
     bool window_open_ = false;            // a window has been started (0 is a real timestamp, not a sentinel)

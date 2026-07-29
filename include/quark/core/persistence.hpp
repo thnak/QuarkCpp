@@ -87,15 +87,9 @@ inline constexpr bool is_event_sourced_v = is_event_sourced_policy<T>::value;
 // replay is totally ordered and a snapshot names the exact log prefix it subsumes.
 using SeqNo = std::uint64_t;
 
-// The FENCING token (012 §"Placement, mobility, and fencing"). Each activation acquires a
-// monotonically increasing token, persisted with the state; the store REJECTS writes carrying a
-// stale token, so a partitioned/superseded old activation cannot corrupt state after a newer one
-// takes over. The bump happens on reconstruct (ADR-009 Restart-reload rule).
-struct FenceToken {
-    std::uint64_t value = 0;
-    friend constexpr bool operator==(FenceToken, FenceToken) = default;
-    friend constexpr bool operator<(FenceToken a, FenceToken b) noexcept { return a.value < b.value; }
-};
+// `FenceToken` now lives in ids.hpp (ADR-028 Phase 8 — so activation.hpp's DeactivateFlushSink can
+// get it without pulling in this whole Store/Snapshot surface); still visible here unqualified via
+// the ids.hpp include above.
 
 // A durable snapshot record as the store sees it: the fence token that wrote it, the commit
 // sequence it subsumes (`through_seq` — every event with seq ≤ this is folded into `record`), and

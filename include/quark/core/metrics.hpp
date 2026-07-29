@@ -158,6 +158,7 @@ struct QUARK_CACHE_ALIGNED ShardCounters {
     // GovernanceCore::depth()), not stored as a separate gauge.
     MetricCounter broker_wakes_enqueued;  // Wake control messages posted to this shard's broker
     MetricCounter broker_wakes_handled;   // Wake messages the broker has finished processing
+    MetricCounter deactivate_flush_failures;  // ADR-028 Phase 8: best-effort persistence-flush errors
     MetricCounter user[kUserCounterSlots];
 
     Histogram message_latency_ns;  // handler start->end latency
@@ -181,6 +182,7 @@ struct MetricsSnapshot {
     std::uint64_t deadline_misses = 0;
     std::uint64_t broker_wakes_enqueued = 0;  // ADR-028 Phase 7
     std::uint64_t broker_wakes_handled = 0;   // ADR-028 Phase 7
+    std::uint64_t deactivate_flush_failures = 0;  // ADR-028 Phase 8
     std::array<std::uint64_t, kUserCounterSlots> user{};
     HistogramSnapshot message_latency_ns{};
     HistogramSnapshot mailbox_depth{};
@@ -235,6 +237,7 @@ public:
             s.deadline_misses += sc->deadline_misses.load();
             s.broker_wakes_enqueued += sc->broker_wakes_enqueued.load();
             s.broker_wakes_handled += sc->broker_wakes_handled.load();
+            s.deactivate_flush_failures += sc->deactivate_flush_failures.load();
             for (std::size_t i = 0; i < kUserCounterSlots; ++i) s.user[i] += sc->user[i].load();
             s.message_latency_ns.merge(sc->message_latency_ns.snapshot());
             s.mailbox_depth.merge(sc->mailbox_depth.snapshot());
@@ -267,6 +270,7 @@ public:
         counter("deadline_misses_total", s.deadline_misses);
         counter("broker_wakes_enqueued_total", s.broker_wakes_enqueued);
         counter("broker_wakes_handled_total", s.broker_wakes_handled);
+        counter("deactivate_flush_failures_total", s.deactivate_flush_failures);
         for (std::size_t i = 0; i < kUserCounterSlots; ++i) {
             if (s.user[i] == 0 && user_names_[i].empty()) continue;
             const std::string& nm = user_names_[i];

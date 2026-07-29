@@ -173,6 +173,12 @@ using DestroyFn = void (*)(void*) noexcept;
 template <class A>
 [[nodiscard]] WireFn make_wire_fn() noexcept;  // defined after has_resource_wire<A> below
 
+// ADR-028 Phase 8 — the on_deactivate() lifecycle hook thunk. A pure function of `A` (null iff `A`
+// has no `on_deactivate()`), compiled unconditionally by `compile_actor_metadata<A>()` — every actor
+// gets this wired, eagerly `spawn<A>()`'d or lazily broker-constructed alike.
+template <class A>
+[[nodiscard]] DeactivateHookSink make_deactivate_hook_sink() noexcept;  // defined after has_on_deactivate<A> below
+
 // ADR-028 Phase 5: the type-erased persistence-recovery thunk — erases BOTH `A` (via `void* self`)
 // AND the concrete `Store` type `S` (via `void* store`), closing over both as template parameters at
 // the one call site that knows them concretely (`TypeRegistry::register_type<A,S>`). Null iff `A`
@@ -183,6 +189,26 @@ using RecoverFn = result<void> (*)(void* self, void* store, ActorId id);
 
 template <class A, class S>
 [[nodiscard]] RecoverFn make_recover_fn() noexcept;  // defined after has_persist_state<A> below
+
+// ADR-028 Phase 8 — the deactivation-time persistence-flush thunk. Same erasure shape as `RecoverFn`
+// (both `A` and the concrete `Store` type `S`), plus the `FenceToken` the broker acquired once at
+// construction (see `Engine::handle_wake`) — never re-derived at flush time. Null iff `A` declares
+// no `Persistent<Snapshot,...>` policy. Called at most once per retirement (Activation::
+// close_out_retire()), a cold path, same cost profile as `RecoverFn`.
+using FlushFn = result<void> (*)(void* self, void* store, ActorId id, FenceToken fence);
+// ADR-028 Phase 8 — acquires this activation's fencing token exactly once, at broker-construction
+// time (closes the pre-existing gap where `declare_lazy<A>(store,...)` never called
+// `store.acquire_fence(id)` at all). A pure function of `S` alone — set for EVERY store-taking
+// `register_type<A,S>` call, independent of `A`'s persistence policy.
+using FenceAcquireFn = FenceToken (*)(void* store, ActorId id);
+
+template <class A, class S>
+[[nodiscard]] FlushFn make_flush_fn() noexcept;  // defined after has_persist_state<A> below
+
+template <class S>
+[[nodiscard]] FenceAcquireFn make_fence_acquire_fn() noexcept {
+    return +[](void* store, ActorId id) -> FenceToken { return static_cast<S*>(store)->acquire_fence(id); };
+}
 
 // The RECONSTRUCT factory (007/ADR-009 §Restart): destroy the actor's state in place and
 // placement-new a FRESH instance at the same address, so `Restart` produces genuinely fresh state
@@ -235,6 +261,11 @@ struct ActorMetadata {
     WireFn wire = nullptr;
     const ResourceScope* scope = nullptr;
     ReclaimSink reclaim{};
+    // ADR-028 Phase 8 — the on_deactivate() lifecycle hook. A pure function of `A` (null iff `A` has
+    // no `on_deactivate()`), compiled unconditionally below — every actor gets this wired, eagerly
+    // `spawn<A>()`'d or lazily broker-constructed alike (unlike `flush`/`fence_acquire` below, which
+    // need a concrete Store type and so are ONLY compiled by the store-taking `register_type<A,S>`).
+    DeactivateHookSink deactivate_hook{};
     // ADR-028 Phase 5 — the lazy-activation broker's one-time persistence-recovery seam. `recover` is
     // a pure function of `<A, S>` (S = the concrete Store type; null iff `A` declares no
     // `Persistent<Snapshot,...>` policy), compiled by `TypeRegistry::register_type<A,S>` (NOT by
@@ -243,6 +274,15 @@ struct ActorMetadata {
     // the type-erased pointer to the caller's concrete Store instance, set at the same registration call.
     RecoverFn recover = nullptr;
     void* store = nullptr;
+    // ADR-028 Phase 8 — the deactivation-time persistence-flush seam. `flush` is a pure function of
+    // `<A, S>` (null iff `A` declares no `Persistent<Snapshot,...>` policy), compiled by
+    // `TypeRegistry::register_type<A,S>` (NOT by `compile_actor_metadata<A>()` — exactly like
+    // `recover` above, so an eagerly-`spawn`'d Persistent<Snapshot> actor is untouched). `fence_acquire`
+    // is a pure function of `S` alone (set for EVERY store-taking `register_type<A,S>` call,
+    // regardless of `A`'s persistence policy) — closes a prior gap where `declare_lazy<A>(store,...)`
+    // never actually called `store.acquire_fence(id)`.
+    FlushFn flush = nullptr;
+    FenceAcquireFn fence_acquire = nullptr;
 };
 
 // Compile-time gather (008 §Metadata compilation). All fields are pure functions of `A`'s policy
@@ -266,6 +306,7 @@ template <class A>
     m.destroy = make_destroy_fn<A>();
     m.reconstruct = make_reconstruct_sink<A>();
     m.wire = make_wire_fn<A>();  // ADR-028 Phase 4: null iff A has no wire() (has_resource_wire<A>)
+    m.deactivate_hook = make_deactivate_hook_sink<A>();  // ADR-028 Phase 8: null iff A has no on_deactivate()
     return m;
 }
 
@@ -288,6 +329,26 @@ template <class A>
         };
     } else {
         return nullptr;
+    }
+}
+
+// ADR-028 Phase 8: an actor opts into a deactivation-time lifecycle hook via a member
+// `void on_deactivate()`. Mirrors `has_resource_wire<A>` exactly: opt-in, member-detected, no
+// virtual. Fires from EXACTLY ONE call site (Activation::close_out_retire()), identically whether
+// triggered by the automatic idle-timeout wheel or the on-demand passivate() API.
+template <class A>
+concept has_on_deactivate = requires(A& a) {
+    { a.on_deactivate() } -> std::same_as<void>;
+};
+
+// ADR-028 Phase 8: the type-erased on_deactivate() thunk (forward-declared above `ActorMetadata`,
+// defined here now that `has_on_deactivate<A>` exists). Null for an A with no `on_deactivate()`.
+template <class A>
+[[nodiscard]] DeactivateHookSink make_deactivate_hook_sink() noexcept {
+    if constexpr (has_on_deactivate<A>) {
+        return DeactivateHookSink{+[](void* self) noexcept { static_cast<A*>(self)->on_deactivate(); }};
+    } else {
+        return {};
     }
 }
 
@@ -323,6 +384,29 @@ template <class A, class S>
             if (!rec) return std::unexpected(rec.error());
             a->restore_state(std::move(rec->state));
             return {};
+        };
+    } else {
+        return nullptr;
+    }
+}
+
+// ADR-028 Phase 8: the type-erased deactivation-time flush thunk (forward-declared above
+// `ActorMetadata`, defined here now that `has_persist_state<A>` exists). Null unless `A` declares
+// `Persistent<Snapshot,...>` — mirrors `make_recover_fn<A,S>` exactly, the write-side counterpart:
+// `through_seq = store.last_seq(id)` is always valid for a pure Persistent<Snapshot> actor (no event
+// log), never rejected by `Store::save_snapshot`'s own `through_seq <= last_seq` invariant.
+template <class A, class S>
+[[nodiscard]] FlushFn make_flush_fn() noexcept {
+    if constexpr (is_snapshot_persistent_v<A>) {
+        static_assert(has_persist_state<A>,
+                      "declare_lazy<A>(store, ...): A declares Persistent<Snapshot,...> but is missing "
+                      "the PersistState alias + snapshot_state()/restore_state() contract (ADR-028 "
+                      "Phase 8 flush)");
+        static_assert(Store<S>, "declare_lazy<A>(store, ...): store must model the 012 Store concept");
+        return +[](void* self, void* store, ActorId id, FenceToken fence) -> result<void> {
+            A* a = static_cast<A*>(self);
+            S& s = *static_cast<S*>(store);
+            return save_snapshot<typename A::PersistState>(s, id, fence, s.last_seq(id), a->snapshot_state());
         };
     } else {
         return nullptr;
@@ -401,6 +485,8 @@ public:
                                                       ReclaimSink reclaim = {}) {
         ActorMetadata m = compile_actor_metadata<A>();
         m.recover = make_recover_fn<A, S>();
+        m.flush = make_flush_fn<A, S>();              // ADR-028 Phase 8
+        m.fence_acquire = make_fence_acquire_fn<S>();  // ADR-028 Phase 8
         m.store = static_cast<void*>(&store);
         return register_metadata(std::move(m), detail::canonical_type_name<A>(),
                                  [] { return result<void>{}; }, scope, reclaim);

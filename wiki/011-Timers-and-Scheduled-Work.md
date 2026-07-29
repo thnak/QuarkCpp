@@ -131,7 +131,7 @@ Periodic timers stop rescheduling once cancelled.
 
 Activation-lifecycle deactivation (`IdleTimeout<Ms>` / `KeepAlive`, 005) is driven by the
 per-shard wheel, resolved by
-[ADR-008](ADR-008-engine-actor-configuration-and-activation-lifecycle-policy):
+[ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md):
 
 - On a drain **Empty** edge, the worker reads `idle_ticks` from the packed operational word
   (013) and **arms a per-activation `Deactivate` entry** (single-writer, lock-free);
@@ -145,6 +145,15 @@ per-shard wheel, resolved by
   on fire).
 - A **live** `IdleTimeout` change reconciles the existing idle population by a shard-local
   sweep (see 005) rather than waiting for the next arm.
+- **On-demand passivation (ADR-028 Phase 8).** `ActorRef<A>::passivate()` posts the SAME
+  `Deactivate` control descriptor through the SAME shared interlock (a CAS guarding the
+  activation's one dedicated control descriptor against a double-post from the two independent
+  triggers) — equally soft/advisory as the wheel: the actor drains every message already
+  queued/in-flight and retires at the next genuinely-idle instant, never a hard mid-handler
+  interrupt. Sequential-only, same restriction as `IdleTimeout<Ms>` above. The
+  `on_deactivate()` lifecycle hook and the deactivation-time persistence flush (012) fire from
+  the same `close_out_retire()` call site regardless of which trigger fired — automatic and
+  on-demand retirement are byte-identical from the actor's point of view.
 
 The `idle_ticks` encoding ceiling is tied to the **build-only wheel granularity**;
 far-future arming rides the heap overflow tier.
@@ -162,7 +171,7 @@ a deadline-carrying message within its actor's mailbox.
 
 A **deadline-unified `EdfBanded` policy** (folding these deadlines into a scheduling band
 key) was **evaluated and deferred** by
-[ADR-010](ADR-010-priority-and-fairness-scheduling-policy): under overload,
+[ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md): under overload,
 deadline-banding can degrade **below** plain FIFO (the EDF-domino effect — proven). The
 scheduler's `band_of()` is the extension point if a future opt-in EDF policy is pursued,
 and it **must preserve per-actor FIFO**.

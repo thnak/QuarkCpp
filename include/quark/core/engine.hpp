@@ -75,6 +75,12 @@ struct PostCourier {
     // today's exact synchronous dead-letter behavior unchanged.
     bool (*activate_fn)(void* engine, ActorId id, Descriptor* d, ReclaimSink origin_reclaim) noexcept =
         nullptr;
+    // ADR-028 Phase 8: on-demand passivation hand-off (006 §passivate). Resolves `id` through the
+    // SAME by_id_/id_table lookup `resolve()` uses (never the lazy-construction `activate()` path —
+    // passivating something never touched is a no-op, not a reason to construct it). Null (default)
+    // ⇒ unsupported — a hand-rolled `PostCourier` (tests, TestKit, SimEngine) keeps `.passivate()`
+    // returning false, matching how `activate_fn == nullptr` already degrades `activate()` today.
+    bool (*passivate_fn)(void* engine, ActorId id) noexcept = nullptr;
 
     [[nodiscard]] Schedulable* resolve(ActorId id) const noexcept {
         return resolve_fn(engine, id);
@@ -84,6 +90,9 @@ struct PostCourier {
     }
     [[nodiscard]] bool activate(ActorId id, Descriptor* d, ReclaimSink origin_reclaim) const noexcept {
         return activate_fn != nullptr && activate_fn(engine, id, d, origin_reclaim);
+    }
+    [[nodiscard]] bool passivate(ActorId id) const noexcept {
+        return passivate_fn != nullptr && passivate_fn(engine, id);
     }
 };
 
@@ -119,7 +128,13 @@ inline thread_local std::uint32_t t_worker_id = 0xFFFF'FFFFu;
 template <class Policy = UniformFIFO>
 class Engine {
 public:
-    explicit Engine(EngineConfig cfg) : cfg_(cfg), type_registry_(cfg_.validation, cfg_.max_types) {
+    // ADR-021 (004 §"Node/Shard resolution ordering", 008 §"Metadata compilation"): `resource_plan`
+    // is walked EAGERLY and SYNCHRONOUSLY right here, on the single thread running this constructor,
+    // strictly before `shards_`' brokers/threads exist — see `resolve_node_shard_resources` below.
+    // Defaults to an empty plan so every pre-existing call site (no Node/Shard resources) is
+    // byte-for-byte unaffected.
+    explicit Engine(EngineConfig cfg, const NodeShardResourcePlan& resource_plan = {})
+        : cfg_(cfg), type_registry_(cfg_.validation, cfg_.max_types) {
         if (cfg_.worker_count == 0) cfg_.worker_count = 1;
         if (cfg_.shard_count == 0) cfg_.shard_count = 1;
         if (cfg_.drain_budget == 0) cfg_.drain_budget = 1;
@@ -128,6 +143,10 @@ public:
         shard_mask_ = cfg_.shard_count - 1;
         shards_ = std::make_unique<Shard[]>(cfg_.shard_count);
         workers_ = std::make_unique<Worker[]>(cfg_.worker_count);
+        // ADR-021: the eager Node/Shard resolution pass — every configured shard's resource table is
+        // fully resolved and immutable before the broker-construction loop below (let alone any real
+        // worker thread) ever runs. Single-threaded, zero atomics/locks/std::call_once.
+        resolve_node_shard_resources(resource_plan);
         // 009: register every shard's embedded ShardCounters (cold, one-time; register_shard just
         // stores a pointer) so metrics_snapshot()/metrics_prometheus() aggregate across all shards.
         for (std::uint32_t sh = 0; sh < cfg_.shard_count; ++sh) metrics_.register_shard(shards_[sh].metrics);
@@ -237,6 +256,7 @@ public:
         auto act = std::make_unique<Activation>(actor.get(), A::dispatch_table(), reclaim,
                                                 max_concurrency_of<A>(), supervision_of<A>());
         act->set_reconstruct(make_reconstruct_sink<A>());  // 007: fresh-state Restart factory
+        act->set_deactivate_hook(make_deactivate_hook_sink<A>());  // ADR-028 Phase 8: on_deactivate()
 
         if constexpr (has_resource_wire<A>) {  // 004: one-time COLD wire pass (fail-fast Validation)
             if (scope != nullptr) {
@@ -351,7 +371,24 @@ public:
 
     // Hand out the Policy-erased courier `ActorRef`/`LocalRouter` (006) use to resolve + post.
     [[nodiscard]] PostCourier post_courier() noexcept {
-        return PostCourier{this, &resolve_courier, &post_courier_fn, &activate_courier_fn};
+        return PostCourier{this, &resolve_courier, &post_courier_fn, &activate_courier_fn,
+                           &passivate_courier_fn};
+    }
+
+    // --- On-demand passivation (ADR-028 Phase 8; 006 §passivate) --------------------------
+    // Resolves `id` through the SAME by_id_/id_table lookup every tell/ask uses (never the
+    // lazy-construction activate() hand-off — passivating an actor that was never touched is a
+    // no-op, not a reason to construct it). Posts the SAME Deactivate control descriptor the
+    // automatic idle-timeout wheel posts, through the SAME shared interlock (post_deactivate) — so
+    // on-demand and timer-triggered retirement are byte-identical from the actor's point of view.
+    // Returns false iff `id` is unresolved; true otherwise (accepted/already-pending, fire-and-forget
+    // — NOT a promise the actor has retired yet, since retirement only ever happens once the mailbox
+    // is genuinely empty, same as the automatic path).
+    [[nodiscard]] bool request_passivate(ActorId id) noexcept {
+        Schedulable* s = resolve(id);
+        if (s == nullptr) return false;
+        (void)post_deactivate(s->activation, s);  // idempotent regardless of who wins the interlock
+        return true;
     }
 
     // --- Producer hot path (002 §Wakeup) ---------------------------------------------------
@@ -507,7 +544,69 @@ public:
     // Direct registry access (e.g. `set_user_counter_name` before/while the engine is running).
     [[nodiscard]] MetricsRegistry& metrics_registry() noexcept { return metrics_; }
 
+    // --- 004/ADR-021 Node/Shard resources ---------------------------------------------------
+    // The fully-resolved, immutable `ResourceScope` for shard `sid` — every Node-scoped resource
+    // (shared pointer, same across every shard) plus that shard's own Shard-scoped resources, both
+    // resolved once during this Engine's construction (see `resolve_node_shard_resources`). Pass
+    // `&engine.shard_resource_scope(sid)` to `spawn<A>()`/`declare_lazy<A>()` so `A::wire()` resolves
+    // its `Cached<>` Node/Shard members with zero factory calls, CAS, or lookups at activation time —
+    // `Cached<T>::wire()` is the SAME plain scan-and-pointer-copy it already is for Activation scope
+    // (004 §"Node/Shard resolution ordering"). An actor whose `wire()` references a type never
+    // `provide_node`/`provide_shard`'d to this Engine's constructor fails with `errc::validation`
+    // (008 §"Resource-type closed-world constraint") — the same undeclared-resource path
+    // `ResourceScope::resolve<T>()` already implements, no new machinery.
+    [[nodiscard]] const ResourceScope& shard_resource_scope(std::uint32_t sid) const noexcept {
+        return shard_scopes_[sid];
+    }
+    [[nodiscard]] const ResourceScope& shard_resource_scope(ActorId id) const noexcept {
+        return shard_scopes_[shard_of(id)];
+    }
+    // Test/observability seam: how many objects the Engine's Node resource arena has constructed —
+    // used to prove a Node factory ran exactly once regardless of `shard_count` (ADR-021 C2).
+    [[nodiscard]] std::size_t node_resources_constructed() const noexcept {
+        return node_storage_.constructed_count();
+    }
+    [[nodiscard]] std::size_t shard_resources_constructed(std::uint32_t sid) const noexcept {
+        return shard_storage_[sid].constructed_count();
+    }
+
 private:
+    // ADR-021 (008 §"Metadata compilation"): the eager Node/Shard resolution pass. Runs entirely
+    // inside the Engine constructor — single-threaded, before `shards_`' brokers exist and long
+    // before `start()` could ever spawn a worker — so a Node-scoped resource shared by every
+    // configured shard is constructed EXACTLY ONCE with zero atomics, locks, or `std::call_once`:
+    // the multi-shard first-touch race is dissolved by ORDERING (nothing else can be running yet),
+    // never arbitrated by synchronization. `build()` time scales linearly in
+    // `shard_count × resource_count` (the accepted 004 trade-off), including for shards that will
+    // host no actor.
+    void resolve_node_shard_resources(const NodeShardResourcePlan& plan) {
+        shard_storage_ = std::make_unique<ResourceArena[]>(cfg_.shard_count);
+        shard_scopes_ = std::make_unique<ResourceScope[]>(cfg_.shard_count);
+        known_resource_types_.reserve(plan.node_entries().size() + plan.shard_entries().size());
+
+        // Node-scoped: each factory runs EXACTLY ONCE, ever — resolved before the per-shard loop
+        // below even starts, so every shard's scope below just copies the SAME already-constructed
+        // pointer in. No shard "races" another for it; there is nothing else running at all.
+        std::vector<std::pair<const void*, void*>> node_ptrs;
+        node_ptrs.reserve(plan.node_entries().size());
+        for (const auto& e : plan.node_entries()) {
+            void* inst = e.construct(e.fn, node_storage_);
+            node_ptrs.emplace_back(e.type_key, inst);
+            known_resource_types_.push_back(e.type_key);
+        }
+        for (const auto& e : plan.shard_entries()) known_resource_types_.push_back(e.type_key);
+
+        for (std::uint32_t sh = 0; sh < cfg_.shard_count; ++sh) {
+            ResourceScope& scope = shard_scopes_[sh];
+            for (const auto& [tk, inst] : node_ptrs) scope.provide_raw(tk, inst, ResourceLifetime::Node);
+            // Shard-scoped: a FRESH factory call for every shard (once per shard, never shared).
+            for (const auto& e : plan.shard_entries()) {
+                void* inst = e.construct(e.fn, shard_storage_[sh], sh);
+                scope.provide_raw(e.type_key, inst, ResourceLifetime::Shard);
+            }
+        }
+    }
+
     // Courier wrappers (bound into PostCourier). Static so they are plain `.rodata` fn-ptr targets
     // — no virtual, no per-Policy indirection beyond the one already-typed call.
     static Schedulable* resolve_courier(void* eng, ActorId id) noexcept {
@@ -520,6 +619,10 @@ private:
     static bool activate_courier_fn(void* eng, ActorId id, Descriptor* d,
                                     ReclaimSink origin_reclaim) noexcept {
         return static_cast<Engine*>(eng)->activate(id, d, origin_reclaim);
+    }
+    // ADR-028 Phase 8: on-demand passivation wrapper.
+    static bool passivate_courier_fn(void* eng, ActorId id) noexcept {
+        return static_cast<Engine*>(eng)->request_passivate(id);
     }
 
     static constexpr std::uint32_t kNoOwner = 0xFFFF'FFFFu;
@@ -791,6 +894,14 @@ private:
                     return;
                 }
             }
+            // ADR-028 Phase 8: acquire this activation's fencing token NOW, once, before any message
+            // dispatches — closing a prior gap where `declare_lazy<A>(store,...)` never actually called
+            // `store.acquire_fence(id)` at all (recovery/register_type only ever passed a default-
+            // constructed FenceToken{} through, which the deactivation-time flush below would have
+            // written under a stale/never-issued token). Set only for actors registered through the
+            // store-taking `register_type<A,S>` overload (m->fence_acquire is null otherwise).
+            FenceToken fence{};
+            if (m->fence_acquire != nullptr) fence = m->fence_acquire(m->store, w.id);
             auto act = std::make_unique<Activation>(actor, m->dispatch, m->reclaim, m->max_concurrency,
                                                     m->supervision);
             act->set_reconstruct(m->reconstruct);
@@ -799,6 +910,11 @@ private:
             // unless the actor declared resources (matching the guard above), so this is a no-op
             // otherwise.
             act->set_resource_wire(m->wire, m->scope);
+            act->set_deactivate_hook(m->deactivate_hook);  // ADR-028 Phase 8: on_deactivate()
+            // ADR-028 Phase 8: the deactivation-time persistence flush — null (`m->flush == nullptr`)
+            // unless A declared Persistent<Snapshot,...> via the store-taking register_type<A,S>.
+            if (m->flush != nullptr)
+                act->set_deactivate_flush(DeactivateFlushSink{m->flush, m->store, w.id, fence});
             const std::uint32_t idle_ticks =
                 m->idle_timeout_ms == 0
                     ? 0
@@ -1012,11 +1128,25 @@ private:
         sh.wheel_pool.release(e);
         if (!live) return;  // stale — a busy edge cancelled it, or a newer arm already won
         act->set_armed_deactivate_entry(nullptr);
+        post_deactivate(act, s);  // ADR-028 Phase 8: a concurrent passivate() may have already posted
+                                  // it — idempotent, see the interlock comment below.
+    }
+
+    // ADR-028 Phase 8: shared build+post+wake sequence — the ONLY two callers are on_deactivate_fire
+    // (the automatic wheel, shard-drain-owner-only) and request_passivate (on-demand, callable from
+    // any producer thread). Both go through Activation::try_claim_deactivate_token() so the shared,
+    // never-pool-managed `deactivate_descriptor_` is never enqueued twice concurrently — the Vyukov
+    // intrusive mailbox requires a descriptor never be re-linked while still linked from a prior
+    // enqueue. Returns true iff THIS call won the race and actually posted it (the loser is a
+    // harmless no-op: a passivation is already pending either way).
+    bool post_deactivate(Activation* act, Schedulable* s) noexcept {
+        if (!act->try_claim_deactivate_token()) return false;  // already pending — idempotent no-op
         Descriptor* d = act->deactivate_descriptor();
         d->release();                          // single-writer in-place reset: Queued, gen++, flags=0
         d->set_flags(kControlFlagDeactivate);  // re-tag as the Deactivate control descriptor
         act->mailbox().enqueue(d);
         notify(s);  // the SAME producer wake path every real message uses (Idle/Dormant->Scheduled)
+        return true;
     }
 
     // Pop and run activations until the run-queue reports Empty (bounded-spin on the non-linearizable
@@ -1104,6 +1234,22 @@ private:
         self.wake_seq.wait(seq, std::memory_order_acquire);  // sleep until wake_one()/wake_all() bumps
         idle_mask_.fetch_and(~(1u << wid), std::memory_order_relaxed);  // clear (waker may already have)
     }
+
+    // ADR-021 (004 §"Node/Shard resource storage outlives owned actors/activations"): declared FIRST
+    // among every data member — and therefore, by C++'s reverse-declaration-order member destruction,
+    // destroyed LAST, strictly after `shards_`/`registry_`/`owned_actors_`/`owned_activations_`/
+    // `by_id_` below. An actor destructor that touches a `Cached<>` resource (e.g. a pool-checkout
+    // RAII guard) therefore never runs after the resource it references has already been torn down.
+    // `node_storage_`/`shard_storage_` are the ARENA storage (each carries its own explicit
+    // destructor-thunk list — `ResourceArena`, resource.hpp — bulk-reclaiming a `pmr` arena does not
+    // by itself invoke placement-constructed destructors); `shard_scopes_` is the per-shard resolved
+    // `ResourceScope` table `spawn<A>()`/`declare_lazy<A>()` callers wire against (`shard_resource_
+    // scope()` above); `known_resource_types_` is the closed-world type-key set captured once, here,
+    // at construction (008 §"Resource-type closed-world constraint").
+    ResourceArena node_storage_;
+    std::unique_ptr<ResourceArena[]> shard_storage_;
+    std::unique_ptr<ResourceScope[]> shard_scopes_;
+    std::vector<const void*> known_resource_types_;
 
     EngineConfig cfg_;                 // FROZEN-CORE (013/ADR-008) — immutable after construction
     // 008/ADR-028 Phase 3: TypeKey → {ActorMetadata, factory} registry, seeded from the FROZEN

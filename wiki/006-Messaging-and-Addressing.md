@@ -44,6 +44,25 @@ order.tell(Ship{ .id = 42 });
 - Returns immediately; no reply channel is allocated.
 - The payload is moved into shard-owned payload storage (`003`).
 
+### `passivate` — on-demand, soft teardown (ADR-028 Phase 8)
+
+```cpp
+bool accepted = order.passivate();
+```
+
+- Fire-and-forget, like `tell` — posts the same `Deactivate` control descriptor the automatic
+  idle-timeout wheel posts (011), through the same shared interlock, so the actor drains every
+  message already queued/in-flight and retires at the next genuinely-idle instant. Never a hard
+  mid-handler interrupt.
+- Returns `false` iff the target never resolves to a live activation (nothing to passivate);
+  `true` means accepted/already-pending, **not** "has retired yet."
+- **Sequential-only** — a compile error on a `Reentrant`/`MaxConcurrency<N>` actor, same
+  restriction as `IdleTimeout<Ms>` (011), since it reuses the same Dekker close-out sequence,
+  proven only for exactly one in-flight drain.
+- The `on_deactivate()` lifecycle hook (005) and the deactivation-time persistence flush (012)
+  fire identically whether retirement was triggered by the wheel or by `passivate()` — one call
+  site serves both.
+
 ### `ask` — request/response
 
 ```cpp
@@ -127,7 +146,7 @@ An actor's **protocol** is the set of message types it enumerates in
 `using protocol = quark::Protocol<…>` and declares a `handle` for. `tell`/`ask` are
 constrained by concept so that sending an unhandled message type is a **compile
 error**, not a runtime dead-letter. The concept checks **protocol membership**, not
-merely that a `handle` overload is callable ([ADR-007](ADR-007-actor-authoring-and-handler-dispatch-api)):
+merely that a `handle` overload is callable ([ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md)):
 
 ```cpp
 template<class A, class M>
@@ -157,7 +176,7 @@ handled-but-unlisted overload is itself a compile error, per 005 Validation).
 ## Publish/Subscribe (broadcast)
 
 **Status: Accepted (x86-64) for local fan-out · Draft for cross-node**
-([ADR-019](ADR-019-best-effort-broadcast-publish-primitive)).
+([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)).
 
 `tell`/`ask` address ONE actor; routers and `Stateless<N>` fan to ONE group/pool
 member. `Topic<M>` is the **subscriber-agnostic one-to-many** verb: a publisher
@@ -208,7 +227,7 @@ ticks.unsubscribe(clockRef);           // no delivery after this returns
 
 ## Open questions
 
-- **One-to-many / broadcast** → **Resolved** ([ADR-019](ADR-019-best-effort-broadcast-publish-primitive)):
+- **One-to-many / broadcast** → **Resolved** ([ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)):
   the missing subscriber-agnostic fan-out primitive is now `Topic<M>` best-effort
   broadcast (see *Publish/Subscribe* above) — Accepted (x86-64) local, Draft cross-node.
 - **Backpressure**: what does `tell` do on a full bounded mailbox — block the
@@ -217,13 +236,13 @@ ticks.unsubscribe(clockRef);           // no delivery after this returns
   **foundational lever** of the whole-engine overload model — bounded mailboxes
   generalized to every exhaustible resource, plus rate limiting, deadline-aware load
   shedding, and circuit breaking — in
-  [022-Resource-Governance-and-Overload-Control](022-Resource-Governance-and-Overload-Control).
-- **Streaming replies** — **resolved in mechanism ([ADR-018](ADR-018-outbound-streaming-replies)), Draft pending the 015 OPEN re-admit gate.**
+  [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md).
+- **Streaming replies** — **resolved in mechanism ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)), Draft pending the 015 OPEN re-admit gate.**
   `ask` returning a stream for multi-item responses is the **024 credit-ring flipped**
   (callee = producer, caller = consumer) — see `ask_stream<F>` above. The **inbound**
   direction was already Accepted (a `StreamRef<F>` handle + `handle(StreamBatch<F>&)` drain
   over the credit-ring of
-  [024-Streaming-and-Inbound-Streams](024-Streaming-and-Inbound-Streams)); the
+  [024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md)); the
   **outbound** reply-routing interaction is now specced (three seams: single-resolve
   `StreamReplyCell`, the N-item ring, in-band EoS; `producer_seq` identity; monotone
   credit-return). The **item-transport leg is proven** (it is the shipped 024 ring), but

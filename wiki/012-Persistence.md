@@ -148,6 +148,28 @@ non-persistent actors never instantiate it — zero cost when unused.
   and is the natural next-iteration target if a tighter replay bound becomes a
   hard requirement (e.g. driven by 023 recovery-time budgets).
 
+## Deactivation-time flush (Snapshot model, ADR-028 Phase 8)
+
+A separate, simpler mechanism from the EventSourced compaction cadence above — applies only to
+the **Snapshot** model (`Persistent<Snapshot>`), not `EventSourced`:
+
+- On retirement (either the automatic idle-timeout wheel or an on-demand `passivate()` call, 011),
+  `close_out_retire()` calls the actor's `snapshot_state()` and persists it via the existing,
+  proven `save_snapshot` write path — the same primitive `recover_snapshot` already reads back on
+  the next activation. No new persistence machinery; a reuse of an existing seam, not a new one.
+- **Wired only for actors registered through `Engine::declare_lazy<A>(store,...)`** — the only
+  existing mechanism that establishes a `{Store, FenceToken}` relationship for an actor at all. An
+  eagerly-`spawn<A>()`'d `Persistent<Snapshot>` actor gets no store regardless of its persistence
+  policy, and this is unchanged — the flush is simply inactive for such an actor, a documented
+  limitation, not a regression.
+- **The fence is now actually acquired at construction.** `declare_lazy<A>(store,...)`'s broker
+  construction previously never called `store.acquire_fence(id)` at all — recovery only ever read,
+  never established ownership. This closed a real gap: any deactivation-time write needs a real,
+  non-stale fence to be meaningfully checked against `Store::save_snapshot`'s own fencing gate.
+- **Best-effort, never fatal.** A flush error is counted (a `deactivate_flush_failures` metric,
+  009) but never blocks retirement — there is nothing left to retry against once the mailbox is
+  genuinely empty and the actor is retiring anyway.
+
 ## Recovery
 
 - **On activation** of a persistent actor: `StateStore::load` the snapshot, then
@@ -178,7 +200,7 @@ cannot corrupt state after re-placement.
 ## Encryption at rest (optional)
 
 Durable records may hold sensitive state. **At-rest encryption is optional
-envelope encryption** ([020-Security](020-Security)): 016's canonical tagged
+envelope encryption** ([020-Security.md](020-Security.md)): 016's canonical tagged
 bytes are produced first (so schema evolution/migration is unchanged), then sealed
 with a per-actor/per-shard data key wrapped by a `Keyring` seam before hitting the
 disk record. The fencing token above is integrity-relevant and is covered by the
