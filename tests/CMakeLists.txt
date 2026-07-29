@@ -217,6 +217,36 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/topic_subscribe_race_test.cpp" AND QUARK_
     ENVIRONMENT "ASAN_OPTIONS=abort_on_error=0:symbolize=0:exitcode=1;UBSAN_OPTIONS=print_stacktrace=0")
 endif()
 
+# ADR-021 C7 teeth (004 §"Node/Shard resource storage outlives owned actors/activations"):
+# -DQUARK_RESOURCE_BAD_TEARDOWN_ORDER declares the actor container BEFORE the resource storage, so the
+# storage is destroyed FIRST — the actor's destructor then touches already-freed memory. ASan must
+# catch the heap-use-after-free; WILL_FAIL inverts that trap into a PASS. Gated to ASan builds only
+# (mirrors topic_no_quiesce_control above) — a plain build's UB may not visibly crash.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/resource_teardown_order_test.cpp" AND QUARK_SANITIZE MATCHES "address")
+  add_executable(resource_teardown_order_control resource_teardown_order_test.cpp)
+  target_link_libraries(resource_teardown_order_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(resource_teardown_order_control PRIVATE QUARK_RESOURCE_BAD_TEARDOWN_ORDER)
+  add_test(NAME resource_teardown_order_control COMMAND resource_teardown_order_control)
+  set_tests_properties(resource_teardown_order_control PROPERTIES
+    WILL_FAIL TRUE
+    ENVIRONMENT "ASAN_OPTIONS=abort_on_error=0:symbolize=0:exitcode=1;UBSAN_OPTIONS=print_stacktrace=0")
+endif()
+
+# ADR-021 C8 teeth (004 §"... must carry an explicit destructor-thunk list"): -DQUARK_RESOURCE_NO_THUNK_
+# LIST swaps in a bare pmr arena with NO destructor-thunk list, so every LeakyResource's destructor (and
+# the heap allocation it owns) is skipped on bulk arena reclaim. The control is ALSO self-checking (a
+# live counter that must return to 0 — see the file banner), so it fails even outside a sanitizer build;
+# wiring it under ASan+LeakSanitizer additionally confirms the leak is independently reported.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/resource_arena_thunk_list_test.cpp" AND QUARK_SANITIZE MATCHES "address")
+  add_executable(resource_arena_thunk_list_control resource_arena_thunk_list_test.cpp)
+  target_link_libraries(resource_arena_thunk_list_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(resource_arena_thunk_list_control PRIVATE QUARK_RESOURCE_NO_THUNK_LIST)
+  add_test(NAME resource_arena_thunk_list_control COMMAND resource_arena_thunk_list_control)
+  set_tests_properties(resource_arena_thunk_list_control PROPERTIES
+    WILL_FAIL TRUE
+    ENVIRONMENT "ASAN_OPTIONS=abort_on_error=0:symbolize=0:exitcode=1;UBSAN_OPTIONS=print_stacktrace=0")
+endif()
+
 # Busy-spin scheduling fragility. A real-hardware contention experiment (ctest -j4 pinned to ~2 cores,
 # approximating a hosted CI runner's core count) showed these specific tests blow up 10-70x — a few
 # seconds unconstrained to 60-170s pinned — while the rest of the ~160-file suite stayed roughly

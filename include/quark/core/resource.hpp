@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory_resource>
 #include <optional>
 #include <stop_token>
 #include <tuple>
@@ -67,6 +68,14 @@ public:
         entries_.push_back(Entry{detail::resource_type_key<T>, &instance, lifetime});
     }
 
+    // Type-erased provide (ADR-021): the Engine's eager Node/Shard resolution pass (008 §"Metadata
+    // compilation") resolves resources behind a type-erased factory (`NodeShardResourcePlan` below),
+    // so it has only a `(type_key, void*)` pair, not a concrete `T&`, at the call site. Cold-path
+    // only — never called once a scope is handed to a `wire()` pass at runtime.
+    void provide_raw(const void* type_key, void* instance, ResourceLifetime lifetime) {
+        entries_.push_back(Entry{type_key, instance, lifetime});
+    }
+
     // Resolve the instance for type T. `errc::validation` (004/008) if no provider was declared —
     // this is the "undeclared resource is a validation error" contract, surfaced through
     // `quark::result` and checked at wire time (cold), never on the hot path.
@@ -98,6 +107,119 @@ private:
         ResourceLifetime lifetime;
     };
     std::vector<Entry> entries_{};
+};
+
+// ---- ResourceArena (ADR-021) — bump/arena storage for eagerly-resolved Node/Shard resources -----
+// Node- and Shard-scoped resources (004 §Lifetimes) are constructed ONCE (Node) or once per
+// configured shard (Shard) during the Engine's cold construction phase and must then live for the
+// Engine's ENTIRE lifetime — in particular, they must outlive every owned actor/activation that may
+// hold a `Cached<T>` pointing into this storage (004 §Rules "Node/Shard resource storage outlives
+// owned actors/activations", ADR-021). A bare `std::pmr::monotonic_buffer_resource` bulk-reclaims its
+// backing chunks on destruction WITHOUT invoking the placement-constructed objects' destructors — so
+// this arena carries an EXPLICIT destructor-thunk list, invoked in REVERSE construction order (the
+// same order ordinary member destruction uses) before the backing memory is released. Both failure
+// modes this guards against (destroyed-too-early UAF; skipped-dtor-on-bulk-reclaim leak) are proven,
+// with deliberately-broken positive controls, by resource_teardown_order_test.cpp /
+// resource_arena_thunk_list_test.cpp.
+class ResourceArena {
+public:
+    ResourceArena() = default;
+    ResourceArena(const ResourceArena&) = delete;
+    ResourceArena& operator=(const ResourceArena&) = delete;
+    ResourceArena(ResourceArena&&) = delete;
+    ResourceArena& operator=(ResourceArena&&) = delete;
+
+    // Placement-construct a T in the arena, remember its destructor thunk, and return a STABLE
+    // pointer (monotonic_buffer_resource never moves/frees an individual allocation until the whole
+    // arena is destroyed). Cold path only (Engine construction) — never called once the Engine is
+    // handing out `Cached<T>` pointers to running activations.
+    template <class T, class... Args>
+    [[nodiscard]] T* emplace(Args&&... args) {
+        void* mem = mbr_.allocate(sizeof(T), alignof(T));
+        T* obj = ::new (mem) T(std::forward<Args>(args)...);
+        thunks_.push_back(Thunk{obj, +[](void* p) noexcept { static_cast<T*>(p)->~T(); }});
+        return obj;
+    }
+
+    // How many objects this arena has constructed (test/observability seam — e.g. proving a Node
+    // factory ran exactly once).
+    [[nodiscard]] std::size_t constructed_count() const noexcept { return thunks_.size(); }
+
+    ~ResourceArena() {
+        // Explicit destructor-thunk list, reverse order — see the class banner. Without this loop,
+        // `mbr_`'s own destructor still runs (freeing the raw byte chunks back to `new_delete_resource`)
+        // but every placement-constructed object's OWN destructor is skipped (proven leaky/dirty by
+        // resource_arena_thunk_list_test.cpp's deliberately-thunk-less control).
+        for (auto it = thunks_.rbegin(); it != thunks_.rend(); ++it) it->dtor(it->obj);
+    }
+
+private:
+    struct Thunk {
+        void* obj;
+        void (*dtor)(void*) noexcept;
+    };
+    std::pmr::monotonic_buffer_resource mbr_{4096, std::pmr::new_delete_resource()};
+    std::vector<Thunk> thunks_{};
+};
+
+// ---- NodeShardResourcePlan (ADR-021) — the closed-world set of Node/Shard resource FACTORIES ------
+// Supplied to the Engine's constructor (008 §"Metadata compilation" cold phase). The Engine walks
+// this plan EXACTLY ONCE, synchronously, on the single thread running its constructor, strictly
+// before any worker thread exists — resolving every Node resource exactly once (shared by every
+// configured shard) and every Shard resource once per configured shard (004 §"Node/Shard resolution
+// ordering"). The type-key set captured here IS the closed world a later guarded `declare_lazy<A>()`
+// is validated against (008 §"Resource-type closed-world constraint") — an actor whose `wire()`
+// references a type never `provide_node`/`provide_shard`'d here fails `ResourceScope::resolve<T>()`
+// with `errc::validation` exactly like any other undeclared resource (no new validation machinery
+// needed: the existing per-shard `ResourceScope` the Engine builds from this plan simply has no entry
+// for that type).
+//
+// Factories are plain (stateless) function pointers — the returned VALUE is placement-constructed
+// into the Engine's `ResourceArena` storage by `ResourceArena::emplace`, so an arbitrarily-constructed
+// `T` is supported without the plan itself owning any heap.
+class NodeShardResourcePlan {
+public:
+    // A Node-scoped resource: `factory()` runs EXACTLY ONCE, ever, shared by every configured shard
+    // (004 §"A Node-scoped resource shared by many shards is therefore constructed exactly once, by a
+    // single thread, with no CAS, lock, or std::call_once").
+    template <class T>
+    void provide_node(T (*factory)()) {
+        node_entries_.push_back(NodeEntry{
+            detail::resource_type_key<T>,
+            +[](void* fn, ResourceArena& arena) -> void* {
+                return arena.emplace<T>(reinterpret_cast<T (*)()>(fn)());
+            },
+            reinterpret_cast<void*>(factory)});
+    }
+
+    // A Shard-scoped resource: `factory(shard_index)` runs exactly once PER configured shard.
+    template <class T>
+    void provide_shard(T (*factory)(std::uint32_t)) {
+        shard_entries_.push_back(ShardEntry{
+            detail::resource_type_key<T>,
+            +[](void* fn, ResourceArena& arena, std::uint32_t sid) -> void* {
+                return arena.emplace<T>(reinterpret_cast<T (*)(std::uint32_t)>(fn)(sid));
+            },
+            reinterpret_cast<void*>(factory)});
+    }
+
+    struct NodeEntry {
+        const void* type_key;
+        void* (*construct)(void* fn, ResourceArena& arena);
+        void* fn;
+    };
+    struct ShardEntry {
+        const void* type_key;
+        void* (*construct)(void* fn, ResourceArena& arena, std::uint32_t shard_index);
+        void* fn;
+    };
+
+    [[nodiscard]] const std::vector<NodeEntry>& node_entries() const noexcept { return node_entries_; }
+    [[nodiscard]] const std::vector<ShardEntry>& shard_entries() const noexcept { return shard_entries_; }
+
+private:
+    std::vector<NodeEntry> node_entries_{};
+    std::vector<ShardEntry> shard_entries_{};
 };
 
 // The one-time COLD wire pass, type-erased over the actor (`ADR-028` Phase 4's broker construction
