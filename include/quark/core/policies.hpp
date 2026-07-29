@@ -37,6 +37,13 @@ struct EventSourced;
 template <class Model, PersistMode Mode>
 struct Persistent;
 
+// Forward decl of the 009/ADR-022 opt-in per-instance-metrics policy surface (canonical definition
+// in metrics_cardinality.hpp — the same forward-declare-and-pattern-match technique as above; this
+// light, frequently-included header never has to pull in the (heavier) metrics cardinality machinery
+// just to detect the tag by template-id).
+template <std::size_t N>
+struct PerInstanceMetrics;
+
 // ============================================================================================
 // Policy catalog (005 §Policy catalog). Every policy is a TYPE; each slot has a default, so an
 // actor with no policies (`Actor<Order>`) is fully valid and Sequential. Order is irrelevant.
@@ -321,6 +328,19 @@ struct as_stateless<::quark::Stateless<N, Opts...>> {
     static constexpr bool cluster_wide = (std::is_same_v<Opts, ::quark::ClusterWide> || ...);
 };
 
+// Matches the forward-declared `PerInstanceMetrics<N>` (009/ADR-022 opt-in per-instance metrics
+// cardinality) by template-id and captures N — mirrors `as_budget<DrainBudget<N>>` above.
+template <class T>
+struct as_per_instance_metrics {
+    static constexpr bool present = false;
+    static constexpr std::size_t value = 0;
+};
+template <std::size_t N>
+struct as_per_instance_metrics<::quark::PerInstanceMetrics<N>> {
+    static constexpr bool present = true;
+    static constexpr std::size_t value = N;
+};
+
 // --- The traits, folded once over the recovered pack. -------------------------------------------
 template <class L>
 struct policy_traits;
@@ -378,6 +398,14 @@ struct policy_traits<PolicyList<Ps...>> {
     static constexpr std::size_t stateless_size =
         (std::size_t{0} + ... + (as_stateless<Ps>::present ? as_stateless<Ps>::value : std::size_t{0}));
     static constexpr bool stateless_cluster_wide = (as_stateless<Ps>::cluster_wide || ...);
+
+    // --- Per-instance metrics (009/ADR-022): opt-in cardinality, at most one per actor. ------------
+    static constexpr std::size_t per_instance_metrics_count =
+        (std::size_t{0} + ... + (as_per_instance_metrics<Ps>::present ? 1 : 0));
+    static constexpr bool has_per_instance_metrics = per_instance_metrics_count != 0;
+    static constexpr std::size_t per_instance_metrics_capacity =
+        (std::size_t{0} + ... +
+         (as_per_instance_metrics<Ps>::present ? as_per_instance_metrics<Ps>::value : std::size_t{0}));
 
     template <class Tag>
     static constexpr bool has = (std::is_same_v<Tag, Ps> || ...);
@@ -493,6 +521,20 @@ template <class A>
 template <class A>
 inline constexpr bool stateless_cluster_wide_v = policy_traits_of<A>::stateless_cluster_wide;
 
+// --- Per-instance metrics (009/ADR-022 Design 3) — opt-in cardinality over the engine-wide
+// `InstanceMetricsArena` (metrics_cardinality.hpp). Absent ⇒ the actor gets ONLY the always-on
+// per-type block. -----------------------------------------------------------------------------
+
+// True iff `A` opts into per-instance metric cardinality via `PerInstanceMetrics<N>`.
+template <class A>
+inline constexpr bool has_per_instance_metrics_v = policy_traits_of<A>::has_per_instance_metrics;
+
+// The declared per-(shard, type) freelist capacity N (0 if not opted in).
+template <class A>
+[[nodiscard]] consteval std::size_t per_instance_metrics_capacity_of() noexcept {
+    return policy_traits_of<A>::per_instance_metrics_capacity;
+}
+
 // True iff `A`'s placement strategy is `Explicit`.
 template <class A>
 inline constexpr bool placement_is_explicit_v = policy_traits_of<A>::placement_facts::strategy_explicit;
@@ -510,6 +552,14 @@ template <class A>
 template <class A>
 [[nodiscard]] consteval bool stateless_persistence_conflict() noexcept {
     return is_stateless_v<A> && policy_traits_of<A>::has_event_sourced_persist;
+}
+// A `Stateless<N>` pool activation is one of N interchangeable, load-routed instances with no stable
+// per-key identity (025 Part C) — there is nothing to pin a `PerInstanceMetrics<N>` slot TO across
+// the activation's lifetime (009 §"Per-instance failure modes" / ADR-022 residual risk). Reject the
+// combination at compile time rather than silently mislabeling or reassigning slots underneath scrape.
+template <class A>
+[[nodiscard]] consteval bool per_instance_metrics_stateless_conflict() noexcept {
+    return policy_traits_of<A>::has_per_instance_metrics && is_stateless_v<A>;
 }
 template <class A>
 [[nodiscard]] consteval bool empty_require_present() noexcept {
@@ -578,6 +628,17 @@ consteval bool validate_actor_policies() noexcept {
     static_assert(!stateless_persistence_conflict<A>(),
                   "conflicting policies: Stateless + Persistent<EventSourced> — a stateless actor "
                   "holds no durable state (025 §Interaction 012/017)");
+
+    // At most one PerInstanceMetrics<N> per actor (009/ADR-022, mirrors Priority/DrainBudget/etc).
+    static_assert(T::per_instance_metrics_count <= 1,
+                  "at most one PerInstanceMetrics<N> per actor (009 §Validation, ADR-022)");
+
+    // PerInstanceMetrics<N> + Stateless<N> is rejected: a pooled activation has no stable per-key
+    // identity to pin an instance slot to (009 §"Per-instance failure modes" / ADR-022).
+    static_assert(!per_instance_metrics_stateless_conflict<A>(),
+                  "conflicting policies: PerInstanceMetrics<N> + Stateless<N> — pool activations have "
+                  "no stable per-key identity for per-instance metric slot pinning (009 §\"Per-instance "
+                  "failure modes\", ADR-022)");
 
     // An empty `Require<>` (no capabilities) narrows nothing — always a config mistake (025).
     static_assert(!empty_require_present<A>(),

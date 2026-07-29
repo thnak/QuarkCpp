@@ -67,6 +67,12 @@ struct EngineConfig {
     // word and lives here instead. `idle_timeout_ms_of<A>() / idle_tick_ms` (rounded up, min 1) is
     // resolved once per `spawn<A>()` into the actor's `idle_ticks` count.
     std::uint32_t idle_tick_ms = 100;
+    // 009 §"Build-time budget gate" / ADR-022: worst-case metrics grid/arena footprint ceiling. A
+    // caller computes the exact footprint via `sizeof()` (metrics_cardinality.hpp's
+    // `TypeMetricsGrid<Spec>::footprint_bytes` / `InstanceMetricsArena<Spec>::footprint_bytes`) and
+    // checks it against this knob with `validate_metrics_budget` BEFORE attempting the allocation.
+    // Default is generous (64 MiB) so an unconfigured engine never spuriously rejects.
+    std::size_t metrics_memory_budget_bytes = 64ull * 1024 * 1024;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -120,6 +126,10 @@ public:
     ConfigBuilder& security_mode(SecurityMode v) noexcept { cfg_.security_mode = v; return *this; }
     ConfigBuilder& busy_spin_limit(unsigned n) noexcept { cfg_.busy_spin_limit = n; return *this; }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }
+    ConfigBuilder& metrics_memory_budget_bytes(std::size_t n) noexcept {
+        cfg_.metrics_memory_budget_bytes = n;
+        return *this;
+    }
 
     // HOT-LEAF SEED setters (these set the INITIAL Live word).
     ConfigBuilder& default_drain_budget(std::uint32_t n) noexcept { cfg_.drain_budget = n; return *this; }
