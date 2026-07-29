@@ -12,6 +12,12 @@ compile_commands.json
 *.gcno
 perf.data*
 callgrind.out.*
+perf_test.log
+
+# Local tooling artifacts
+.codegraph/
+.whmcp-tmp/
+*.deb
 
 # Editor
 .cache/
