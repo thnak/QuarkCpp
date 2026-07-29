@@ -1,7 +1,7 @@
 # Why `tail_` stalls the mailbox
 
 *Companion explainer to [002 — Scheduler](002-Scheduler.md) §Mailbox hot-path baseline and
-[ADR-031](decisions/ADR-031-mailbox-mpsc-hot-path-r8-judgment.md)/[ADR-032](decisions/ADR-032-mailbox-mpsc-hot-path-r9-judgment.md).*
+[ADR-031](decisions/ADR-031-mailbox-mpsc-hot-path-r8-judgment.md)/[ADR-032](decisions/ADR-032-mailbox-mpsc-hot-path-r9-judgment.md)/[ADR-033](decisions/ADR-033-mailbox-mpsc-hot-path-r10-judgment.md).*
 
 One atomic variable decides who gets to send a message next. When only one
 thread ever sends, that costs nothing. When several do, it becomes the whole
@@ -118,10 +118,28 @@ explicitly (ADR-004) and has held for nine design rounds since.
   reusable result recommended for pairing with proper hazard-pointer/RCU
   reclamation in a future round, rather than re-attempting SEG-REX as
   specified.
-- **Open** — closing the gap still needs a producer-side design that gives
-  each sender its own cache line, merged fairly by the one consumer, without
-  giving up the mailbox's FIFO/ordering guarantee. Not yet attempted as a
-  fresh round.
+- **ADR-033** — tried two more fresh candidates. SEG-HP (a hazard-pointer/
+  RCU-paired descendant of SEG-REX, answering ADR-032's own recommendation)
+  was disqualified by a *new* tri-state-contract violation (a
+  premature-`Empty` race at an ordinary segment-rotation boundary,
+  195/200 isolated repro) plus a ~370-400x rotation-burst p999 regression —
+  it did strictly improve on SEG-REX's oldest-message-discovery result
+  (flat, array-indexed, no reversal walk at all) but that gain is not yet
+  detachable from its broken mechanics. `DeliveryMode<ThroughputFirst<K>>`
+  abandoned the "make one mailbox scale" premise for an explicit opt-in
+  K-shard-plus-single-consumer design; it passed every safety/correctness
+  gate but its own throughput claim (>=3x) fell to 1.2x-1.5x real /
+  2.1x-2.7x under an idealized, collision-free control — proving, not just
+  arguing, that the single-executor invariant's one merge-consumer is
+  itself the new ceiling for this whole design family.
+- **Open, but now bounded** — closing the gap for the *default*,
+  ordering-preserving FIFO path still needs a producer-side design that
+  gives each sender its own cache line, merged fairly by the one consumer,
+  without giving up the mailbox's FIFO/ordering guarantee. ADR-033 supplies
+  the first proven ceiling for that family of designs (~2x-2.7x aggregate,
+  not near-linear with shard count), so a future attempt should scope
+  itself against that number rather than an unbounded hope. Not yet
+  attempted as a fresh round for the default (non-opt-in) path.
 
 ---
-*Field notes on the mailbox MPSC lineage, ADR-029 through ADR-032 — informational, not a spec or an ADR itself.*
+*Field notes on the mailbox MPSC lineage, ADR-029 through ADR-033 — informational, not a spec or an ADR itself.*

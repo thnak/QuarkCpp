@@ -138,6 +138,47 @@ oversubscription. Admission control and the scheduler's park path are the same
 > C3v2 and S2/S4 checks were) — "0 sanitizer reports" alone is not evidence of
 > correctness for this design space.
 >
+> **Update (ADR-033, r10 judgment) — a new permanent negative example: the
+> tri-state contract can be broken at an *ordinary* rotation boundary, not
+> only via force-seal/reclamation.** SEG-HP (a hazard-pointer/RCU-paired
+> descendant of SEG-REX) was disqualified by a bug neither its architect nor
+> its red-team anticipated: `try_dequeue()` returns `Empty` at a normal,
+> non-force-sealed full-segment-rotation boundary — the gap between
+> publishing a segment's last slot and linking the next segment — even
+> though the producer has already committed guaranteed-forthcoming work.
+> Reproduced 195/200 (97.5%) in an isolated repro and firing 13,353/240,000
+> times in a multi-lane stress run. Cite this as a new, permanent negative
+> example under the "Busy must never be misread as Empty" rule: a design
+> can violate the tri-state contract at its *ordinary* steady-state
+> boundary conditions, not only at its explicitly-guarded seal/reclamation
+> edges — any future segmented-mailbox design must test both. The same
+> design's F3 result (flat, array-indexed, no-reversal-walk
+> oldest-message-discovery latency) is a strictly stronger version of
+> SEG-REX's own ADR-032 finding and remains a reusable idea, but only once
+> paired with a fix to this bug and to the design's single per-mailbox
+> `head_seg_` cross-lane stall cursor (a stalled lane blocking every other
+> lane for the full measurement window, ~0.13-0.18s) — not a reason to
+> re-adopt SEG-HP as specified. See ADR-033.
+>
+> **Update (ADR-033, r10 judgment) — a new standing scoping constraint on
+> the P-scaling gap: the single-executor invariant caps any multi-shard
+> redesign's achievable throughput, and this round measured that cap.**
+> `DeliveryMode<ThroughputFirst<K>>` (K independent mailbox shards merged by
+> one round-robin consumer, offered as an explicit opt-in rather than a
+> mailbox redesign) passed every safety/correctness claim, but its central
+> throughput claim (>=3x at P=K=8) fell to 1.2x-1.5x measured, 2.1x-2.7x
+> even under an *idealized*, collision-free control that removes hash
+> quality as a confound. The root cause is structural, not tunable: this
+> spec's own single-executor invariant means exactly one consumer thread
+> merges all K shards, and that consumer's finite capacity to service real
+> concurrent cross-core coherence traffic from K live producers is the new
+> bottleneck (confirmed by an isolated single-threaded drain-only
+> diagnostic showing the merge consumer alone is not itself slow). Any
+> future mailbox-adjacent proposal claiming near-linear scaling with shard
+> count K must explain what it changes about the single consumer, not just
+> the producer side — absent that, evaluate it against a ~2x-2.7x realistic
+> ceiling, not an assumed linear one. See ADR-033.
+>
 > **Methodology warning (ADR-031) — unsound cross-producer FIFO verification.**
 > ADR-031's cross-examination of REX-CAS/C found that a shared monotonic
 > counter sampled to tag messages, when sampled **outside** the actual publish

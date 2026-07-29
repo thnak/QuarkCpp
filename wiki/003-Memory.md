@@ -243,6 +243,62 @@ the other:
   without first replacing it with real hazard-pointer/RCU-style deferred
   reclamation — see 015's residual-risk note on this same design.
 
+### Rejected designs (round 10, ADR-033)
+
+- **SEG-HP** (per-slot-`Descriptor*`/generation-gated segmented Treiber-push,
+  hazard-pointer/RCU-paired descendant of SEG-REX) — disqualified: a
+  reproducible premature-`Empty` violation of the Busy/Empty/mid-publish
+  tri-state contract at an *ordinary* (non-force-sealed) full-segment-
+  rotation boundary — the gap between publishing a segment's last slot and
+  linking the next segment lets `try_dequeue()` report `Empty` even though
+  guaranteed-forthcoming work is already committed (195/200 isolated repro;
+  13,353/240,000 in one multi-lane stress run) — plus a ~370-400x rotation-
+  burst p999 regression versus the incumbent (91.9-112.8µs vs. 250-286ns).
+  Do not re-attempt this specific rotation/reclamation mechanism without
+  first fixing both defects (see 015's residual-risk note and ADR-033's
+  round-11 scoping experiment). Its array-indexed, no-reversal-walk flat
+  p999 oldest-message-discovery result (F3) is real and strictly better than
+  SEG-REX's own finding, but is not detachable from the broken mechanics
+  around it — bank it, do not reuse the design as shipped.
+- **`DeliveryMode<ThroughputFirst<K>>`** (K independent unmodified-Vyukov
+  shards, one per producer-thread-hash-lane, merged by a round-robin
+  single consumer) — not disqualified on safety (every `safe`/`correct`
+  claim proved CORRECT), but its central throughput claim (>=3x at P=K=8)
+  fell to 1.2x-1.5x real / 2.1x-2.7x idealized-ceiling, and a second claim
+  (idle-shard latency "must not shift materially") was also disproven
+  (1.7x-2.8x p50 degradation). Both trace to the same structural cause: the
+  single-executor invariant means one consumer thread still merges all K
+  shards. Not adopted as the default this round; flagged as a candidate for
+  a future opt-in implementation decision, contingent on restating the
+  throughput claim honestly and documenting the idle-shard cost. See
+  ADR-033.
+
+**Methodological lesson (ADR-033, r10) — a harness must be shown incapable
+of a structurally-forced verdict before its result is trusted.** Two
+harness-construction traps were caught by the r10 prover in its own
+first-draft test code, before they could produce a false verdict: a
+single-threaded strict-alternation lost-wakeup harness that could never
+exhibit a lost wakeup *by construction*, regardless of whether the design
+under test was correct; and a `Busy`-observability harness with two threads
+illegally calling `try_dequeue()` on the same shard concurrently — itself a
+violation of `Mailbox`'s own single-consumer precondition, caught only
+because TSan flagged the harness's *own* race. This sits alongside the
+existing TSan-same-atomic-object blind spot (below) as a standing
+requirement: any future mailbox-adjacent proof must verify the harness
+itself cannot pass or fail independently of the design's actual behavior,
+and cannot itself violate the invariant it is meant to check.
+
+**Hash-diffusion caveat (ADR-033, r10) — a single-fold avalanche hash is
+measurably weaker for small sequential inputs.** A thread-nonce-keyed
+sharding hash of the form `h ^= h >> 32`, evaluated against a
+process-wide monotonic counter, showed ~5.76% worse lane spread for the
+*first* values the counter produces — exactly the common case of a fixed
+worker pool spawned once at startup. This is real but currently
+unquantified in downstream impact (throughput/fairness effect not yet
+measured at realistic K/pool sizes); flag it as a caveat for any future
+thread-id/nonce-based shard- or lane-assignment hash in this codebase, not
+yet a disqualifying defect on its own. See ADR-033 (`DeliveryMode` F2b).
+
 ## Shared-payload reclamation (broadcast)
 
 A `Topic<M>` publish (ADR-019) allocates **one** immutable, pool-allocated

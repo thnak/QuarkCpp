@@ -82,14 +82,17 @@ producer:  tail_.exchange(desc, acq_rel);    atomic_thread_fence(seq_cst);  exec
 > **0/200k**. Keep this as a permanent regression test. See
 > [ADR-002](decisions/ADR-002-mailbox-mpsc-hot-path-r2.md).
 
-## Mailbox hot-path baseline (ADR-029 r7, ADR-031 r8, ADR-032 r9 judgment)
+## Mailbox hot-path baseline (ADR-029 r7, ADR-031 r8, ADR-032 r9, ADR-033 r10 judgment)
 
 The intrusive Vyukov mailbox (003) won its 7th consecutive design round in
 ADR-029, then successfully defended against two fresh challengers (a
 segmented-ring/epoch-gated design and a 4th-generation Treiber-push/batch-
 reversal design) in ADR-031 r8, then again in ADR-032 r9 against a resident
 sequence-numbered ring with overflow valve (SBR-v5) and a segmented Treiber-
-push/bounded-batch-reversal design (SEG-REX) — neither dislodged it. Measured
+push/bounded-batch-reversal design (SEG-REX), then again in ADR-033 r10
+against a hazard-pointer/RCU-paired SEG-REX descendant (SEG-HP) and an
+explicit opt-in per-caller policy tag (`DeliveryMode<OrderFirst|
+ThroughputFirst<K>|LatencyFirst>`) — none dislodged it. Measured
 numbers from all rounds are real data points on different hosts/load
 conditions, so all are recorded rather than treated as one canonical figure:
 
@@ -125,13 +128,36 @@ conditions, so all are recorded rather than treated as one canonical figure:
   still needs a materially different producer-side design; ADR-032 flags
   pairing SEG-REX's bounded-segment reversal (which *did* achieve flat p999
   independent of backlog depth) with real hazard-pointer/RCU reclamation as
-  the most promising untried direction. See ADR-031, ADR-032.
+  the most promising untried direction. See ADR-031, ADR-032, and
+  [TAIL-CONTENTION.md](TAIL-CONTENTION.md) for the mechanism walkthrough.
 - **Busy/Empty/mid-publish tri-state contract validated as the reference
   correctness property for future designs (ADR-032).** SBR-v5's C2 claim
   (paused-producer correctly reports Busy, never folded into Empty) passed
   cleanly under 300+ trials specifically because it reused this contract
   unmodified — any future segmented/ring redesign of the mailbox must
   reproduce this same tri-state handling, not just match throughput.
+- **P-scaling gap: two fresh candidates tried and rejected, but the
+  achievable ceiling for the whole design family is now empirically bounded
+  (ADR-033 r10).** SEG-HP (a hazard-pointer/RCU-paired descendant of
+  ADR-032's SEG-REX) was disqualified by a *new* tri-state-contract
+  violation — `try_dequeue()` returns `Empty` at an ordinary,
+  non-force-sealed segment-rotation boundary even though the producer has
+  already committed guaranteed-forthcoming work (195/200 isolated repro;
+  13,353/240,000 in one multi-lane stress run) — plus a ~370-400x p999
+  regression under synchronized rotation-burst contention (91.9-112.8µs vs.
+  the incumbent's 250-286ns). `DeliveryMode<OrderFirst|ThroughputFirst<K>|
+  LatencyFirst>`, an explicit opt-in per-caller policy tag rather than a
+  mailbox redesign, passed every safety/correctness gate cleanly but its
+  central throughput claim (>=3x at P=K=8) fell to 1.2x-1.5x real /
+  2.1x-2.7x idealized-ceiling — root-caused, via an idealized
+  collision-free control, to the single-executor invariant itself: exactly
+  one consumer thread still merges all K shards, and that consumer's
+  finite capacity to service concurrent cross-core coherence traffic from
+  K live producers is the new bottleneck. **Any future multi-shard-plus-
+  single-consumer mailbox proposal attacking this gap should be evaluated
+  against a ~2x-2.7x realistic ceiling, proven via an idealized
+  collision-free control, not an assumed near-linear scaling with shard
+  count K.** See ADR-033 and [TAIL-CONTENTION.md](TAIL-CONTENTION.md).
 
 ## Sharding
 
