@@ -218,11 +218,15 @@ data-plane flow-control design, not a defect in the proven placement/FIFO core.
 - **Cross-node backpressure (the named residual for full acceptance)**: how a remote full
   mailbox (006) signals the sender without head-of-line blocking the shared connection. Needs
   its own gate before 010's backpressure path promotes.
-- Split-brain policy under network partition — HRW gives deterministic placement,
-  but two partitions may each activate the "same" actor; reconcile via persistence
-  fencing tokens (012)?
+- *(Split-brain policy under network partition: resolved for `EffectivelyOnce` actors —
+  HRW gives deterministic placement, but two partitions may still each activate the "same"
+  actor; the store accepts only the higher fencing token at commit, so the zombie
+  activation's commit (and its transactional outbox) is rejected, producing no state and no
+  output. See the partition worked example in `017-Delivery-Guarantees`. Actors that don't
+  opt into `EffectivelyOnce` accept this as the documented CP/AP tradeoff, not a gap.)*
 - Node-identity / certificate revocation propagation in a coordinator-free cluster
-  — gossip a revocation list over SWIM vs. short-lived certs (020).
+  — gossip a revocation list over SWIM vs. short-lived certs (020). *(Same open item as
+  020-Security's "Certificate/identity revocation" — not yet resolved in either spec.)*
 - Whether shard-granularity or actor-granularity is the unit of re-placement on
   membership change. *(Addressed by 026: the **virtual bin** is the re-placement unit
   at scale — a join/leave moves ~1/N bins, quantized and cache-friendly.)*
