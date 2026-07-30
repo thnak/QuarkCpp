@@ -110,9 +110,9 @@ int main() {
     // ---------------------------------------------------------------------------------------------
     {
         namespace fs = std::filesystem;
-        char tmpl[] = "/tmp/quark_rembench_XXXXXX";
-        const char* dir = ::mkdtemp(tmpl);
-        const std::string path = std::string(dir) + "/r.qrem";
+        auto tmp = fs::temp_directory_path() / "quark_rembench_XXXXXX";
+        fs::create_directories(tmp);
+        const std::string path = (tmp / "r.qrem").string();
         constexpr std::size_t M = 20'000;
 
         FileReminderStore store(path);
@@ -134,7 +134,7 @@ int main() {
         std::printf("   cancel (remove)    : %.0f ns/op   (1 fdatasync/op)\n", cancel_ns);
         std::printf("   note               : fsync cost is device-bound (tmpfs ~0.2us, ext4 ~2ms); the\n");
         std::printf("                        O(1) index work + exactly-one-sync-per-op is what's fixed.\n\n");
-        fs::remove_all(dir);
+        fs::remove_all(tmp);
     }
 
     std::printf("done. (numbers are tripwires on this VM, not the 023 reference stamp — ADR-017.)\n");

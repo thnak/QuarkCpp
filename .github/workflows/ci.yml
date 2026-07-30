@@ -179,7 +179,8 @@ jobs:
         shell: cmd
         run: |
           cmake -S . -B build -A x64 -DQUARK_BUILD_BENCH=OFF ^
-            ${{ matrix.config.sanitize != '' && format('-DQUARK_SANITIZE={0}', matrix.config.sanitize) || '' }}
+            ${{ matrix.config.sanitize != '' && format('-DQUARK_SANITIZE={0}', matrix.config.sanitize) || '' }} ^
+            ${{ matrix.config.sanitize != '' && '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=ProgramDatabase' || '' }}
 
       # Multi-config generator (VS/MSBuild): --config is required on both build and ctest below.
       - name: Build
@@ -193,6 +194,12 @@ jobs:
         # ctest's own process-level -j undercounts true concurrency here, since several tests are
         # themselves multi-threaded; RUN_SERIAL on the specific busy-spin tests (tests/CMakeLists.txt)
         # is the primary fix, this just avoids adding MORE process-level contention on top of that.
+        #
+        # MSVC ASAN: symbolize=0 prevents ASAN's stack-symbolizer from hanging when debug info is
+        # incomplete on the CI runner (observed C5072/LNK4302 warnings). halt_on_error=0 keeps a
+        # detected error as a clean non-zero exit rather than a SIGABRT that ctest can't timeout.
+        env:
+          ASAN_OPTIONS: symbolize=0:halt_on_error=0
         run: ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 1800
 
       - name: Upload ctest logs on failure

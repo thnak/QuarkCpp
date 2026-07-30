@@ -29,7 +29,11 @@ namespace {
 // on THIS hardware. 10x the trials (matching the same fix applied to topic_no_quiesce_control after an
 // identical symptom — see topic_subscribe_race_test.cpp) for a much lower false-negative rate; runtime
 // stays well inside ctest's per-test timeout (~100s at this count, measured).
+#if defined(_MSC_VER) && defined(__SANITIZE_ADDRESS__)
+constexpr std::uint64_t kTrials = 500'000;
+#else
 constexpr std::uint64_t kTrials = 50'000'000;
+#endif
 
 // The two close-out flags, each on its own cache line (isolate the StoreLoad — like armed_ vs the ring
 // cursors). Reset every trial; the racing store/load pair runs under a sense-reversing barrier.

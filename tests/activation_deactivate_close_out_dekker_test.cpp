@@ -28,7 +28,11 @@ namespace {
 // second time and pointing at the trial count's margin against the runner's own (likely virtualized,
 // possibly time-sliced-vCPU) hit rate for this few-nanosecond store-buffer-drain window. 10x again,
 // matching topic_no_quiesce_control's precedent for the identical symptom.
+#if defined(_MSC_VER) && defined(__SANITIZE_ADDRESS__)
+constexpr std::uint64_t kTrials = 500'000;
+#else
 constexpr std::uint64_t kTrials = 50'000'000;
+#endif
 
 // ax = the consumer's "retire_to_dormant" store; ay = the producer's "message enqueued" store. Each
 // on its own cache line (isolate the StoreLoad, like the real retire_to_dormant/mailbox pair).
