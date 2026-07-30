@@ -73,6 +73,13 @@ struct EngineConfig {
     // checks it against this knob with `validate_metrics_budget` BEFORE attempting the allocation.
     // Default is generous (64 MiB) so an unconfigured engine never spuriously rejects.
     std::size_t metrics_memory_budget_bytes = 64ull * 1024 * 1024;
+    // ADR-035: bounded, read-only spin BEFORE a worker commits to park()'s OS block (futex/
+    // WaitOnAddress). Distinct axis from busy_spin_limit (a DIFFERENT spin bounding the mailbox/
+    // run-queue's non-linearizable Busy tri-state WHILE draining, ns-order); this one bridges the
+    // gap between "no work right now" and the µs-order park/wake syscall round trip, never touches
+    // idle_mask_, and always falls through to the unmodified park() Dekker rendezvous. 0 disables it
+    // (byte-for-byte park() path, only a predictable branch added at the call site). Never unbounded.
+    std::uint32_t pre_park_spin_limit = 256;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -125,6 +132,7 @@ public:
     ConfigBuilder& validation(Validation v) noexcept { cfg_.validation = v; return *this; }
     ConfigBuilder& security_mode(SecurityMode v) noexcept { cfg_.security_mode = v; return *this; }
     ConfigBuilder& busy_spin_limit(unsigned n) noexcept { cfg_.busy_spin_limit = n; return *this; }
+    ConfigBuilder& pre_park_spin_limit(std::uint32_t n) noexcept { cfg_.pre_park_spin_limit = n; return *this; }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }
     ConfigBuilder& metrics_memory_budget_bytes(std::size_t n) noexcept {
         cfg_.metrics_memory_budget_bytes = n;
