@@ -114,21 +114,37 @@ every config, including TSan — both new fan-out primitives are race-free under
 
 ## Known-divergent, asserted-in-part: `type_key` cross-toolchain conformance (008)
 
-`metadata_typekey_conformance_test` pins **golden `type_key` constants** so any drift — a new
-compiler, a new compiler version, or an edit to the name slicer / fingerprint folder — turns red
-instead of silently invalidating already-written durable records. (Its sibling
+`tests/metadata_typekey_conformance_test.cpp` pins **golden `type_key` constants** so any drift —
+a new compiler, a new compiler version, or an edit to the name slicer / fingerprint folder — turns
+red instead of silently invalidating already-written durable records. (Its sibling
 `metadata_typekey_test` asserts only self-consistency and cannot detect drift by construction.)
+
+**Correction (2026-07-30):** this section previously described measured results (specific golden
+hex constants, a `g++ 14.3 / clang 20.1` comparison) for a test file that **did not exist in the
+repository** — `git log --all` shows it was never committed on any branch; only this section's
+prose and `OpenQuestions.md`'s item 1 described it. The test now actually exists and has actually
+been run; the numbers below are real, freshly measured, and superseded the earlier (unverified)
+ones. Toolchains used: **Clang 22.1.5** and real **MSVC 19.51.36252 (`cl.exe`)**, both on this
+Windows/x86-64 box — g++ was not available here, so the GCC leg is unconfirmed locally and rides
+on Linux CI to actually exercise it.
+
 It is deliberately **tiered**, because two of the three tiers do not hold today:
 
 | Tier | Types | Status | Asserted? |
 |---|---|---|---|
-| 1 | Described types (`fingerprint_v<T>`) | Portable **by construction** — folds `{(tag, wire_type)}`, no name enters it. Byte-identical g++ 14.3 / clang 20.1. | Golden, **all** toolchains |
-| 2 | User-defined names, actor protocol folds | Byte-identical g++ 14.3 / clang 20.1. **MSVC excluded**: its `__FUNCSIG__` slice keeps the `struct`/`class` elaborator (`struct ns::Point` vs `ns::Point`), so every name-derived key differs. Read from source — not yet measured on a Windows host. | Golden, `#if !defined(_MSC_VER)` |
-| 3 | Builtin spellings and templates over them | **Divergent today.** `size_t` = `long unsigned int` (GCC) vs `unsigned long` (Clang); same for `long long unsigned int`/`unsigned long long` and `long long int`/`long long`; propagates into `Wrap<uint64_t>`. Different string → different FNV-1a → different key for the same type. | Determinism only — a golden would hard-fail one compiler |
+| 1 | Described types (`fingerprint_v<T>`) | Portable **by construction** — folds `{(tag, wire_type)}`, no name enters it. **Measured byte-identical, Clang 22.1.5 ↔ real MSVC 19.51** (`0x60eb68b9763e6f4c`); GCC unconfirmed locally but portability holds by construction, not by two toolchains agreeing. | Golden, **all** toolchains |
+| 2 | User-defined names, actor protocol folds | **Measured divergent, Clang ↔ real MSVC**: Clang (`__clang__` branch, `0xba4a66eb2b3e6ff3`) vs real MSVC (`__FUNCSIG__` elaborator keeps `struct`/`class`, `0x2d4c989423ddf201`) — the predicted divergence is now confirmed, not merely plausible. | Golden per branch — **not** `#if !defined(_MSC_VER)` (see correction below) |
+| 3 | Builtin spellings and templates over them | **Divergent today.** Measured Clang ↔ MSVC also diverge (`Wrap<size_t>`: `0xb49a2938a7872282` vs `0xd72ff69f238be657`), same class of issue documented for GCC vs Clang. | Determinism only — a golden would hard-fail one compiler |
+
+**Guard correction:** the previous `#if !defined(_MSC_VER)` guard for Tier 2 was wrong and would
+have silently mis-asserted on Windows: Clang targeting the MSVC ABI (the default on Windows)
+defines **both** `__clang__` and `_MSC_VER`. `metadata.hpp`'s `canonical_type_name()` checks
+`__clang__` before `_MSC_VER`, so Windows-Clang correctly takes the Clang/GCC branch — but a guard
+keyed on `!defined(_MSC_VER)` would exclude it anyway. The test now mirrors `metadata.hpp`'s own
+dispatch order (`#if defined(__clang__) || defined(__GNUC__)` ... `#elif defined(_MSC_VER)`).
 
 Tier 3 is the open half of [OpenQuestions.md](OpenQuestions.md) item 1; closing it (normalizing the
-spellings, or mandating explicit per-type keys) promotes Tier 3 into Tier 1. Confirming the Tier-2
-MSVC exclusion on Windows CI is the next concrete step. Both tiers' goldens were verified to be
-non-vacuous by negative control: perturbing a Tier-1 constant and renaming the fixture namespace
-each turn the test red, and the namespace rename leaves all four Tier-1 fingerprints intact —
-directly demonstrating the name-independence Tier 1 rests on.
+spellings, or mandating explicit per-type keys) promotes Tier 3 into Tier 1. The Tier-2 MSVC
+divergence is now **confirmed**, not just predicted. Tier 1's golden is non-vacuous by negative
+control: a fields-swapped sibling type (same fields, tags 1↔2 swapped) moves the fingerprint
+(`0x54f52ae0703db766`), demonstrating the 016 field-order invariant the fold rests on.

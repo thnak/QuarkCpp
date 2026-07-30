@@ -308,30 +308,43 @@ These affect multiple subsystems; resolving one constrains several specs.
    developer-assigned explicit `type_key` as the fallback if it proves unreliable.
    *(This is a conformance test to write, not a design question.)*
 
-   **Partially answered — the test now exists and the answer is "no, not yet".**
-   [`tests/metadata_typekey_conformance_test.cpp`](tests/metadata_typekey_conformance_test.cpp)
-   pins golden key constants in three tiers (the pre-existing `metadata_typekey_test.cpp`
-   asserts only self-consistency and cannot observe drift at all). Measured on
-   Linux/x86-64, g++ 14.3 vs clang 20.1:
-   - **Described types are portable** — `fingerprint_v<T>` folds `{(tag, wire_type)}`
-     with no name, so it is toolchain-independent *by construction*. Byte-identical
-     across both compilers. This is the tier durable headers and wire negotiation ride on.
-   - **User-defined names agree GCC↔Clang** — also byte-identical, so those goldens are
-     asserted for both.
-   - **Builtin spellings DIVERGE today**: `size_t` is `long unsigned int` (GCC) vs
-     `unsigned long` (Clang); likewise `long long unsigned int`/`unsigned long long` and
-     `long long int`/`long long`. Different string → different FNV-1a → **different
-     `type_key` for the same type**, and it propagates into any template over them
-     (`Wrap<uint64_t>`). Left as recorded-not-asserted (Tier 3); pinning a golden would
-     hard-fail one compiler.
-   - **MSVC diverges for every name-derived key** (read from source, not yet measured —
-     no Windows host here): the `__FUNCSIG__` slice in `metadata.hpp §canonical_type_name`
-     retains the `struct`/`class` elaborator, yielding `struct ns::Point` where GCC/Clang
-     yield `ns::Point`. Tier 2 is therefore `#if !defined(_MSC_VER)`-guarded. **Confirming
-     this on Windows CI is the next step.**
+   **Answered for real as of 2026-07-30 — the test now actually exists and has actually run.**
+   This entry previously described `tests/metadata_typekey_conformance_test.cpp` as written and
+   measured, with specific golden constants and a "g++ 14.3 vs clang 20.1" comparison. It wasn't:
+   `git log --all` showed the file was never committed on any branch — the numbers were
+   unverified prose, not test output. The file has now actually been written and run (see
+   [`tests/metadata_typekey_conformance_test.cpp`](tests/metadata_typekey_conformance_test.cpp) and
+   [VERIFICATION.md](VERIFICATION.md)'s conformance section), on **Clang 22.1.5** and real
+   **MSVC 19.51.36252 (`cl.exe`)**, both on Windows/x86-64 (no g++ available on this box — the
+   GCC leg is unconfirmed locally, gated on Linux CI actually running it):
+   - **Described types are portable** — `fingerprint_v<T>` folds `{(tag, wire_type)}` with no
+     name, so it is toolchain-independent *by construction*. **Measured byte-identical, Clang ↔
+     real MSVC** (`0x60eb68b9763e6f4c` for a two-`int`-field type — this happens to be the exact
+     value item 2 below cites for its `Point`/`Account` collision example, an independent
+     confirmation the fold logic itself is correct). This is the tier durable headers and wire
+     negotiation ride on.
+   - **User-defined names diverge Clang ↔ real MSVC — now confirmed, not just predicted**:
+     Clang `0xba4a66eb2b3e6ff3` vs real MSVC `0x2d4c989423ddf201` for the identical type. The
+     `__FUNCSIG__` slice in `metadata.hpp §canonical_type_name` retains the `struct`/`class`
+     elaborator (`struct ns::Point` vs `ns::Point`), which is exactly why they differ.
+   - **Guard correction**: the original plan to gate Tier 2's golden on `#if !defined(_MSC_VER)`
+     was wrong. Clang on Windows targets the MSVC ABI by default and defines **both**
+     `__clang__` and `_MSC_VER`; `canonical_type_name()` checks `__clang__` first (so
+     Windows-Clang correctly takes the Clang/GCC branch), but a `!defined(_MSC_VER)` guard would
+     have excluded it anyway. The test now mirrors `metadata.hpp`'s actual dispatch order.
+   - **Builtin spellings DIVERGE today**: measured Clang ↔ MSVC also diverge for
+     `Wrap<size_t>` (`0xb49a2938a7872282` vs `0xd72ff69f238be657`), the same class of issue
+     previously described for GCC vs Clang (`size_t` = `long unsigned int` vs `unsigned long`
+     vs `unsigned __int64`). Different string → different FNV-1a → **different `type_key` for
+     the same type**. Left as recorded-not-asserted (Tier 3); pinning a golden would hard-fail
+     at least one toolchain.
 
-   Closing this means normalizing the spellings (strip the MSVC elaborator, canonicalize
-   builtin names) or mandating an explicit per-type key; then Tier 3 promotes to Tier 1.
+   GCC's leg (the original g++ 14.3 comparison) is still unconfirmed on this box and needs a
+   real run — Linux CI (`.github/workflows/ci.yml`, `test` job) now exercises this file on both
+   gcc-release and clang-release, so the next CI run is the actual first cross-toolchain-on-Linux
+   data point. Closing Tier 3 means normalizing the spellings (strip the MSVC elaborator,
+   canonicalize builtin names) or mandating an explicit per-type key; then Tier 3 promotes to
+   Tier 1.
 
 2. **`type_key` collisions between distinct Described types** (008/016) — **NEW, design,
    not verification.** Because `fingerprint_v<T>` folds only `{(tag, wire_type)}` and
