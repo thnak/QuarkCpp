@@ -46,31 +46,30 @@ struct Job {
 // The first arriver parks on the condvar (yielding its core), so even a single-core scheduler makes
 // progress: the other worker gets scheduled, arrives, and trips the rendezvous. A generous timeout is a
 // safety net against an unexpected single-worker run (never hit in practice — the backlog spans slots).
+// ADR-035 note: this used to be an ASYMMETRIC rendezvous — the trip-winner never blocked, and
+// instead slept an arbitrary fixed duration (originally 1ms) to *guess* how long the woken loser
+// would take to reacquire the lock and reach the shared critical section, so both sides' RMW
+// windows would land close enough in real time to overlap. That guess depended on real OS
+// wake-latency, which shifted once the engine's bounded pre-park spin (EngineConfig::
+// pre_park_spin_limit, ADR-035) started busy-polling on the same cores this test's threads run
+// on: 1ms started deterministically failing to catch the tear, but so did 20ms and 100ms — no
+// fixed guess was reliable, because the winner racing ahead (or oversleeping past the loser) is
+// the wrong shape of fix for an unpredictable wake latency. Replaced with a genuine SYMMETRIC
+// barrier: neither side proceeds until BOTH have arrived, removing the asymmetric head start
+// entirely (the residual notify-vs-wake latency is now absorbed by widening the RMW race window
+// itself below, not by guessing a sleep duration).
 struct OverlapGate {
     std::mutex m;
     std::condition_variable cv;
     int arrived = 0;
-    bool tripped = false;
     int need = 2;
     void arrive() {
         std::unique_lock<std::mutex> lk(m);
-        if (tripped) return;
         if (++arrived >= need) {
-            tripped = true;
             cv.notify_all();
-            lk.unlock();
-            // The trip-winner never blocks, but the thread(s) it just woke DO need to actually get
-            // scheduled and reacquire `m` before they reach the shared critical section right after
-            // arrive() returns. On a loaded/virtualized CI host that OS wake latency can exceed the
-            // winner's own remaining work, so without this it can race ahead and finish its own
-            // critical section before the other side ever wakes — no real overlap, no torn state,
-            // and (observed in CI) the shared-state CONTROL's tearing silently fails to fire. A short
-            // real-time sleep — not a spin, whose duration is hardware-speed-dependent — gives the
-            // woken side a generous, host-independent window to catch up first.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            return;
+        } else {
+            cv.wait_for(lk, std::chrono::seconds(5), [&] { return arrived >= need; });
         }
-        cv.wait_for(lk, std::chrono::seconds(5), [&] { return tripped; });
     }
 };
 
@@ -127,10 +126,16 @@ struct Worker : Actor<Worker, Sequential> {
 
 #ifdef QUARK_STATELESS_SHARED_STATE_CONTROL
         // Shared plain accumulator RMW'd by ≥2 activations concurrently → data race + lost updates. The
-        // spin widens the read-modify-write window so the tearing is reliable even without TSan (bumped
-        // from 64: observed NOT-FIRED, torn=0, on a noisy shared CI runner at the smaller width).
+        // spin widens the read-modify-write window so the tearing is reliable even without TSan.
+        // Widened 4096 -> 200,000 (ADR-035): with the OverlapGate now a genuine symmetric barrier (both
+        // sides start their RMW near-simultaneously, no artificial pre-delay), the residual notify-vs-OS-
+        // wake latency for whichever side was the blocked waiter needs to land INSIDE this window for the
+        // race to manifest. 4096 iterations (a few hundred ns) was reliable pre-ADR-035 but is no longer
+        // wide enough once the engine's bounded pre-park spin adds real scheduling-latency variance on a
+        // core-constrained host; 200,000 iterations is still on the order of tens of microseconds per
+        // call, keeping the whole M=40,000-message run comfortably sub-second (machine-safety budget).
         long tmp = g_ctrl_count;
-        for (int s = 0; s < 4096; ++s) {
+        for (int s = 0; s < 200'000; ++s) {
             std::atomic_signal_fence(std::memory_order_seq_cst);  // compiler barrier: widen the RMW window
         }
         g_ctrl_count = tmp + 1;
