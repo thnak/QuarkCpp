@@ -84,13 +84,21 @@ void check(bool c, const char* what, bool& ok) {
 inline constexpr std::uint64_t kTier1Golden = 0x60eb68b9763e6f4cULL;
 inline constexpr std::uint64_t kTier1SwappedGolden = 0x54f52ae0703db766ULL;
 
-// Tier 2 golden, measured on Clang (this box) — the branch metadata.hpp's canonical_type_name()
+// Tier 2 golden, measured on Clang (Windows box) — the branch metadata.hpp's canonical_type_name()
 // takes whenever __clang__ is defined, INCLUDING Windows Clang, which also defines _MSC_VER for
 // MSVC-ABI compatibility. `#if !defined(_MSC_VER)` (as OpenQuestions.md originally proposed) is
 // therefore the WRONG guard here — it would wrongly exclude a real Clang build on Windows. The
 // guard below mirrors metadata.hpp's actual dispatch order (__clang__ / __GNUC__ checked BEFORE
-// _MSC_VER). Not independently confirmed against real GCC on this box.
-inline constexpr std::uint64_t kTier2GoldenClangGcc = 0xba4a66eb2b3e6ff3ULL;
+// _MSC_VER).
+inline constexpr std::uint64_t kTier2GoldenClang = 0xba4a66eb2b3e6ff3ULL;
+// Real GCC golden — measured directly (g++ 15.2.0, WSL/Linux). CORRECTED: this was originally
+// assumed to share Clang's golden (both use __PRETTY_FUNCTION__-based name slicing in
+// canonical_type_name()), but real GCC diverges from real Clang here too, not just from MSVC —
+// the two compilers' __PRETTY_FUNCTION__ output for the identical type is NOT byte-identical
+// (a different name string folds to a different FNV-1a key). This was caught by ThreadSanitizer
+// CI running this test for the first time on GCC and failing it, exactly the drift-detection this
+// test exists for.
+inline constexpr std::uint64_t kTier2GoldenGcc = 0xc1a54de107d9d89fULL;
 // Real MSVC (cl.exe, __clang__ NOT defined) golden — measured directly, confirms the predicted
 // elaborator divergence (`struct ns::Point` vs `ns::Point`) is real, not merely plausible.
 inline constexpr std::uint64_t kTier2GoldenRealMsvc = 0x2d4c989423ddf201ULL;
@@ -115,15 +123,31 @@ int main() {
           "Tier 1 negative control: swapping which field carries which tag MUST move the "
           "fingerprint (016 field-order invariant) — proves the golden above is non-vacuous", ok);
 
-    // --- Tier 2: golden on the __clang__/__GNUC__ branch; real MSVC diverges (confirmed). ----
-    // This mirrors metadata.hpp's OWN dispatch priority, not a naive _MSC_VER check.
-#if defined(__clang__) || defined(__GNUC__)
-    check(tier2_key == kTier2GoldenClangGcc,
-          "Tier 2 golden (Clang/GCC name-derived key) drifted", ok);
+    // --- Tier 2: one golden PER COMPILER — Clang, GCC, and MSVC all diverge from each other
+    // (confirmed; GCC vs Clang was originally assumed to match since both use
+    // __PRETTY_FUNCTION__-based slicing, but real measurement disproved that — see the golden
+    // constants' comments above). This mirrors metadata.hpp's OWN dispatch priority
+    // (__clang__ checked before __GNUC__ before _MSC_VER), not a naive _MSC_VER check.
+#if defined(__clang__)
+    check(tier2_key == kTier2GoldenClang,
+          "Tier 2 golden (Clang name-derived key) drifted", ok);
+    check(tier2_key != kTier2GoldenGcc,
+          "Tier 2 CONFIRMED divergence: Clang's __PRETTY_FUNCTION__ slice yields a different "
+          "name-derived key than GCC's for the identical type",
+          ok);
+#elif defined(__GNUC__)
+    check(tier2_key == kTier2GoldenGcc,
+          "Tier 2 golden (GCC name-derived key) drifted", ok);
+    check(tier2_key != kTier2GoldenClang,
+          "Tier 2 CONFIRMED divergence: GCC's __PRETTY_FUNCTION__ slice yields a different "
+          "name-derived key than Clang's for the identical type — if this ever matches, one of "
+          "the two toolchains' canonical_type_name() slicing changed and this pairing may be "
+          "closeable",
+          ok);
 #elif defined(_MSC_VER)
     check(tier2_key == kTier2GoldenRealMsvc,
           "Tier 2 golden (real MSVC name-derived key) drifted", ok);
-    check(tier2_key != kTier2GoldenClangGcc,
+    check(tier2_key != kTier2GoldenClang && tier2_key != kTier2GoldenGcc,
           "Tier 2 CONFIRMED divergence: real MSVC's __FUNCSIG__ elaborator (`struct ns::T` vs "
           "`ns::T`) yields a different name-derived key than Clang/GCC for the identical type — "
           "if this ever matches, MSVC's canonical_type_name() slicing changed and Tier 2 may be "

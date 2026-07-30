@@ -123,28 +123,32 @@ red instead of silently invalidating already-written durable records. (Its sibli
 hex constants, a `g++ 14.3 / clang 20.1` comparison) for a test file that **did not exist in the
 repository** — `git log --all` shows it was never committed on any branch; only this section's
 prose and `OpenQuestions.md`'s item 1 described it. The test now actually exists and has actually
-been run; the numbers below are real, freshly measured, and superseded the earlier (unverified)
-ones. Toolchains used: **Clang 22.1.5** and real **MSVC 19.51.36252 (`cl.exe`)**, both on this
-Windows/x86-64 box — g++ was not available here, so the GCC leg is unconfirmed locally and rides
-on Linux CI to actually exercise it.
+been run on all three real toolchains this session: **Clang 22.1.5** and real
+**MSVC 19.51.36252 (`cl.exe`)** on Windows/x86-64, and real **g++ 15.2.0** via a WSL/Ubuntu
+environment reached later the same session (used to run this project's TSan gate, which is not
+available on native Windows/clang — running the full suite under TSan is what caught the Tier 2
+error described below).
 
 It is deliberately **tiered**, because two of the three tiers do not hold today:
 
 | Tier | Types | Status | Asserted? |
 |---|---|---|---|
-| 1 | Described types (`fingerprint_v<T>`) | Portable **by construction** — folds `{(tag, wire_type)}`, no name enters it. **Measured byte-identical, Clang 22.1.5 ↔ real MSVC 19.51** (`0x60eb68b9763e6f4c`); GCC unconfirmed locally but portability holds by construction, not by two toolchains agreeing. | Golden, **all** toolchains |
-| 2 | User-defined names, actor protocol folds | **Measured divergent, Clang ↔ real MSVC**: Clang (`__clang__` branch, `0xba4a66eb2b3e6ff3`) vs real MSVC (`__FUNCSIG__` elaborator keeps `struct`/`class`, `0x2d4c989423ddf201`) — the predicted divergence is now confirmed, not merely plausible. | Golden per branch — **not** `#if !defined(_MSC_VER)` (see correction below) |
-| 3 | Builtin spellings and templates over them | **Divergent today.** Measured Clang ↔ MSVC also diverge (`Wrap<size_t>`: `0xb49a2938a7872282` vs `0xd72ff69f238be657`), same class of issue documented for GCC vs Clang. | Determinism only — a golden would hard-fail one compiler |
+| 1 | Described types (`fingerprint_v<T>`) | Portable **by construction** — folds `{(tag, wire_type)}`, no name enters it. **Measured byte-identical across all three real toolchains** (`0x60eb68b9763e6f4c`, Clang 22.1.5 / MSVC 19.51 / GCC 15.2.0). | Golden, **all** toolchains |
+| 2 | User-defined names, actor protocol folds | **Measured divergent across ALL THREE toolchains, pairwise.** Clang `0xba4a66eb2b3e6ff3`, GCC `0xc1a54de107d9d89f`, MSVC `0x2d4c989423ddf201` — all three different. GCC was originally *assumed* to share Clang's golden (both use `__PRETTY_FUNCTION__`-based slicing) and the test originally asserted that; TSan CI running this test on real GCC for the first time failed it, proving that assumption wrong — same slicing logic, different compiler-emitted string, different FNV-1a key. | One golden **per compiler** — **not** `#if !defined(_MSC_VER)`, and **not** a shared Clang/GCC golden (see correction below) |
+| 3 | Builtin spellings and templates over them | **Divergent today, confirmed on all three.** `Wrap<size_t>`: Clang `0xb49a2938a7872282`, MSVC `0xd72ff69f238be657`, GCC `0x6a63503e4e5ba5c9` — three different `size_t` spellings (`unsigned long` / `unsigned __int64` / `long unsigned int`), three different folds. | Determinism only — a golden would hard-fail at least two of three compilers |
 
 **Guard correction:** the previous `#if !defined(_MSC_VER)` guard for Tier 2 was wrong and would
 have silently mis-asserted on Windows: Clang targeting the MSVC ABI (the default on Windows)
-defines **both** `__clang__` and `_MSC_VER`. `metadata.hpp`'s `canonical_type_name()` checks
-`__clang__` before `_MSC_VER`, so Windows-Clang correctly takes the Clang/GCC branch — but a guard
-keyed on `!defined(_MSC_VER)` would exclude it anyway. The test now mirrors `metadata.hpp`'s own
-dispatch order (`#if defined(__clang__) || defined(__GNUC__)` ... `#elif defined(_MSC_VER)`).
+defines **both** `__clang__` and `_MSC_VER`. The subsequent `#if defined(__clang__) ||
+defined(__GNUC__)` fix was *also* wrong — it assumed Clang and GCC share one golden, which real
+GCC disproved. The test now asserts one golden per compiler, mirroring `metadata.hpp`'s own
+per-compiler dispatch order (`__clang__` → `__GNUC__` → `_MSC_VER`) with no branch merging.
 
 Tier 3 is the open half of [OpenQuestions.md](OpenQuestions.md) item 1; closing it (normalizing the
-spellings, or mandating explicit per-type keys) promotes Tier 3 into Tier 1. The Tier-2 MSVC
-divergence is now **confirmed**, not just predicted. Tier 1's golden is non-vacuous by negative
-control: a fields-swapped sibling type (same fields, tags 1↔2 swapped) moves the fingerprint
-(`0x54f52ae0703db766`), demonstrating the 016 field-order invariant the fold rests on.
+spellings, or mandating explicit per-type keys) promotes Tier 3 into Tier 1. Tier 1's golden is
+non-vacuous by negative control: a fields-swapped sibling type (same fields, tags 1↔2 swapped)
+moves the fingerprint (`0x54f52ae0703db766`), demonstrating the 016 field-order invariant the fold
+rests on. Given Tier 2's GCC-vs-Clang assumption was also wrong once measured, treat every Tier 2
+golden as toolchain-*version*-fragile, not just toolchain-*family*-fragile — a future compiler
+minor version changing `__PRETTY_FUNCTION__`/`__FUNCSIG__` spelling is exactly the drift this test
+exists to catch, not a false alarm to suppress.
