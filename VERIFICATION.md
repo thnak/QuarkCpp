@@ -111,3 +111,24 @@ The outbound-streaming-reply suite (`reply_stream_backpressure_test`, `reply_str
 and the broadcast suite (`topic_at_most_once_test`, `topic_payload_reclaim_test`,
 `topic_publisher_no_stall_test`, `topic_subscribe_race_test`, ADR-019) are likewise present and green in
 every config, including TSan — both new fan-out primitives are race-free under real concurrency.
+
+## Known-divergent, asserted-in-part: `type_key` cross-toolchain conformance (008)
+
+`metadata_typekey_conformance_test` pins **golden `type_key` constants** so any drift — a new
+compiler, a new compiler version, or an edit to the name slicer / fingerprint folder — turns red
+instead of silently invalidating already-written durable records. (Its sibling
+`metadata_typekey_test` asserts only self-consistency and cannot detect drift by construction.)
+It is deliberately **tiered**, because two of the three tiers do not hold today:
+
+| Tier | Types | Status | Asserted? |
+|---|---|---|---|
+| 1 | Described types (`fingerprint_v<T>`) | Portable **by construction** — folds `{(tag, wire_type)}`, no name enters it. Byte-identical g++ 14.3 / clang 20.1. | Golden, **all** toolchains |
+| 2 | User-defined names, actor protocol folds | Byte-identical g++ 14.3 / clang 20.1. **MSVC excluded**: its `__FUNCSIG__` slice keeps the `struct`/`class` elaborator (`struct ns::Point` vs `ns::Point`), so every name-derived key differs. Read from source — not yet measured on a Windows host. | Golden, `#if !defined(_MSC_VER)` |
+| 3 | Builtin spellings and templates over them | **Divergent today.** `size_t` = `long unsigned int` (GCC) vs `unsigned long` (Clang); same for `long long unsigned int`/`unsigned long long` and `long long int`/`long long`; propagates into `Wrap<uint64_t>`. Different string → different FNV-1a → different key for the same type. | Determinism only — a golden would hard-fail one compiler |
+
+Tier 3 is the open half of [OpenQuestions.md](OpenQuestions.md) item 1; closing it (normalizing the
+spellings, or mandating explicit per-type keys) promotes Tier 3 into Tier 1. Confirming the Tier-2
+MSVC exclusion on Windows CI is the next concrete step. Both tiers' goldens were verified to be
+non-vacuous by negative control: perturbing a Tier-1 constant and renaming the fixture namespace
+each turn the test red, and the namespace rename leaves all four Tier-1 fingerprints intact —
+directly demonstrating the name-independence Tier 1 rests on.

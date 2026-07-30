@@ -308,7 +308,60 @@ These affect multiple subsystems; resolving one constrains several specs.
    developer-assigned explicit `type_key` as the fallback if it proves unreliable.
    *(This is a conformance test to write, not a design question.)*
 
-2. **Weak-memory (AArch64) proof of the mailbox handoff** (001/002/003, ADR-002).
+   **Partially answered — the test now exists and the answer is "no, not yet".**
+   [`tests/metadata_typekey_conformance_test.cpp`](tests/metadata_typekey_conformance_test.cpp)
+   pins golden key constants in three tiers (the pre-existing `metadata_typekey_test.cpp`
+   asserts only self-consistency and cannot observe drift at all). Measured on
+   Linux/x86-64, g++ 14.3 vs clang 20.1:
+   - **Described types are portable** — `fingerprint_v<T>` folds `{(tag, wire_type)}`
+     with no name, so it is toolchain-independent *by construction*. Byte-identical
+     across both compilers. This is the tier durable headers and wire negotiation ride on.
+   - **User-defined names agree GCC↔Clang** — also byte-identical, so those goldens are
+     asserted for both.
+   - **Builtin spellings DIVERGE today**: `size_t` is `long unsigned int` (GCC) vs
+     `unsigned long` (Clang); likewise `long long unsigned int`/`unsigned long long` and
+     `long long int`/`long long`. Different string → different FNV-1a → **different
+     `type_key` for the same type**, and it propagates into any template over them
+     (`Wrap<uint64_t>`). Left as recorded-not-asserted (Tier 3); pinning a golden would
+     hard-fail one compiler.
+   - **MSVC diverges for every name-derived key** (read from source, not yet measured —
+     no Windows host here): the `__FUNCSIG__` slice in `metadata.hpp §canonical_type_name`
+     retains the `struct`/`class` elaborator, yielding `struct ns::Point` where GCC/Clang
+     yield `ns::Point`. Tier 2 is therefore `#if !defined(_MSC_VER)`-guarded. **Confirming
+     this on Windows CI is the next step.**
+
+   Closing this means normalizing the spellings (strip the MSVC elaborator, canonicalize
+   builtin names) or mandating an explicit per-type key; then Tier 3 promotes to Tier 1.
+
+2. **`type_key` collisions between distinct Described types** (008/016) — **NEW, design,
+   not verification.** Because `fingerprint_v<T>` folds only `{(tag, wire_type)}` and
+   deliberately excludes the name, the property that makes it toolchain-portable (item 1)
+   also makes it **non-unique**: structurally identical types share a key. Measured in one
+   TU, g++ 14.3 — `Point{int x;int y}`, `Other{int p;int q}` and `Account{uint64 id;int64
+   balance}` all fold to `0x60eb68b9763e6f4c`. 008 promotes this fingerprint to *the durable,
+   cross-run/cross-node type identity*, so two same-shape message types silently share a
+   durable record header and wire identity. `Account` colliding with `Point` is the pointed
+   case: `uint64_t` and `int` both map to the varint wire type, so semantically unrelated
+   types with different field widths and names are one identity downstream.
+   - **Scope**: registered *actor* types are safe — their keys seed with the canonical name
+     (unique) and startup Validation runs a Strict collision scan (`metadata.hpp:506`).
+     Described *message* types do not go through that registry, so nothing catches them.
+   - **`describe.hpp:236`'s field-order invariant is NOT violated** — checked separately.
+     Swapping *tags* (`(2,x),(1,y)` vs `(1,x),(2,y)`) does yield a distinct fingerprint, and
+     differing wire types at the same tag likewise. Reordering *declarations* while tags stay
+     attached to their fields correctly yields the same fingerprint — that is a compatible
+     schema change, not a defect. The fold behaves exactly as 016 specifies; the open question
+     is only whether a *schema-shape* fingerprint is the right thing to promote to *type
+     identity*.
+   - **The tension is structural**: name-free ⇒ portable but colliding; name-based ⇒ unique
+     but toolchain-fragile (item 1). Adding the name to the fingerprint trades this defect
+     straight back for item 1. A direction worth red-teaming is **splitting the roles**: keep
+     the shape fingerprint for wire/schema negotiation, where shape-equality is precisely the
+     desired semantic, and give durable type identity a separate normalized-or-explicit key —
+     plausibly the same mechanism as item 1's "developer-assigned explicit `type_key`"
+     fallback, closing both. That is an ADR (`design-debate-prove`), not a patch.
+
+3. **Weak-memory (AArch64) proof of the mailbox handoff** (001/002/003, ADR-002).
    The intrusive-Vyukov mailbox was chosen with executed evidence, but the host had
    no herd7/GenMC, so **all sanitizer evidence is x86-TSO**. Two edges are unproven
    on a weakly-ordered target: the exec-state release/acquire handoff that carries
@@ -325,7 +378,7 @@ These affect multiple subsystems; resolving one constrains several specs.
    design to invent. *(024's `armed.exchange`-as-Dekker-arm is the same class of
    x86-TSO-only evidence and defers with this item.)*
 
-3. **Stream async-suspend resume against the real scheduler** (024/002/015,
+4. **Stream async-suspend resume against the real scheduler** (024/002/015,
    ADR-005) — **RESOLVED** ([ADR-014](decisions/ADR-014-streaming-async-suspend-real-scheduler-gate.md)).
    StreamChannel's split-cursor exactly-once-across-suspension property, previously proven
    only against an in-thread model resolver, is now **wired to the real 002 multi-threaded
@@ -390,11 +443,15 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   inbound streaming (024). The former entries here (Security, DoS/governance,
   benchmark harness) are resolved by 020, 022, and 023 respectively. **Outbound streaming
   replies — the last open *design* question — is now resolved in mechanism by
-  [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)** (above). What remains is all
-  **verification to run, not specs to design**: the `type_key` conformance test, the AArch64
-  weak-memory proof of the mailbox handoff, and the **015 OPEN-cell re-admit real-scheduler
-  gate** — which now blocks *both* an ordinary `ask`'s co_await resume and 006 outbound's OPEN
-  handshake promotion.)*
+  [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)** (above). What remains is
+  **mostly verification to run**: the `type_key` conformance test (now written — it reports
+  a real GCC↔Clang divergence on builtin spellings, item 1), the AArch64 weak-memory proof of
+  the mailbox handoff, and the **015 OPEN-cell re-admit real-scheduler gate** — which now
+  blocks *both* an ordinary `ask`'s co_await resume and 006 outbound's OPEN handshake
+  promotion. **One design question has since reopened**: `type_key` collisions between
+  structurally identical Described types (item 2) — the name-free fingerprint that makes
+  durable keys toolchain-portable also makes them non-unique, and it contradicts
+  `describe.hpp:236`'s stated field-order invariant. That one needs an ADR, not a test.)*
 
 ## Decisions locked (do not reopen without cause)
 
