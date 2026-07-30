@@ -92,8 +92,13 @@ int main(int argc, char** argv) {
     Engine eng(EngineConfig{workers, shards, 64, 1024});
     auto aid = eng.spawn<PingActor>(42).value();
 
-    // Get a reference for each producer thread
-    detail::MessagePool pool{4096};
+    // Get a reference for each producer thread.
+    // num_partitions == num_producers: the MessagePool free-list fix (message_pool.hpp,
+    // commit 1964203) removes producer-side mutex contention by giving each producer thread's
+    // lane its own partition. The original single-arg `MessagePool pool{4096}` here defaulted
+    // to num_partitions=1 (today's back-compat default), so this bench was measuring the
+    // pre-fix, single-shared-free-list behavior even after the fix landed in the library.
+    detail::MessagePool pool{4096, num_producers};
     LocalRouter router(eng.post_courier(), pool);
     ActorRef<PingActor> ref = router.get<PingActor>(42);
     eng.start();
