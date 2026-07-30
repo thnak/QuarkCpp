@@ -343,18 +343,46 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
 - **001** — *(Reply ordering for concurrent `ask`s: resolved, ADR-007 — Sequential→request-order, Reentrant→completion-order via pooled `ReplyCell`. Reentrancy/quiescence: resolved, 015.)*
 - **002** — *(`Priority<P>` queue structure: resolved — K-band per-shard run-queue, `UniformFIFO` default, ADR-010. Drain-budget accounting: resolved, 015.)*
 - **003** — inline-small-payload optimization. *(Reentrant payload reclamation: resolved, 015.)*
-- **004** — cold-shard resolution order. *(Resource-declaration ergonomics: resolved as member fields, ADR-007. `PerMessage` factory failure: resolved — fails the message, checked pre-handler, ADR-009.)*
+- **004** — *(Cold-shard resolution order: resolved — Node/Shard resources are resolved eagerly, for every configured shard, synchronously inside `Engine`'s `build()` cold phase, strictly before any worker thread exists; a Node-scoped resource shared by many shards is dissolved by ordering, not synchronization (no CAS/lock/`call_once`), ADR-021. Resource-declaration ergonomics: resolved as member fields, ADR-007. `PerMessage` factory failure: resolved — fails the message, checked pre-handler, ADR-009.)*
 - **005** — *(Resource-declaration ergonomics **and** `handle` dispatch mechanism: both resolved, ADR-007 — member fields + dense jump-table. Only `tell`/`ask` naming remains.)*
 - **006** — **outbound** streaming replies (`ask` returning a stream). *(`ask` from sync code: resolved — async-only, no `ask_sync`, ADR-007. Typed vs. dynamic refs: resolved — always-typed, ADR-007. Backpressure/overflow policy: resolved as the foundational lever of governance, 022. **Inbound** streaming: resolved, 024.)*
 - **007** — *(State rollback on `Resume`, escalation granularity, `ask` retry across restart, Restart+persistence reload: all resolved, ADR-009 — assert-intact + opt-in `Transactional<>`, `Supervision<Node|PerType|Tree>`, `OnRestartAsk<Fail|Retry>`. Restart quiescence: resolved, 015.)*
 - **008** — *(Hot-reload / dynamic registration after `build()`: resolved — guarded `add_actor_type<T>()`, incremental Validation + release table swap, pre-sized to `max_types`, ADR-008.)*
-- **009** — histogram bucket layout; metric cardinality control.
+- **009** — whether user counters are declared as a resource/policy (compile-time slot) or
+  registered dynamically at startup. *(Histogram bucket layout: resolved — per-metric
+  configurable compile-time `HistogramSpec`, closed-form bucket lookup, Validation-capped
+  `bucket_count`, ADR-022. Cardinality control: resolved — per-type always-on grid + opt-in
+  per-instance `PerInstanceMetrics<N>` over a build-time-sized critical-arena, ADR-022.)*
 - **010** — **cross-node backpressure** (the named residual keeping 010 at *Accepted core* rather than full Accepted). *(Cross-node FIFO-under-relay: resolved — proven, ADR-011. Re-placement granularity: resolved, 026. Split-brain effect safety: resolved via fencing, 017; transport per-OS via the PAL; formation/bootstrap/connection-lifecycle/elastic-scale: resolved, 021.)*
-- **011** — wheel granularity vs. deadline precision; timekeeper drift. *(Cross-node time: resolved, 018. Idle-timeout deactivation mechanism: resolved, ADR-008.)*
-- **012** — log compaction cadence. *(Reentrant commit ordering: resolved, 015; schema evolution: resolved, 016; EventSourced staging fence + Restart reload: resolved, ADR-009.)*
+- **011** — shard-fairness/starvation under `shard_count > worker_count` (tracked against
+  002/ADR-010 — not a wheel-design gap; the timekeeper's targeted wake cannot rescue a worker
+  that's busy rather than parked). *(Wheel granularity/tier sizing vs. deadline precision, and
+  timekeeper-tick drift: resolved — 5 fixed tiers × 64 slots on a 64µs base tick, a single
+  relaxed `next_due_hint_` per shard, ADR-023. Cross-node time: resolved, 018. Idle-timeout
+  deactivation mechanism: resolved, ADR-008. On-demand passivation reusing the same
+  deactivation/close-out path: resolved, ADR-034.)*
+- **012** — exactly-once effects: combining at-least-once delivery (010) with idempotent,
+  fenced persistence to get effectively-once semantics. *(The `ask`-retry-across-restart case
+  folds into `OnRestartAsk<Retry<N,IdempotencyKey>>` (007, ADR-009); cross-node
+  effectively-once is resolved in 017. Log compaction cadence for EventSourced actors, and
+  sync-vs-background checkpoints: resolved — wall-clock `CompactEvery<T>` cadence, checkpoint
+  write always async/background, idle-deactivation as a required trigger, ADR-024. Reentrant
+  commit ordering: resolved, 015. Schema evolution: resolved, 016. Deactivation-time flush of
+  `declare_lazy`-registered actors, reusing `save_snapshot` with a fence acquired at
+  construction: resolved, ADR-034.)*
 - **013** — *(Live reconfiguration **and** override precedence across layers: both resolved, ADR-008 — reconfig class + packed Live word + five-layer scope. Only a publish-path storm governor remains.)*
-- **014** — interleaving exploration strategy; in-process vs. multi-process distribution tests. *(The sim backend seam is now pinned by the PAL, 019.)*
-- **019** — vectored I/O generality; minimum OS versions / fallback matrix.
+- **014** — in-process vs. multi-process distribution (010) test tier. *(Interleaving
+  exploration strategy: resolved — a compile-time `Chooser` policy for random search plus
+  DPOR-pruned bounded model checking (`explore_bounded(N, branch_cap)`), ADR-025.
+  Performance-regression testing: resolved — the native-PAL benchmark harness + quantified
+  budgets, 023, is the perf counterpart to this spec's sim-backend correctness. The sim
+  backend seam is now pinned by the PAL, 019.)*
+- **019** — whether `SimEngine` uses build-time backend selection or the templated
+  `Engine<Pal>` form for in-process coexistence with a real engine in one test. *(Vectored/
+  scatter-gather I/O and registered-buffer generality: resolved — one mandatory Tier-1
+  baseline plus a named Tier-2 extension point (`advanced_io()`/`AdvancedIo`), byte-identical
+  caller source across backends, ADR-026. Minimum OS versions and the fallback matrix:
+  resolved, ADR-026.)*
 
 ## Not yet specced at all
 
