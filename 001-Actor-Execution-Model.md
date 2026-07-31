@@ -124,6 +124,16 @@ rather than assuming the fifth round's proof still covers it. Re-verified:
 182/182 MSVC ASAN — no races, no regressions, FIFO and the linger→dispatch
 hand-off both intact. See ADR-036's round-3 section.
 
+**ADR-036 round 4: default changed to 0, no new safety claim needed.** Round 4
+fixed a measurement-harness bug and found the round-1 contention/backlog
+throughput win does not reproduce for the adaptive mechanism (see 002
+§"Activation-scoped post-drain linger" and ADR-036's round-4 section). Per
+that result `activation_linger_spin_limit`'s default changed from 32 to 0 —
+byte-for-byte the pre-ADR-036 `drain_step`. No code in `activation.hpp`
+changed this round, so the sixth reconfirmation above (which already covered
+the mechanism at every spin bound, including 0) still stands unmodified; this
+is a config-default change, not a new execution-model claim.
+
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
 contract (a worker requeuing an activation via work-steal, and a different

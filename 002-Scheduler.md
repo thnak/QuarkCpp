@@ -249,8 +249,9 @@ an activation's mailbox draining to empty triggers a full `Running->Idle` exec-s
 (CAS + run-queue enqueue + idle-bitmask scan) — measured at 18-25% of messages in a tight
 single-producer loop against a fast-draining actor. Before `drain_step` commits to that transition
 on an empty mailbox, it runs a **bounded, read-only post-drain linger**
-(`EngineConfig::activation_linger_spin_limit`, default 32, sequential drain path only, a *ceiling*
-not a fixed spin count — see below): re-poll THIS activation's own mailbox a bounded number of
+(`EngineConfig::activation_linger_spin_limit`, default 0 — disabled by default, see round 4 below
+— sequential drain path only, a *ceiling* not a fixed spin count when a caller opts in): re-poll
+THIS activation's own mailbox a bounded number of
 `cpu_relax()`-paced times; a hit is dispatched directly (the linger's own successful dequeue result
 flows straight into normal processing, never a second dequeue — the naive "re-enter the loop"
 implementation would drop or duplicate the message it already popped, closed by construction, not
@@ -290,14 +291,20 @@ recovering the bench-gate numbers: re-measured at 29.53-29.65 M cycles/s/core / 
 regression. `sizeof(Activation)` grew 640B→704B (the new evidence byte crossing an alignment
 boundary), still comfortably under the 2048B/idle hard ceiling.
 
-**The round-1 contention win (+26.4%, one measured case) has NOT been reconfirmed for the adaptive
-mechanism as shipped.** A re-run against the original F2 harness was inconclusive, not confirming or
-refuting it — the harness's `drain_budget` let a single `drain_step` call absorb an entire backlog
-wave, so the churn regime the win depends on was never actually exercised in the re-run. Per this
-project's own "proven beats claimed" bar, the number is carried forward only as a plausibility
-argument, not restated as a proven result for the current code — see
-`decisions/ADR-036-activation-linger-idle-churn-reduction.md`'s round-3 section for the full
-disposition and the harness fix needed before it can be re-measured. Sequential drain only —
+**Round 4 fixed the F2/F5 harnesses and re-measured the round-1 contention win — refuted, not just
+unreconfirmed.** The original F2/F5 harnesses used a `drain_budget` large enough that a single
+`drain_step` call absorbed an entire backlog wave, so the mailbox never observed a genuine `Empty`
+status and no `linger_spin_limit` config could show an effect (the round-3 inconclusive result).
+Round 4 replaced the workload with synchronized producer bursts separated by calibrated idle gaps —
+validated to genuinely exercise `Idle->Scheduled` transitions (8-16% activation/send ratio, up from
+the broken harness's 0.05-0.18%) — and, after also catching and closing a first-call-in-process
+warm-up bias that had produced a spurious ~10-20% "win," found **no statistically distinguishable
+difference** between `linger_spin_limit=0` and `32`/`256` in either activation churn or throughput,
+cross-validated under g++ and clang++, P∈{1,2,3,4} producers. Per this project's own "proven beats
+claimed" bar, `activation_linger_spin_limit`'s **default changed from 32 to 0** —
+byte-for-byte the pre-ADR-036 `drain_step`, zero behavior change from master unless a caller opts
+in. See `decisions/ADR-036-activation-linger-idle-churn-reduction.md`'s round-4 section for the full
+harness fix, bias-controlled data, and decision. Sequential drain only —
 `drain_step_governed_seq` (022 admission bookkeeping runs per-message inside its own loop, not
 before it) and `drain_step_reentrant` (015's own Parked-based mechanism) are both unaffected. A
 cache-line-isolation alternative targeting the fixed per-transition cost instead of transition
