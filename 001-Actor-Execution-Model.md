@@ -109,6 +109,21 @@ implementation would have dropped or duplicated the message the linger
 already popped; this is now closed and proven (2,440+ reps across four
 bounds, zero loss/duplication, FIFO intact). See ADR-036.
 
+**Reconfirmed a sixth time (ADR-036 round 3).** The fifth reconfirmation's
+unconditional linger was found to regress this repo's own `activation_bench`/
+`sched_bench` gate benches 12-17x (a zero-concurrency-mailbox cost the fifth
+round's proof never exercised) and was replaced by an evidence-gated adaptive
+bound (`linger_evidence_`, lane-only, 0..4) that scales the effective spin
+ceiling instead of always spinning it in full. The single-executor guarantee
+is architecturally identical to the fifth reconfirmation's — `exec_` is still
+never written while lingering, by the same construction — but the
+implementation changed materially enough (new fields, new evidence-bump/decay
+branches on every `drain_step` exit) to warrant independent re-verification
+rather than assuming the fifth round's proof still covers it. Re-verified:
+166/166 real ThreadSanitizer (WSL/g++ 14, pinned), 181/181 Release suite,
+182/182 MSVC ASAN — no races, no regressions, FIFO and the linger→dispatch
+hand-off both intact. See ADR-036's round-3 section.
+
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
 contract (a worker requeuing an activation via work-steal, and a different

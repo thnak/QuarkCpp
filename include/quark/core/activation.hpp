@@ -41,6 +41,7 @@
 #pragma once
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
@@ -448,19 +449,28 @@ public:
         // own scoping notes). Zero 015 machinery is touched.
         // ====================================================================================
         std::uint32_t remaining = budget;
+        std::uint32_t dispatched_this_call = 0;
         for (;;) {
-            if (remaining == 0) return DrainOutcome::BudgetExhausted;
+            if (remaining == 0) {
+                note_batch_evidence(dispatched_this_call);
+                return DrainOutcome::BudgetExhausted;
+            }
 
             DrainResult r = mailbox_.try_dequeue();
             if (r.status == DrainStatus::Empty) {
-                if (!linger_and_repoll(r)) return DrainOutcome::DrainedEmpty;
+                if (!linger_and_repoll(r)) {
+                    note_batch_evidence(dispatched_this_call);
+                    return DrainOutcome::DrainedEmpty;
+                }
                 // `r` now holds the Message the linger's OWN re-poll found — falls straight into
                 // the claim/dispatch code below with NO second try_dequeue() for it (ADR-036).
             } else if (r.status == DrainStatus::Busy) {
+                note_batch_evidence(dispatched_this_call);
                 return DrainOutcome::Busy;
             }
 
             --remaining;
+            ++dispatched_this_call;
             Descriptor* d = r.desc;
 
             std::uint16_t claim_flags = 0;
@@ -559,7 +569,9 @@ public:
     // drain_step_reentrant is already out of scope). Default 32, proven (ADR-036) to help under
     // backlog/contention; do not raise without re-running ADR-036's contention sweep (256
     // measurably regressed throughput under contention in that proof). 0 disables it.
-    void set_linger_spin_limit(std::uint32_t n) noexcept { linger_spin_limit_ = n; }
+    void set_linger_spin_limit(std::uint32_t n) noexcept {
+        linger_spin_limit_ = n > kLingerSpinLimitMax ? kLingerSpinLimitMax : n;
+    }
     [[nodiscard]] std::uint32_t linger_spin_limit() const noexcept { return linger_spin_limit_; }
 
     // ---- Close-out seam (002): DrainedEmpty → relinquish via the seq_cst Dekker rendezvous ----
@@ -892,16 +904,69 @@ private:
     // dispatches that exact result with no second try_dequeue() (ADR-036 fix #1: the linger/
     // dispatch hand-off — the naive "continue back to the top of the loop" implementation would
     // drop or duplicate the message this function already popped).
+    // ---- ADR-036 revision: adaptive evidence-scaled linger ---------------------------------
+    // `linger_evidence_` (0..kLingerEvidenceMax) is a lane-only, decayed running signal of "did
+    // lingering recently pay off" — bumped when a re-poll finds a message OR when a drain_step()
+    // call dispatched a real batch (>= kLingerBatchThreshold messages, i.e. backlog was present),
+    // decayed when a linger spin runs its full bound and finds nothing. `linger_bound()` scales
+    // the configured `linger_spin_limit_` by evidence/kLingerEvidenceMax, so a truly-idle,
+    // one-message-at-a-time caller (evidence stays 0) never spins at all — the flat design's
+    // regression — while a backlogged/bursty caller ramps the spin up toward the full configured
+    // bound. Deliberately NOT bumped on `Busy` (see drain_step()): a `Busy` result carries no
+    // information about whether MORE messages are coming, only that a producer is mid-publish
+    // RIGHT NOW — bumping evidence there reintroduced an "evidence hangover" (a single stray Busy
+    // parked full-bound spinning onto subsequent truly-idle calls) in an earlier iteration of this
+    // design; the revised design fixes it by never touching evidence on Busy.
+    static constexpr std::uint8_t  kLingerEvidenceMax    = 4;
+    static constexpr std::uint8_t  kLingerHitBump        = 2;
+    static constexpr std::uint8_t  kLingerMissDecay      = 2;
+    static constexpr std::uint32_t kLingerBatchThreshold = 2;
+    static constexpr std::uint8_t  kLingerBatchBumpMax   = 3;
+    static constexpr std::uint32_t kLingerSpinLimitMax   = 1u << 12;  // 4096
+
+    QUARK_ALWAYS_INLINE void bump_linger_evidence(std::uint8_t d) noexcept {
+        const unsigned v = static_cast<unsigned>(linger_evidence_) + d;
+        linger_evidence_ = static_cast<std::uint8_t>(v > kLingerEvidenceMax ? kLingerEvidenceMax : v);
+    }
+    QUARK_ALWAYS_INLINE void decay_linger_evidence(std::uint8_t d) noexcept {
+        linger_evidence_ = static_cast<std::uint8_t>(d >= linger_evidence_ ? 0 : linger_evidence_ - d);
+    }
+
+    // Called once per drain_step() exit (Empty/Busy/BudgetExhausted) with how many messages that
+    // call actually dispatched. A batch at/above kLingerBatchThreshold is evidence of backlog —
+    // bump proportionally to log2(batch size), capped at kLingerBatchBumpMax.
+    QUARK_ALWAYS_INLINE void note_batch_evidence(std::uint32_t dispatched_this_call) noexcept {
+        if (dispatched_this_call < kLingerBatchThreshold) return;
+        const unsigned bits = static_cast<unsigned>(std::bit_width(dispatched_this_call));
+        const unsigned bump = bits - 1u;
+        bump_linger_evidence(static_cast<std::uint8_t>(bump > kLingerBatchBumpMax ? kLingerBatchBumpMax : bump));
+    }
+
+    // The evidence-scaled spin bound: `linger_spin_limit_ * linger_evidence_ / kLingerEvidenceMax`,
+    // rounded up (never truncates a nonzero product to 0 — safe-2 in the design). 0 whenever either
+    // factor is 0 — a fresh/idle activation (evidence == 0) or a disabled linger (spin_limit_ == 0)
+    // costs exactly one extra branch, no spin.
+    QUARK_ALWAYS_INLINE std::uint32_t linger_bound() const noexcept {
+        if (linger_spin_limit_ == 0 || linger_evidence_ == 0) return 0;
+        const std::uint64_t num =
+            static_cast<std::uint64_t>(linger_spin_limit_) * static_cast<std::uint64_t>(linger_evidence_)
+            + (kLingerEvidenceMax - 1);
+        return static_cast<std::uint32_t>(num / kLingerEvidenceMax);
+    }
+
     QUARK_ALWAYS_INLINE bool linger_and_repoll(DrainResult& r) noexcept {
-        for (std::uint32_t i = 0; i < linger_spin_limit_; ++i) {
+        const std::uint32_t bound = linger_bound();
+        if (bound == 0) return false;
+        for (std::uint32_t i = 0; i < bound; ++i) {
             pal::cpu_relax();
             r = mailbox_.try_dequeue();
-            if (r.status == DrainStatus::Message) return true;
+            if (r.status == DrainStatus::Message) { bump_linger_evidence(kLingerHitBump); return true; }
             // Empty or Busy: neither found a dispatchable message yet — keep spinning. Busy (a
             // producer demonstrably mid-publish) is folded into "keep spinning" rather than
             // surfaced: the linger exists precisely because a message is plausible, and Busy is
             // the strongest available evidence of that.
         }
+        decay_linger_evidence(kLingerMissDecay);
         return false;
     }
 
@@ -1534,6 +1599,9 @@ private:
     // drain-owning worker, inside drain_step()/linger_and_repoll()) — never touched off-lane, so
     // it needs no atomic. Default 32 per the proven design; 0 disables the linger.
     std::uint32_t linger_spin_limit_ = 32;
+    // ADR-036 revision: adaptive linger evidence (0..kLingerEvidenceMax). Lane-only, same as
+    // linger_spin_limit_ above — see linger_bound()/bump_linger_evidence()/decay_linger_evidence().
+    std::uint8_t linger_evidence_ = 0;
 };
 
 inline void QuiescenceGuard::release() noexcept {

@@ -80,19 +80,33 @@ struct EngineConfig {
     // idle_mask_, and always falls through to the unmodified park() Dekker rendezvous. 0 disables it
     // (byte-for-byte park() path, only a predictable branch added at the call site). Never unbounded.
     std::uint32_t pre_park_spin_limit = 256;
-    // ADR-036: bounded, read-only re-poll of an activation's OWN mailbox before drain_step commits
-    // to a DrainedEmpty exit (Running->Idle). Distinct axis from pre_park_spin_limit (worker-level,
-    // any_work() across ALL shards, engaged only once the whole worker finds nothing anywhere) and
-    // from busy_spin_limit (bounds the Busy tri-state, a different DrainStatus). Fires on every
-    // Empty drain exit for THIS activation, not just the rare whole-engine-idle case — proven
-    // (design-debate-prove, ADR-036) to cut Idle->Scheduled activation churn under backlog/
-    // contention (+26.4% throughput, one measured case) at 32, but to NOT reliably hit its own
-    // <5%-churn target under sparse/idle-ish traffic, and a larger bound (256) measurably
-    // REGRESSES throughput under contention (-50.6%, one measured case) — 32 is the proven,
-    // shipped default; do not raise it without re-running ADR-036's contention sweep. Sequential
-    // drain path only (drain_step_governed_seq/drain_step_reentrant are unaffected, ADR-036 fix
-    // #2). 0 disables it (byte-for-byte the pre-linger drain_step, one predictable branch added).
-    // Never unbounded.
+    // ADR-036 (round 3, adaptive): CEILING for a bounded, read-only re-poll of an activation's OWN
+    // mailbox before drain_step commits to a DrainedEmpty exit (Running->Idle). This is NOT the
+    // spin count actually used on any given call — Activation keeps a lane-only, per-activation
+    // evidence counter (linger_evidence_, 0..4) that scales the EFFECTIVE bound between 0 and this
+    // ceiling, so a genuinely idle/zero-concurrency activation pays ~zero cost (evidence stays 0,
+    // effective bound stays 0) while an activation under real sustained/clustered contention ramps
+    // toward this ceiling. Evidence grows ONLY from a real dispatched batch (>=2 messages in one
+    // drain_step call) or the linger's own re-poll finding a message — NEVER from a raw Busy status
+    // (round 1 bumped on Busy too; that let 1-2 ordinary timing races saturate evidence and reproduce
+    // near-full linger cost on the next idle transition — "evidence hangover", closed structurally
+    // in round 3 by removing Busy from the evidence-write path entirely, see the ADR).
+    //
+    // Round 1 shipped this as an UNCONDITIONAL spin (every Empty exit paid the full bound) and it
+    // proved a real backlog/contention win (+26.4% throughput, one measured case) — but it was never
+    // run against this repo's own bench-gate targets (activation_bench/sched_bench), which are
+    // strictly-sequential zero-concurrency loops: there the unconditional spin was PURE WASTE on
+    // every message and regressed both benches 12-17x ([goal]->[MISS]), confirmed live on real
+    // hardware. Round 3's adaptive gating fixes that regression (bench-gate parity re-confirmed,
+    // within ~1-3% of pre-ADR-036 numbers) while keeping the mechanism available for real backlog.
+    // The round-1 contention win (+26.4%) has NOT been reconfirmed for the adaptive mechanism as
+    // shipped — carried forward as a plausibility argument only, not a proven result for this code
+    // (see decisions/ADR-036-...md's round-3 section; the old F2 harness under-exercised the churn
+    // regime and needs a fix before re-measuring). Distinct axis from pre_park_spin_limit
+    // (worker-level, any_work() across ALL shards) and busy_spin_limit (bounds the Busy tri-state).
+    // Sequential drain path only (drain_step_governed_seq/drain_step_reentrant unaffected). 0
+    // disables it (byte-for-byte the pre-linger drain_step). Never unbounded — the setter clamps to
+    // kLingerSpinLimitMax (4096) to keep the evidence-scaled bound arithmetic overflow-free.
     std::uint32_t activation_linger_spin_limit = 32;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields

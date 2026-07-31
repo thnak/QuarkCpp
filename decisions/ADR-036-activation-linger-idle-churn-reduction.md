@@ -2,11 +2,28 @@
 
 ## Status
 
-Accepted (Design A's linger mechanism adopted, `activation_linger_spin_limit` defaulted to
-**32**, not the originally-proposed uniform "<5% everywhere" claim — shipped with corrected,
-honest scope). Design B's two cache-line/memory-order cuts are **not adopted** — proven to
-carry no measured benefit on the real hot path. A round-3 adaptive-linger hybrid is scoped
-but not designed, red-teamed, or measured.
+**Round 1 finding superseded by Round 3 (see "## Round 3" below — historical Round 1 content
+below is kept intact, not erased).** Round 1 accepted Design A's **flat, unconditional**
+linger (`activation_linger_spin_limit` defaulted to **32**, spinning the full bound on
+*every* empty-mailbox drain exit regardless of any evidence a message was actually
+imminent). After merge-in-spirit, that flat default was found to **catastrophically regress**
+the project's own 023 perf-gate bench targets (`activation_bench`, `sched_bench`) in the
+zero-concurrency/single-core shape those benches exercise — 17x/12.7x throughput loss,
+~6x p50 latency — because Round 1's proof round never ran the actual repo bench-gate
+targets, only bespoke synthetic backlog/sparse probes. **The flat default is retired.**
+Round 3 replaces it with an **evidence-gated adaptive linger** (same knob name/semantics,
+`activation_linger_spin_limit` still nominally 32, but now scales the *effective* spin bound
+by a per-activation, lane-only evidence counter that starts at 0, so a mailbox with no
+concurrent producers pays the same ~zero cost as `spin_limit=0`). **The adaptive design is
+Accepted and ships as ADR-036's new default**, proven to close the regression to within
+~1-3% of the pre-ADR-036 baseline on the real bench-gate targets, with all Round-1 safety/
+correctness invariants reconfirmed (ASan, MSVC ASAN, real TSan, full suite) against the new
+implementation. Design B's two cache-line/memory-order cuts remain **not adopted** (Round 1
+finding, untouched by Round 3). Round 1's F2/F5 sustained-backlog/contention throughput-win
+numbers were **not reconfirmed** under the adaptive design this round (inconclusive, not
+refuted — harness limitation) and are now **explicitly demoted** to a carried-forward
+plausibility argument, not a proven result for the code that ships — see "## Round 3" for
+the full mechanism, evidence table, and disposition.
 
 ## Question
 
@@ -78,6 +95,16 @@ Pacing-dependent results are recorded per-regime, not averaged away.
 | B | C6: relocating the activations metric changes counted edges | correct (prediction) | yes | **CORRECT**, prediction exactly confirmed | consumer-side relocation counts N+1 for N budget-exhaustion resumptions vs 1 at the producer-side placement; identical to baseline in the non-exhausted case |
 
 ## Decision
+
+> **[SUPERSEDED IN PART BY ROUND 3]** Everything below in this section is the **Round 1**
+> decision record, kept verbatim for history. The flat/unconditional spin shape it describes
+> (spin the full configured bound on every `Empty` drain exit, no evidence gating) is
+> **retired** — see "## Round 3" for why and for what replaced it. The F2/F5 throughput
+> numbers quoted below (+26.4%, 23.98%→1.56%, the P∈{1,2,4} churn-reduction table) are
+> **Round 1 measurements of the flat design only**. Round 3's attempt to reconfirm them
+> against the shipped adaptive design was **inconclusive** (harness limitation, not a
+> refutation) — do not read them as proven for the code that ships today. See Round 3's
+> "Disposition of the unreconfirmed contention-win claim."
 
 **Design A ships — but not as originally claimed.** The mechanism (bounded
 post-drain linger with the `DrainResult`-hoist hand-off fix) is adopted with
@@ -192,6 +219,14 @@ ADR-029/031/032/035.
    made for its own park/wake backoff, now doubly motivated since both rounds
    independently converged on "a fixed bound cannot serve both traffic
    shapes well."
+
+   **[ACTIONED IN ROUND 3 — see below, partially superseded.]** An adaptive
+   bound was built, red-teamed, and shipped, but it was motivated by a *more
+   severe* problem than this risk anticipated: not merely "no reduction under
+   idle-ish traffic" but a **catastrophic bench-gate regression under true
+   zero-concurrency** (17x/12.7x). The adaptive design fixes that. It does
+   **not** fully resolve this risk's original framing (a uniform <5% target
+   across both traffic shapes in one run) — see Round 3's own residual risks.
 2. **The tail_-cache-line contention risk (F5) is confirmed real but
    unresolved.** Red-team's worry that the linger's own re-poll structurally
    contends harder with producers than ADR-035's pre-park spin was proven
@@ -323,3 +358,242 @@ Engine. For the recommended follow-up round on the disclosed F1/F5 tension:
   (`taskset -c 0-3`), not a single dev-box run, before being treated as
   canonical, per `CLAUDE.md`'s machine-safety rules and `PERFORMANCE.md`'s
   own conventions.
+
+---
+
+## Round 3 (2026-07-31): Flat-Linger Regression Discovery and the Adaptive-Evidence Redesign
+
+This section is a **new, additive round** on top of Round 1 above (Round 2 — the
+"scoping experiment" Round 1 recommended — was subsumed directly into this round's
+work rather than run as a separate cycle). Round 1's content is kept verbatim above,
+not deleted; superseded claims are marked inline where they appear. This section is the
+current, authoritative state of ADR-036.
+
+### Why this round happened
+
+Round 1 shipped the flat, unconditional linger (`activation_linger_spin_limit=32`,
+spins the full bound on every `Empty` drain exit, no gating). After it was merged in
+spirit (branch `adr-036-activation-linger`, PR #6, still unmerged as of this round),
+it was found to **catastrophically regress the project's own official 023 perf-gate
+benches** — `activation_bench` and `sched_bench`, both strictly sequential, single-core,
+one-message-per-cycle loops with **no concurrent producer**. Confirmed live, twice, via
+git-worktree A/B on the real dev machine:
+
+| Bench | Master (pre-ADR-036) | Flat-linger branch | Regression |
+|---|---|---|---|
+| `activation_bench` activate/deactivate cycle | 29.9–31.1 M cycles/s/core `[goal]` | 1.7–1.8 M cycles/s/core `[MISS]` | **17x worse** |
+| `sched_bench` full-lifecycle throughput | 22.8 M msg/s/core `[goal]` | 1.8 M msg/s/core `[MISS]` | **12.7x worse** |
+| p50 latency (both benches) | ~100ns | ~600ns | **6x worse** |
+
+Root cause: an unconditional spin is pure waste in any shape where the mailbox is
+*always* genuinely empty (no concurrency) — Round 1's proof round never exercised the
+repo's actual bench-gate targets, only bespoke synthetic backlog/sparse probes, so this
+was never caught before merge-in-spirit. Per `023-Performance-Targets-and-Budgets.md`'s
+own stated tight-loop floor (≥20 M/s/core **Hard** floor for the peak enqueue/dequeue
+shape) and its own gate rule ("a change fails the gate when a Hard budget is violated"),
+1.8 M msg/s/core is not merely a Goal regression — it is a Hard-floor-class failure on
+the project's own written policy, and a direct violation of this project's zero-cost
+hot-path invariant (`CONVENTIONS.md`), not just a missed aspiration.
+
+### The adaptive design (what ships)
+
+`include/quark/core/activation.hpp`'s `linger_and_repoll`/`linger_bound` (replacing the
+flat spin) add a per-activation, **lane-only** (no atomics — read/written only by the
+drain-owning worker, same discipline as `linger_spin_limit_` itself), decayed evidence
+counter:
+
+- `linger_evidence_` : `std::uint8_t`, range `0..kLingerEvidenceMax` (4), starts at 0.
+- `linger_bound()` computes the **effective** spin bound as a ceiling-division scaling of
+  the configured `linger_spin_limit_` by `linger_evidence_ / kLingerEvidenceMax`, in
+  64-bit arithmetic:
+  `bound = ceil(linger_spin_limit_ * linger_evidence_ / kLingerEvidenceMax)`,
+  and returns **0** outright when `linger_spin_limit_ == 0` or `linger_evidence_ == 0`.
+  At evidence 0 (a fresh or genuinely-idle activation) this is **byte-for-byte the same
+  effective bound as `spin_limit=0`** — the design's central claim, and the one the
+  bench-gate numbers below confirm in practice.
+- Evidence only ever **grows** from two observed signals, both real activity, never from
+  a raw `Busy` mailbox status:
+  1. `note_batch_evidence(dispatched_this_call)` — called at *every* `drain_step` exit
+     (including the `Busy` exit), but gated on `dispatched_this_call >= kLingerBatchThreshold`
+     (2); the bump scales with `std::bit_width` of the dispatched count (2–3 msgs → +1,
+     4–7 → +2, 8+ → +3), capped below `kLingerEvidenceMax` per call.
+  2. The linger's own re-poll finding a message (`kLingerHitBump = 2`).
+- Evidence **decays** (`kLingerMissDecay = 2`) only when a linger spin runs its *full*
+  bound and finds nothing.
+- The setter clamps to `kLingerSpinLimitMax = 4096` (`n > max ? max : n`), closing the
+  overflow risk red-team found at large configured limits.
+
+### Red-team findings this round, and how each was closed
+
+1. **SERIOUS — 32-bit overflow / monotonicity inversion** in the bound formula at large
+   `linger_spin_limit_` values. **Closed** by moving the multiply to 64-bit and by the
+   `kLingerSpinLimitMax=4096` setter clamp.
+2. **SERIOUS — silent truncation-to-zero** for small `linger_spin_limit_` values,
+   collapsing graduated evidence into a step function. **Closed** by ceiling-division
+   arithmetic, which guarantees `spin_limit >= 1 && evidence >= 1 => bound >= 1`.
+3. **SERIOUS, most substantive — "evidence hangover."** The pre-revision design also
+   bumped evidence on a raw `Busy` mailbox status. Since `Busy` can repeat from ordinary,
+   non-adversarial timing jitter (two producers briefly overlapping a poll —
+   `Engine::run_activation` itself retries on `Busy` up to `busy_spin_limit`=64 times),
+   just 1–2 ordinary races could saturate evidence to max and reproduce near the original
+   catastrophic spin cost on the *next* genuinely idle transition — meaning the design's
+   "fast" claims would only have held for zero-concurrency mailboxes, not the engine's
+   normal use case (actors with real concurrent producers). **Closed structurally, not
+   just bounded**: `Busy` was removed from the evidence-write path entirely. Verified by
+   code inspection (confirmed independently by this judge reading `drain_step` and
+   `linger_and_repoll`): the outer `drain_step` `Busy` exit only calls
+   `note_batch_evidence(dispatched_this_call)`, which is a no-op whenever
+   `dispatched_this_call == 0` — structurally the case on an immediate-`Busy` call before
+   anything has been dispatched — and the inner `linger_and_repoll` loop's own `Busy`
+   observation just keeps spinning without ever touching `linger_evidence_`. There is no
+   remaining code path that writes evidence from a `Busy` result with zero real dispatch.
+4. Flagged, not fully closed this round: **unmeasured/backwards bump-constant
+   calibration** (`kLingerHitBump`, `kLingerMissDecay`, `kLingerBatchThreshold`,
+   `kLingerBatchBumpMax`, `kLingerEvidenceMax` were chosen by design judgment, not swept)
+   — carried to Round 3 residual risks below.
+5. Disclosed, accepted as an explicit design trade-off: **isolated bursts after a long
+   idle gap get zero linger benefit** (evidence has fully decayed) — same shape as Round
+   1's F1 sparse-traffic disclosure, now a formalized boundary of the adaptive mechanism
+   rather than a uniform-target miss.
+
+### Evidence table (Round 3)
+
+Same evidentiary bar as Round 1: only claims that survived red-teaming (after required
+fixes) and were then run as real, compiled, executed evidence count.
+
+| Claim | Kind | Survived red-team? | Proven? | Number / result |
+|---|---|---|---|---|
+| Bound-formula arithmetic (no overflow, monotonic both directions, no zero-truncation) | correct | yes, after fixes #1/#2 | **CORRECT** | exhaustive table, `spin_limit ∈ {0,1,2,3,4,100,4096} × evidence ∈ {0..4}` |
+| `activation_bench` regression fixed | fast (regression-fix) | yes | **CORRECT** | 29.53 / 29.54 / 29.65 M cycles/s/core `[goal]` (3 runs) — within ~1–3% of master's 29.9–31.1; flat-linger was 1.7–1.8 `[MISS]` |
+| `sched_bench` regression fixed | fast (regression-fix) | yes | **CORRECT** | 22.1 / 21.9 / 22.2 M msg/s/core `[goal]` (3 runs) vs master's 22.8; flat-linger was 1.8 `[MISS]` |
+| p50 latency parity (both benches) | fast | yes | **CORRECT** | 100.0ns on every run, both benches — matches master; flat-linger was ~600ns |
+| Evidence-hangover eliminated (fix #3) | safe | yes | **CORRECT** | code-inspection-verified — no write path reaches `linger_evidence_` from a `Busy` result with `dispatched_this_call==0`; independently re-confirmed by this judge |
+| Full correctness suite | correct | yes | **CORRECT** | 181/181 (Release, Windows, clang++, dev machine), incl. explicit `sched_no_lost_wakeup_test`/`_control`, `sched_work_stealing_test` |
+| MSVC ASAN | safe | yes | **CORRECT** | 182/182 |
+| Real TSan (WSL/g++14, `taskset -c 0-3`, `-j1` build, pinned run) | safe | yes | **CORRECT** | 166/166, clean, no races; one pre-existing, unrelated, already-known-class compiler warning noted during build, not a test failure |
+| Footprint under 023 hard ceiling | correct | yes | **CORRECT** | `sizeof(Activation)` 640B (flat) → 704B (adaptive, one new field pushes past an alignment boundary); both under the 2048B/idle hard ceiling; `activation_bench`'s own footprint report confirms `[under ceiling]` |
+| Sustained-backlog contention win (F2-equivalent) reconfirmed for the adaptive design | fast | attempted; harness did not exercise the target regime | **INCONCLUSIVE** — neither confirmed nor refuted | unmodified replay of Round 1's F2 3-producer harness (N=6M, limits {0,32,256}, 4 runs): activation-per-send ratio came out 0.05–0.18% across **all** configs (vs Round 1's original 23.98%→1.56% for limit 0→32) — two orders of magnitude lower, meaning the mailbox essentially never truly empties in this replay for any config (a large `drain_budget` lets one `drain_step` call absorb most of the backlog per call); throughput flat/noisy across limit=0/32/256 (5.3–5.8 M msg/s), no config consistently ahead |
+
+### Decision (Round 3)
+
+**The adaptive design ships as ADR-036's new default, replacing the flat design in
+full.** Per this project's own ranking discipline:
+
+- **Rule 4 (respect the invariants) is the deciding rule here.** The flat design's
+  17x/12.7x regression on `activation_bench`/`sched_bench` — both zero-concurrency,
+  single-core, sequential loops — is a direct violation of the zero-cost hot-path
+  invariant this project treats as load-bearing (`CONVENTIONS.md`; `023`'s own Hard-floor
+  gate language). A design that pays real, non-negligible cost on a mailbox that is
+  *always* empty is not a "safe but slow" tradeoff; it is a broken invariant on the exact
+  path (`Activation::drain_step`'s sequential hot path) this codebase's ADR history has
+  iterated on more than any other. The flat design is therefore **disqualified as a
+  default**, independent of anything it got right elsewhere.
+- **Rule 2 (proven beats claimed) is cleanly satisfied for the fix itself.** The
+  regression-fix claim was tested against the *correct* evidence this time — the actual
+  repo bench-gate targets, not synthetic substitutes — and came back CORRECT with tight,
+  repeated (3-run) numbers within 1–3% of the pre-ADR-036 baseline on both benches, plus
+  matching p50 latency.
+- **Rule 1 (safety is a gate) is fully cleared.** Every safety-relevant finding
+  (arithmetic overflow/truncation, evidence-hangover) was closed with a real fix, not a
+  workaround, and re-verified: 181/181 suite, 182/182 MSVC ASAN, 166/166 real TSan clean
+  (including the two named lost-wakeup/work-stealing invariant tests). No `safe`/`correct`
+  claim is WRONG for the adaptive design.
+- **Rule 3 (then optimize fast) does not apply as a tiebreak here** — there is no other
+  safe survivor to compare against. The flat design is disqualified by rule 4; the
+  adaptive design is the only design this round that both stops the regression and
+  passes every safety check.
+
+**Footprint cost is accepted, not free, and should be disclosed:** `sizeof(Activation)`
+grows 640B → 704B (10%) to carry `linger_evidence_` and its alignment padding — still
+comfortably inside the 2048B/idle hard ceiling, but a real, non-zero cost that the spec
+update below must state plainly rather than omit.
+
+### Disposition of the unreconfirmed contention-win claim
+
+**Chosen: option (c) — ship now, explicitly demote the Round 1 F2/F5 contention/backlog
+numbers to "unverified under the adaptive design, carried forward from the flat design's
+proof as a plausibility argument only, not a measured result."**
+
+Justification, against this ADR's own stated methodology ("Only claims that survived
+red-teaming... and were then run as real, compiled, sanitized/instrumented C++23 count
+toward the decision"):
+
+- **Why not (a) ship anyway and let the old numbers stand unqualified.** The mechanism
+  changed materially between the two proofs: Round 1's F2/F5 numbers were measured
+  against an **unconditional** spin_limit=32 that engages the full bound from message
+  one, with no ramp-up. The shipped adaptive design starts every activation at
+  evidence=0 (bound=0) and must earn evidence via `note_batch_evidence`'s
+  `dispatched_this_call >= 2` gate or a linger hit before the spin engages at all — a
+  materially different ramp-up profile under exactly the sustained-backlog shape F2
+  measured. Restating Round 1's numbers as still-true for this different code would
+  violate this ADR's own "proven beats claimed" bar; an inconclusive re-test is not a
+  reconfirmation, and this project does not let unproven claims carry decision weight.
+- **Why not (b) hold shipping until the F2 harness is fixed and rerun.** The regression
+  this round exists to fix is **proven, severe, and currently live** on the unmerged
+  branch (17x/12.7x on the project's own primary sequential-path benches) — a rule-4
+  invariant violation with zero safe alternative on the table. The F2 harness's failure
+  to exercise the target regime is a **test-harness bug** (an oversized `drain_budget`
+  letting one `drain_step` call absorb the whole backlog), not evidence of a problem with
+  the adaptive mechanism itself, and not a safety concern under rule 1. Blocking a proven,
+  severe, safety-clean regression-fix on an unrelated and merely inconclusive (not
+  refuted) upside claim inverts this project's own priority order (rule 1/4 gate before
+  rule 3 optimizes) and leaves the catastrophic regression live on `PR #6`'s branch for
+  no offsetting benefit.
+- **Precedent within this very ADR.** Round 1 itself did exactly this shape of
+  disposition for F1's "<5% everywhere" claim — shipped the mechanism, demoted the
+  overclaimed uniform result to its actual, regime-qualified scope, and recorded the gap
+  as a residual risk rather than either hiding it or blocking the ship. Round 3 applies
+  the identical discipline to F2/F5.
+
+**Practical effect on the spec:** any spec text stating F2's "+26.4% throughput" or F5's
+churn-reduction table as a property of the *shipped* mechanism must be rewritten to
+attribute those numbers explicitly to the retired flat design and labeled unverified for
+the adaptive one — see spec recommendations below.
+
+### Residual risks (Round 3 — appended; Round 1's numbered list above is unchanged)
+
+7. **Round 1's F2/F5 sustained-backlog/contention throughput win is not reconfirmed for
+   the adaptive design.** See disposition above. The next round must first fix the F2
+   harness (cap or parameterize `drain_budget` so a single `drain_step` call cannot
+   absorb an entire backlog wave, or otherwise force genuine empty-mailbox transitions
+   between waves) and only then rerun the comparison before this claim can be restated as
+   proven for the mechanism that actually ships. Until then, treat the contention-win
+   story as a plausibility argument carried forward from different code, not a property
+   of `include/quark/core/activation.hpp` as it exists today.
+8. **Bump/decay/threshold constants are not independently calibrated or swept.**
+   `kLingerHitBump=2`, `kLingerMissDecay=2`, `kLingerBatchThreshold=2`,
+   `kLingerBatchBumpMax=3`, `kLingerEvidenceMax=4` were chosen by design judgment and
+   validated only indirectly — via the bench-gate parity result (which mainly exercises
+   the evidence=0 floor) and the arithmetic correctness table (which is regime-agnostic).
+   No dedicated ablation swept these against a real contention/backlog regime. This
+   should be folded into the same follow-up round as risk #7, ideally the same corrected
+   harness exercising both the zero-concurrency floor and a genuine backlog regime in one
+   run.
+9. **Isolated post-idle-gap bursts get zero linger benefit, by design.** Evidence must be
+   earned before the linger helps; a burst immediately after a long idle period pays the
+   same (near-zero) cost as no linger at all for its first ~1–2 messages. This is the
+   same trade-off shape as Round 1's F1 sparse-traffic disclosure, now a formalized,
+   intentional boundary of the adaptive mechanism rather than an accidental uniform-target
+   miss — disclosed here so it is not later mistaken for a bug.
+10. **`Activation`'s footprint grew 640B → 704B (10%)**, still under the 2048B/idle hard
+    ceiling but a real, permanent cost of the fix — should be stated in the spec, not
+    silently absorbed.
+11. **`pal::cpu_relax()`'s ARM64 `YIELD` remains unverified on real hardware** — Round 1
+    residual risk #3, untouched this round; the proving environment (this round: Windows
+    dev machine + WSL/g++14) remains x86-64-only.
+12. **Round 3's evidence is single-machine.** The bench-gate numbers are from this
+    session's real dev machine (the same machine that reproduced the original regression
+    twice via git-worktree A/B); TSan is from WSL/g++14 on the same box. Not yet re-run on
+    the Linux CI matrix — same caveat as Round 1's residual risk #6.
+
+### Round 3 verdict summary
+
+**The adaptive evidence-gated linger ships as ADR-036's default, fully replacing the flat
+design.** The catastrophic bench-gate regression that made the flat design unshippable is
+conclusively fixed and proven on the project's own primary sequential-path benches (within
+1–3% of the pre-ADR-036 baseline, 3 runs each, matching p50 latency); every safety/
+correctness claim red-team raised was closed with a real fix and re-verified under ASan,
+MSVC ASAN, real TSan, and the full correctness suite. Round 1's sustained-backlog
+throughput win is carried forward only as a disclosed, unverified plausibility argument,
+not restated as a measured property of the shipped code — the next round's first job is
+fixing the F2 harness and reconfirming (or refuting) it for real.

@@ -159,6 +159,19 @@ false-sharing mechanism is real in isolation (4.45x in a synthetic control) but 
 park/wake round-trip cost in the real engine (-1.6%, i.e. the wrong direction, against a
 pre-declared 3%-improvement bar).
 
+**Correction (2026-07-31, ADR-036 round 3):** the table and single-threaded numbers above were
+measured against ADR-036's ROUND-1 design — an unconditional linger that always spun the full
+bound. That design was subsequently found to catastrophically regress this repo's own
+`activation_bench`/`sched_bench` gate benches (12-17x, zero-concurrency case the round-1 proof never
+exercised) and was replaced by an evidence-gated adaptive bound (`decisions/ADR-036-...md`'s round-3
+section). The adaptive mechanism's effective spin is 0 whenever an activation hasn't recently seen
+real batch evidence — a strictly *more* conservative floor than round-1's always-spin behavior — so
+the numbers above should, if anything, move no worse than flat/within-noise for this bench suite's
+own single/light-producer shape (the same regime round-1 already showed near-zero effect for), but
+this has **not been re-measured** against the adaptive code and should not be assumed without
+re-running. Flagged as a follow-up bench task, not a blocker for the adaptive fix itself (which
+exists to correct a regression, not to move these particular numbers).
+
 ## Results (Linux/WSL2, g++ 15.2.0, `taskset`-pinned, ADR-035 + partitioned pool live)
 
 All numbers above are from an unpinned, shared Windows dev host — genuinely useful for *ratios*
