@@ -125,6 +125,53 @@ follow-up noted in `message_pool.hpp`'s file banner, plus ADR-035's own recommen
 (EWMA-gated near-zero idle cost + the tighter fixed-spin shape) for a further throughput gain
 without the adaptive design's measured ~380µs worst-case tail.
 
+**Update (2026-07-31, ADR-036):** the follow-up round targeted a THIRD bottleneck the OS-wake fix
+didn't touch — `metrics_snapshot().activations` (Idle->Scheduled exec-state transitions) stayed at
+18-25% of messages even after ADR-035, because the mailbox drains to empty and reactivates every
+~4-5 messages under a tight producer loop, each cycle paying a CAS + run-queue enqueue + idle_mask_
+scan regardless of whether an OS wake syscall fires. A design-debate-prove round (
+`decisions/ADR-036-activation-linger-idle-churn-reduction.md`) shipped a bounded, activation-scoped
+post-drain linger (`EngineConfig::activation_linger_spin_limit`, default 32): before an activation
+commits to the Running->Idle transition on an empty mailbox, it re-polls its OWN mailbox a bounded
+number of times first, and if a message lands during that window it's picked up directly with no
+exec-state transition at all. **Proven, honest result: this helps substantially under sustained
+backlog/contention (+26.4% throughput in the prover's dedicated 3-producers-vs-1-worker stress
+test, activations 23.98%->1.56%) but does NOT reliably help — and does not meaningfully move — the
+kind of single/light-producer, mostly-idle traffic this bench suite's own MPSC/throughput
+benchmarks exercise.** Re-measured on the same pinned Linux host, same session:
+
+| Producers | Quark (post-ADR-035) | Quark (+ ADR-036 linger) | Change |
+|---|---|---|---|
+| 1 | 0.99 M/s | 1.13 M/s | +14%, within run-to-run noise on this host |
+| 2 | 2.32 M/s | 2.25 M/s | flat |
+| 4 | 3.12 M/s | 3.22 M/s | +3%, within noise |
+
+Single-threaded Tell/throughput (1 worker, `taskset -c 0`) similarly barely moved (throughput
+1.06->1.11 M/s, Tell p50 80->81ns, p999 22,855->24,317ns) — expected, since a single producer in a
+tight loop against an otherwise-idle actor is close to the "sparse/idle-ish" traffic regime
+ADR-036's own proof found the linger does NOT help (F1: 93.10% vs 92.31% baseline activations at
+that pacing, essentially no reduction). **The lesson, stated plainly: ADR-036 is a real fix for a
+real problem (sustained backlog), but this bench suite's specific shape (single/light producers
+against a fast-draining actor) isn't that problem** — closing the remaining CAF gap in *this*
+benchmark shape needs a different angle than activation-churn reduction. A rejected sibling design
+(cutting the fixed per-transition cost via cache-line isolation) was proven NOT to help either — the
+false-sharing mechanism is real in isolation (4.45x in a synthetic control) but swamped by
+park/wake round-trip cost in the real engine (-1.6%, i.e. the wrong direction, against a
+pre-declared 3%-improvement bar).
+
+**Correction (2026-07-31, ADR-036 round 3):** the table and single-threaded numbers above were
+measured against ADR-036's ROUND-1 design — an unconditional linger that always spun the full
+bound. That design was subsequently found to catastrophically regress this repo's own
+`activation_bench`/`sched_bench` gate benches (12-17x, zero-concurrency case the round-1 proof never
+exercised) and was replaced by an evidence-gated adaptive bound (`decisions/ADR-036-...md`'s round-3
+section). The adaptive mechanism's effective spin is 0 whenever an activation hasn't recently seen
+real batch evidence — a strictly *more* conservative floor than round-1's always-spin behavior — so
+the numbers above should, if anything, move no worse than flat/within-noise for this bench suite's
+own single/light-producer shape (the same regime round-1 already showed near-zero effect for), but
+this has **not been re-measured** against the adaptive code and should not be assumed without
+re-running. Flagged as a follow-up bench task, not a blocker for the adaptive fix itself (which
+exists to correct a regression, not to move these particular numbers).
+
 ## Results (Linux/WSL2, g++ 15.2.0, `taskset`-pinned, ADR-035 + partitioned pool live)
 
 All numbers above are from an unpinned, shared Windows dev host — genuinely useful for *ratios*

@@ -242,6 +242,70 @@ host — worse than the wake-syscall cost it was fixing, and in tension with thi
 bounded-spin discipline (`busy_spin_limit` above). A hybrid (adaptive gating + the tighter fixed
 spin shape) is recorded as an unproven round-2 target.
 
+### Activation-scoped post-drain linger (ADR-036)
+
+ADR-035 cut the OS-wake-syscall rate, but a separate cost remained: even without a syscall firing,
+an activation's mailbox draining to empty triggers a full `Running->Idle` exec-state transition
+(CAS + run-queue enqueue + idle-bitmask scan) — measured at 18-25% of messages in a tight
+single-producer loop against a fast-draining actor. Before `drain_step` commits to that transition
+on an empty mailbox, it runs a **bounded, read-only post-drain linger**
+(`EngineConfig::activation_linger_spin_limit`, default 32, sequential drain path only, a *ceiling*
+not a fixed spin count — see below): re-poll THIS activation's own mailbox a bounded number of
+`cpu_relax()`-paced times; a hit is dispatched directly (the linger's own successful dequeue result
+flows straight into normal processing, never a second dequeue — the naive "re-enter the loop"
+implementation would drop or duplicate the message it already popped, closed by construction, not
+by convention). `exec_` is **never written** during the linger — it stays `Running` the whole time,
+so a racing producer's CAS (which expects `Idle`) fails cheaply and silently: no run-queue enqueue,
+no idle-bitmask touch, no `activations` metric increment for that message. On a full miss,
+`close_out()` runs completely unmodified.
+
+**Round 1 shipped this as an unconditional spin** (every `Empty` exit paid the full bound) and
+proved a real backlog/contention win (regime-qualified, not uniform: sustained backlog/contention
+cut churn sharply — one measured case 23.98%→1.56% — with +26.4% throughput and 27-40% faster
+`post()`; sparse/idle-ish traffic saw essentially no effect). **That proof round never ran this
+repo's own bench-gate targets** (`activation_bench`, `sched_bench`) — only bespoke synthetic
+backlog/sparse probes. Both gate benches are strictly-sequential, single-core, one-message-per-cycle
+loops with no concurrent producer — every `Empty` there is a *true* empty, so the unconditional spin
+was pure waste on every single message. Confirmed live, twice, via git-worktree A/B against master
+on real hardware: `activation_bench`'s "activate/deactivate cycle" and `sched_bench`'s
+"full-lifecycle throughput" both went `[goal]`→`[MISS]`, 12-17x worse, p50 latency ~6x worse. A
+larger bound (256), tried as a fix for the sparse-traffic gap, made contention **worse** (-50.6%,
+one measured case) — no single *fixed* bound serves both traffic shapes.
+
+**Round 3 replaced the fixed spin with an evidence-gated adaptive bound.** `Activation` keeps a
+lane-only, per-activation counter (`linger_evidence_`, 0..4, no atomics — written only inside
+`drain_step`/`linger_and_repoll`, exactly like `linger_spin_limit_` itself) that scales the
+*effective* spin bound between 0 and `activation_linger_spin_limit` (now a ceiling). Evidence starts
+at 0 (effective bound 0 — byte-identical cost to `activation_linger_spin_limit=0`) and grows **only**
+from a real dispatched batch (≥2 messages in one `drain_step` call) or the linger's own re-poll
+finding a message — **never** from a raw `DrainStatus::Busy` result. (Round 1's design *did* bump on
+`Busy`, and since `Busy` can repeat from ordinary non-adversarial timing jitter — two producers
+occasionally overlapping a poll, retried by the caller up to `busy_spin_limit`=64 times — just 1-2
+routine races could saturate evidence and reproduce near-full linger cost on the *next* genuinely
+idle transition, an "evidence hangover" red-team found and round 3 closed **structurally** by
+removing `Busy` from the evidence-write path entirely, not by re-tuning it.) A genuinely idle,
+zero-concurrency activation therefore never accumulates evidence and pays ~zero linger cost, exactly
+recovering the bench-gate numbers: re-measured at 29.53-29.65 M cycles/s/core / 22.1-22.2 M msg/s/core
+/ matching ~100ns p50 on both benches — within ~1-3% of pre-ADR-036 master, decisively fixing the
+regression. `sizeof(Activation)` grew 640B→704B (the new evidence byte crossing an alignment
+boundary), still comfortably under the 2048B/idle hard ceiling.
+
+**The round-1 contention win (+26.4%, one measured case) has NOT been reconfirmed for the adaptive
+mechanism as shipped.** A re-run against the original F2 harness was inconclusive, not confirming or
+refuting it — the harness's `drain_budget` let a single `drain_step` call absorb an entire backlog
+wave, so the churn regime the win depends on was never actually exercised in the re-run. Per this
+project's own "proven beats claimed" bar, the number is carried forward only as a plausibility
+argument, not restated as a proven result for the current code — see
+`decisions/ADR-036-activation-linger-idle-churn-reduction.md`'s round-3 section for the full
+disposition and the harness fix needed before it can be re-measured. Sequential drain only —
+`drain_step_governed_seq` (022 admission bookkeeping runs per-message inside its own loop, not
+before it) and `drain_step_reentrant` (015's own Parked-based mechanism) are both unaffected. A
+cache-line-isolation alternative targeting the fixed per-transition cost instead of transition
+frequency was proven and rejected in round 1: the underlying false-sharing mechanism is real in
+isolation (4.45× in a synthetic control) but is swamped by park/wake round-trip cost in the real
+engine (-1.6%, i.e. the wrong direction, against a pre-declared 3%-improvement bar) — not worth
+shipping as a performance change.
+
 ## Broadcast schedules activations, not messages (ADR-019)
 
 Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))

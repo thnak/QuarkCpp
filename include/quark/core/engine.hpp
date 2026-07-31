@@ -36,10 +36,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-#include <immintrin.h>  // _mm_pause (detail::cpu_relax) — MSVC has no __builtin_ia32_pause
-#endif
-
 #include "quark/core/activation.hpp"
 #include "quark/core/actor.hpp"           // ADR-028 Phase 4: Actor<> CRTP base for the internal broker
 #include "quark/core/config.hpp"
@@ -107,16 +103,6 @@ struct DrainBudget {
 // engine_config.hpp; the Live operational word (`HotCell`) in hot_cell.hpp (both included above).
 
 namespace detail {
-QUARK_ALWAYS_INLINE void cpu_relax() noexcept {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-    _mm_pause();  // MSVC has no __builtin_ia32_pause; this is its PAUSE-instruction intrinsic
-#elif defined(__x86_64__) || defined(_M_X64)
-    __builtin_ia32_pause();
-#else
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
-}
-
 // Per-worker identity, set by the worker lane on entry. Observability/test seam only (lets a
 // handler learn which lane is executing it — e.g. to witness a work-steal). Not on the hot path.
 inline thread_local std::uint32_t t_worker_id = 0xFFFF'FFFFu;
@@ -209,6 +195,7 @@ public:
         s->shard = sid;
         act.set_metrics(&shards_[sid].metrics);  // 009: wire this activation to its shard's counters
         act.set_idle_ticks(idle_ticks);  // 011/ADR-028 Phase 2
+        act.set_linger_spin_limit(cfg_.activation_linger_spin_limit);  // ADR-036
         s->band = static_cast<std::uint16_t>(band < Policy::bands ? band : Policy::bands - 1);
         // Default drain budget = the FROZEN `EngineConfig::drain_budget` (013/ADR-008): a per-actor
         // `DrainBudget<N>` still wins (budget != 0), else the engine-wide frozen default. This is
@@ -1019,7 +1006,7 @@ private:
     // source of the no-lost-wakeup guarantee regardless of how many probes ran first.
     QUARK_ALWAYS_INLINE bool pre_park_spin() noexcept {
         for (std::uint32_t i = 0; i < cfg_.pre_park_spin_limit; ++i) {
-            detail::cpu_relax();
+            pal::cpu_relax();
             if (any_work() || stopping_.load(std::memory_order_acquire)) return true;
         }
         return false;
@@ -1184,7 +1171,7 @@ private:
             }
             if (r.status == RunStatus::Busy) {
                 if (++busy < cfg_.busy_spin_limit) {
-                    detail::cpu_relax();
+                    pal::cpu_relax();
                     continue;
                 }
                 break;  // spun out — the close-out re-check / next wakeup catches it
@@ -1218,7 +1205,7 @@ private:
             }
             if (o == Activation::DrainOutcome::Busy) {
                 if (++busy < cfg_.busy_spin_limit) {
-                    detail::cpu_relax();
+                    pal::cpu_relax();
                     continue;  // mailbox producer mid-publish — bounded spin, keep Running
                 }
                 // still Busy after the bounded spin — yield the lane, re-enqueue (never unbounded).

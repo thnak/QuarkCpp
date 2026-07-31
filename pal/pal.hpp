@@ -16,6 +16,10 @@
 #include <chrono>
 #include <cstdint>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>  // _mm_pause (pal::cpu_relax) — MSVC has no __builtin_ia32_pause
+#endif
+
 // BootClock/WallClock — the canonical suspend-counting monotonic clock + civil wall clock, one
 // concrete backend per OS (019 §"Per-OS backends"). Compile-time selection, not a vtable (019
 // §"Compile-time backend selection, not a vtable").
@@ -58,6 +62,25 @@ inline constexpr std::uint32_t platform_abi_tag = 0x78'86'64'4C;  // 'x','86','6
 // on AArch64; re-gate the whole close-out under a weak-memory model before promoting.
 QUARK_ALWAYS_INLINE void store_load_barrier() noexcept {
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+// A cheap spin-wait hint for bounded busy-poll loops (ADR-035's pre-park spin, ADR-036's
+// post-drain linger, the mailbox/run-queue Busy tri-state spins). Not a memory barrier — purely a
+// low-power/hyperthread-yield instruction, safe to call any number of times. x86: `PAUSE`. AArch64:
+// `YIELD` (a real hardware hint, not a compiler-only fence — ADR-036 found that emitting only a
+// compiler barrier here on non-x86 would have widened a documented gap onto a newly HOT call site).
+// Any other arch falls back to a compiler barrier only — still correct (the loop's own re-check is
+// what matters for progress), just without the low-power hint.
+QUARK_ALWAYS_INLINE void cpu_relax() noexcept {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();  // MSVC has no __builtin_ia32_pause; this is its PAUSE-instruction intrinsic
+#elif defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
 }
 
 // --- Clock ------------------------------------------------------------------
