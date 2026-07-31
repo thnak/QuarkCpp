@@ -80,6 +80,20 @@ struct EngineConfig {
     // idle_mask_, and always falls through to the unmodified park() Dekker rendezvous. 0 disables it
     // (byte-for-byte park() path, only a predictable branch added at the call site). Never unbounded.
     std::uint32_t pre_park_spin_limit = 256;
+    // ADR-036: bounded, read-only re-poll of an activation's OWN mailbox before drain_step commits
+    // to a DrainedEmpty exit (Running->Idle). Distinct axis from pre_park_spin_limit (worker-level,
+    // any_work() across ALL shards, engaged only once the whole worker finds nothing anywhere) and
+    // from busy_spin_limit (bounds the Busy tri-state, a different DrainStatus). Fires on every
+    // Empty drain exit for THIS activation, not just the rare whole-engine-idle case — proven
+    // (design-debate-prove, ADR-036) to cut Idle->Scheduled activation churn under backlog/
+    // contention (+26.4% throughput, one measured case) at 32, but to NOT reliably hit its own
+    // <5%-churn target under sparse/idle-ish traffic, and a larger bound (256) measurably
+    // REGRESSES throughput under contention (-50.6%, one measured case) — 32 is the proven,
+    // shipped default; do not raise it without re-running ADR-036's contention sweep. Sequential
+    // drain path only (drain_step_governed_seq/drain_step_reentrant are unaffected, ADR-036 fix
+    // #2). 0 disables it (byte-for-byte the pre-linger drain_step, one predictable branch added).
+    // Never unbounded.
+    std::uint32_t activation_linger_spin_limit = 32;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -133,6 +147,10 @@ public:
     ConfigBuilder& security_mode(SecurityMode v) noexcept { cfg_.security_mode = v; return *this; }
     ConfigBuilder& busy_spin_limit(unsigned n) noexcept { cfg_.busy_spin_limit = n; return *this; }
     ConfigBuilder& pre_park_spin_limit(std::uint32_t n) noexcept { cfg_.pre_park_spin_limit = n; return *this; }
+    ConfigBuilder& activation_linger_spin_limit(std::uint32_t n) noexcept {
+        cfg_.activation_linger_spin_limit = n;
+        return *this;
+    }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }
     ConfigBuilder& metrics_memory_budget_bytes(std::size_t n) noexcept {
         cfg_.metrics_memory_budget_bytes = n;

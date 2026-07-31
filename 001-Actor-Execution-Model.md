@@ -95,6 +95,20 @@ pre-park spin ahead of `park()` but deliberately never touches per-actor
 exec-state — both candidate designs' single-executor and FIFO claims proved
 CORRECT under concurrent stress across the spin/park boundary. See ADR-035.
 
+**Reconfirmed a fifth time (ADR-036).** The activation idle-churn
+design-debate-prove cycle (002 §"Activation-scoped post-drain linger") added
+a bounded post-drain linger directly inside `drain_step`'s `Empty` exit —
+`exec_` is never written while lingering (no store, no CAS), so a racing
+producer's Idle-expecting CAS fails cheaply and single-executor holds by
+construction, not by proof-after-the-fact. Verified CORRECT under concurrent
+stress (including work-stealing pressure) and under real ThreadSanitizer at
+every tested bound. The linger's own successful re-poll result is threaded
+directly into dispatch with no second dequeue — an earlier draft of this
+design left that hand-off unspecified, and the naive "re-enter the loop"
+implementation would have dropped or duplicated the message the linger
+already popped; this is now closed and proven (2,440+ reps across four
+bounds, zero loss/duplication, FIFO intact). See ADR-036.
+
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
 contract (a worker requeuing an activation via work-steal, and a different

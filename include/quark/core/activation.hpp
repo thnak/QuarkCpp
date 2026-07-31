@@ -61,6 +61,7 @@
 #include "quark/core/hot_cell.hpp"  // 013/022 Overflow + the LIVE bound/overflow/shed word (0-RMW read)
 #include "quark/core/ids.hpp"       // ActorId, FenceToken (ADR-028 Phase 8 DeactivateFlushSink)
 #include "quark/core/mailbox.hpp"
+#include "pal/pal.hpp"  // pal::cpu_relax() — ADR-036's post-drain linger
 #include "quark/core/message_context.hpp"
 #include "quark/core/metrics.hpp"  // 009: ShardCounters — engine-wired at registration (set_metrics)
 #include "quark/core/resource.hpp"  // WireFn/ResourceScope (007 Restart re-wire, "Phase 6" redirected)
@@ -442,15 +443,22 @@ public:
         if (QUARK_UNLIKELY(gov_)) return drain_step_governed_seq(budget);  // 022 governed sequential
 
         // ====================================================================================
-        // Sequential path — VERBATIM 001 single-in-flight park. Zero 015 machinery is touched.
+        // Sequential path — 001 single-in-flight park, plus ADR-036's bounded post-drain linger on
+        // the `Empty` exit (drain_step_governed_seq/drain_step_reentrant are unaffected — see their
+        // own scoping notes). Zero 015 machinery is touched.
         // ====================================================================================
         std::uint32_t remaining = budget;
         for (;;) {
             if (remaining == 0) return DrainOutcome::BudgetExhausted;
 
-            const DrainResult r = mailbox_.try_dequeue();
-            if (r.status == DrainStatus::Empty) return DrainOutcome::DrainedEmpty;
-            if (r.status == DrainStatus::Busy) return DrainOutcome::Busy;
+            DrainResult r = mailbox_.try_dequeue();
+            if (r.status == DrainStatus::Empty) {
+                if (!linger_and_repoll(r)) return DrainOutcome::DrainedEmpty;
+                // `r` now holds the Message the linger's OWN re-poll found — falls straight into
+                // the claim/dispatch code below with NO second try_dequeue() for it (ADR-036).
+            } else if (r.status == DrainStatus::Busy) {
+                return DrainOutcome::Busy;
+            }
 
             --remaining;
             Descriptor* d = r.desc;
@@ -542,6 +550,17 @@ public:
             return DrainOutcome::Suspended;
         }
     }
+
+    // ---- Activation-scoped bounded post-drain linger config (ADR-036) ---------------------
+    // Sequential drain path only (drain_step_governed_seq's per-message admission bookkeeping —
+    // GovernanceCore::depth(), DropOldest/deadline-shed — runs INSIDE its own loop body, not
+    // before it, so a linger there would need to re-run that same admission logic on every
+    // re-polled message; judged too large a surface to safely extend this round, same as
+    // drain_step_reentrant is already out of scope). Default 32, proven (ADR-036) to help under
+    // backlog/contention; do not raise without re-running ADR-036's contention sweep (256
+    // measurably regressed throughput under contention in that proof). 0 disables it.
+    void set_linger_spin_limit(std::uint32_t n) noexcept { linger_spin_limit_ = n; }
+    [[nodiscard]] std::uint32_t linger_spin_limit() const noexcept { return linger_spin_limit_; }
 
     // ---- Close-out seam (002): DrainedEmpty → relinquish via the seq_cst Dekker rendezvous ----
     [[nodiscard]] bool close_out() noexcept {
@@ -862,6 +881,30 @@ private:
     };
     std::unique_ptr<GovernanceCore> gov_{};  // null for an ungoverned activation (zero cost)
 
+    // ---- Activation-scoped bounded post-drain linger core (ADR-036) -----------------------
+    // Called ONLY from the plain sequential drain_step()'s Empty arm. Re-polls THIS activation's
+    // OWN mailbox up to `linger_spin_limit_` times, pal::cpu_relax()-paced. `exec_` is NEVER
+    // touched here — no store, no CAS — so a racing producer's wake_after_enqueue() CAS (which
+    // expects Idle) fails cheaply and silently: no exec-state transition, no run-queue enqueue, no
+    // `activations` metric increment (that fires only on the Idle/Dormant->Scheduled CAS edge
+    // inside post()/notify_enqueued(), which never succeeds while exec_ stays Running) — the
+    // message is picked up by THIS re-poll instead, and `r` is overwritten in place so the caller
+    // dispatches that exact result with no second try_dequeue() (ADR-036 fix #1: the linger/
+    // dispatch hand-off — the naive "continue back to the top of the loop" implementation would
+    // drop or duplicate the message this function already popped).
+    QUARK_ALWAYS_INLINE bool linger_and_repoll(DrainResult& r) noexcept {
+        for (std::uint32_t i = 0; i < linger_spin_limit_; ++i) {
+            pal::cpu_relax();
+            r = mailbox_.try_dequeue();
+            if (r.status == DrainStatus::Message) return true;
+            // Empty or Busy: neither found a dispatchable message yet — keep spinning. Busy (a
+            // producer demonstrably mid-publish) is folded into "keep spinning" rather than
+            // surfaced: the linger exists precisely because a message is plausible, and Busy is
+            // the strongest available evidence of that.
+        }
+        return false;
+    }
+
     // ====================================================================================
     // 022 governed SEQUENTIAL drain. Mirrors the verbatim 001 sequential drain (single in-flight,
     // supervision guard, park) with three admission-side governance hooks that run BEFORE a message
@@ -872,6 +915,12 @@ private:
     //   3. deadline-aware shedding (018) — a doomed message (deadline already passed) is shed FIRST
     //      and cheapest with `errc::timeout`, before it consumes a cycle (spec §Load shedding).
     // A message that survives the hooks dispatches identically to the sequential path.
+    //
+    // ADR-036's post-drain linger is OUT OF SCOPE here (fix #2, option (b)): the admission hooks
+    // above run PER MESSAGE as part of THIS loop's own body, not before it — a linger re-poll here
+    // would need to re-run the same DropOldest/deadline-shed/depth-accounting sequence on every
+    // message it finds, a second, non-trivial admission call site that risks silently drifting
+    // from this one. Not attempted this round; `enable_governance()` activations never linger.
     // ====================================================================================
     DrainOutcome drain_step_governed_seq(std::uint32_t budget) noexcept {
         GovernanceCore& g = *gov_;
@@ -1481,6 +1530,10 @@ private:
     std::uint32_t escalations_ = 0;       // total escalations (observability / tests)
     std::uint32_t faults_ = 0;            // total handler faults contained (observability / tests)
     std::uint32_t dead_letters_ = 0;      // total messages routed to dead-letter
+    // ADR-036: bounded post-drain linger spin count. Lane-only (read/written only by the
+    // drain-owning worker, inside drain_step()/linger_and_repoll()) — never touched off-lane, so
+    // it needs no atomic. Default 32 per the proven design; 0 disables the linger.
+    std::uint32_t linger_spin_limit_ = 32;
 };
 
 inline void QuiescenceGuard::release() noexcept {

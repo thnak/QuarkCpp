@@ -242,6 +242,42 @@ host — worse than the wake-syscall cost it was fixing, and in tension with thi
 bounded-spin discipline (`busy_spin_limit` above). A hybrid (adaptive gating + the tighter fixed
 spin shape) is recorded as an unproven round-2 target.
 
+### Activation-scoped post-drain linger (ADR-036)
+
+ADR-035 cut the OS-wake-syscall rate, but a separate cost remained: even without a syscall firing,
+an activation's mailbox draining to empty triggers a full `Running->Idle` exec-state transition
+(CAS + run-queue enqueue + idle-bitmask scan) — measured at 18-25% of messages in a tight
+single-producer loop against a fast-draining actor. Before `drain_step` commits to that transition
+on an empty mailbox, it runs a **bounded, read-only post-drain linger**
+(`EngineConfig::activation_linger_spin_limit`, default 32, sequential drain path only): re-poll
+THIS activation's own mailbox a bounded number of `cpu_relax()`-paced times; a hit is dispatched
+directly (the linger's own successful dequeue result flows straight into normal processing, never
+a second dequeue — the naive "re-enter the loop" implementation would drop or duplicate the
+message it already popped, closed by construction, not by convention). `exec_` is **never written**
+during the linger — it stays `Running` the whole time, so a racing producer's CAS (which expects
+`Idle`) fails cheaply and silently: no run-queue enqueue, no idle-bitmask touch, no `activations`
+metric increment for that message. On a full miss, `close_out()` runs completely unmodified.
+
+**Measured (`decisions/ADR-036-activation-linger-idle-churn-reduction.md`), regime-qualified, not
+uniform:** under sustained backlog/contention (a slow-relative-to-producers consumer, or multiple
+concurrent producers), the default (32) cuts activation churn sharply (one measured case:
+23.98%→1.56%) with a real throughput win (+26.4%, one measured case) and 27-40% faster `post()`
+latency. Under sparse/idle-ish traffic (gaps between sends exceeding the spin window), the default
+does **not** reliably meet its own reduction target (one measured case: 93.10% vs 92.31%
+baseline — essentially no effect) — there is no single fixed bound that helps both traffic shapes
+simultaneously. A larger bound (256) closes the sparse-traffic gap but **regresses badly under
+contention** (down to -50.6%, one measured case) because the linger's re-poll contends with the
+same mailbox-tail cache line producers need — this is worse overlap than ADR-035's `pre_park_spin`
+sees, since the linger fires precisely when a message is plausibly imminent. 32 is the proven,
+shipped default; **256 is an explicitly rejected default**, not merely untested. Sequential drain
+only — `drain_step_governed_seq` (022 admission bookkeeping runs per-message inside its own loop,
+not before it) and `drain_step_reentrant` (015's own Parked-based mechanism) are both unaffected.
+A cache-line-isolation alternative targeting the fixed per-transition cost instead of transition
+frequency was proven and rejected in the same round: the underlying false-sharing mechanism is
+real in isolation (4.45× in a synthetic control) but is swamped by park/wake round-trip cost in the
+real engine (-1.6%, i.e. the wrong direction, against a pre-declared 3%-improvement bar) — not
+worth shipping as a performance change.
+
 ## Broadcast schedules activations, not messages (ADR-019)
 
 Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))
