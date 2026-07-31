@@ -124,3 +124,53 @@ which remains open — unexplored: CAF's own producer-side design, and Quark's s
 follow-up noted in `message_pool.hpp`'s file banner, plus ADR-035's own recommended round-2 hybrid
 (EWMA-gated near-zero idle cost + the tighter fixed-spin shape) for a further throughput gain
 without the adaptive design's measured ~380µs worst-case tail.
+
+## Results (Linux/WSL2, g++ 15.2.0, `taskset`-pinned, ADR-035 + partitioned pool live)
+
+All numbers above are from an unpinned, shared Windows dev host — genuinely useful for *ratios*
+(as noted throughout), but not trustworthy at the sub-microsecond scale the Tell latency numbers
+live at. This section is a from-scratch, `taskset -c 0-3`-pinned Linux run (WSL2/Ubuntu, real
+g++ 15.2.0, CAF v1.1.0 built from source at the same commit `0378ece` the Windows numbers used) —
+the same methodology `CLAUDE.md`'s machine-safety rules prescribe for real benchmarking. **Caveat:**
+WSL2 is itself a lightweight VM, not bare metal — its futex/scheduling costs are not guaranteed to
+match a native Linux CI runner; treat this as a second, more-trustworthy-than-Windows data point,
+not a final answer.
+
+### Single-threaded (1 worker, `taskset -c 0`)
+
+| Metric | Quark | CAF | Note |
+|---|---|---|---|
+| Spawn | **1,310.8 ns** | 1,597.2 ns | Quark wins, consistent with Windows |
+| Tell p50 | 80 ns | 70 ns | **~parity** — the Windows "2×" gap was measurement noise, not real |
+| Tell p999 | 22,855 ns | **2,635 ns** | CAF wins, real (~8.7×) — much smaller than Windows' noisy 70×, but genuine |
+| Ask p50 | 13,076 ns | 12,205 ns | ~parity |
+| Throughput | 1.06 M/s | **4.31 M/s** | CAF wins, ~4× — the real, substantiated gap |
+
+### 4 workers (`taskset -c 0-3`)
+
+| Metric | Quark | CAF |
+|---|---|---|
+| Spawn | **1,032 ns** | 5,529.4 ns (Quark wins big) |
+| Throughput | 0.94 M/s | 2.06 M/s (CAF ~2.2×) |
+
+### MPSC scaling (`taskset -c 0-3`)
+
+| Producers | Quark (M/s) | CAF (M/s) | CAF vs Quark |
+|---|---|---|---|
+| 1 | 0.99 | 1.85 | 1.87× |
+| 2 | 2.32 | 3.07 | 1.32× |
+| 4 | 3.12 | 7.81 | 2.50× |
+
+Quark still scales *up* with producer count on Linux (0.99 → 2.32 → 3.12), confirming the
+partitioning + ADR-035 fixes hold cross-platform, not just on the Windows host they were developed
+on. The ratio pattern differs from the Windows session (a flat ~1.3× at every producer count) —
+here it's non-monotonic (1.87× → 1.32× → 2.50×), plausibly a WSL2-specific virtualization/core-
+topology artifact rather than a Quark-specific regression, but not yet root-caused.
+
+**Corrected picture**: with pinned data, Quark and CAF are close on *latency* (spawn, tell p50,
+ask) — the large Windows-reported gaps there were mostly measurement noise. The real, reproducible
+gap is **bulk throughput** (single-producer ~4×, 4-worker ~2.2×, MPSC 1.3–2.5× depending on
+producer count) and **Tell p999 tail latency** (~8.7×, smaller than first thought but real). This
+narrows what's actually worth investigating next: not "Quark's messaging is slow," but
+specifically "Quark's sustained bulk throughput and tail latency trail CAF's" — a much more
+targeted question than the original benchmark suite suggested.
