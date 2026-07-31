@@ -89,6 +89,12 @@ to mailbox internals: any future mailbox redesign inherits this proof for
 free only if it leaves `ExecStateCell`'s transitions untouched, exactly as
 both r9 challengers correctly did. See ADR-032.
 
+**Reconfirmed a fourth time (ADR-035), incidentally.** The worker idle-backoff
+design-debate-prove cycle (002 §"Idle backoff before park") added a bounded
+pre-park spin ahead of `park()` but deliberately never touches per-actor
+exec-state — both candidate designs' single-executor and FIFO claims proved
+CORRECT under concurrent stress across the spin/park boundary. See ADR-035.
+
 **Work-steal/requeue handoff — relied upon, not yet formally specified
 (tracked).** The `Running → Scheduled → Scheduled → Running` release/acquire
 contract (a worker requeuing an activation via work-steal, and a different

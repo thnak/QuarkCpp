@@ -218,6 +218,30 @@ x86 leak is small (~0.05–0.09%) but nonzero, so the fence is load-bearing and 
 guard is `lost == 0` vs `lost > 0`. See
 [ADR-004](decisions/ADR-004-mailbox-mpsc-hot-path-r4.md).
 
+### Idle backoff before park (ADR-035)
+
+A worker parking (blocking on its `std::atomic` wait signal) the instant its scan finds nothing
+means every producer that lands a message on an already-parked worker pays a real OS wake syscall
+(futex / `WaitOnAddress`) synchronously inside its own `tell()` call — measured on one host at
+31.0%/15.8%/4.4% of sends at 1/2/4 producers for a fast-draining single-shard workload. Before
+committing to `park()`, a worker runs a **bounded, read-only pre-park spin**
+(`EngineConfig::pre_park_spin_limit`, default 256): re-probe `any_work()` (a plain acquire load,
+the same probe `park()`'s own rescan already uses) between bounded `cpu_relax()` pauses; a hit
+re-enters the ordinary scan path, a full miss falls through to `park()` completely unmodified. The
+spin **never writes the idle bitmask** — a producer's targeted wake only fires a syscall when a
+worker's idle bit is set, so a message landing during the spin is picked up by the spin's own probe
+instead, and `park()`'s announce/fence/rescan Dekker rendezvous (the sole source of the
+no-lost-wakeup guarantee above) is reached in exactly the state it would have been in without the
+spin. `pre_park_spin_limit = 0` disables it (a predictable branch is the only added cost). Measured
+(one host, `decisions/ADR-035-worker-park-wake-backoff-policy.md`): the wake-syscall ratio dropped
+from ~26-31%/~15%/~4-6% to ~0.02-0.26% at 1/2/4 producers; throughput improved modestly (single
+digit to low double-digit percent); a genuinely idle worker still converges to near-0% CPU. An
+adaptive (EWMA-gated exponential) alternative was proven to win more on throughput but was
+rejected as the default: its measured worst-case single spin round cost ~380µs on the proving
+host — worse than the wake-syscall cost it was fixing, and in tension with this section's own
+bounded-spin discipline (`busy_spin_limit` above). A hybrid (adaptive gating + the tighter fixed
+spin shape) is recorded as an unproven round-2 target.
+
 ## Broadcast schedules activations, not messages (ADR-019)
 
 Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))

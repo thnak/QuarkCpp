@@ -88,12 +88,39 @@ The 1-producer number moved too (2.72 → 1.90, run-to-run machine variance — 
 core-pinned); treat the ratios, not the raw single-thread values, as the signal until a pinned
 re-run exists.
 
+**Update (2026-07-30, ADR-035):** the remaining gap was root-caused to a second, independent
+issue — `Engine::worker_loop` parked the instant its scan found nothing, with no backoff, so
+producers landing on an already-parked worker paid a real OS wake syscall (futex/`WaitOnAddress`)
+synchronously inside their own `tell()` call. Measured directly via `metrics_snapshot().wakeups`:
+31.0%/15.8%/4.4% of sends at 1/2/4 producers were paying that cost. A full design-debate-prove
+cycle (`decisions/ADR-035-worker-park-wake-backoff-policy.md`) picked a bounded 256-iteration
+pre-park spin (`EngineConfig::pre_park_spin_limit`, default 256) as the winner over a
+higher-throughput but worse-worst-case adaptive alternative. Re-measured in the same session,
+same host, with both fixes (partitioned pool + ADR-035 spin) live:
+
+| Producers | Quark (partition fix only) | Quark (+ ADR-035 spin) | CAF (this session) | CAF vs Quark |
+|---|---|---|---|---|
+| 1 | 1.90 M/s | 2.24 M/s | 2.90 M/s | 1.3× |
+| 2 | 3.15 M/s | 4.00 M/s | 5.27 M/s | 1.3× |
+| 4 | 5.76 M/s | 6.31 M/s | 8.53 M/s | 1.35× |
+
+The gap tightens further, from ~2.1–2.75× down to a consistent ~1.3×. CAF's own numbers moved
+between sessions too (this run: 2.90/5.27/8.53 vs the earlier 3.99/8.66/13.39) — unpinned
+run-to-run noise on a shared dev box, not a real change in CAF — so the *ratio* within one session
+is the trustworthy signal, not the cross-session absolute deltas. Tell p999 did **not** improve on
+this host in the ADR-035 prove phase (both the winning and rejected designs measured
+statistically-indistinguishable p999 vs baseline here) — flagged as unproven/host-noise in the ADR,
+not claimed as fixed.
+
 ### Key insight
 
-The original "throughput drops with more producers" finding was **not** a Vyukov mailbox
-limitation — it was `MessagePool`'s single shared free-list mutex serializing every producer
-regardless of target actor (root-caused in commit `1964203`, GitHub issue #4). With one partition
-per producer lane, Quark's mailbox scales in the right direction; CAF still leads in absolute
-throughput at this producer range, which remains open (unexplored: per-thread buffer or
-split-queue design on CAF's side, and Quark's own shard-keyed pool follow-up noted in
-`message_pool.hpp`'s file banner).
+Two independent, now-fixed bottlenecks accounted for most of the original gap: (1) `MessagePool`'s
+single shared free-list mutex serializing every producer regardless of target actor (root-caused
+in commit `1964203`, GitHub issue #4) — fixed by per-producer-lane partitioning; (2)
+`Engine::worker_loop` paying a real OS wake syscall on ~15-31% of sends because it parked
+immediately on the first empty scan with no backoff — fixed by ADR-035's bounded pre-park spin.
+CAF still leads in absolute throughput at this producer range (~1.3× now, down from ~2.1-2.75×),
+which remains open — unexplored: CAF's own producer-side design, and Quark's shard-keyed pool
+follow-up noted in `message_pool.hpp`'s file banner, plus ADR-035's own recommended round-2 hybrid
+(EWMA-gated near-zero idle cost + the tighter fixed-spin shape) for a further throughput gain
+without the adaptive design's measured ~380µs worst-case tail.

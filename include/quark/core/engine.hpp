@@ -1000,8 +1000,29 @@ private:
                 if (scan_and_run(wid)) continue;  // final confirm nothing is left
                 break;
             }
+#if !defined(QUARK_SCHED_BROKEN_WAKEUP)
+            // ADR-035: bounded pre-park spin. Gated out under the broken-wakeup negative control so
+            // sched_no_lost_wakeup_control keeps reaching park()'s exact original race window — see
+            // pre_park_spin()'s comment.
+            if (pre_park_spin()) continue;
+#endif
             park(wid);  // deschedule until targeted wake; returns early if it re-finds work
         }
+    }
+
+    // ADR-035: bounded, read-only spin between "scan found nothing anywhere" and committing to
+    // park()'s OS block. Never touches idle_mask_ — a producer's wake_one() sees this worker as
+    // still-busy for the whole spin and takes the existing zero-syscall "every worker busy" path,
+    // so a message landing here is picked up by this function's own any_work() probe instead of a
+    // futex/WaitOnAddress wake. If the bounded budget is exhausted, park() runs completely
+    // unmodified — its Dekker rendezvous (announce idle → seq_cst fence → rescan) is the sole
+    // source of the no-lost-wakeup guarantee regardless of how many probes ran first.
+    QUARK_ALWAYS_INLINE bool pre_park_spin() noexcept {
+        for (std::uint32_t i = 0; i < cfg_.pre_park_spin_limit; ++i) {
+            detail::cpu_relax();
+            if (any_work() || stopping_.load(std::memory_order_acquire)) return true;
+        }
+        return false;
     }
 
     // Scan shards in this worker's preference order; drain the first productive shard fully, then
