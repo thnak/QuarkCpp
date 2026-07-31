@@ -172,6 +172,20 @@ this has **not been re-measured** against the adaptive code and should not be as
 re-running. Flagged as a follow-up bench task, not a blocker for the adaptive fix itself (which
 exists to correct a regression, not to move these particular numbers).
 
+**Correction (2026-07-31, ADR-036 round 4): the sustained-backlog win cited above (+26.4%,
+23.98%->1.56%) is retracted, not carried forward.** Round 4 fixed the harness that produced those
+round-1 numbers (its `drain_budget` let a single `drain_step` call absorb an entire backlog wave,
+masking any real per-config difference) and, with that fixed plus a second warm-up/process-order
+measurement bias also closed, re-measured the contention win for the adaptive mechanism as shipped:
+**no statistically distinguishable benefit** over `linger_spin_limit=0`, cross-validated under g++
+and clang++, P∈{1,2,3,4} producers (`decisions/ADR-036-...md`'s round-4 section has the full data).
+`activation_linger_spin_limit`'s default is now **0** — this bench suite's own Producers-1/2/4
+table above and the single-threaded Tell numbers were already measured on a build where the linger
+barely moved anything for this traffic shape; with the default now 0, a fresh run of this table
+would exercise byte-for-byte pre-ADR-036 `drain_step` and should reproduce the original
+`post-ADR-035` column, not the `+ADR-036 linger` one. Not re-run here — flagged as the same
+follow-up bench task as before, now with a clearer expected outcome.
+
 ## Results (Linux/WSL2, g++ 15.2.0, `taskset`-pinned, ADR-035 + partitioned pool live)
 
 All numbers above are from an unpinned, shared Windows dev host — genuinely useful for *ratios*

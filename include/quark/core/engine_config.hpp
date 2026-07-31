@@ -97,17 +97,25 @@ struct EngineConfig {
     // run against this repo's own bench-gate targets (activation_bench/sched_bench), which are
     // strictly-sequential zero-concurrency loops: there the unconditional spin was PURE WASTE on
     // every message and regressed both benches 12-17x ([goal]->[MISS]), confirmed live on real
-    // hardware. Round 3's adaptive gating fixes that regression (bench-gate parity re-confirmed,
+    // hardware. Round 3's adaptive gating fixed that regression (bench-gate parity re-confirmed,
     // within ~1-3% of pre-ADR-036 numbers) while keeping the mechanism available for real backlog.
-    // The round-1 contention win (+26.4%) has NOT been reconfirmed for the adaptive mechanism as
-    // shipped — carried forward as a plausibility argument only, not a proven result for this code
-    // (see decisions/ADR-036-...md's round-3 section; the old F2 harness under-exercised the churn
-    // regime and needs a fix before re-measuring). Distinct axis from pre_park_spin_limit
-    // (worker-level, any_work() across ALL shards) and busy_spin_limit (bounds the Busy tri-state).
-    // Sequential drain path only (drain_step_governed_seq/drain_step_reentrant unaffected). 0
-    // disables it (byte-for-byte the pre-linger drain_step). Never unbounded — the setter clamps to
-    // kLingerSpinLimitMax (4096) to keep the evidence-scaled bound arithmetic overflow-free.
-    std::uint32_t activation_linger_spin_limit = 32;
+    // Round 4 fixed the F2/F5 harnesses (the originals never let the mailbox go genuinely empty, so
+    // no config could show an effect) and, with that bug and a second warm-up/process-order bias
+    // both closed, RE-MEASURED the round-1 contention win for the adaptive mechanism as shipped:
+    // REFUTED, not merely unreconfirmed — limit=32/256 showed no statistically distinguishable
+    // reduction in activation churn or throughput improvement over limit=0, cross-validated under
+    // g++ and clang++ (see decisions/ADR-036-...md's round-4 section for the full harness fix and
+    // data). Default is therefore 0 (mechanism byte-for-byte disabled, matching the pre-ADR-036
+    // drain_step exactly) per this project's own "proven beats claimed" bar: an unproven-benefit
+    // default is not justified, even though sizeof(Activation) already carries the (unconditional)
+    // +64B linger_evidence_/constants footprint regardless of this default. The mechanism remains
+    // available and correct for callers who opt in with a measured need. Distinct axis from
+    // pre_park_spin_limit (worker-level, any_work() across ALL
+    // shards) and busy_spin_limit (bounds the Busy tri-state). Sequential drain path only
+    // (drain_step_governed_seq/drain_step_reentrant unaffected). 0 disables it (byte-for-byte the
+    // pre-linger drain_step). Never unbounded — the setter clamps to kLingerSpinLimitMax (4096) to
+    // keep the evidence-scaled bound arithmetic overflow-free.
+    std::uint32_t activation_linger_spin_limit = 0;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------

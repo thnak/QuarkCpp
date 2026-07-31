@@ -2,28 +2,33 @@
 
 ## Status
 
-**Round 1 finding superseded by Round 3 (see "## Round 3" below — historical Round 1 content
-below is kept intact, not erased).** Round 1 accepted Design A's **flat, unconditional**
-linger (`activation_linger_spin_limit` defaulted to **32**, spinning the full bound on
-*every* empty-mailbox drain exit regardless of any evidence a message was actually
-imminent). After merge-in-spirit, that flat default was found to **catastrophically regress**
-the project's own 023 perf-gate bench targets (`activation_bench`, `sched_bench`) in the
-zero-concurrency/single-core shape those benches exercise — 17x/12.7x throughput loss,
-~6x p50 latency — because Round 1's proof round never ran the actual repo bench-gate
-targets, only bespoke synthetic backlog/sparse probes. **The flat default is retired.**
-Round 3 replaces it with an **evidence-gated adaptive linger** (same knob name/semantics,
-`activation_linger_spin_limit` still nominally 32, but now scales the *effective* spin bound
-by a per-activation, lane-only evidence counter that starts at 0, so a mailbox with no
-concurrent producers pays the same ~zero cost as `spin_limit=0`). **The adaptive design is
-Accepted and ships as ADR-036's new default**, proven to close the regression to within
-~1-3% of the pre-ADR-036 baseline on the real bench-gate targets, with all Round-1 safety/
-correctness invariants reconfirmed (ASan, MSVC ASAN, real TSan, full suite) against the new
+**Round 1 finding superseded by Round 3, Round 3's open contention-win question closed
+(refuted) by Round 4 (see "## Round 3" / "## Round 4" below — historical content is kept
+intact, not erased).** Round 1 accepted Design A's **flat, unconditional** linger
+(`activation_linger_spin_limit` defaulted to **32**, spinning the full bound on *every*
+empty-mailbox drain exit regardless of any evidence a message was actually imminent). After
+merge-in-spirit, that flat default was found to **catastrophically regress** the project's
+own 023 perf-gate bench targets (`activation_bench`, `sched_bench`) in the zero-concurrency/
+single-core shape those benches exercise — 17x/12.7x throughput loss, ~6x p50 latency —
+because Round 1's proof round never ran the actual repo bench-gate targets, only bespoke
+synthetic backlog/sparse probes. **The flat default is retired.** Round 3 replaced it with
+an **evidence-gated adaptive linger** (same knob name/semantics, but now scales the
+*effective* spin bound by a per-activation, lane-only evidence counter that starts at 0, so a
+mailbox with no concurrent producers pays the same ~zero cost as `spin_limit=0`). **The
+adaptive design is Accepted and ships**, proven to close the regression to within ~1-3% of
+the pre-ADR-036 baseline on the real bench-gate targets, with all Round-1 safety/correctness
+invariants reconfirmed (ASan, MSVC ASAN, real TSan, full suite) against the new
 implementation. Design B's two cache-line/memory-order cuts remain **not adopted** (Round 1
-finding, untouched by Round 3). Round 1's F2/F5 sustained-backlog/contention throughput-win
-numbers were **not reconfirmed** under the adaptive design this round (inconclusive, not
-refuted — harness limitation) and are now **explicitly demoted** to a carried-forward
-plausibility argument, not a proven result for the code that ships — see "## Round 3" for
-the full mechanism, evidence table, and disposition.
+finding, untouched by Rounds 3/4). Round 1's F2/F5 sustained-backlog/contention throughput-win
+numbers were left **inconclusive** under the adaptive design at the end of Round 3 (a harness
+bug, not evidence either way). **Round 4 fixed that harness bug (plus a second, previously
+unknown warm-up/process-order measurement bias it uncovered) and re-measured for real:
+the contention/backlog win is REFUTED for the adaptive mechanism as shipped** — no
+statistically distinguishable benefit over `spin_limit=0`, cross-validated under g++ and
+clang++. Per that result, **`activation_linger_spin_limit`'s default is changed from 32 to
+0** (mechanism byte-for-byte disabled by default, same code path as pre-ADR-036, remains
+available and correct for opt-in use) — see "## Round 4" for the full harness fix, data, and
+decision.
 
 ## Question
 
@@ -597,3 +602,152 @@ MSVC ASAN, real TSan, and the full correctness suite. Round 1's sustained-backlo
 throughput win is carried forward only as a disclosed, unverified plausibility argument,
 not restated as a measured property of the shipped code — the next round's first job is
 fixing the F2 harness and reconfirming (or refuting) it for real.
+
+## Round 4 (2026-07-31): F2/F5 Harness Fix and Contention-Win Refutation
+
+### Why this round happened
+
+Round 3 shipped the adaptive design and closed the catastrophic bench-gate regression, but
+left residual risk #7 open: the F2 (3-producer sustained-backlog) and F5 (P∈{1,2,4}
+continuous-producer) harnesses, unmodified-replayed against the new adaptive mechanism, came
+back inconclusive (0.05–0.18% activation/send ratio across every `linger_spin_limit`
+config — two orders of magnitude below Round 1's original 23.98%/1.56% numbers). This round's
+job, per residual risk #7's own instructions, was to fix that harness and get a real answer.
+
+### Root cause of the harness bug
+
+Both `run_backlog()` (F2) and `run()` (F5) construct `Engine<> eng(EngineConfig{1, 1, 1024,
+64})`. `EngineConfig`'s fields are `{worker_count, shard_count, drain_budget,
+busy_spin_limit}` — so `drain_budget=1024`. With 3-4 producer threads posting continuously at
+full speed against a single worker, the backlog routinely exceeds 1024 queued messages, so
+`Activation::drain_step` almost always returns `BudgetExhausted` (dispatch up to budget,
+re-scheduled directly) rather than ever observing a genuine `Empty` mailbox. Since the
+`activations` metric only increments on a real `Idle->Scheduled` edge, and the linger
+mechanism only ever engages on the `Empty` exit path, a harness whose mailbox is
+backlogged-by-construction for its entire duration can't exercise the linger's code path at
+all, for any config — exactly the flat, indistinguishable 0.05–0.18% result Round 3 saw.
+
+### The fix: wave/burst workload, not just a smaller budget
+
+Shrinking `drain_budget` alone does not fix this — as long as producers saturate the
+consumer continuously, the mailbox is backlogged by construction regardless of batch size.
+The actual fix, per residual risk #7's own text ("force genuine empty-mailbox transitions
+between waves"), restructures the workload: N producers, synchronized by `std::barrier`, send
+a burst of `K` messages each, then all pause for a calibrated gap (busy-spun via
+`pal::cpu_relax()` against `steady_clock`, not `sleep_for` — OS scheduling-quantum jitter
+can't resolve microsecond-scale gaps) before the next wave. This models real bursty backlog
+traffic — the regime the linger targets — instead of a workload that is saturated for its
+entire duration by construction.
+
+**Validated, not assumed**: the fixed harness was proven to actually exercise the target
+regime before any comparison number was trusted from it, the same rigor this ADR has applied
+throughout. Activation/send ratio rose from the old harness's 0.05–0.18% to **8–16%** at gap
+≥ ~800ns and plateaued there — a two-orders-of-magnitude change confirming real per-wave
+`Idle->Scheduled` transitions are now genuinely happening.
+
+### A second bug found during proving: warm-up/process-order bias
+
+The first pass at a "fixed" comparison (batching `limit ∈ {0, 32, 256}` calls inside one
+process, one after another) showed a clean, cross-compiler-reproducible ~10-20%
+activation-ratio reduction and throughput win for `limit=32/256` — indistinguishable in shape
+from a reconfirmed Round-1 win. A reversed-run-order control and a same-limit-repeated-5x-
+in-one-process control proved this was **entirely a first-call-in-process artifact**
+(thread/Engine/pool construction overhead): whichever config happened to run *first* in a
+process scored ~2 points worse on the activation ratio, independent of its actual
+`linger_spin_limit` value. This is exactly the class of measurement error this ADR's own
+"proven beats claimed" discipline exists to catch — a plausible, reproducible, and *wrong*
+result. Fixed by adding a `single` mode: one discarded primer run, then one measured run,
+always exactly one config per fresh process. Every number below is bias-controlled this way.
+
+### Results (bias-controlled, gap=2000ns, burst=8/producer, waves=20000, n=8 trials/cell — 4 g++ 15.2.0 + 4 clang++ 20.1.8, WSL2 Ubuntu, `taskset -c 0-4` pinned, ≤5 threads)
+
+| P | limit | activ/send % (mean±sd) | throughput msgs/s (mean±sd) |
+|---|-------|------------------------|------------------------------|
+| 1 | 0   | 15.48 ± 0.32 | 1,449,314 ± 49,486 |
+| 1 | 32  | 15.68 ± 0.19 | 1,435,542 ± 70,288 |
+| 1 | 256 | 15.47 ± 0.46 | 1,383,620 ± 127,431 |
+| 2 | 0   | 10.43 ± 0.34 | 711,508 ± 160,786 |
+| 2 | 32  | 10.31 ± 0.25 | 662,663 ± 77,105 |
+| 2 | 256 | 10.17 ± 0.44 | 542,319 ± 128,437 |
+| 3 (F2) | 0   | 8.71 ± 0.08 | 176,266 ± 21,592 |
+| 3 (F2) | 32  | 8.44 ± 0.23 | 151,191 ± 31,278 |
+| 3 (F2) | 256 | 8.58 ± 0.18 | 180,383 ± 15,883 |
+| 4 | 0   | 8.44 ± 0.09 | 201,163 ± 19,679 |
+| 4 | 32  | 8.47 ± 0.12 | 213,264 ± 26,876 |
+| 4 | 256 | 8.44 ± 0.16 | 216,059 ± 18,618 |
+
+Every `limit=0` vs `limit=32/256` gap sits within ~1 combined standard deviation, with no
+consistent direction — `limit=0` is the *fastest* throughput at both P=1 and P=2. A gap=0
+(back-to-back bursts, no idle window at all) sweep shows the same pattern. No config shows a
+reproducible edge on either the activation-churn or throughput metric.
+
+### Why the true effect is plausibly near-zero, not just noisy
+
+`Engine::pre_park_spin` (ADR-035, `pre_park_spin_limit=256` default, unconditional and
+independent of ADR-036) already spins on `any_work()` before a worker calls the OS-blocking
+`park()`, and ADR-035 already measured this cutting OS-wake syscalls to 0.26-1.25% of sends.
+The expensive part of an idle transition (a futex-class wait) was therefore already mostly
+eliminated *before* ADR-036 shipped; the `activations` counter ADR-036 targets is comparatively
+cheap (one CAS + one run-queue push) in the single-worker/single-shard topology F2/F5 use "to
+isolate the linger's effect from work-stealing" — leaving little further win available for the
+linger to extract in exactly the topology built to showcase it.
+
+### Evidence table (Round 4)
+
+| Claim | Kind | Survived red-team? | Proven? | Number / result |
+|---|---|---|---|---|
+| Harness fix exercises genuine empty-mailbox transitions | correct (harness) | n/a (measurement fix, not a design claim) | **CORRECT** | activation/send ratio 0.05-0.18% (old, broken) → 8-16% (fixed, plateaued at gap≥800ns) |
+| Warm-up/process-order bias identified and closed | correct (measurement) | n/a | **CORRECT** | reversed-order + same-limit-repeated-5x controls isolate a ~2-point first-call-in-process penalty, independent of `linger_spin_limit` |
+| Round-1 contention/backlog win reconfirmed for the adaptive design | fast | attempted, bias-controlled | **REFUTED** | all `limit=0` vs `32/256` deltas within ~1 combined sd, P∈{1,2,3,4}, cross-validated g++15.2.0/clang++20.1.8, n=8/cell |
+
+### Decision (Round 4)
+
+**`activation_linger_spin_limit`'s default changes from 32 to 0.** Per this project's own
+ranking discipline:
+
+- **Rule 2 (proven beats claimed) is the deciding rule here.** The only justification for a
+  non-zero default was the round-1 contention/backlog win. That claim is now proven false for
+  the mechanism that actually ships, under a harness built specifically to exercise the regime
+  it depends on and cross-validated across two compilers. Carrying a non-zero default forward
+  on a refuted claim would itself violate this ADR's own evidentiary bar.
+- **The cost is real even though the regression is fixed.** `sizeof(Activation)` already
+  carries the unconditional +64B `linger_evidence_`/constants footprint regardless of this
+  default (that cost is not recoverable by changing the default — the field exists whenever
+  the mechanism is compiled in). But the *runtime* cost of a non-zero default — however small
+  after Round 3's adaptive gating — is no longer offset by any proven benefit, so there is no
+  remaining reason to pay it by default.
+- **The mechanism is not removed.** It is correct, safety-clean (Round 3's full ASan/MSVC
+  ASAN/TSan/suite reconfirmation stands unchanged — no code in `activation.hpp` changed this
+  round, only the `EngineConfig` default), and available to any caller with a measured need
+  that this round's topology and traffic shape didn't happen to cover. `0` reproduces the
+  pre-ADR-036 `drain_step` byte-for-byte, so this default change carries zero regression risk
+  on top of Round 3's already-verified bench-gate parity.
+
+### Residual risks (Round 4 — appended; Rounds 1/3's numbered lists above are unchanged)
+
+13. **Round 4's evidence is from WSL2 (a VM), not bare metal.** No native g++/clang++ was
+    available on the Windows dev host for this round, so F2/F5 were rebuilt and run under
+    WSL2 Ubuntu (g++ 15.2.0, clang++ 20.1.8) rather than natively. Sub-microsecond gap-timing
+    questions (the 800ns validation threshold, the ~2000ns headline gap) are close enough to a
+    VM scheduler's noise floor that one confirming run on bare-metal Linux (e.g. the CI
+    matrix) would strengthen this result, though the refutation itself rests on relative
+    (`limit=0` vs `32/256`) comparisons within the same environment, which is far more robust
+    to absolute VM timing noise than any single absolute number would be.
+14. **Residual risk #7 is now closed** (harness fixed, contention win measured and refuted for
+    the adaptive design) but residual risk #8 (bump/decay/threshold constants not
+    independently calibrated) is now moot for the *default* configuration — those constants
+    only matter to a caller who opts back into a non-zero `linger_spin_limit`, which is no
+    longer the shipped default.
+
+### Round 4 verdict summary
+
+**Residual risk #7 is closed.** The F2/F5 harness bug (a backlog workload that was saturated
+by construction, plus a second warm-up/process-order measurement bias found while fixing it)
+is fixed and validated to genuinely exercise empty-mailbox transitions. Re-measured against
+the adaptive mechanism as shipped, cross-validated under two compilers with the measurement
+bias controlled: **the round-1 contention/backlog throughput win does not reproduce** —
+`activation_linger_spin_limit`'s default changes from 32 to 0 as a direct consequence, per
+this ADR's own "proven beats claimed" bar. The mechanism itself is unchanged, remains fully
+verified (Round 3's ASan/MSVC ASAN/TSan/suite evidence stands), and stays available for opt-in
+use by any caller with a real, measured backlog-churn problem this round's benches didn't
+happen to cover.
