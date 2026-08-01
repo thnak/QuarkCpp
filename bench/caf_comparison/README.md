@@ -124,25 +124,81 @@ AMD Ryzen 5 4600H, 6 physical cores / 12 logical (SMT), Windows, clang++ 22.1.5.
 > binaries** — treat any older copy of this README (or the historical `10.74 M/s` figure) as
 > measuring a since-fixed methodology bug, not a stable property of Quark.
 
+> **Re-run #3 (2026-08-01, same day) — `ask`-bench fairness fix, plus two disclosed (not fixed)
+> architectural asymmetries. This one narrows an interpretation, it doesn't reverse a conclusion.**
+> A user comparing `caf_bench.cpp`'s `bench_ask_latency()` (`self->mail(v).request(echoer,
+> 10s).receive(...)`) against `quark_bench.cpp`'s `block_on(ref2.ask<int>(v))` flagged that the two
+> calls don't do the same amount of work. Three things were checked:
+> 1. **CAF's `10s` timeout arms a real per-call timer.** `libcaf_core/caf/mailer.hpp` schedules a
+>    timeout message via `clock.schedule_message(...)` on every `request()` call whose timeout
+>    isn't `infinite`, then disposes it once the reply arrives. Quark's `block_on`/`AskFuture::wait()`
+>    (`include/quark/core/actor_ref.hpp`) has no timeout mechanism at all to compare against — it
+>    parks unconditionally on a `ReplyCell`. **Fixed**: `caf_bench.cpp` now passes `caf::infinite`
+>    instead of `10s`, which `mailer.hpp` special-cases to skip `schedule_message` entirely, matching
+>    Quark's un-timed wait. **Measured effect: none within this session's noise floor** — CAF's ask
+>    p50 was 2,000/15,500 ns (@1/@12) before the fix and 1,900-2,000/15,500-15,600 ns after, across
+>    two runs each. The timer tax is real in the source but evidently dwarfed by other per-request
+>    cost, so this is a legitimate fairness fix that (honestly) changed nothing measurable this
+>    session — reported as such rather than quietly dropped.
+> 2. **The bigger, unfixable asymmetry: CAF's `receive()` runs a general-mailbox consume loop; Quark's
+>    `ask` bypasses the mailbox entirely.** `libcaf_core/caf/blocking_actor.cpp`'s `receive_impl` (the
+>    body behind `scoped_actor::receive`) does, on every call: `unstash()` any previously-shelved
+>    messages, `await_data()` (condvar wait on the actor's one general mailbox), `pop_front()`, check
+>    the popped message's id against the pending request and `stash_.push()`+loop if it doesn't match,
+>    construct type-erased views to check for `exit_msg`/`down_msg` and run supervision bookkeeping if
+>    so, then runtime-dispatch into the behavior's type-erased matcher (`consume()`). None of that
+>    machinery ever fires in this benchmark (only one request is ever in flight, no exit/down
+>    messages exist), but the cost of checking still runs every call — it's the price of `scoped_actor`
+>    being a real actor with one general-purpose inbox that can receive *anything*. Quark's `ask`
+>    (`actor_ref.hpp`) deliberately routes the reply through a dedicated one-shot `ReplyCell` *inside*
+>    the ask envelope specifically to avoid this — `block_on` just parks on that one cell and reads a
+>    known-`R`-typed slot, no queue, no id match, no stash, no exit/down check, no matcher dispatch.
+>    **Not fixed, because it can't be**: this is each engine's real, idiomatic implementation of
+>    synchronous ask, and CAF's mailbox-based design is inherent to its actor model, not a bench bug.
+>    But it means a meaningful share of the ask-latency gap reported below is "dedicated reply slot"
+>    vs "general mailbox reuse," not a clean measurement of raw scheduler/dispatch speed — attribute
+>    it accordingly.
+> 3. **`bench_spawn()` has an analogous, also-unfixed asymmetry.** `quark_bench.cpp`'s `bench_spawn()`
+>    never calls `eng.start()` — it constructs the `Engine`, spawns 100k actors, and lets it go out of
+>    scope, with **zero live worker threads at any point**, regardless of the `workers` argument.
+>    `caf_bench.cpp`'s `actor_system` starts its scheduler threads at construction (inherent to CAF's
+>    lifecycle — there's no "registered but not running" state to spawn into), so its spawn loop runs
+>    while N real OS threads are already live. This plausibly explains why Quark's spawn cost stays
+>    flat across worker counts while CAF's grows with them (see the table below and Key Finding #3) —
+>    it may not be "CAF's spawn path is worse," it may be "CAF pays a live-scheduler tax during spawn
+>    that Quark's bench structurally never exercises." Not fixed: there's no way to make Quark's
+>    engine spawn into a live scheduler and still call it the same "spawn" operation, nor a way to make
+>    CAF spawn before its scheduler exists — the two engines' lifecycles don't have a common instant to
+>    measure at.
+>
+> **Every number in the table below is a fresh same-session re-run** (all four metrics, both engines,
+> both worker counts) so the table stays internally consistent; it isn't a mix of this session's ask
+> numbers spliced into an older session's other numbers.
+
 ## Single-threaded vs max-threaded (1 producer, 1 actor)
 
 | Metric | Quark @1 | Quark @12 | CAF @1 | CAF @12 |
 |---|---|---|---|---|
-| Spawn (10k actors) | 772 ns | 775 ns | 936 ns | 4,255 ns |
-| Tell p50 / p99 / p999 | 100 / 700 / 1,100 ns | 100 / 2,300 / 2,900 ns | 100 / 400 / 800 ns | 100 / 200 / 3,600 ns |
-| Ask p50 / p99 / p999 | 600 / 1,900 / 3,800 ns | 1,300 / 3,500 / 9,000 ns | 2,000 / 16,500 / 39,000 ns | 15,500 / 22,200 / 33,000 ns |
-| Throughput | 6.90 M/s | 7.27 M/s | **7.73 M/s** | **7.38 M/s** |
+| Spawn (10k actors) | 749 ns | 851 ns | 1,162 ns | 4,219 ns |
+| Tell p50 / p99 / p999 | 100 / 800 / 2,300 ns | 100 / 700 / 1,100 ns | 100 / 400 / 800 ns | 200 / 400 / 900 ns |
+| Ask p50 / p99 / p999 | 600 / 1,600 / 3,300 ns | 1,400 / 3,700 / 11,300 ns | 2,000 / 16,100 / 33,800 ns | 15,500 / 21,700 / 29,500 ns |
+| Throughput | 7.40 M/s | 7.47 M/s | **7.73 M/s** | 7.48 M/s |
 
-**With both bench-fidelity bugs fixed, CAF now leads single-threaded throughput** (7.73 vs
-6.90 M/s, CAF **1.12×** ahead) and the two engines are essentially tied at 12 workers (7.38 vs
-7.27 M/s, CAF barely ahead). **This reverses every prior session's headline "Quark wins
-single-threaded throughput" finding in this file** — that finding was built on a CAF baseline
-deflated ~25-30% by the `sleep_for(500ms)`-inside-the-timed-window bug described in the callout
-above, not a real engine capability gap. Quark still wins clearly elsewhere: spawn at 12 workers
-(775 ns vs CAF's 4,255 ns, **5.5×**, unaffected by either fix — CAF's spawn cost keeps ballooning
-with scheduler thread count, Quark's doesn't) and `ask` p50 at both worker counts (600 vs 2,000 ns
-@1, **3.3×**; 1,300 vs 15,500 ns @12, **~11.9×** — CAF's ask latency degrades badly under its own
-multi-threaded scheduler). `tell` p50 is tied at 100 ns for both engines at both worker counts.
+**CAF leads single-threaded throughput this session too** (7.73 vs 7.40 M/s, CAF **1.04×** ahead);
+at 12 workers Quark is marginally ahead (7.47 vs 7.48 M/s — a tie within noise). The headline from
+the bench-fidelity fix (CAF, not Quark, wins single-threaded throughput once the `sleep_for`
+bug is gone) still stands; the exact margin moves session to session on this unpinned host, as it
+has every session in this file. Quark still wins clearly elsewhere: spawn at both worker counts
+(749 vs 1,162 ns @1, **1.55×**; 851 vs 4,219 ns @12, **5.0×** — CAF's spawn cost keeps ballooning
+with scheduler thread count, Quark's doesn't, though **the "Re-run #3" callout above discloses this
+isn't a clean same-operation comparison**: Quark's `bench_spawn` never starts its scheduler, CAF's
+is always live) and `ask` p50 at both worker counts (600 vs 2,000 ns @1, **3.3×**; 1,400 vs
+15,500 ns @12, **~11.1×** — CAF's ask latency degrades badly under its own multi-threaded
+scheduler, and re-measuring after the `infinite`-timeout fairness fix confirms this gap is real,
+not a timer-tax artifact, though **per the same callout, expect a meaningful share of it to be
+"dedicated ReplyCell" vs "general mailbox + behavior-matcher dispatch," not a pure engine-speed
+delta**). `tell` p50 is tied at 100 ns for both engines at 1 worker; CAF's ticks up slightly to
+200 ns at 12.
 
 ## MPSC scaling, shared mailbox (N producers → 1 actor)
 
@@ -298,14 +354,15 @@ callout near the top of this file before drawing conclusions from any single del
 
 ## Key findings
 
-1. **A bench-fidelity bug flipped the single-threaded throughput headline — this is the biggest correction in this file's history, bigger than the warmup fix below.** `caf_bench.cpp` measured its throughput number with a 500ms sleep captured *inside* the timed window, deflating every CAF single-threaded throughput figure in every prior session by ~25-30%. Fixed (see the "Re-run #2" callout in the Machine section): **CAF now leads single-threaded throughput, 7.73 vs 6.90 M/s (1.12×)**, reversing the "Quark wins by ~1.37-1.39×" claim every earlier session in this file made. A second, related bug (unconditional per-message clock reads in the MPSC/sharded benches, purely to feed a 1-in-16 sample) was also fixed, which is why this session's P=1 rows in the MPSC tables now actually match the single-threaded table's number, closing the exact discrepancy that prompted this investigation. Treat every throughput comparison from earlier sessions in this file's git history as measuring these bugs, not a stable property of either engine.
+1. **A bench-fidelity bug flipped the single-threaded throughput headline — this is the biggest correction in this file's history, bigger than the warmup fix below.** `caf_bench.cpp` measured its throughput number with a 500ms sleep captured *inside* the timed window, deflating every CAF single-threaded throughput figure in every prior session by ~25-30%. Fixed (see the "Re-run #2" callout in the Machine section): **CAF leads single-threaded throughput this session, 7.73 vs 7.40 M/s (1.04×)**, reversing the "Quark wins by ~1.37-1.39×" claim every earlier session in this file made. A second, related bug (unconditional per-message clock reads in the MPSC/sharded benches, purely to feed a 1-in-16 sample) was also fixed, which is why this session's P=1 rows in the MPSC tables now actually match the single-threaded table's number, closing the exact discrepancy that prompted this investigation. Treat every throughput comparison from earlier sessions in this file's git history as measuring these bugs, not a stable property of either engine.
 2. **Warmup discipline was a real, separate fix from #1 and remains valid.** Switching every bench's warmup from a fixed op count to ~1s of wall-clock time (see that callout) fixed a >2× run-to-run swing in Quark's own numbers and flipped sharded MPSC from "Quark ahead at P=1/P=2" to "CAF ahead everywhere." Both fixes are real; they just corrected different things (#1 was a bug in measuring CAF, this one was a bug in measuring Quark) and happened to land in the same file across different sessions.
-3. **Quark still wins clearly on `ask` latency and spawn at high worker counts — unaffected by either bug fix.** Quark's spawn cost stays flat with worker count (775 ns @12) while CAF's balloons (4,255 ns @12, **5.5×** worse). Quark's `ask` p50 leads CAF's at both worker counts (600 vs 2,000 ns @1, **3.3×**; 1,300 vs 15,500 ns @12, **~11.9×**) — CAF's ask latency degrades badly under its own multi-threaded scheduler, Quark's doesn't.
-4. **The shared-mailbox gap is real and CAF-favoring at every producer count** (1.24×-1.76× this session) — sharding away mailbox contention narrows it somewhat at low P (sharded P=1: Quark actually leads, 0.86×) but CAF pulls ahead again from P=2 onward and the gap widens with P in both topologies, the shared-mailbox shape where every producer contends for the same actor's mailbox and `MessagePool` partition-lane traffic.
-5. **Oversubscription hurts Quark specifically**, and this is the one finding that has now been directly investigated, not just observed — unaffected by the bench-fidelity fixes above (the stress test's `sent`/`received` counters and duration measurement were never in the buggy code path). The sharded bench's one-worker-per-producer design means P=12 spawns 24 OS threads on a 12-thread machine; Quark's throughput barely regresses P=8→P=12 this session (17.93→17.76 M/s, **-0.9%**, smaller than either prior session's -4.6%/-10.4%) while CAF's keeps climbing. The sustained stress test above quantifies the mechanism as a latency-tail cost, not a correctness or throughput-collapse one: aggregate throughput and message integrity hold in every run, but Quark's tail latency blows up once oversubscription starts. **Root-cause confirmed, and multiple candidate fixes built, proven, and re-tested across four rounds.** [ADR-038](../../decisions/ADR-038-scheduler-oversubscription-tail-latency.md) traced this to `try_drain_shard`'s `drain_owner` CAS stranding other workers behind a preempted shard owner. Round 1 built and proved three competing fixes (a naive `yield()`-based backoff was *proven counterproductive*; bounded cooperative drain-owner eviction won). Round 2 refuted the hope that its p999 side-effect was a proving-harness artifact. Round 3 built a cheaper heuristic that materially helped but didn't close the gap. **Round 4 combined it with yield-escalation, found no further improvement, and — more importantly — found that re-measuring the exact same configuration in a fresh session flipped its sign** (+9.9% worse → -1.0% better), evidence this shared host's noise floor exceeds the effect sizes being chased. The investigation is now **closed pending a quiet, pinned CI host**, not resolved; every knob stays at its default-off/zero value. See `002-Scheduler.md`'s "Bounded cooperative drain-owner eviction (ADR-038)" section and the ADR's Rounds 2-4 for the full evidence.
-6. **Quark's single-producer `throughput` bench gets slightly faster with more workers this session** (6.90 M/s @1 → 7.27 M/s @12, +5%) — a change from both prior sessions' slight *slowdown* (~9-10%), plausibly just session-to-session noise on a shared host rather than a real trend reversal; not concerning either way since the effect size is small in both directions.
-7. **Quark has no mailbox backpressure today.** `MessagePool` cold-allocates unboundedly when a partition is exhausted rather than throttling producers (RFC 022 documents this as an open gap, not yet implemented) — confirmed by the stress-test incident described below: hammering a single shared mailbox harder than its one consumer can drain grew RSS to ~18GB in seconds. Not a risk under the paired/sharded topologies real workloads use, but a real gap if a workload ever does route sustained heavy traffic at a single actor identity.
-8. **Every absolute number in this file remains a single unpinned-host run**, now across three same-day sessions that have each moved meaningfully from the last — two for real, disclosed reasons (warmup, then bench-fidelity bugs) and some purely from host noise (see ADR-038 Round 4's finding that even a *fixed* configuration's measured sign can flip session-to-session). A `taskset`-pinned Linux CI re-run remains the natural follow-up before treating any absolute number here as canonical; ratios and directional trends, cross-checked against ADR-level evidence where it exists (like ADR-038), are the more trustworthy signal this file can currently offer.
+3. **Quark still wins clearly on `ask` latency and spawn at high worker counts — unaffected by either bug fix, but both are disclosed asymmetries, not clean same-operation comparisons (see the "Re-run #3" callout).** Quark's spawn cost stays flat with worker count (851 ns @12) while CAF's balloons (4,219 ns @12, **5.0×** worse) — plausibly because Quark's `bench_spawn` never starts its scheduler (no live worker threads at all) while CAF's is always live from construction, not purely a spawn-path efficiency gap. Quark's `ask` p50 leads CAF's at both worker counts (600 vs 2,000 ns @1, **3.3×**; 1,400 vs 15,500 ns @12, **~11.1×**) — re-measured after removing CAF's per-call timeout-timer tax (`10s` → `infinite`) with no change to the gap, so this one *is* a real dispatch-latency difference, but a meaningful share of it is architectural (Quark's dedicated `ReplyCell` vs CAF's general-mailbox `receive()` with stash/exit/down/matcher overhead) rather than a pure "engine A is faster than engine B" statement.
+4. **The ask-latency and spawn gaps are each explained by a specific, cited architectural or lifecycle difference, not just "CAF is slower" — see the "Re-run #3" callout for the full mechanism (source-line citations in `caf/mailer.hpp` and `caf/blocking_actor.cpp` vs `quark/core/actor_ref.hpp`).** This doesn't change which engine reports the smaller number; it changes what conclusion is safe to draw from that number.
+5. **The shared-mailbox gap is real and CAF-favoring at every producer count** (1.24×-1.76× this session) — sharding away mailbox contention narrows it somewhat at low P (sharded P=1: Quark actually leads, 0.86×) but CAF pulls ahead again from P=2 onward and the gap widens with P in both topologies, the shared-mailbox shape where every producer contends for the same actor's mailbox and `MessagePool` partition-lane traffic.
+6. **Oversubscription hurts Quark specifically**, and this is the one finding that has now been directly investigated, not just observed — unaffected by the bench-fidelity fixes above (the stress test's `sent`/`received` counters and duration measurement were never in the buggy code path). The sharded bench's one-worker-per-producer design means P=12 spawns 24 OS threads on a 12-thread machine; Quark's throughput barely regresses P=8→P=12 this session (17.93→17.76 M/s, **-0.9%**, smaller than either prior session's -4.6%/-10.4%) while CAF's keeps climbing. The sustained stress test above quantifies the mechanism as a latency-tail cost, not a correctness or throughput-collapse one: aggregate throughput and message integrity hold in every run, but Quark's tail latency blows up once oversubscription starts. **Root-cause confirmed, and multiple candidate fixes built, proven, and re-tested across four rounds.** [ADR-038](../../decisions/ADR-038-scheduler-oversubscription-tail-latency.md) traced this to `try_drain_shard`'s `drain_owner` CAS stranding other workers behind a preempted shard owner. Round 1 built and proved three competing fixes (a naive `yield()`-based backoff was *proven counterproductive*; bounded cooperative drain-owner eviction won). Round 2 refuted the hope that its p999 side-effect was a proving-harness artifact. Round 3 built a cheaper heuristic that materially helped but didn't close the gap. **Round 4 combined it with yield-escalation, found no further improvement, and — more importantly — found that re-measuring the exact same configuration in a fresh session flipped its sign** (+9.9% worse → -1.0% better), evidence this shared host's noise floor exceeds the effect sizes being chased. The investigation is now **closed pending a quiet, pinned CI host**, not resolved; every knob stays at its default-off/zero value. See `002-Scheduler.md`'s "Bounded cooperative drain-owner eviction (ADR-038)" section and the ADR's Rounds 2-4 for the full evidence.
+7. **Quark's single-producer `throughput` bench gets slightly faster with more workers this session** (7.40 M/s @1 → 7.47 M/s @12, +1%) — a smaller version of both prior sessions' pattern (one prior session showed +5%, another a slight *slowdown* of ~9-10%), plausibly just session-to-session noise on a shared host rather than a stable trend either way; not concerning either way since the effect size is small in every direction seen so far.
+8. **Quark has no mailbox backpressure today.** `MessagePool` cold-allocates unboundedly when a partition is exhausted rather than throttling producers (RFC 022 documents this as an open gap, not yet implemented) — confirmed by the stress-test incident described below: hammering a single shared mailbox harder than its one consumer can drain grew RSS to ~18GB in seconds. Not a risk under the paired/sharded topologies real workloads use, but a real gap if a workload ever does route sustained heavy traffic at a single actor identity.
+9. **Every absolute number in this file remains a single unpinned-host run**, now across three same-day sessions that have each moved meaningfully from the last — two for real, disclosed reasons (warmup, then bench-fidelity bugs) and some purely from host noise (see ADR-038 Round 4's finding that even a *fixed* configuration's measured sign can flip session-to-session). A `taskset`-pinned Linux CI re-run remains the natural follow-up before treating any absolute number here as canonical; ratios and directional trends, cross-checked against ADR-level evidence where it exists (like ADR-038), are the more trustworthy signal this file can currently offer.
 
 ## History
 
@@ -329,5 +386,14 @@ Full narrative of each investigation round (the `MessagePool` partitioning fix, 
   file's history by ~25-30% — reversing this file's headline single-threaded-throughput conclusion.
   See the "Re-run #2" callout in the Machine section for the full writeup; no dedicated ADR, this
   was a bench-harness fix, not an engine design decision.
+- **`ask`-bench fairness fix + two disclosed asymmetries (2026-08-01, same day)**: user noticed
+  `caf_bench.cpp`'s `.request(echoer, 10s)` and Quark's un-timed `block_on` don't do the same amount
+  of work. Fixed the CAF timeout to `infinite` (removes a real but, measured, inconsequential
+  per-call timer-scheduling cost); disclosed but left unfixed two deeper asymmetries that can't be
+  fixed without changing what's being measured — CAF's `receive()` running a general-mailbox
+  consume loop (stash/unstash, exit/down checks, type-erased matcher dispatch) versus Quark's
+  dedicated `ReplyCell`, and `bench_spawn()` never starting Quark's scheduler while CAF's is live
+  from construction. See the "Re-run #3" callout in the Machine section for the full writeup and
+  source citations; no dedicated ADR, this is bench-harness methodology, not an engine change.
 
 Prior versions of this README (`git log -- bench/caf_comparison/README.md`) have the session-by-session before/after tables for each of those fixes if you need the historical progression rather than just the current state above.

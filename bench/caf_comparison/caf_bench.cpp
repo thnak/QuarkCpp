@@ -129,9 +129,14 @@ static double bench_ask_latency(actor_system& sys) {
     auto echoer = sys.spawn(echo_actor);
     scoped_actor self{sys};
 
+    // infinite, not a fixed duration: a finite timeout makes CAF arm a real timer via
+    // clock.schedule_message() on every request and dispose it on reply (see caf/mailer.hpp) --
+    // bookkeeping Quark's block_on()/ReplyCell never pays, since it has no timeout mechanism to
+    // compare against. infinite skips that scheduling path entirely (mailer.hpp checks
+    // `relative_timeout != infinite` before scheduling), isolating the engine-dispatch cost.
     warmup_for(kWarmupSeconds, [&](uint64_t i) {
         self->mail(static_cast<int>(i))
-            .request(echoer, 10s)
+            .request(echoer, infinite)
             .receive([&](int) {}, [&](const error&) {});
     });
 
@@ -141,7 +146,7 @@ static double bench_ask_latency(actor_system& sys) {
     for (uint64_t i = 0; i < kSamples; ++i) {
         auto t0 = steady_clock::now();
         self->mail(static_cast<int>(i))
-            .request(echoer, 10s)
+            .request(echoer, infinite)
             .receive(
                 [&](int v) {
                     if (v != static_cast<int>(i))
