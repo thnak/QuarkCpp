@@ -94,14 +94,18 @@ int main(int argc, char** argv) {
 
     Engine eng(EngineConfig{workers, shards, 64, 1024});
 
+    // Pool must exist before spawn() so pool.sink() can be wired in as each actor's ReclaimSink —
+    // otherwise every tell() past the initial pool capacity cold-allocates a fresh Cell via
+    // make_unique instead of recycling (mailbox_pool_partition_bench.cpp documents this exact bug).
+    detail::MessagePool pool{4096, num_producers};
+
     // Spawn one PingActor per producer, keyed 0..num_producers-1 so the engine's key%shard_count
     // placement spreads them across distinct shards.
     std::vector<ActorId> aids;
     aids.reserve(num_producers);
     for (unsigned t = 0; t < num_producers; ++t)
-        aids.push_back(eng.spawn<PingActor>(t).value());
+        aids.push_back(eng.spawn<PingActor>(t, pool.sink()).value());
 
-    detail::MessagePool pool{4096, num_producers};
     LocalRouter router(eng.post_courier(), pool);
     std::vector<ActorRef<PingActor>> refs;
     refs.reserve(num_producers);

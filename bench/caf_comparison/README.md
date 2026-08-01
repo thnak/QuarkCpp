@@ -382,3 +382,57 @@ table in this file — not yet re-run on the `taskset`-pinned WSL2/Linux host th
 mailbox numbers were. Given the effect (or lack of one) is large and consistent across all three
 producer counts and both frameworks, it's unlikely to be pure noise, but a pinned Linux confirmation
 run is the natural follow-up, same as every other number in this file.
+
+## 2026-08-01 correction: `quark_bench`/`quark_mpsc_bench`/`quark_mpsc_sharded_bench` never wired `ReclaimSink` — every Quark number above understates real throughput
+
+**This invalidates the "removing mailbox contention doesn't move the numbers" conclusion two
+sections up.** All three Quark bench files called `eng.spawn<PingActor>(key)` (and, in
+`quark_bench.cpp`, `eng.spawn<EchoActor>(42)`) **without** passing `pool.sink()` as the
+`ReclaimSink` argument. Without it, `MessagePool::reclaim()` is never invoked — every `tell()` past
+the pool's initial capacity (256–4096 cells, far smaller than the 500,000+ messages these benches
+send) cold-allocates a fresh `Cell` via `make_unique` (`message_pool.hpp`'s `grow_one()`) instead of
+recycling one, turning the whole bench into an unbounded-heap-allocation stress test rather than a
+steady-state mailbox measurement. This exact bug was already identified and fixed once, in
+`bench/mailbox_pool_partition_bench.cpp`'s own header comment (tracing back to GitHub issue #4 /
+ADR-020), but the fix never made it back into these three files — so every Quark number in this
+README up to this point was measuring the cold-allocation path, not steady-state `tell()`.
+
+**Fix:** construct the `MessagePool` before `spawn()` (already the case in all three files) and pass
+`pool.sink()` (or the per-`Engine` equivalent) as `spawn<A>()`'s second argument. Trivial, three
+one-line changes.
+
+**Corrected numbers (Windows, unpinned, same host/session, immediately after the fix, `clang++
+22.1.5`):**
+
+| Benchmark | Quark before fix | Quark after fix | CAF | Ratio (after fix) |
+|---|---|---|---|---|
+| Single-thread tell throughput | 2.57 M/s | **4.60 M/s** | 5.01 M/s | 1.09× |
+| Single-thread tell p999 | 47,200 ns | **2,500 ns** | 800 ns | — |
+| MPSC shared, P=1 | 2.03 M/s | **4.13 M/s** | 5.12 M/s | 1.24× |
+| MPSC shared, P=2 | 3.82 M/s | **5.06 M/s** | 7.90 M/s | 1.56× |
+| MPSC shared, P=4 | 6.90 M/s | **7.60 M/s** | 12.73 M/s | 1.68× |
+| Sharded, P=1 | 2.28 M/s | **2.93 M/s** | 4.24 M/s | 1.45× |
+| Sharded, P=2 | 3.59 M/s | **6.56 M/s** | 8.23 M/s | 1.25× |
+| Sharded, P=4 | 6.03 M/s | **10.80 M/s** | 13.98 M/s | 1.29× |
+
+The old p999 tail (47,200 ns single-threaded, in the same ballpark as the mysterious
+tens-of-microsecond tails scattered through every Quark table in this file) is the signature of a
+`make_unique<Cell>` heap-allocation stall on the send path — it drops to 2,500 ns once messages
+actually recycle. The single-threaded gap against CAF falls from 1.95× to 1.09×.
+
+**Scaling re-read:** with the bug fixed, sharded P=1→P=4 scaling is 2.93→10.80 M/s (3.69×, 92%
+efficiency vs. ideal 4×) — this now **exceeds** CAF's sharded scaling (4.24→13.98 M/s, 3.30×, 82%
+efficiency). The "removing contention doesn't move throughput" finding above was an artifact of both
+the shared and sharded benches paying the same unbounded cold-allocation cost, which swamped
+whatever partitioning benefit sharding would otherwise show — with steady-state recycling restored,
+sharding's contention-removal effect is visible again, and it's a real win, not a wash.
+
+The remaining ~1.1×–1.7× gap vs. CAF is real (not a measurement artifact this time): the
+`std::mutex`-guarded free-list in `MessagePool::acquire()`/`reclaim()` (one lock/unlock pair on
+allocate, another on reclaim, per message — see the file banner in `message_pool.hpp`) is the next
+suspect, plus CAF's more mature scheduler. Closing that gap further would be a hot-path redesign
+(e.g. a lock-free per-partition free list) and belongs in this repo's `design-debate-prove` ADR
+pipeline, not an ad-hoc bench fix — flagged here as a candidate, not started.
+
+**Caveat:** single Windows session, unpinned, same noise caveats as everywhere else in this file. A
+pinned Linux/WSL2 re-run with the fix applied is the natural follow-up.

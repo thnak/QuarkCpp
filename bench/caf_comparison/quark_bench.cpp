@@ -97,7 +97,7 @@ double bench_tell_latency(unsigned workers) {
 
     detail::MessagePool pool{256};
     Engine eng(EngineConfig{workers, workers, 64, 1024});
-    auto aid = eng.spawn<PingActor>(42).value();
+    auto aid = eng.spawn<PingActor>(42, pool.sink()).value();
     LocalRouter router(eng.post_courier(), pool);
     ActorRef<PingActor> ref = router.get<PingActor>(42);
     eng.start();
@@ -127,7 +127,7 @@ double bench_ask_latency(unsigned workers) {
 
     detail::MessagePool ask_pool{256};
     Engine eng2(EngineConfig{workers, workers, 64, 1024});
-    auto aid2 = eng2.spawn<EchoActor>(42).value();
+    auto aid2 = eng2.spawn<EchoActor>(42, ask_pool.sink()).value();
     LocalRouter router2(eng2.post_courier(), ask_pool);
     ActorRef<EchoActor> ref2 = router2.get<EchoActor>(42);
     eng2.start();
@@ -165,7 +165,7 @@ double bench_throughput(unsigned workers) {
 
     detail::MessagePool thr_pool{256};
     Engine eng3(EngineConfig{workers, workers, 64, 1024});
-    auto aid3 = eng3.spawn<PingActor>(42).value();
+    auto aid3 = eng3.spawn<PingActor>(42, thr_pool.sink()).value();
     LocalRouter router3(eng3.post_courier(), thr_pool);
     ActorRef<PingActor> ref3 = router3.get<PingActor>(42);
     eng3.start();

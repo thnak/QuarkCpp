@@ -90,7 +90,6 @@ int main(int argc, char** argv) {
     unsigned shards = 1;
 
     Engine eng(EngineConfig{workers, shards, 64, 1024});
-    auto aid = eng.spawn<PingActor>(42).value();
 
     // Get a reference for each producer thread.
     // num_partitions == num_producers: the MessagePool free-list fix (message_pool.hpp,
@@ -99,6 +98,10 @@ int main(int argc, char** argv) {
     // to num_partitions=1 (today's back-compat default), so this bench was measuring the
     // pre-fix, single-shared-free-list behavior even after the fix landed in the library.
     detail::MessagePool pool{4096, num_producers};
+    // pool.sink() MUST be wired into spawn() as the ReclaimSink, or every tell() past the
+    // initial pool capacity cold-allocates a fresh Cell via make_unique instead of recycling
+    // (mailbox_pool_partition_bench.cpp already documented this exact bug for this file).
+    auto aid = eng.spawn<PingActor>(42, pool.sink()).value();
     LocalRouter router(eng.post_courier(), pool);
     ActorRef<PingActor> ref = router.get<PingActor>(42);
     eng.start();
