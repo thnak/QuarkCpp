@@ -363,11 +363,22 @@ different momentarily-busy shards never pays the atomic-touching path. Re-measur
 median improved -43.4% versus the un-gated shape, throughput regression mostly recovered (+4.6%),
 and max latency **inverted to beat disabled** (-14.2%) — but p999 still sits +9.9% worse than
 disabled at median, so the mechanism stays **default-off**, now on evidence of real progress rather
-than an unaddressed regression. See
-[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s "Round 2"/"Round 3"
-sections for the full data, the two competing designs Round 1 rejected (yield-escalation,
-oversubscription-gated pre-park backoff — the latter *proven counterproductive* under real
-saturation), and the residual risks before enabling in production.
+than an unaddressed regression. **Round 4 tried combining Round 3's mechanism with bounded
+yield-escalation** (`EngineConfig::yield_spin_limit`, appended to `pre_park_spin()`, never inside a
+`drain_owner` critical section) — Round 1's other candidate, never previously tested together with
+Cooperative Eviction. Combining did not help (a net negative versus eviction alone), but
+yield-escalation measured *alone* through the real scheduler for the first time looked like the best
+p999 performer of anything tried (-10.6% vs disabled) — a reversal of Round 1's original,
+differently-harnessed finding. **Round 4 also found that re-measuring Round 3's own configuration
+fresh, in a new session, flipped its sign** (Round 3: +9.9% worse than disabled; Round 4's
+re-baseline: -1.0%, i.e. slightly better) — demonstrating this shared, unpinned host's noise floor
+is large enough to flip conclusions at the effect sizes in play. **This investigation is closed
+pending a quiet, pinned host, not resolved**; every `drain_owner_steal_*`/`yield_spin_limit` knob
+stays at its default-off/zero value. See
+[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s "Round 2"/"Round 3"/
+"Round 4" sections for the full data, the two competing designs Round 1 rejected (the naive
+yield-only design and an oversubscription-gated pre-park backoff — the latter *proven
+counterproductive* under real saturation), and the residual risks before enabling in production.
 
 ## Broadcast schedules activations, not messages (ADR-019)
 

@@ -15,9 +15,31 @@ harness (+8-96%) — and named the concrete next step: a cheaper eviction-probe 
 `EngineConfig::drain_owner_steal_miss_threshold`) and re-measured, same rigor, same real scheduler:
 it materially helps (p999 median -43.4%, max -13.1%, throughput +4.6% versus the un-gated shape) but
 **does not close the gap to disabled** (p999 still +9.9% worse median, though max latency is now
-*better* than disabled, -14.2%). **Accepted, default-off stays correct for now** — this is real,
-measured progress, not a fix ready to ship default-on. See "## Round 3" for the full data,
-including a small threshold sweep (4/8/32).
+*better* than disabled, -14.2%). See "## Round 3" for the full data, including a small threshold
+sweep (4/8/32).
+
+**Round 4 tried combining Cooperative Eviction with Round 1's other candidate (bounded
+yield-escalation on the idle-transition path, never inside a `drain_owner` critical section) — the
+"natural next step" Round 1 itself named. It did not close the gap; combining is a net negative
+versus eviction alone.** The one new, genuinely interesting finding: yield-escalation **alone**,
+measured for the first time through the real scheduler (Round 1's original numbers for it came from
+a less realistic harness), looks like the best p999 performer of everything tried across all four
+rounds — but Round 4 also directly re-measured Round 3's own "eviction-alone" configuration in a
+fresh session and got a **different-signed result** (Round 3: +9.9% worse than disabled; Round 4's
+same-config re-baseline: -1.0%, i.e. better) for the identical code and config. **This is the
+decision-relevant finding of Round 4, more than any single mechanism's numbers**: single-session
+percentages on this shared, unpinned host are not precise enough to certify full closure (or
+non-closure) either way. See "## Round 4" for the full data and reasoning.
+
+**Status: closed for this investigation track, not because the problem is solved, but because
+further rounds on this measurement environment have negative marginal information value — the
+noise floor is now demonstrated to exceed the effect sizes being chased.** `drain_owner_steal_*`
+and `yield_spin_limit` all stay at their default-off/zero values; nothing about default engine
+behavior changes as a result of any round in this file landing. The oversubscription tail-latency
+problem this ADR opened with is real, partially characterized, and **not fully resolved** — genuine
+resolution needs a quiet, dedicated, `taskset`-pinned Linux host, which no round in this ADR has
+had access to (every round's own residual risks say so). Re-opening this investigation with that
+kind of host is the honest next step, not another same-environment round.
 
 ## Question
 
@@ -522,3 +544,125 @@ not yet a fix ready to ship default-on.** Per this project's own ranking discipl
     than p999 to you") should be formalized in the spec is an open product question, not answered
     by this round's evidence alone** — this round only establishes that the trade-off exists and
     is now more favorable than Round 2's, not who should take it.
+
+## Round 4 (2026-08-01): Combining With Yield-Escalation, and a Measurement-Noise Finding
+
+### The design
+
+Round 1's own text left "Yield-Escalation (site A)" — a bounded `std::this_thread::yield()`
+escalation appended to `pre_park_spin()`, strictly on the idle-transition path outside any lock,
+never inside a `drain_owner` critical section — as "not adopted this round but not dead... a
+combined round is the natural next step." Round 4 built it: `EngineConfig::yield_spin_limit` (new
+field, default **0**), appended to `pre_park_spin()` after the existing `cpu_relax()` spin and
+before `park()`. It touches no Cooperative-Eviction state and vice versa (disjoint code paths), so
+the two mechanisms compose freely and independently — either, both, or neither can be enabled.
+
+### Methodology
+
+Same rigor as Rounds 2/3: real `Engine::worker_loop` via `quark_stress_bench.exe` (extended with an
+8th... a 7th optional CLI arg, `yield_spin_limit`), WSL2 Ubuntu g++ 15.2.0 (`taskset -c 0-11`),
+paired interleaved trials, all configs measured fresh in one session. Four configs, 10 trials/config
+at P=12, 6 trials/config at P=8:
+
+- **A — fully disabled** (the floor)
+- **C — Cooperative Eviction only** (Round 3's winner, re-baselined this session:
+  `probe_limit=64 ack_spin_limit=128 miss_threshold=8 yield_spin_limit=0`)
+- **F — Yield-Escalation only**, first-ever measurement through the real scheduler
+  (`probe_limit=0 yield_spin_limit=8`)
+- **G — combined** (`probe_limit=64 ack_spin_limit=128 miss_threshold=8 yield_spin_limit=8`)
+
+**Correctness held in all 64 trials — exact `sent == received`, zero loss/duplication, every config,
+both pair counts.**
+
+### Results (medians)
+
+| P | metric | A (disabled) | C (evict only) | F (yield only) | G (combined) |
+|---|---|---|---|---|---|
+| 12 | p999 (ns) | 83,481 | 82,674 | **74,619** | 87,999 |
+| 12 | max (ns) | 6,691,585 | **4,136,100** | 6,731,662 | 5,429,023 |
+| 12 | throughput (M/s) | 21.98 | 21.55 | 22.04 | 21.67 |
+| 8 | p999 (ns) | 62,006 | 65,577 | 62,422 | 70,952 |
+| 8 | max (ns) | 2,762,674 | **2,146,593** | 3,882,727 | 3,315,309 |
+
+Full 64-row per-trial data (all four configs, both P levels) is preserved in the proving session's
+artifacts, not reproduced in full here — every summary number above is a real median over 10 (P=12)
+or 6 (P=8) trials, not a single run.
+
+### Verdict — the three questions this round asked
+
+**(1) Does combining (G) beat eviction-alone (C) on p999? No — it modestly hurts.** G beats C in
+only 4/10 trials at P=12 (median +6.4% worse than C) and 2/6 at P=8 (+8.2% worse). It also dilutes
+C's own max-latency win (G: -18.9% vs A; C alone: -38.2% vs A). Combining the two mechanisms is a
+net negative relative to eviction alone, not a synergy.
+
+**(2) Does combining (G) reach parity with fully-disabled (A)? No — blunt answer, a real gap
+remains.** At P=12, G's p999 median is +5.4% worse than A (5/10 wins — a coin flip in win-rate, but
+the direction and magnitude are not a win). At P=8, G is clearly worse (+14.4%, 3/6 wins). The
+combined mechanism does not close this ADR's central gap.
+
+**(3) How does yield-escalation alone (F) look, measured properly for the first time?** This is the
+round's most interesting single result: F has the *best* p999 of anything tried, at P=12 (-10.6% vs
+A, 7/10 wins; -9.7% vs C, 7/10 wins) — a sharp reversal from Round 1's original (differently-
+harnessed) finding of "+76% worse." But F's max latency is flat versus A (+0.6%), not the -55%
+improvement Round 1's original harness reported — so F reproduces Round 1's p999 story in the
+*opposite* direction while failing to reproduce its max-latency win. At P=8, F is noise-flat vs A
+(+0.7%, 2/6 wins). **F is a promising, unconfirmed lead for a future round with a much larger trial
+count — not something this round's evidence is strong enough to adopt.**
+
+### The decision-relevant finding: this round's own internal inconsistency
+
+Round 4 re-measured Round 3's exact "eviction-alone" configuration (C) fresh, in a new session, as
+its own baseline-for-comparison. **Round 3 found C median +9.9% worse than disabled (4/10 wins);
+Round 4's fresh measurement of the identical config found C median -1.0% (i.e. slightly *better*,
+5/10 wins) than disabled.** Same code, same config, different session, opposite sign. Every prior
+round in this file has disclosed "single-host, unpinned, shared-machine" as a caveat on its exact
+percentages while still trusting its qualitative direction (e.g. Round 2's "persists, and is
+larger" verdict, treated as robust even though the exact multiple might not be). Round 4's C-vs-A
+flip is a stronger finding than that standing caveat: it shows the *sign* of a real comparison can
+flip session-to-session for a config with a genuinely small, real effect size — meaning this
+environment cannot currently be trusted to certify "the gap is closed" OR "the gap remains" for an
+effect in roughly this size range (a few percent to ~10%) without either much larger trial counts
+or a quieter host. This is why the ADR's Status section closes this investigation track here rather
+than continuing to chase F or re-tuning G on this same setup.
+
+### Decision (Round 4)
+
+**No default changes.** `drain_owner_steal_probe_limit`, `drain_owner_steal_miss_threshold`, and
+the new `yield_spin_limit` all stay at their shipped defaults (0, 8, 0 respectively — the first two
+irrelevant when the mechanism is off). Per this project's own ranking discipline:
+
+- **Rule 2 (proven beats claimed) cuts against declaring victory on F.** F's P=12 result is
+  promising but is a single 10-trial session, and this exact round just demonstrated that a
+  same-magnitude effect (C-vs-A) is not stable across sessions at this trial count. Adopting F by
+  default on this evidence would repeat the mistake this project's whole methodology exists to
+  avoid — see ADR-036 Round 4's own warm-up/process-order bias finding for the precedent.
+- **This is not a "keep grinding" situation — it is a "the tool can't measure this precisely
+  enough yet" situation**, and the honest response is to say so, not to run a fifth same-environment
+  round chasing a number that may not replicate. Per this project's own worst-case-first,
+  evidence-over-elegance culture (ADR-004, ADR-033, ADR-035's own SAFE-4 precedent), an honestly
+  unresolved question is preferred over a confidently wrong one.
+
+### Residual risks (Round 4 — appended; Rounds 1/2/3's numbered lists above are unchanged)
+
+26. **Yield-Escalation alone (F) is the most promising unconfirmed lead from any round in this
+    ADR and deserves a dedicated future round** with a much larger trial count (e.g. 30+ per
+    config) and ideally two independent sessions/hosts, specifically because Round 4 proved this
+    environment's noise floor can flip the sign of an effect this size. Do not treat F's P=12
+    numbers here as more than a lead.
+27. **The C-vs-A sign flip between Round 3 and Round 4 is itself unexplained** — no dedicated
+    experiment isolates whether it's host thermal/load state, WSL2 VM scheduling variance, or
+    something else. It is reported as an empirical fact, not diagnosed.
+28. **No clang++ cross-check this round either** (same WSL2 instance gap as Round 3) — only g++
+    15.2.0 backs Round 4's numbers, compounding residual risk #22 rather than resolving it.
+29. **A process-management mistake occurred and was caught during this round's proving**: an
+    initial trial-launch attempt used WSL2's ephemeral `tmpfs /tmp`, which was silently wiped when
+    the lightweight VM idled between tool calls, producing an incomplete/garbage first attempt.
+    Caught before any numbers were reported (not a data-integrity risk to the numbers above);
+    redone under persistent storage as one continuous run. Recorded so a future round copies the
+    build tree somewhere persistent (not `/tmp`) from the start.
+30. **This ADR's investigation is closed pending a quiet, pinned host, not resolved.** The
+    oversubscription tail-latency problem this ADR opened with (bench/caf_comparison/README.md's
+    original P=12 stress-test finding) is real and only partially mitigated (Round 3's heuristic,
+    default-off). A future round on real CI infrastructure — not another pass on this shared dev
+    machine — is the credible path to either shipping a default-on fix or conclusively
+    characterizing why one isn't achievable.

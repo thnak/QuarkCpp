@@ -157,6 +157,14 @@ int main(int argc, char** argv) {
         int v = std::atoi(argv[6]);
         if (v >= 0) drain_owner_steal_miss_threshold = static_cast<std::uint32_t>(v);
     }
+    // ADR-038 Round 4 (yield-escalation, site A only, combined with Round 3's cooperative eviction):
+    // a seventh optional trailing arg. Default 0 matches EngineConfig's own shipped default so
+    // existing 6-arg invocations are unchanged.
+    std::uint32_t yield_spin_limit = 0;
+    if (argc > 7) {
+        int v = std::atoi(argv[7]);
+        if (v >= 0) yield_spin_limit = static_cast<std::uint32_t>(v);
+    }
 
     // Circuit breaker: hard cap on total messages enqueued across all pairs in the stress window,
     // independent of the wall-clock timer. In the paired topology a healthy run's cumulative sent
@@ -180,9 +188,10 @@ int main(int argc, char** argv) {
     std::printf("Duration:  %.1fs sustained (+%.1fs untimed warmup) | send cap: %llu | watchdog: %.0fs\n",
                 duration_s, warmup_s, static_cast<unsigned long long>(kMaxTotalSent), kWatchdogCeilingS);
     std::printf("ADR-038 cooperative eviction: probe_limit=%u ack_spin_limit=%u miss_threshold=%u"
-                " (probe_limit=0 = shipped default, byte-identical to pre-ADR-038 behavior)\n",
+                " | yield_spin_limit=%u (both 0 = shipped default, byte-identical to pre-ADR-038"
+                " behavior)\n",
                 drain_owner_steal_probe_limit, drain_owner_steal_ack_spin_limit,
-                drain_owner_steal_miss_threshold);
+                drain_owner_steal_miss_threshold, yield_spin_limit);
     if (total_threads > 4) {
         std::printf("WARNING: %u threads exceeds this repo's standing 4-thread multi-thread-stress "
                     "cap (CLAUDE.md). Only run this deliberately, ramped up from a smaller pair "
@@ -215,6 +224,7 @@ int main(int argc, char** argv) {
         .drain_owner_steal_probe_limit = drain_owner_steal_probe_limit,
         .drain_owner_steal_ack_spin_limit = drain_owner_steal_ack_spin_limit,
         .drain_owner_steal_miss_threshold = drain_owner_steal_miss_threshold,
+        .yield_spin_limit = yield_spin_limit,
     });
     detail::MessagePool pool{4096, pairs};
     std::vector<ActorId> aids;

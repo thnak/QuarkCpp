@@ -1029,6 +1029,20 @@ private:
             pal::cpu_relax();
             if (any_work() || stopping_.load(std::memory_order_acquire)) return true;
         }
+        // ADR-038 Round 4: bounded yield-escalation, site A only (this idle-transition path — NEVER
+        // inside a `drain_owner` critical section; ADR-038 Round 1's red-team rejected yielding at
+        // sites B/C, inside try_drain_shard/cooperative_evict, for lengthening exactly the stranding
+        // window Cooperative Eviction exists to close). Distinct from the cpu_relax() spin above:
+        // `std::this_thread::yield()` actually relinquishes this OS thread's remaining timeslice,
+        // which matters once OS thread count exceeds core count and a relax-spin just burns a
+        // quantum a producer or another worker could have used instead. Same idle_mask_-untouched
+        // guarantee as the relax-spin above (nothing here writes it) — a message landing here is
+        // still picked up by this function's own any_work() probe, never a lost wakeup. 0 disables
+        // it (byte-for-byte the pre-Round-4 pre_park_spin(), the shipped default).
+        for (std::uint32_t i = 0; i < cfg_.yield_spin_limit; ++i) {
+            std::this_thread::yield();
+            if (any_work() || stopping_.load(std::memory_order_acquire)) return true;
+        }
         return false;
     }
 

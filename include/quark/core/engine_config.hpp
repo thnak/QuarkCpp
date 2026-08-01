@@ -148,6 +148,16 @@ struct EngineConfig {
     // signature this mechanism exists to catch) does. Only consulted when
     // `drain_owner_steal_probe_limit != 0`; irrelevant when the mechanism is disabled (the default).
     std::uint32_t drain_owner_steal_miss_threshold = 8;
+    // ADR-038 Round 4: bounded yield-escalation appended to `pre_park_spin()`, site A only (never
+    // inside a `drain_owner` critical section — see `pre_park_spin()`'s comment). Round 1 measured
+    // this alone improving max latency/throughput at P=12 but regressing p999 (+76%); this round
+    // combines it with the Round 3 cheaper-heuristic Cooperative Eviction to see whether the two
+    // mechanisms' effects compose favorably (they touch disjoint code paths: this is on the
+    // fully-idle path outside any lock, Cooperative Eviction is inside `scan_and_run`'s CAS-fail
+    // branch) or not. 0 disables it (byte-for-byte the pre-Round-4 `pre_park_spin()`, the shipped
+    // default). Distinct axis from `pre_park_spin_limit` (a `cpu_relax()` spin, tried first) and
+    // `busy_spin_limit` (bounds the mailbox/run-queue Busy tri-state, unrelated).
+    std::uint32_t yield_spin_limit = 0;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -215,6 +225,10 @@ public:
     }
     ConfigBuilder& drain_owner_steal_miss_threshold(std::uint32_t n) noexcept {
         cfg_.drain_owner_steal_miss_threshold = n;
+        return *this;
+    }
+    ConfigBuilder& yield_spin_limit(std::uint32_t n) noexcept {
+        cfg_.yield_spin_limit = n;
         return *this;
     }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }
