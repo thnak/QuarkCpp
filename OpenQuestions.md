@@ -439,7 +439,14 @@ These affect multiple subsystems; resolving one constrains several specs.
 Each drafted spec ends with its own *Open questions* section; the notable ones:
 
 - **001** — *(Reply ordering for concurrent `ask`s: resolved, ADR-007 — Sequential→request-order, Reentrant→completion-order via pooled `ReplyCell`. Reentrancy/quiescence: resolved, 015.)*
-- **002** — *(`Priority<P>` queue structure: resolved — K-band per-shard run-queue, `UniformFIFO` default, ADR-010. Drain-budget accounting: resolved, 015.)*
+- **002** — *(`Priority<P>` queue structure: resolved — K-band per-shard run-queue, `UniformFIFO` default, ADR-010. Drain-budget accounting: resolved, 015.)* Busy-spin tail-latency cost under
+  thread oversubscription (OS threads > logical cores) — **tracked, not yet root-caused**. All of
+  `pre_park_spin()`/`drain_run_queue`/`run_activation`'s Busy retries are pure `cpu_relax()`
+  busy-waits with no yield fallback, and `try_drain_shard`'s `drain_owner` CAS can strand other
+  workers behind a preempted owner. Observed in `bench/caf_comparison/README.md`'s stress test at
+  P=12 (24 threads on 12 cores): p999 ~4× and max latency ~60× worse than P=8, while CAF stays flat.
+  Neither ADR-035 nor ADR-036 tested thread counts above core count. See 002's own "Busy-spin cost
+  under thread oversubscription" section for the scoped `design-debate-prove` follow-up.
 - **003** — inline-small-payload optimization. *(Reentrant payload reclamation: resolved, 015.)*
 - **004** — *(Cold-shard resolution order: resolved — Node/Shard resources are resolved eagerly, for every configured shard, synchronously inside `Engine`'s `build()` cold phase, strictly before any worker thread exists; a Node-scoped resource shared by many shards is dissolved by ordering, not synchronization (no CAS/lock/`call_once`), ADR-021. Resource-declaration ergonomics: resolved as member fields, ADR-007. `PerMessage` factory failure: resolved — fails the message, checked pre-handler, ADR-009.)*
 - **005** — *(Resource-declaration ergonomics **and** `handle` dispatch mechanism: both resolved, ADR-007 — member fields + dense jump-table. Only `tell`/`ask` naming remains.)*

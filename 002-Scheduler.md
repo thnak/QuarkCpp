@@ -460,6 +460,42 @@ here** (002/ADR-010), not a 011 concern — the fix belongs to drain-owner
 acquisition fairness across shards assigned to one worker, not to the timer
 wheel.
 
+### Busy-spin cost under thread oversubscription (tracked, not yet root-caused)
+
+Every idle-avoidance spin on this hot path — `pre_park_spin()` (ADR-035 above), `drain_run_queue`'s
+Busy retry, and `run_activation`'s own Busy retry, all `cpu_relax()`-paced and bounded by
+`pre_park_spin_limit`/`busy_spin_limit` — is built on one assumption: a spinning worker occupies an
+otherwise-idle core, so trading wall-clock for an avoided syscall is free. None of these loops ever
+fall back to `sched_yield()`/`std::this_thread::yield()`; they are pure `cpu_relax()` busy-waits.
+That assumption holds as long as OS thread count ≤ logical core count — the regime both ADR-035 and
+ADR-036 tuned and measured in. It does not hold once thread count exceeds core count: a worker
+descheduled mid-spin just resumes whenever the OS next grants it a quantum, and — more pointedly —
+`try_drain_shard`'s `drain_owner` CAS (single-writer arbitration per shard, above) means a worker
+preempted **while it holds `drain_owner`** blocks every other worker's scan of that shard until the
+OS reschedules the owner, not until the message is actually drained. Under oversubscription this
+turns an ordinary preemption into a producer-visible stall.
+
+Observed in `bench/caf_comparison/README.md`'s sustained-stress table: at 12 pairs (24 OS threads —
+12 producers + 12 Quark workers — on a 12-logical-core host, 2× oversubscribed), Quark's p999
+roughly quadruples again versus 8 pairs (26.4µs→106.7µs) and its worst single message balloons
+~60× (339µs→20.3ms), while aggregate throughput and message-count correctness both hold. CAF's p999
+stays under 26µs at the same pair count on the same host. This is a single, unpinned-Windows-host
+measurement (see that file's Machine section) — real and reproducible in this run, but the
+`drain_owner`-holdup mechanism above is a plausible explanation from reading the code, **not yet
+isolated by a dedicated experiment**.
+
+**Scoped for a future `design-debate-prove` round, not yet run:** does escalating `cpu_relax()` to
+a real yield past some bound (unconditionally, or gated on detected oversubscription) close this gap
+without regressing the ≤core-count case ADR-035/036 already tuned? Is a bounded ownership timeout on
+`drain_owner` needed, or is preemption-while-holding-the-CAS a red herring once yielding is fixed?
+Neither ADR-035 nor ADR-036 measured worker/producer thread counts above the configured
+worker/shard count (== core count in their proving setups) — this is genuinely untested territory
+for both. `CLAUDE.md`'s machine-safety rule caps this repo's normal dev-box thread counts at 4
+specifically to stay clear of this regime; `bench/caf_comparison/README.md`'s P=12 sweep is a
+deliberate, documented exception to plot a full scaling curve, so this gap does not affect any
+normal build/test/bench workflow — only P > core-count topologies, which today only that one bench
+suite exercises.
+
 ## Open questions
 
 Resolved: budget accounting for `Reentrant` actors — the drain budget is the
