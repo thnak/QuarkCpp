@@ -415,6 +415,25 @@ These affect multiple subsystems; resolving one constrains several specs.
    absolute-latency budget (023 silicon) and the ARM64 weak-memory re-gate of the `seq_cst`
    Dekker close-out (TSO-proven only).
 
+5. **`MessagePool` throughput-priority allocator — revisit if a throughput-prioritizing
+   policy is ever added** (003, ADR-037). ADR-037's `design-debate-prove` debate settled the
+   free-list synchronization question with the **TLS acquire/reclaim magazine** (Design 2):
+   the cleanest 8/8-proven-claims record, and the design that best answers the specific metric
+   the task was invoked to fix (uncontended/single-threaded round-trip cost). A losing design —
+   **Design 3, per-worker-lane SPSC return rings** — measured a stronger **contended**-throughput
+   ceiling (3–4x sustained under real contention, vs. Design 2's 1.27x–3.0x) but was rejected
+   because its *isolated* round-trip claim failed to clear its own bar, and it requires a new,
+   Scheduler-stamped `worker_lane_id()` contract (`002-Scheduler.md`) that Design 2 does not need.
+   That trade-off — better peak throughput under real multi-worker contention, at the cost of a
+   new cross-subsystem contract and a design that loses on the uncontended case — is exactly the
+   shape of choice `Priority<P>` / `DrainBudget<N>` / other CRTP policies already make explicit as
+   compile-time knobs. **If Quark ever grows a per-pool or per-actor policy that lets a caller
+   opt into "prioritize sustained throughput under contention over uncontended latency"** (a
+   policy that does not exist today), Design 3 is the concrete, already-red-teamed-and-proven
+   starting point — see ADR-037's evidence table and residual risks for the measured numbers and
+   the `worker_lane_id()` integration shape it would need. Not otherwise actionable: Design 2 is
+   the correct default and no such policy is proposed or scoped here.
+
 ## Per-spec open questions
 
 Each drafted spec ends with its own *Open questions* section; the notable ones:

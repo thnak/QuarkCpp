@@ -124,6 +124,55 @@ Because the allocator is shard-owned and a shard is drained by one worker at a
 time in the common case, allocation is contention-free without locks on the hot
 path.
 
+### Free-list synchronization (ADR-037)
+
+`quark::detail::MessagePool` (`include/quark/detail/message_pool.hpp`) implements the
+descriptor pool above: each partition is a plain `std::mutex` + intrusive
+`free_head`, one partition per producer-thread lane (`num_partitions`, default 1) to
+remove producer-vs-producer contention. A `design-debate-prove` debate (ADR-037)
+settled the residual cost that partitioning alone does not remove — `acquire()` and
+`reclaim()` each still took the partition mutex once, a full lock/unlock round trip
+per message. The winning design fronts the existing mutex+`free_head` with a small,
+non-atomic, thread-local **magazine** (a bounded `Descriptor*[64]` array) per
+`(thread, partition)` pair: `acquire()` pops from the calling thread's magazine and
+only touches the mutex when it is empty, refilling up to 32 cells in one critical
+section; `reclaim()` pushes into the drain lane's magazine for the cell's home
+partition and only touches the mutex once the magazine hits capacity, returning 32
+cells in one critical section. Net effect: the mutex is touched roughly 1/32nd as
+often, for a measured 1.27x–3.0x round-trip throughput improvement across producer
+counts {1, 2, 4} (see ADR-037 for the full evidence table).
+
+**Pool lifetime clause.** A `MessagePool` is safe to destroy at any time — no
+resident magazine cell is ever dereferenced after its owning pool dies, guarded by a
+generation-safe `std::weak_ptr<PartitionToken>` liveness check on every magazine
+touch, never a raw pointer compare. Ordinary `Engine` shutdown (which joins every
+worker thread before any pool it fed a `ReclaimSink` to is destroyed) needs no
+extra step: a thread's magazines flush automatically, through the normal
+mutex-guarded splice, when that thread exits. A caller that keeps a thread running
+**past** the lifetime of a specific pool — and wants that pool's steady-state cell
+count to conserve exactly rather than forfeit a bounded resident batch — must call
+`quark::detail::flush_current_thread_message_caches()` on every thread that touched
+the pool before destroying it. Skipping this call is always safe (never a
+use-after-free); at worst it leaves up to 64 cells per thread absent from that
+pool's free list at the moment of destruction, which is moot once the pool's own
+storage is freed with it.
+
+**Capacity-sizing note.** Because up to 64 cells can sit resident in each thread
+that touches a partition rather than on its `free_head` at any instant, pre-sizing
+a partition to only its exact steady-state working-set count is no longer
+sufficient to guarantee zero cold growth under multi-thread traffic — operators
+should budget headroom (measured: a 40-cell pre-sized/2-thread config needed
+73–103 cells in practice). This does not change the 0-heap-allocation-once-pre-
+sized contract; it only raises how much pre-sizing "enough" requires under
+concurrent access.
+
+**Thread-local footprint.** Every thread that ever calls `acquire()`/`reclaim()` on
+any `MessagePool` in the process pays a fixed ~36 KB `thread_local` cost (a
+64-slot, direct-mapped magazine table, shared across every pool that thread
+touches, not allocated per-pool). Fine at this repo's stated thread-count scale;
+worth revisiting only if the engine grows into a very-high-thread-count deployment
+shape.
+
 ## Cancellation and memory
 
 Cancellation is a **state transition only** — no descriptor is freed early and no

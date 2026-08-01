@@ -436,3 +436,45 @@ pipeline, not an ad-hoc bench fix — flagged here as a candidate, not started.
 
 **Caveat:** single Windows session, unpinned, same noise caveats as everywhere else in this file. A
 pinned Linux/WSL2 re-run with the fix applied is the natural follow-up.
+
+## 2026-08-01: ADR-037 (TLS acquire/reclaim magazine) landed — the mutex tax flagged above is closed
+
+The `std::mutex`-guarded free-list flagged as "the next suspect" two sections up went through this
+repo's `design-debate-prove` ADR pipeline (3 competing designs, red-teamed, implemented in real
+C++23, TSan/ASan-proven under g++-14/clang++-20 on WSL2 Ubuntu) — see
+[`decisions/ADR-037-message-pool-freelist-sync.md`](../../decisions/ADR-037-message-pool-freelist-sync.md).
+The winner (a thread-local "magazine" batching `acquire()`/`reclaim()` against the existing
+partition mutex ~32-at-a-time, cutting lock calls ~32x) is now implemented in
+`include/quark/detail/message_pool.hpp` and exercised by the full 182-test suite (including two new
+tests: a use-after-free/dangling-pool safety proof, clean under real ASan on this Windows/MSVC-clang
+target, and the existing partition-concurrency/ABA-stress tests as regression coverage) — not just a
+scratch prove-pass artifact.
+
+**Re-measured on this same Windows host, same session, immediately after landing it:**
+
+| Benchmark | Pre-ADR-037 (mutex only) | Post-ADR-037 (magazine) | CAF | Change |
+|---|---|---|---|---|
+| Single-thread tell throughput | 4.60 M/s | **8.8–9.4 M/s** | 4.5–4.7 M/s | **Quark now ahead of CAF**, ~1.9–2.1× its pre-ADR-037 number |
+| MPSC shared, P=1 | 4.13 M/s | **3.97 M/s** | 4.72 M/s | ~flat (see note) |
+| MPSC shared, P=2 | 5.06 M/s | **5.97 M/s** | 7.69 M/s | +18% |
+| MPSC shared, P=4 | 7.60 M/s | **9.20 M/s** | 12.59 M/s | +21% |
+| `mailbox_pool_partition_bench`, 4 producers, num_partitions=4 | (not measured at this default) | **9.78 M/s** | — | new data point, not a CAF comparison |
+
+The single-threaded win is the largest and most direct: that path has exactly one thread touching
+one partition, so the magazine removes essentially all of the mutex round-trip cost with zero
+contention to begin with — mean tell latency dropped from the 187 ns measured right after the
+`ReclaimSink` fix to a session range that pushed throughput past CAF's own number, a first for this
+file. The MPSC numbers improved less proportionally (P=1 is within noise of its pre-ADR-037 figure,
+P=2/P=4 up 18–21%) — expected, since MPSC's per-producer partitioning already meant each producer's
+mutex was only lightly contended before this change, so there was less contention-tax left for the
+magazine to amortize away versus the genuinely uncontended single-thread case. The CAF-vs-Quark gap
+on the shared-mailbox MPSC shape narrows from the previous session's 1.24×–1.68× to roughly
+1.19×–1.37×, still real but smaller.
+
+**Caveat:** single Windows session, unpinned — same noise caveats as everywhere else in this file,
+and CAF's own single-threaded number moved session-to-session here too (4.49–4.54 M/s vs the ~5.0 M/s
+seen in the prior session), consistent with this file's recurring point that CAF's absolute numbers
+carry more session-to-session variance on this host than Quark's. The *direction* (large single-
+thread win, smaller but real MPSC win) is unambiguous; a `taskset`-pinned Linux/WSL2 re-run — the
+same host ADR-037's own TSan/ASan evidence was gathered on — is the natural next step for a cleaner
+absolute number, consistent with every other "re-run on Linux" note in this file.
