@@ -451,10 +451,13 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   try_drain_shard_with_steal`/`cooperative_evict`) but shipped **default-off**, and stays that way:
   a Round 2 re-measurement against the real `worker_loop` (not the original proving harness)
   **refuted** the hope that the disclosed p999 regression was a harness artifact — it is unanimous
-  and larger under the real scheduler (median +130% at P=12). The mechanism is not disqualified
-  (safety/correctness untouched), but a cheaper eviction-probe heuristic is now a named prerequisite
-  for ever flipping the default on. See 002's "Bounded cooperative drain-owner eviction (ADR-038)"
-  section and [ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s Round 2.
+  and larger under the real scheduler (median +130% at P=12). **Round 3 built the named cheaper
+  heuristic** (`EngineConfig::drain_owner_steal_miss_threshold`, a lane-local consecutive-miss gate)
+  and re-measured: real progress (p999 -43.4% vs the un-gated shape, throughput mostly recovered,
+  max latency now *beats* disabled) but not full parity (p999 still +9.9% worse than disabled at
+  median) — default stays off, on evidence of progress rather than an unaddressed regression. See
+  002's "Bounded cooperative drain-owner eviction (ADR-038)" section and
+  [ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s Round 2/Round 3.
 - **003** — inline-small-payload optimization. *(Reentrant payload reclamation: resolved, 015.)*
 - **004** — *(Cold-shard resolution order: resolved — Node/Shard resources are resolved eagerly, for every configured shard, synchronously inside `Engine`'s `build()` cold phase, strictly before any worker thread exists; a Node-scoped resource shared by many shards is dissolved by ordering, not synchronization (no CAS/lock/`call_once`), ADR-021. Resource-declaration ergonomics: resolved as member fields, ADR-007. `PerMessage` factory failure: resolved — fails the message, checked pre-handler, ADR-009.)*
 - **005** — *(Resource-declaration ergonomics **and** `handle` dispatch mechanism: both resolved, ADR-007 — member fields + dense jump-table. Only `tell`/`ask` naming remains.)*

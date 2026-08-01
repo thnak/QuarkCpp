@@ -941,6 +941,10 @@ private:
     struct alignas(::quark::cache_line_size) Worker {
         std::atomic<std::uint32_t> wake_seq{0};  // personal futex word (targeted wakeup)
         std::vector<std::uint32_t> scan_order;   // shard scan order (own first), built cold at start()
+        // ADR-038 Round 3: lane-local (this worker only, no atomics) consecutive-miss tracking for
+        // the cheaper eviction-probe heuristic in try_drain_shard_with_steal — see its comment.
+        std::uint32_t steal_probe_shard = kNoOwner;  // shard this worker's miss streak is tracking
+        std::uint32_t steal_probe_miss_streak = 0;   // consecutive CAS-fail misses on that shard
     };
 
     [[nodiscard]] std::uint32_t home_worker(std::uint32_t shard) const noexcept {
@@ -1119,9 +1123,31 @@ private:
     // are never touched by two threads at once in any interleaving (ADR-038 S1, proven with a negative
     // control: the naive "just force-steal after a timeout" alternative was built and TSan caught a
     // real race on the mailbox's non-atomic `head_` exactly as predicted).
+    //
+    // ADR-038 Round 3: Round 2 proved the unconditional shape below (probe on EVERY miss) makes p999
+    // WORSE against the real scheduler, not better — the added `evict_`-touching atomic traffic on
+    // this already-hot scan-miss path outweighs the benefit. This round adds a cheap, lane-local
+    // consecutive-miss gate (see the top of the function body) so the expensive probe only engages
+    // once a worker has missed the SAME shard's CAS several times in a row, not on a single passing
+    // miss — see `EngineConfig::drain_owner_steal_miss_threshold`.
     bool try_drain_shard_with_steal(std::uint32_t wid, std::uint32_t sid) noexcept {
         if (try_drain_shard(wid, sid)) return true;
         if (cfg_.drain_owner_steal_probe_limit == 0) return false;
+
+        // ADR-038 Round 3: cheaper heuristic — pay only two lane-local integer compares for the
+        // common case (a scattered miss, or a fresh miss on a different shard than last time), and
+        // only engage the expensive probe-spin/eviction-request path below once this worker has
+        // missed THIS SAME shard's CAS `drain_owner_steal_miss_threshold` times in a row. No atomic
+        // on `evict_` is touched until the threshold is reached.
+        Worker& self = workers_[wid];
+        if (self.steal_probe_shard != sid) {
+            self.steal_probe_shard = sid;
+            self.steal_probe_miss_streak = 1;
+        } else {
+            ++self.steal_probe_miss_streak;
+        }
+        if (self.steal_probe_miss_streak < cfg_.drain_owner_steal_miss_threshold) return false;
+        self.steal_probe_miss_streak = 0;  // engaging now — next window starts fresh, win or lose
 
         Shard& sh = shards_[sid];
         const std::uint32_t owner = sh.drain_owner.load(std::memory_order_acquire);

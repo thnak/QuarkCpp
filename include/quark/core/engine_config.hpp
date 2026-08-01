@@ -135,6 +135,19 @@ struct EngineConfig {
     // request, before giving up and falling back to skipping the shard (today's unchanged behavior).
     // Only consulted when `drain_owner_steal_probe_limit != 0`.
     std::uint32_t drain_owner_steal_ack_spin_limit = 128;
+    // ADR-038 Round 3 (the cheaper heuristic Round 2's own residual risks named as the concrete next
+    // step): the CAS-fail miss path (`try_drain_shard_with_steal`, reached every time a worker's scan
+    // finds a shard owned by someone else) is far hotter than the eviction-probe itself — under real
+    // idle-avoidance, Round 2 measured the unconditional probe-on-every-miss shape making p999 WORSE
+    // (median +130% at P=12), not better, plausibly from the added atomic traffic on that already-hot
+    // path. This knob bounds how many CONSECUTIVE misses on the SAME shard, by the SAME worker, are
+    // paid at near-zero cost (two lane-local integer compares, no atomics touched) before the full
+    // probe-spin/eviction-request machinery engages — a worker cycling through many different
+    // momentarily-busy shards never accumulates a streak and never pays the expensive path; only a
+    // worker that keeps coming back to find the SAME shard still owned (the actual stuck-owner
+    // signature this mechanism exists to catch) does. Only consulted when
+    // `drain_owner_steal_probe_limit != 0`; irrelevant when the mechanism is disabled (the default).
+    std::uint32_t drain_owner_steal_miss_threshold = 8;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -198,6 +211,10 @@ public:
     }
     ConfigBuilder& drain_owner_steal_ack_spin_limit(std::uint32_t n) noexcept {
         cfg_.drain_owner_steal_ack_spin_limit = n;
+        return *this;
+    }
+    ConfigBuilder& drain_owner_steal_miss_threshold(std::uint32_t n) noexcept {
+        cfg_.drain_owner_steal_miss_threshold = n;
         return *this;
     }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }

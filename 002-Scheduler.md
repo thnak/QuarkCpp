@@ -354,11 +354,20 @@ attributed to the busy-poll proving harness rather than the mechanism itself. **
 identical experiment against the real `worker_loop`/`park()` path and refuted that hypothesis**: at
 P=12 (2× oversubscription, the regime this ADR exists to fix) the regression is unanimous and larger
 under the real scheduler (median +130%) than under the harness (+8-96%) — the scan-path eviction
-probe's atomic traffic is a genuine cost under real idle-avoidance, not a proving artifact. See
-[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s "Round 2" section for the
-full data, the two competing designs Round 1 rejected (yield-escalation, oversubscription-gated
-pre-park backoff — the latter *proven counterproductive* under real saturation), and the residual
-risks before enabling in production.
+probe's atomic traffic (paid on *every* `drain_owner` CAS-fail miss, not just genuinely stuck ones)
+is a genuine cost under real idle-avoidance, not a proving artifact. **Round 3 built the cheaper
+heuristic Round 2 named as the concrete next step**: `Worker` now tracks a lane-local
+(`EngineConfig::drain_owner_steal_miss_threshold`, default 8) consecutive-miss streak per shard, and
+the expensive probe only engages once that streak is reached — a worker cycling through many
+different momentarily-busy shards never pays the atomic-touching path. Re-measured, same rigor: p999
+median improved -43.4% versus the un-gated shape, throughput regression mostly recovered (+4.6%),
+and max latency **inverted to beat disabled** (-14.2%) — but p999 still sits +9.9% worse than
+disabled at median, so the mechanism stays **default-off**, now on evidence of real progress rather
+than an unaddressed regression. See
+[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s "Round 2"/"Round 3"
+sections for the full data, the two competing designs Round 1 rejected (yield-escalation,
+oversubscription-gated pre-park backoff — the latter *proven counterproductive* under real
+saturation), and the residual risks before enabling in production.
 
 ## Broadcast schedules activations, not messages (ADR-019)
 

@@ -2,16 +2,22 @@
 
 ## Status
 
-**Round 1 finding on the p999 side-effect's cause superseded by Round 2 (see "## Round 2" below;
-historical content kept intact, not erased).** Round 1 shipped Bounded Cooperative Drain-Owner
-Eviction default-off and named one open question: was F2's p999 regression an artifact of the
-proving harness's busy-poll simplification (no real `park()`/wake), or a real cost of the mechanism
-under genuine idle-avoidance? Round 2 ran the ADR's own named tie-breaking experiment — the real
-`Engine::worker_loop`, not the harness — and **refutes the entanglement hypothesis at P=12** (the
-regime this ADR exists to fix): the p999 regression not only persists but is larger under the real
-scheduler (median +130%) than under the busy-poll harness (+8-96%). **Accepted, default-off is
-reconfirmed as correct — not merely unresolved.** See "## Round 2" for the full data and the
-concrete follow-up it points to (a cheaper eviction-probe heuristic, not just re-tuning).
+**Round 1's finding on the p999 side-effect's cause was superseded by Round 2; Round 2's residual
+risk was actioned and partially resolved by Round 3 (see "## Round 2"/"## Round 3" below;
+historical content kept intact throughout, not erased).** Round 1 shipped Bounded Cooperative
+Drain-Owner Eviction default-off and named one open question: was F2's p999 regression an artifact
+of the proving harness's busy-poll simplification, or a real cost under genuine idle-avoidance?
+Round 2 ran the real `Engine::worker_loop` and **refuted the entanglement hypothesis** — the
+regression persisted and was larger under the real scheduler (median +130% at P=12) than under the
+harness (+8-96%) — and named the concrete next step: a cheaper eviction-probe heuristic, since
+`try_drain_shard_with_steal` was probing on every single miss, not just genuinely stuck ones.
+**Round 3 built that heuristic** (a lane-local consecutive-miss gate,
+`EngineConfig::drain_owner_steal_miss_threshold`) and re-measured, same rigor, same real scheduler:
+it materially helps (p999 median -43.4%, max -13.1%, throughput +4.6% versus the un-gated shape) but
+**does not close the gap to disabled** (p999 still +9.9% worse median, though max latency is now
+*better* than disabled, -14.2%). **Accepted, default-off stays correct for now** — this is real,
+measured progress, not a fix ready to ship default-on. See "## Round 3" for the full data,
+including a small threshold sweep (4/8/32).
 
 ## Question
 
@@ -380,3 +386,139 @@ reopening whether it's safe to ship at all.
     appearing mid-task) — not acted on, disclosed here for the record since it touched a
     session that was producing this ADR's evidence; it has no bearing on the technical
     verdict above.
+
+## Round 3 (2026-08-01): The Cheaper Heuristic Residual Risk #15 Named — Built and Measured
+
+### The design
+
+`try_drain_shard_with_steal` paid its full probe-spin + `evict_`-touching machinery on **every**
+CAS-fail miss — including transient ones (a worker's scan passing through a shard that happens to
+be briefly busy, with no genuine stall). Round 2's evidence pointed at this as the likely source of
+the real-scheduler p999 regression. The fix: each `Worker` gains two lane-local fields (no atomics —
+touched only by the owning thread), `steal_probe_shard` and `steal_probe_miss_streak`. On a miss,
+if the shard differs from the one already being tracked, the tracker resets to that shard with a
+streak of 1; if it's the SAME shard as last time, the streak increments. The expensive probe/request
+path only engages once the streak reaches `EngineConfig::drain_owner_steal_miss_threshold` (new
+field, default **8**) — a worker cycling through many different momentarily-busy shards never
+accumulates a streak past 1-2 and never touches `evict_` at all; only a worker that keeps coming back
+to find the SAME shard still owned (the actual stuck-owner signature this mechanism exists to catch)
+pays the cost. The streak resets to 0 once engaged, win or lose, so a slow-to-ack owner gets a fresh
+full window before being probed again rather than being hammered every miss.
+
+### Methodology
+
+Same rigor as Round 2: real `Engine::worker_loop`/`park()`/wake via `quark_stress_bench.exe`
+(extended with a sixth optional CLI arg, `miss_threshold`, default 8 — existing invocations
+unchanged), WSL2 Ubuntu g++ 15.2.0 (clang++ unavailable in this WSL instance this round — no
+cross-compiler check, disclosed as a gap), paired and **interleaved** trials (A/B/C/A/B/C/...,
+guarding against the first-call-in-process bias ADR-036 Round 4 found). Three configs, all
+re-measured fresh in the SAME session (no cross-session comparison against Round 2's numbers, per
+this project's own standing caution about absolute numbers on a shared host):
+
+- **A — disabled** (`probe_limit=0`, today's shipped default, the floor)
+- **B — threshold=1** (`probe_limit=64 ack_spin_limit=128 miss_threshold=1`): reproduces Round 2's
+  original "probe on every miss" shape, re-baselined in this same session
+- **C — threshold=8** (`probe_limit=64 ack_spin_limit=128 miss_threshold=8`): the new default
+
+10 trials/config at P=12 pairs (2× oversubscription, the regime this ADR exists to fix), 6
+trials/config at P=8 pairs (1.33×), plus a 6-trial-each sweep of threshold=4 and threshold=32 at
+P=12 only. **Correctness held in all 60 trials, every config, every threshold value tried — exact
+`sent == received`, zero loss/duplication.**
+
+### Results — P=12, 10 trials/config (ns)
+
+| trial | A p999 | B p999 | C p999 | A max | B max | C max |
+|---|---|---|---|---|---|---|
+| 1 | 74,309 | 95,788 | 95,348 | 771,693 | 10,249,273 | 6,763,465 |
+| 2 | 70,681 | 121,246 | 118,100 | 4,057,623 | 5,512,274 | 449,187 |
+| 3 | 134,851 | 183,673 | 297,449 | 11,486,570 | 7,796,291 | 6,276,928 |
+| 4 | 60,191 | 95,328 | 54,331 | 5,855,153 | 4,047,564 | 4,065,658 |
+| 5 | 88,806 | 71,784 | 189,102 | 29,602,984 | 2,603,052 | 4,065,717 |
+| 6 | 90,850 | 282,336 | 68,398 | 7,471,386 | 6,343,153 | 5,971,731 |
+| 7 | 52,649 | 229,047 | 68,969 | 8,047,930 | 23,204,017 | 4,786,381 |
+| 8 | 68,383 | 114,634 | 90,388 | 6,373,208 | 7,754,362 | 9,482,666 |
+| 9 | 68,508 | 173,904 | 52,278 | 8,046,228 | 17,744,122 | 7,786,041 |
+| 10 | 106,378 | 160,500 | 68,157 | 6,801,567 | 5,548,541 | 9,502,816 |
+
+Throughput medians (M/s): A=24.02, B=21.33, C=22.32. p999 medians: A≈72,495, B=140,873, C=79,679.
+Max medians (M): A≈7.26, B≈6.34, C≈6.12.
+
+**P=8, 6 trials/config (medians only — full 18-row table preserved in the proving session's
+artifacts, not reproduced here):** p999 medians A=74,359 / B=71,639 / C=68,508 ns — all within
+noise of each other at this ratio, matching Round 2's finding that P=8 is closer to noise than
+P=12. Max medians A=2,729,272 / B=1,137,483 / C=2,946,765 ns. Throughput medians A=21.54 / B=19.80 /
+C=21.34 M/s.
+
+**P=12 threshold sweep, 6 trials each:** threshold=4 — p999 median 79,413 ns, max median
+6,412,001 ns, throughput 23.08 M/s (essentially matches threshold=8 — a plateau, not a knife-edge).
+threshold=32 — p999 median 92,037 ns, max median 7,878,989 ns, throughput 23.52 M/s (worse than
+threshold=8 on both latency metrics; plausible mechanism: too high a threshold delays rescuing a
+genuinely stalled owner, the opposite failure mode from threshold=1's per-miss tax).
+
+### Verdict
+
+**The heuristic materially helps relative to the un-gated shape (claim: CORRECT).** C beats B on
+p999 in 8/10 trials at P=12 (median 79,679 vs 140,873 ns, **-43.4%**), on max in 6/10 (median
+-13.1%), and on throughput (22.32 vs 21.33 M/s, **+4.6%** — recovering most of B's throughput
+regression). This is real, measured progress on the exact residual risk Round 2 named, not a
+re-tuning of an already-working thing.
+
+**The heuristic does NOT close the gap to disabled — a real cost remains (claim: PARTIALLY
+WRONG against the implicit "safe to enable" hope).** C's p999 is still +9.9% worse than A's median,
+and C beats A in only 4/10 trials at P=12 — down from B's 0/10, but not parity. **Max latency,
+however, is now BETTER than disabled** (median -14.2%, 7/10 trials better) — the metric this ADR's
+own original numbers (60× worse at P=12 in the very first observation that motivated this ADR)
+flagged as the most extreme concern. Throughput cost versus disabled is -7.1%, real but bounded, not
+catastrophic. At P=8 all three configs sit within roughly ±8% of each other on p999 — noise-
+dominated, consistent with Round 2.
+
+**Threshold=8 (the shipped default) is a reasonable choice within this sweep's resolution, not an
+arbitrary one.** Threshold=4 performs essentially identically (a plateau supports 8 not being a
+fragile knife-edge value); threshold=32 is worse on every metric tried, consistent with "too
+conservative a threshold delays genuine rescue."
+
+### Decision (Round 3)
+
+**`drain_owner_steal_probe_limit`'s default stays 0 (disabled). This is closer, real progress —
+not yet a fix ready to ship default-on.** Per this project's own ranking discipline:
+
+- **Rule 2 (proven beats claimed) still governs.** The mechanism, even with the cheaper heuristic,
+  has a measured, non-noise p999 cost relative to disabled at P=12 (median +9.9%, C wins only 4/10
+  trials) — this is a real, if much smaller, regression, not a refuted one. Shipping default-on
+  would mean shipping a still-measured cost with no compensating uniform win.
+- **The trade shape changed in a way worth naming precisely, not just "still not good enough."**
+  Round 2's mechanism was strictly worse than disabled on every metric tried (p999, and by
+  implication the tail behavior the ADR exists to fix). Round 3's heuristic **inverts the sign on
+  max latency** (now better than disabled) while retaining a smaller p999 cost and a smaller
+  throughput cost. A workload that specifically cares about worst-case single-message latency more
+  than p999 might reasonably opt in today via `EngineConfig::drain_owner_steal_probe_limit` — this
+  is not a recommendation this ADR makes for a default, but it is a materially different, more
+  nuanced trade than Round 2 left behind, and the mechanism is not disqualified.
+- **No safety/correctness claim from Round 1 is touched.** 60/60 new trials clean (exact
+  conservation, zero loss/duplication) across every config and threshold value tried this round.
+
+### Residual risks (Round 3 — appended; Rounds 1/2's numbered lists above are unchanged)
+
+20. **Round 3's p999 cost (median +9.9% vs disabled at P=12) is not further root-caused.** The
+    heuristic clearly reduces cost relative to probing every miss, but what remains — a real,
+    smaller regression, not noise — has no dedicated experiment isolating its source (plausibly the
+    lane-local streak-tracking's own branch/compare cost on the hot miss path, or residual
+    engagement frequency even at threshold=8 under sustained P=12 contention; both are
+    inferences, not proven).
+21. **The threshold sweep is narrow (4/8/32 only) and single-session.** A finer sweep (e.g. 2, 6,
+    12, 16, 24) and a second session/host would be needed before treating "8 is near-optimal" as
+    more than "8 and 4 are similar and clearly better than both 1 and 32 within this sweep."
+22. **No clang++ cross-check this round** — WSL2 instance used for proving did not have clang++
+    installed; only g++ 15.2.0 backs this round's numbers. Round 2 had both compilers; this is a
+    real reduction in this round's evidentiary strength, disclosed rather than hidden.
+23. **P=8's numbers remain noise-dominated for all three configs**, consistent with Round 2 — no
+    new information at that oversubscription ratio this round beyond reconfirming the P=12-specific
+    nature of both the original problem and this fix's effect.
+24. **All Round 3 evidence is again single-host, WSL2-under-shared-load** — same standing caveat as
+    every prior round in this file. The qualitative verdict (heuristic helps, doesn't fully close
+    the gap, max latency inverts favorably) should be treated as more robust than the exact
+    percentages until re-run on a quiet, `taskset`-pinned Linux CI host.
+25. **Whether a workload-specific opt-in recommendation (e.g., "enable if max-latency matters more
+    than p999 to you") should be formalized in the spec is an open product question, not answered
+    by this round's evidence alone** — this round only establishes that the trade-off exists and
+    is now more favorable than Round 2's, not who should take it.
