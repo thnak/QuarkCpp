@@ -82,10 +82,10 @@ int main(int argc, char** argv) {
 
     // One actor per producer: same total volume as quark_mpsc_bench.cpp, but each producer's
     // messages land on its own dedicated actor/mailbox instead of a shared one.
-    constexpr std::uint64_t kPerProducer = 500'000;
-    constexpr std::uint64_t kWarmupPerProducer = 10'000;
+    constexpr std::uint64_t kPerProducer = 3'000'000;
+    // Warmup is wall-clock bounded, not a fixed op count — mirrors quark_mpsc_bench.cpp's fix.
+    constexpr double kWarmupSeconds = 1.0;
     const std::uint64_t kTotal = kPerProducer * num_producers;
-    const std::uint64_t kWarmupTotal = kWarmupPerProducer * num_producers;
 
     // N shards / N workers: one actor and one worker "lane" per producer, so there's no
     // cross-producer mailbox contention and no shared-worker scheduling contention either.
@@ -114,13 +114,17 @@ int main(int argc, char** argv) {
 
     eng.start();
 
-    // --- Warmup ---
+    // --- Warmup (wall-clock bounded, all producers stop together) ---
     {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(kWarmupSeconds);
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < num_producers; ++t) {
-            threads.emplace_back([&refs, t, kWarmupPerProducer]() {
-                for (std::uint64_t i = 0; i < kWarmupPerProducer; ++i) {
-                    refs[t].tell(static_cast<int>(t * kWarmupPerProducer + i));
+            threads.emplace_back([&refs, t, deadline]() {
+                std::uint64_t i = 0;
+                for (;;) {
+                    refs[t].tell(static_cast<int>(i & 0x7FFFFFFF));
+                    ++i;
+                    if ((i & 1023) == 0 && std::chrono::steady_clock::now() >= deadline) return;
                 }
             });
         }

@@ -80,10 +80,12 @@ int main(int argc, char** argv) {
         num_producers = 64;
 
     // Total messages: scale with producers so each sends enough
-    constexpr std::uint64_t kPerProducer = 500'000;
-    constexpr std::uint64_t kWarmupPerProducer = 10'000;
+    constexpr std::uint64_t kPerProducer = 3'000'000;
+    // Warmup is wall-clock bounded, not a fixed op count (see the warmup block below) — a fixed
+    // count can finish in single-digit milliseconds at Quark's throughput, nowhere near enough for
+    // CPU turbo-boost/frequency scaling to reach steady state on this unpinned laptop host.
+    constexpr double kWarmupSeconds = 1.0;
     const std::uint64_t kTotal = kPerProducer * num_producers;
-    const std::uint64_t kWarmupTotal = kWarmupPerProducer * num_producers;
 
     // Engine with 1 worker (the single consumer) + enough shards
     unsigned workers = 1;
@@ -106,13 +108,17 @@ int main(int argc, char** argv) {
     ActorRef<PingActor> ref = router.get<PingActor>(42);
     eng.start();
 
-    // --- Warmup ---
+    // --- Warmup (wall-clock bounded, all producers stop together) ---
     {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(kWarmupSeconds);
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < num_producers; ++t) {
-            threads.emplace_back([&ref, t, kWarmupPerProducer]() {
-                for (std::uint64_t i = 0; i < kWarmupPerProducer; ++i) {
-                    ref.tell(static_cast<int>(t * kWarmupPerProducer + i));
+            threads.emplace_back([&ref, t, deadline]() {
+                std::uint64_t i = 0;
+                for (;;) {
+                    ref.tell(static_cast<int>((t << 24) | static_cast<unsigned>(i & 0xFFFFFF)));
+                    ++i;
+                    if ((i & 1023) == 0 && std::chrono::steady_clock::now() >= deadline) return;
                 }
             });
         }

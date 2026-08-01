@@ -99,8 +99,9 @@ int main(int argc, char** argv) {
     if (num_producers > 64)
         num_producers = 64;
 
-    constexpr uint64_t kPerProducer = 500'000;
-    constexpr uint64_t kWarmupPerProducer = 10'000;
+    constexpr uint64_t kPerProducer = 3'000'000;
+    // Warmup is wall-clock bounded, not a fixed op count — mirrors quark_mpsc_bench.cpp's fix.
+    constexpr double kWarmupSeconds = 1.0;
     const uint64_t kTotal = kPerProducer * num_producers;
 
     actor_system_config cfg;
@@ -113,13 +114,17 @@ int main(int argc, char** argv) {
     // Spawn ping actor
     auto pinger = sys.spawn(ping_actor);
 
-    // --- Warmup ---
+    // --- Warmup (wall-clock bounded, all producers stop together) ---
     {
+        auto deadline = steady_clock::now() + duration<double>(kWarmupSeconds);
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < num_producers; ++t) {
-            threads.emplace_back([&pinger, t]() {
-                for (uint64_t i = 0; i < kWarmupPerProducer; ++i) {
-                    anon_mail(static_cast<int>(t * kWarmupPerProducer + i)).send(pinger);
+            threads.emplace_back([&pinger, t, deadline]() {
+                uint64_t i = 0;
+                for (;;) {
+                    anon_mail(static_cast<int>((t << 24) | static_cast<unsigned>(i & 0xFFFFFF))).send(pinger);
+                    ++i;
+                    if ((i & 1023) == 0 && steady_clock::now() >= deadline) return;
                 }
             });
         }

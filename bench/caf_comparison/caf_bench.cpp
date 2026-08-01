@@ -57,6 +57,23 @@ static void print_stats(const char* label, const Stats& s) {
                 s.mean, s.min, s.max);
 }
 
+// Time-bounded warmup, mirrors quark_bench.cpp's — a fixed op count can complete in single-digit
+// milliseconds, nowhere near enough for CPU turbo-boost/frequency scaling to reach steady state
+// on this unpinned laptop host. Runs `op` for `seconds` of wall time, checking the clock every
+// 4096 iterations rather than every call.
+constexpr double kWarmupSeconds = 1.0;
+
+template <class F>
+void warmup_for(double seconds, F&& op) {
+    auto deadline = steady_clock::now() + duration<double>(seconds);
+    uint64_t i = 0;
+    for (;;) {
+        op(i);
+        ++i;
+        if ((i & 0xFFF) == 0 && steady_clock::now() >= deadline) return;
+    }
+}
+
 // ---- Ping actor (event-based, fire-and-forget) -------------------------
 
 static behavior ping_actor(event_based_actor* self) {
@@ -80,21 +97,21 @@ static behavior echo_actor(event_based_actor* self) {
 // ---- Tell latency: scoped_actor --> remote actor, fire-and-forget --------
 
 static double bench_tell_latency(actor_system& sys) {
-    constexpr uint64_t kWarmup = 10'000;
-    constexpr uint64_t kSamples = 100'000;
+    constexpr uint64_t kSamples = 500'000;
 
     auto pinger = sys.spawn(ping_actor);
     scoped_actor self{sys};
 
+    warmup_for(kWarmupSeconds, [&](uint64_t i) { anon_mail(static_cast<int>(i)).send(pinger); });
+
     std::vector<double> samples;
     samples.reserve(kSamples);
 
-    for (uint64_t i = 0; i < kWarmup + kSamples; ++i) {
+    for (uint64_t i = 0; i < kSamples; ++i) {
         auto t0 = steady_clock::now();
         anon_mail(static_cast<int>(i)).send(pinger);
         auto t1 = steady_clock::now();
-        if (i >= kWarmup)
-            samples.push_back(duration<double, std::nano>(t1 - t0).count());
+        samples.push_back(duration<double, std::nano>(t1 - t0).count());
     }
 
     self->mail(0).send(pinger);  // ensure delivery before destroy
@@ -107,16 +124,21 @@ static double bench_tell_latency(actor_system& sys) {
 // ---- Ask latency: scoped_actor --> event_actor, request-response ---------
 
 static double bench_ask_latency(actor_system& sys) {
-    constexpr uint64_t kWarmup = 5'000;
-    constexpr uint64_t kSamples = 50'000;
+    constexpr uint64_t kSamples = 200'000;
 
     auto echoer = sys.spawn(echo_actor);
     scoped_actor self{sys};
 
+    warmup_for(kWarmupSeconds, [&](uint64_t i) {
+        self->mail(static_cast<int>(i))
+            .request(echoer, 10s)
+            .receive([&](int) {}, [&](const error&) {});
+    });
+
     std::vector<double> samples;
     samples.reserve(kSamples);
 
-    for (uint64_t i = 0; i < kWarmup + kSamples; ++i) {
+    for (uint64_t i = 0; i < kSamples; ++i) {
         auto t0 = steady_clock::now();
         self->mail(static_cast<int>(i))
             .request(echoer, 10s)
@@ -131,8 +153,7 @@ static double bench_ask_latency(actor_system& sys) {
                                  static_cast<unsigned long long>(i));
                 });
         auto t1 = steady_clock::now();
-        if (i >= kWarmup)
-            samples.push_back(duration<double, std::nano>(t1 - t0).count());
+        samples.push_back(duration<double, std::nano>(t1 - t0).count());
     }
 
     auto stats = summarize(samples);
@@ -143,16 +164,20 @@ static double bench_ask_latency(actor_system& sys) {
 // ---- Throughput: fire-and-forget, bulk ---------------------------------
 
 static double bench_throughput(actor_system& sys) {
-    constexpr uint64_t kOps = 1'000'000;
+    constexpr uint64_t kOps = 10'000'000;
     auto pinger = sys.spawn(ping_actor);
     scoped_actor self{sys};
+
+    warmup_for(kWarmupSeconds, [&](uint64_t i) { anon_mail(static_cast<int>(i)).send(pinger); });
+    self->mail(0).send(pinger);  // flush warmup
+    std::this_thread::sleep_for(50ms);
 
     auto t0 = steady_clock::now();
     for (uint64_t i = 0; i < kOps; ++i) {
         anon_mail(static_cast<int>(i)).send(pinger);
     }
     self->mail(0).send(pinger);  // flush
-    std::this_thread::sleep_for(50ms);
+    std::this_thread::sleep_for(500ms);
     auto t1 = steady_clock::now();
 
     double secs = duration<double>(t1 - t0).count();
@@ -166,7 +191,13 @@ static double bench_throughput(actor_system& sys) {
 // ---- Spawn overhead ----------------------------------------------------
 
 static double bench_spawn(actor_system& sys) {
-    constexpr uint64_t kSpawns = 10'000;
+    constexpr uint64_t kSpawns = 100'000;
+
+    warmup_for(kWarmupSeconds, [&](uint64_t) {
+        auto h = sys.spawn(ping_actor);
+        (void)h;
+    });
+
     auto t0 = steady_clock::now();
     for (uint64_t i = 0; i < kSpawns; ++i) {
         auto h = sys.spawn(ping_actor);
