@@ -61,10 +61,12 @@ void print_stats(const char* label, const Stats& s) {
 
 struct PingActor : Actor<PingActor, Sequential> {
     using protocol = Protocol<int>;
-    std::atomic<std::uint64_t> count{0};
 
-    void handle(const int&) noexcept {
-        count.fetch_add(1, std::memory_order_relaxed);
+    void handle(const int&) noexcept { /* just receive — mirrors quark_bench.cpp's throughput
+                                           actor exactly; a per-message atomic increment here
+                                           (the original shape) was pure, unread instrumentation
+                                           tax that made this bench's P=1 number incomparable to
+                                           quark_bench.exe's plain throughput measurement */
     }
 };
 
@@ -149,13 +151,20 @@ int main(int argc, char** argv) {
             }
 
             for (std::uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = pal::clock::now();
-                ref.tell(static_cast<int>(t * kPerProducer + i));
-                auto e = pal::clock::now();
-                // Sample every 10th message to keep vector size manageable
+                // Sample every 16th message (both the timestamp calls AND the tell() they wrap —
+                // taking `pal::clock::now()` unconditionally on every iteration, even when the
+                // sample was going to be discarded, was a real, unnecessary per-message tax that
+                // made this bench's throughput number incomparable to an uninstrumented one;
+                // this was the actual cause of the P=1 mismatch against quark_bench.exe's plain
+                // throughput measurement, not a difference in the engine).
                 if ((i & 0xF) == 0) {
+                    auto s = pal::clock::now();
+                    ref.tell(static_cast<int>(t * kPerProducer + i));
+                    auto e = pal::clock::now();
                     double ns = std::chrono::duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    ref.tell(static_cast<int>(t * kPerProducer + i));
                 }
             }
         });

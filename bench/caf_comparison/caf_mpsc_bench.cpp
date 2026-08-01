@@ -59,15 +59,14 @@ void print_stats(const char* label, const Stats& s) {
                 s.mean, s.min, s.max);
 }
 
-// Shared atomic counter for message tracking
-std::atomic<uint64_t> g_count{0};
-
 // ---- Ping actor (fire-and-forget) ---------------------------------------
+// (no counter — the original per-message atomic increment here was unread instrumentation tax
+// that skewed this bench's throughput number against an uninstrumented one; see
+// quark_mpsc_bench.cpp's identical fix)
 
 behavior ping_actor(event_based_actor* self) {
     return {
         [=](int) {
-            g_count.fetch_add(1, std::memory_order_relaxed);
         },
     };
 }
@@ -130,7 +129,6 @@ int main(int argc, char** argv) {
         }
         for (auto& th : threads) th.join();
     }
-    g_count.store(0, std::memory_order_relaxed);
 
     // --- Timed run ---
     std::vector<std::vector<double>> thread_samples(num_producers);
@@ -150,12 +148,16 @@ int main(int argc, char** argv) {
             }
 
             for (uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = steady_clock::now();
-                anon_mail(static_cast<int>(t * kPerProducer + i)).send(pinger);
-                auto e = steady_clock::now();
+                // Only pay the clock() cost on sampled iterations — see quark_mpsc_bench.cpp's
+                // identical fix and its comment for why this matters.
                 if ((i & 0xF) == 0) {
+                    auto s = steady_clock::now();
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pinger);
+                    auto e = steady_clock::now();
                     double ns = duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pinger);
                 }
             }
         });

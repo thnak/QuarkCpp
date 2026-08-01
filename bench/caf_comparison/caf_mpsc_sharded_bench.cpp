@@ -132,12 +132,16 @@ int main(int argc, char** argv) {
             }
 
             for (uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = steady_clock::now();
-                anon_mail(static_cast<int>(t * kPerProducer + i)).send(pingers[t]);
-                auto e = steady_clock::now();
+                // Only pay the clock() cost on sampled iterations — see quark_mpsc_bench.cpp's
+                // identical fix and its comment for why this matters.
                 if ((i & 0xF) == 0) {
+                    auto s = steady_clock::now();
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pingers[t]);
+                    auto e = steady_clock::now();
                     double ns = duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pingers[t]);
                 }
             }
         });

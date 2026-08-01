@@ -176,9 +176,15 @@ static double bench_throughput(actor_system& sys) {
     for (uint64_t i = 0; i < kOps; ++i) {
         anon_mail(static_cast<int>(i)).send(pinger);
     }
+    auto t1 = steady_clock::now();  // measure the SEND loop only — mirrors quark_bench.cpp's
+                                     // bench_throughput() exactly. The flush+sleep below is
+                                     // teardown safety (let the actor drain before `sys`/`pinger`
+                                     // go out of scope), not part of what's being measured; it was
+                                     // previously captured INSIDE the timed window, adding a fixed
+                                     // 500ms to every run's denominator and deflating this bench's
+                                     // throughput number against an uninstrumented measurement.
     self->mail(0).send(pinger);  // flush
     std::this_thread::sleep_for(500ms);
-    auto t1 = steady_clock::now();
 
     double secs = duration<double>(t1 - t0).count();
     double mps = static_cast<double>(kOps) / secs / 1e6;

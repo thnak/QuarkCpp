@@ -62,10 +62,11 @@ void print_stats(const char* label, const Stats& s) {
 
 struct PingActor : Actor<PingActor, Sequential> {
     using protocol = Protocol<int>;
-    std::atomic<std::uint64_t> count{0};
 
-    void handle(const int&) noexcept {
-        count.fetch_add(1, std::memory_order_relaxed);
+    void handle(const int&) noexcept { /* just receive — mirrors quark_bench.cpp's throughput
+                                           actor exactly; see quark_mpsc_bench.cpp's identical fix
+                                           for why the original per-message atomic increment here
+                                           was unread, unnecessary instrumentation tax */
     }
 };
 
@@ -149,12 +150,16 @@ int main(int argc, char** argv) {
             }
 
             for (std::uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = pal::clock::now();
-                refs[t].tell(static_cast<int>(t * kPerProducer + i));
-                auto e = pal::clock::now();
+                // See quark_mpsc_bench.cpp's identical fix: only pay the clock() cost on sampled
+                // iterations, not every message.
                 if ((i & 0xF) == 0) {
+                    auto s = pal::clock::now();
+                    refs[t].tell(static_cast<int>(t * kPerProducer + i));
+                    auto e = pal::clock::now();
                     double ns = std::chrono::duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    refs[t].tell(static_cast<int>(t * kPerProducer + i));
                 }
             }
         });
