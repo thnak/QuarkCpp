@@ -79,8 +79,9 @@ int main(int argc, char** argv) {
     if (num_producers > 64)
         num_producers = 64;
 
-    constexpr uint64_t kPerProducer = 500'000;
-    constexpr uint64_t kWarmupPerProducer = 10'000;
+    constexpr uint64_t kPerProducer = 3'000'000;
+    // Warmup is wall-clock bounded, not a fixed op count — mirrors quark_mpsc_bench.cpp's fix.
+    constexpr double kWarmupSeconds = 1.0;
     const uint64_t kTotal = kPerProducer * num_producers;
 
     actor_system_config cfg;
@@ -96,13 +97,17 @@ int main(int argc, char** argv) {
     for (unsigned t = 0; t < num_producers; ++t)
         pingers.push_back(sys.spawn(ping_actor));
 
-    // --- Warmup ---
+    // --- Warmup (wall-clock bounded, all producers stop together) ---
     {
+        auto deadline = steady_clock::now() + duration<double>(kWarmupSeconds);
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < num_producers; ++t) {
-            threads.emplace_back([&pingers, t]() {
-                for (uint64_t i = 0; i < kWarmupPerProducer; ++i) {
-                    anon_mail(static_cast<int>(t * kWarmupPerProducer + i)).send(pingers[t]);
+            threads.emplace_back([&pingers, t, deadline]() {
+                uint64_t i = 0;
+                for (;;) {
+                    anon_mail(static_cast<int>(i & 0x7FFFFFFF)).send(pingers[t]);
+                    ++i;
+                    if ((i & 1023) == 0 && steady_clock::now() >= deadline) return;
                 }
             });
         }
@@ -127,12 +132,16 @@ int main(int argc, char** argv) {
             }
 
             for (uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = steady_clock::now();
-                anon_mail(static_cast<int>(t * kPerProducer + i)).send(pingers[t]);
-                auto e = steady_clock::now();
+                // Only pay the clock() cost on sampled iterations — see quark_mpsc_bench.cpp's
+                // identical fix and its comment for why this matters.
                 if ((i & 0xF) == 0) {
+                    auto s = steady_clock::now();
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pingers[t]);
+                    auto e = steady_clock::now();
                     double ns = duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pingers[t]);
                 }
             }
         });

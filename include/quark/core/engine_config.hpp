@@ -116,6 +116,48 @@ struct EngineConfig {
     // pre-linger drain_step). Never unbounded — the setter clamps to kLingerSpinLimitMax (4096) to
     // keep the evidence-scaled bound arithmetic overflow-free.
     std::uint32_t activation_linger_spin_limit = 0;
+    // ADR-038: bounded cooperative drain-owner eviction. Under OS-thread oversubscription (worker +
+    // producer thread count > hardware_concurrency()), a worker holding a shard's `drain_owner` can be
+    // preempted mid-drain; every other worker's scan just sees the shard as owned and skips it (never
+    // blocks), so a producer's message is stuck until the OS specifically reschedules the preempted
+    // owner — an OS-reschedule-timescale stall (observed: p999 ~4x and max latency ~60x worse at 2x
+    // oversubscription, bench/caf_comparison/README.md). This knob bounds how many `cpu_relax()`
+    // iterations a contending worker probes the owner's per-activation progress checkpoint before
+    // posting a generation-tagged eviction request; the owner honors it voluntarily at its own next
+    // checkpoint (never mid-activation — see `cooperative_evict()`), never by force. 0 disables it
+    // (byte-for-byte the pre-ADR-038 try_drain_shard/drain_run_queue — proven, ADR-038 F1). Default is
+    // 0: ADR-038 shipped this default-off pending re-measurement of a disclosed p999 side-effect (10/10
+    // trials regressed, bounded magnitude, plausibly-but-not-yet-proven attributable to the eviction
+    // probe's added atomic traffic on the busy-poll path in the proving harness) on a quiet, dedicated
+    // host — see decisions/ADR-038-scheduler-oversubscription-tail-latency.md before enabling.
+    std::uint32_t drain_owner_steal_probe_limit = 0;
+    // Bounded `cpu_relax()`-paced spin a contender waits for the owner's ack after posting an eviction
+    // request, before giving up and falling back to skipping the shard (today's unchanged behavior).
+    // Only consulted when `drain_owner_steal_probe_limit != 0`.
+    std::uint32_t drain_owner_steal_ack_spin_limit = 128;
+    // ADR-038 Round 3 (the cheaper heuristic Round 2's own residual risks named as the concrete next
+    // step): the CAS-fail miss path (`try_drain_shard_with_steal`, reached every time a worker's scan
+    // finds a shard owned by someone else) is far hotter than the eviction-probe itself — under real
+    // idle-avoidance, Round 2 measured the unconditional probe-on-every-miss shape making p999 WORSE
+    // (median +130% at P=12), not better, plausibly from the added atomic traffic on that already-hot
+    // path. This knob bounds how many CONSECUTIVE misses on the SAME shard, by the SAME worker, are
+    // paid at near-zero cost (two lane-local integer compares, no atomics touched) before the full
+    // probe-spin/eviction-request machinery engages — a worker cycling through many different
+    // momentarily-busy shards never accumulates a streak and never pays the expensive path; only a
+    // worker that keeps coming back to find the SAME shard still owned (the actual stuck-owner
+    // signature this mechanism exists to catch) does. Only consulted when
+    // `drain_owner_steal_probe_limit != 0`; irrelevant when the mechanism is disabled (the default).
+    std::uint32_t drain_owner_steal_miss_threshold = 8;
+    // ADR-038 Round 4: bounded yield-escalation appended to `pre_park_spin()`, site A only (never
+    // inside a `drain_owner` critical section — see `pre_park_spin()`'s comment). Round 1 measured
+    // this alone improving max latency/throughput at P=12 but regressing p999 (+76%); this round
+    // combines it with the Round 3 cheaper-heuristic Cooperative Eviction to see whether the two
+    // mechanisms' effects compose favorably (they touch disjoint code paths: this is on the
+    // fully-idle path outside any lock, Cooperative Eviction is inside `scan_and_run`'s CAS-fail
+    // branch) or not. 0 disables it (byte-for-byte the pre-Round-4 `pre_park_spin()`, the shipped
+    // default). Distinct axis from `pre_park_spin_limit` (a `cpu_relax()` spin, tried first) and
+    // `busy_spin_limit` (bounds the mailbox/run-queue Busy tri-state, unrelated).
+    std::uint32_t yield_spin_limit = 0;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -171,6 +213,22 @@ public:
     ConfigBuilder& pre_park_spin_limit(std::uint32_t n) noexcept { cfg_.pre_park_spin_limit = n; return *this; }
     ConfigBuilder& activation_linger_spin_limit(std::uint32_t n) noexcept {
         cfg_.activation_linger_spin_limit = n;
+        return *this;
+    }
+    ConfigBuilder& drain_owner_steal_probe_limit(std::uint32_t n) noexcept {
+        cfg_.drain_owner_steal_probe_limit = n;
+        return *this;
+    }
+    ConfigBuilder& drain_owner_steal_ack_spin_limit(std::uint32_t n) noexcept {
+        cfg_.drain_owner_steal_ack_spin_limit = n;
+        return *this;
+    }
+    ConfigBuilder& drain_owner_steal_miss_threshold(std::uint32_t n) noexcept {
+        cfg_.drain_owner_steal_miss_threshold = n;
+        return *this;
+    }
+    ConfigBuilder& yield_spin_limit(std::uint32_t n) noexcept {
+        cfg_.yield_spin_limit = n;
         return *this;
     }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }

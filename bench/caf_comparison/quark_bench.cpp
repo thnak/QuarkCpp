@@ -55,6 +55,24 @@ void print_stats(const char* label, const Stats& s) {
                 s.mean, s.min, s.max);
 }
 
+// Time-bounded warmup: a fixed op count can complete in single-digit milliseconds at Quark's
+// throughput, nowhere near enough for CPU turbo-boost/frequency scaling to reach steady state on
+// this unpinned laptop host — a real cause of this file's run-to-run variance (see README.md's
+// "Single-threaded vs max-threaded" caveat). Runs `op` for `seconds` of wall time instead, checking
+// the clock every 4096 iterations (not every call) to avoid adding its own per-iteration overhead.
+constexpr double kWarmupSeconds = 1.0;
+
+template <class F>
+void warmup_for(double seconds, F&& op) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+    std::uint64_t i = 0;
+    for (;;) {
+        op(i);
+        ++i;
+        if ((i & 0xFFF) == 0 && std::chrono::steady_clock::now() >= deadline) return;
+    }
+}
+
 // ---- Ping actor (fire-and-forget) --------------------------------------
 
 struct PingActor : Actor<PingActor, Sequential> {
@@ -74,9 +92,15 @@ struct EchoActor : Actor<EchoActor, Sequential> {
 // ---- Spawn overhead ----------------------------------------------------
 
 double bench_spawn(unsigned workers) {
-    constexpr std::uint64_t kSpawns = 10'000;
+    constexpr std::uint64_t kSpawns = 100'000;
 
     Engine eng(EngineConfig{workers, workers, 64, 1024});
+
+    warmup_for(kWarmupSeconds, [&](std::uint64_t i) {
+        auto aid = eng.spawn<PingActor>(kSpawns + i).value();
+        (void)aid;
+    });
+
     auto t0 = pal::clock::now();
     for (std::uint64_t i = 0; i < kSpawns; ++i) {
         auto aid = eng.spawn<PingActor>(i).value();
@@ -92,8 +116,7 @@ double bench_spawn(unsigned workers) {
 // ---- Tell latency: ActorRef -> Actor, fire-and-forget -------------------
 
 double bench_tell_latency(unsigned workers) {
-    constexpr std::uint64_t kWarmup = 10'000;
-    constexpr std::uint64_t kSamples = 100'000;
+    constexpr std::uint64_t kSamples = 500'000;
 
     detail::MessagePool pool{256};
     Engine eng(EngineConfig{workers, workers, 64, 1024});
@@ -102,15 +125,16 @@ double bench_tell_latency(unsigned workers) {
     ActorRef<PingActor> ref = router.get<PingActor>(42);
     eng.start();
 
+    warmup_for(kWarmupSeconds, [&](std::uint64_t i) { ref.tell(static_cast<int>(i)); });
+
     std::vector<double> samples;
     samples.reserve(kSamples);
 
-    for (std::uint64_t i = 0; i < kWarmup + kSamples; ++i) {
+    for (std::uint64_t i = 0; i < kSamples; ++i) {
         auto t0 = pal::clock::now();
         ref.tell(static_cast<int>(i));
         auto t1 = pal::clock::now();
-        if (i >= kWarmup)
-            samples.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
+        samples.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
     }
 
     eng.stop();
@@ -122,8 +146,7 @@ double bench_tell_latency(unsigned workers) {
 // ---- Ask latency: ActorRef -> Actor, request-response ------------------
 
 double bench_ask_latency(unsigned workers) {
-    constexpr std::uint64_t kWarmup = 5'000;
-    constexpr std::uint64_t kSamples = 50'000;
+    constexpr std::uint64_t kSamples = 200'000;
 
     detail::MessagePool ask_pool{256};
     Engine eng2(EngineConfig{workers, workers, 64, 1024});
@@ -132,10 +155,15 @@ double bench_ask_latency(unsigned workers) {
     ActorRef<EchoActor> ref2 = router2.get<EchoActor>(42);
     eng2.start();
 
+    warmup_for(kWarmupSeconds, [&](std::uint64_t i) {
+        auto res = block_on(ref2.ask<int>(static_cast<int>(i)));
+        (void)res;
+    });
+
     std::vector<double> samples;
     samples.reserve(kSamples);
 
-    for (std::uint64_t i = 0; i < kWarmup + kSamples; ++i) {
+    for (std::uint64_t i = 0; i < kSamples; ++i) {
         auto t0 = pal::clock::now();
         auto res = block_on(ref2.ask<int>(static_cast<int>(i)));
         auto t1 = pal::clock::now();
@@ -148,8 +176,7 @@ double bench_ask_latency(unsigned workers) {
         if (res.value() != static_cast<int>(i))
             std::fprintf(stderr, "value mismatch at i=%llu\n",
                          static_cast<unsigned long long>(i));
-        if (i >= kWarmup)
-            samples.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
+        samples.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
     }
 
     eng2.stop();
@@ -161,7 +188,7 @@ double bench_ask_latency(unsigned workers) {
 // ---- Throughput: fire-and-forget, bulk ---------------------------------
 
 double bench_throughput(unsigned workers) {
-    constexpr std::uint64_t kOps = 1'000'000;
+    constexpr std::uint64_t kOps = 10'000'000;
 
     detail::MessagePool thr_pool{256};
     Engine eng3(EngineConfig{workers, workers, 64, 1024});
@@ -169,6 +196,8 @@ double bench_throughput(unsigned workers) {
     LocalRouter router3(eng3.post_courier(), thr_pool);
     ActorRef<PingActor> ref3 = router3.get<PingActor>(42);
     eng3.start();
+
+    warmup_for(kWarmupSeconds, [&](std::uint64_t i) { ref3.tell(static_cast<int>(i)); });
 
     auto t0 = pal::clock::now();
     for (std::uint64_t i = 0; i < kOps; ++i) {

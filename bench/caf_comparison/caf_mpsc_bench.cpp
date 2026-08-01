@@ -59,15 +59,14 @@ void print_stats(const char* label, const Stats& s) {
                 s.mean, s.min, s.max);
 }
 
-// Shared atomic counter for message tracking
-std::atomic<uint64_t> g_count{0};
-
 // ---- Ping actor (fire-and-forget) ---------------------------------------
+// (no counter — the original per-message atomic increment here was unread instrumentation tax
+// that skewed this bench's throughput number against an uninstrumented one; see
+// quark_mpsc_bench.cpp's identical fix)
 
 behavior ping_actor(event_based_actor* self) {
     return {
         [=](int) {
-            g_count.fetch_add(1, std::memory_order_relaxed);
         },
     };
 }
@@ -99,8 +98,9 @@ int main(int argc, char** argv) {
     if (num_producers > 64)
         num_producers = 64;
 
-    constexpr uint64_t kPerProducer = 500'000;
-    constexpr uint64_t kWarmupPerProducer = 10'000;
+    constexpr uint64_t kPerProducer = 3'000'000;
+    // Warmup is wall-clock bounded, not a fixed op count — mirrors quark_mpsc_bench.cpp's fix.
+    constexpr double kWarmupSeconds = 1.0;
     const uint64_t kTotal = kPerProducer * num_producers;
 
     actor_system_config cfg;
@@ -113,19 +113,22 @@ int main(int argc, char** argv) {
     // Spawn ping actor
     auto pinger = sys.spawn(ping_actor);
 
-    // --- Warmup ---
+    // --- Warmup (wall-clock bounded, all producers stop together) ---
     {
+        auto deadline = steady_clock::now() + duration<double>(kWarmupSeconds);
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < num_producers; ++t) {
-            threads.emplace_back([&pinger, t]() {
-                for (uint64_t i = 0; i < kWarmupPerProducer; ++i) {
-                    anon_mail(static_cast<int>(t * kWarmupPerProducer + i)).send(pinger);
+            threads.emplace_back([&pinger, t, deadline]() {
+                uint64_t i = 0;
+                for (;;) {
+                    anon_mail(static_cast<int>((t << 24) | static_cast<unsigned>(i & 0xFFFFFF))).send(pinger);
+                    ++i;
+                    if ((i & 1023) == 0 && steady_clock::now() >= deadline) return;
                 }
             });
         }
         for (auto& th : threads) th.join();
     }
-    g_count.store(0, std::memory_order_relaxed);
 
     // --- Timed run ---
     std::vector<std::vector<double>> thread_samples(num_producers);
@@ -145,12 +148,16 @@ int main(int argc, char** argv) {
             }
 
             for (uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = steady_clock::now();
-                anon_mail(static_cast<int>(t * kPerProducer + i)).send(pinger);
-                auto e = steady_clock::now();
+                // Only pay the clock() cost on sampled iterations — see quark_mpsc_bench.cpp's
+                // identical fix and its comment for why this matters.
                 if ((i & 0xF) == 0) {
+                    auto s = steady_clock::now();
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pinger);
+                    auto e = steady_clock::now();
                     double ns = duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    anon_mail(static_cast<int>(t * kPerProducer + i)).send(pinger);
                 }
             }
         });

@@ -61,10 +61,12 @@ void print_stats(const char* label, const Stats& s) {
 
 struct PingActor : Actor<PingActor, Sequential> {
     using protocol = Protocol<int>;
-    std::atomic<std::uint64_t> count{0};
 
-    void handle(const int&) noexcept {
-        count.fetch_add(1, std::memory_order_relaxed);
+    void handle(const int&) noexcept { /* just receive — mirrors quark_bench.cpp's throughput
+                                           actor exactly; a per-message atomic increment here
+                                           (the original shape) was pure, unread instrumentation
+                                           tax that made this bench's P=1 number incomparable to
+                                           quark_bench.exe's plain throughput measurement */
     }
 };
 
@@ -80,10 +82,12 @@ int main(int argc, char** argv) {
         num_producers = 64;
 
     // Total messages: scale with producers so each sends enough
-    constexpr std::uint64_t kPerProducer = 500'000;
-    constexpr std::uint64_t kWarmupPerProducer = 10'000;
+    constexpr std::uint64_t kPerProducer = 3'000'000;
+    // Warmup is wall-clock bounded, not a fixed op count (see the warmup block below) — a fixed
+    // count can finish in single-digit milliseconds at Quark's throughput, nowhere near enough for
+    // CPU turbo-boost/frequency scaling to reach steady state on this unpinned laptop host.
+    constexpr double kWarmupSeconds = 1.0;
     const std::uint64_t kTotal = kPerProducer * num_producers;
-    const std::uint64_t kWarmupTotal = kWarmupPerProducer * num_producers;
 
     // Engine with 1 worker (the single consumer) + enough shards
     unsigned workers = 1;
@@ -106,13 +110,17 @@ int main(int argc, char** argv) {
     ActorRef<PingActor> ref = router.get<PingActor>(42);
     eng.start();
 
-    // --- Warmup ---
+    // --- Warmup (wall-clock bounded, all producers stop together) ---
     {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(kWarmupSeconds);
         std::vector<std::thread> threads;
         for (unsigned t = 0; t < num_producers; ++t) {
-            threads.emplace_back([&ref, t, kWarmupPerProducer]() {
-                for (std::uint64_t i = 0; i < kWarmupPerProducer; ++i) {
-                    ref.tell(static_cast<int>(t * kWarmupPerProducer + i));
+            threads.emplace_back([&ref, t, deadline]() {
+                std::uint64_t i = 0;
+                for (;;) {
+                    ref.tell(static_cast<int>((t << 24) | static_cast<unsigned>(i & 0xFFFFFF)));
+                    ++i;
+                    if ((i & 1023) == 0 && std::chrono::steady_clock::now() >= deadline) return;
                 }
             });
         }
@@ -143,13 +151,20 @@ int main(int argc, char** argv) {
             }
 
             for (std::uint64_t i = 0; i < kPerProducer; ++i) {
-                auto s = pal::clock::now();
-                ref.tell(static_cast<int>(t * kPerProducer + i));
-                auto e = pal::clock::now();
-                // Sample every 10th message to keep vector size manageable
+                // Sample every 16th message (both the timestamp calls AND the tell() they wrap —
+                // taking `pal::clock::now()` unconditionally on every iteration, even when the
+                // sample was going to be discarded, was a real, unnecessary per-message tax that
+                // made this bench's throughput number incomparable to an uninstrumented one;
+                // this was the actual cause of the P=1 mismatch against quark_bench.exe's plain
+                // throughput measurement, not a difference in the engine).
                 if ((i & 0xF) == 0) {
+                    auto s = pal::clock::now();
+                    ref.tell(static_cast<int>(t * kPerProducer + i));
+                    auto e = pal::clock::now();
                     double ns = std::chrono::duration<double, std::nano>(e - s).count();
                     thread_samples[t].push_back(ns);
+                } else {
+                    ref.tell(static_cast<int>(t * kPerProducer + i));
                 }
             }
         });

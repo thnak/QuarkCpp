@@ -274,6 +274,43 @@ enforced **`(d+1)·K·M`** starvation bound. *Caveat:* RMW counts came from objd
 counting + TSan (`perf_event_paranoid=4` blocked HW counters) — re-confirm with `perf c2c`
 on a `CAP_PERFMON` CI box before stamping the HW-counter form of the gate.
 
+### Scheduler oversubscription tail latency (002, ADR-038)
+
+A **distinct** regime from every ≤core-count budget above: OS thread count (workers +
+producers) exceeding `hardware_concurrency()`. Not gated by any ≤core-count Hard budget
+row — `drain_owner_steal_probe_limit`/`drain_owner_steal_ack_spin_limit` are cold
+`BuildOnly` config, default **0** (disabled), and disabled is proven byte-identical to
+pre-ADR-038 behavior (ADR-038 claim F1), so this section's numbers do not retroactively
+apply to any measurement taken above. Baseline (mechanism disabled, the shipped default),
+`bench/caf_comparison/README.md`'s stress test, single unpinned Windows host:
+
+| Metric | P=8 pairs (16 threads, 1.33× oversub.) | P=12 pairs (24 threads, 2× oversub.) |
+|---|---|---|
+| p999 | 26.4 µs | 106.7 µs (~4× worse) |
+| max latency | 339.2 µs | 20,260.9 µs (~60× worse) |
+| Aggregate throughput / correctness | holds | holds (0 lost/duplicated) |
+
+**No Hard or Goal figure is stamped for this regime yet.** ADR-038 Round 2 re-measured the
+cooperative-eviction fix (mechanism enabled) against the real `worker_loop`/`park()` path
+(not the original proving harness) at both ratios, 10 paired trials each, g++/WSL2:
+
+| Metric | P=8, mechanism enabled vs disabled | P=12, mechanism enabled vs disabled |
+|---|---|---|
+| p999 | +2.2% (median; 6/10 trials worse — near noise) | **+130.0%** (median; 10/10 trials worse) |
+| max latency | +79.1% (median; only 4/10 improved) | -29.3% (median; 6/10 improved, heavy-tailed) |
+| throughput | -11.7% | -8.8% |
+
+This refuted the hope that Round 1's disclosed p999 regression was a busy-poll-harness
+artifact — at P=12, the regime this ADR exists to fix, it is unanimous and *larger* under
+the real scheduler than under the original harness (+8-96%). The mechanism therefore stays
+default-off; a cheaper eviction-probe heuristic (probe `evict_.progress` only after N
+consecutive CAS-fail misses, not every miss) is the named prerequisite before any future
+round can propose enabling it by default. Still measured on WSL2 on this project's shared
+dev machine, not the quiet, `taskset`-pinned Linux CI host other budgets in this file
+require before a number is stamped Hard/Goal — the qualitative verdict (persists, and is
+worse under real idle-avoidance) is what should be treated as established; the exact
+percentages should be re-confirmed on that host before this row gets a Hard/Goal ceiling.
+
 ## How a budget binds a design
 
 A budget is only real if something enforces it. Each is wired to the existing

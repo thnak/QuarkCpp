@@ -58,6 +58,28 @@ for %%p in (1 2 4) do (
     echo.
 )
 
+REM ---- Sustained stress test (whole-engine survivability, both engines) ----
+REM Kept at 1-2 pairs here (2-4 total OS threads, at/under CLAUDE.md's standing 4-thread cap) so
+REM the unattended sweep stays safe. Higher pair counts (4/6/12+) are a genuine stress/soak test
+REM that can pin all cores for the full duration and should be run manually, ramped up gradually —
+REM see README.md's "Sustained stress test" section for the 1-12 pair results (both engines) and
+REM why (an earlier, unsafe version of the Quark bench made the dev box unresponsive; both
+REM *_stress_bench.exe's current safety design — no ask()/request() during the flood, a hard send
+REM cap, a process watchdog — is what makes even the manual higher-pair runs safe now, but this
+REM automated sweep still stays conservative).
+echo ========== 5. SUSTAINED STRESS TEST (paired producer/actor lanes) ==========
+echo.
+for %%p in (1 2) do (
+    echo --- Quark stress, %%p pair(s), 3s sustained ---
+    quark_stress_bench.exe %%p 3 1
+    echo.
+)
+for %%p in (1 2) do (
+    echo --- CAF stress, %%p pair(s), 3s sustained ---
+    caf_stress_bench.exe %%p 3 1
+    echo.
+)
+
 echo ============================================================
 echo  All benchmarks complete.
 echo ============================================================

@@ -439,7 +439,30 @@ These affect multiple subsystems; resolving one constrains several specs.
 Each drafted spec ends with its own *Open questions* section; the notable ones:
 
 - **001** — *(Reply ordering for concurrent `ask`s: resolved, ADR-007 — Sequential→request-order, Reentrant→completion-order via pooled `ReplyCell`. Reentrancy/quiescence: resolved, 015.)*
-- **002** — *(`Priority<P>` queue structure: resolved — K-band per-shard run-queue, `UniformFIFO` default, ADR-010. Drain-budget accounting: resolved, 015.)*
+- **002** — *(`Priority<P>` queue structure: resolved — K-band per-shard run-queue, `UniformFIFO` default, ADR-010. Drain-budget accounting: resolved, 015.)* Busy-spin tail-latency cost under
+  thread oversubscription (OS threads > logical cores) — **partially addressed, ADR-038**. Observed
+  in `bench/caf_comparison/README.md`'s stress test at P=12 (24 threads on 12 cores): p999 ~4× and
+  max latency ~60× worse than P=8, while CAF stays flat — traced to `try_drain_shard`'s `drain_owner`
+  CAS stranding other workers behind a preempted owner. Three competing designs were built,
+  red-teamed, and proven (real C++, sanitizers, benchmarks): a naive oversubscription-gated
+  `yield()` backoff was **proven counterproductive** (made max latency worse in 9/10 trials, the
+  same SAFE-4-class hazard ADR-035 already rejected once); **bounded cooperative drain-owner
+  eviction** won and is implemented (`EngineConfig::drain_owner_steal_probe_limit`, `Engine::
+  try_drain_shard_with_steal`/`cooperative_evict`) but shipped **default-off**, and stays that way:
+  a Round 2 re-measurement against the real `worker_loop` (not the original proving harness)
+  **refuted** the hope that the disclosed p999 regression was a harness artifact — it is unanimous
+  and larger under the real scheduler (median +130% at P=12). **Round 3 built the named cheaper
+  heuristic** (`EngineConfig::drain_owner_steal_miss_threshold`, a lane-local consecutive-miss gate)
+  and re-measured: real progress (p999 -43.4% vs the un-gated shape, throughput mostly recovered,
+  max latency now *beats* disabled) but not full parity (p999 still +9.9% worse than disabled at
+  median). **Round 4 combined it with a bounded yield-escalation** (`EngineConfig::yield_spin_limit`,
+  Round 1's other candidate) — combining made things worse, not better, but yield-escalation alone
+  looked like the best p999 performer of anything tried. **Round 4 also found the SAME configuration
+  Round 3 measured flipped sign in a fresh session** (+9.9% worse → -1.0%, i.e. better) — evidence
+  this shared host's noise floor exceeds the effect sizes being chased. **Investigation closed
+  pending a quiet, pinned host** — every knob stays at its default-off/zero value; this is honestly
+  unresolved, not silently abandoned. See 002's "Bounded cooperative drain-owner eviction (ADR-038)"
+  section and [ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s Round 2/3/4.
 - **003** — inline-small-payload optimization. *(Reentrant payload reclamation: resolved, 015.)*
 - **004** — *(Cold-shard resolution order: resolved — Node/Shard resources are resolved eagerly, for every configured shard, synchronously inside `Engine`'s `build()` cold phase, strictly before any worker thread exists; a Node-scoped resource shared by many shards is dissolved by ordering, not synchronization (no CAS/lock/`call_once`), ADR-021. Resource-declaration ergonomics: resolved as member fields, ADR-007. `PerMessage` factory failure: resolved — fails the message, checked pre-handler, ADR-009.)*
 - **005** — *(Resource-declaration ergonomics **and** `handle` dispatch mechanism: both resolved, ADR-007 — member fields + dense jump-table. Only `tell`/`ask` naming remains.)*
