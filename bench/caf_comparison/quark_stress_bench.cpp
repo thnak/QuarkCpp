@@ -28,9 +28,10 @@
 // shared-mailbox version did for the same "producer count" argument.
 //
 // Build: see CMakeLists.txt
-// Run:   quark_stress_bench.exe [pairs] [duration_seconds] [warmup_seconds]
+// Run:   quark_stress_bench.exe [pairs] [duration_seconds] [warmup_seconds] [probe_limit] [ack_spin_limit]
 // Default: pairs = 2 (4 total OS threads, at this repo's standing multi-thread-stress cap),
-//          duration = 5s, warmup = 1s.
+//          duration = 5s, warmup = 1s, probe_limit = 0 (ADR-038 cooperative eviction disabled,
+//          shipped default), ack_spin_limit = 128 (only consulted when probe_limit != 0).
 
 #include "quark/core/actor.hpp"
 #include "quark/core/actor_ref.hpp"
@@ -134,6 +135,22 @@ int main(int argc, char** argv) {
         if (w >= 0) warmup_s = w;
     }
 
+    // ADR-038 tie-breaking experiment (proving-only CLI toggle): two trailing, optional args to
+    // exercise Bounded Cooperative Drain-Owner Eviction (shipped default-off, probe_limit=0) through
+    // this bench's real worker_loop/park()/wake path, instead of the F2 harness's busy-poll
+    // simplification. Defaults (0 / 128) match EngineConfig's own shipped defaults, so existing
+    // 3-arg invocations are byte-identical to before this change.
+    std::uint32_t drain_owner_steal_probe_limit = 0;
+    if (argc > 4) {
+        int v = std::atoi(argv[4]);
+        if (v >= 0) drain_owner_steal_probe_limit = static_cast<std::uint32_t>(v);
+    }
+    std::uint32_t drain_owner_steal_ack_spin_limit = 128;
+    if (argc > 5) {
+        int v = std::atoi(argv[5]);
+        if (v >= 0) drain_owner_steal_ack_spin_limit = static_cast<std::uint32_t>(v);
+    }
+
     // Circuit breaker: hard cap on total messages enqueued across all pairs in the stress window,
     // independent of the wall-clock timer. In the paired topology a healthy run's cumulative sent
     // count isn't itself a memory risk (each lane drains what it sends — this isn't a proxy for
@@ -155,6 +172,9 @@ int main(int argc, char** argv) {
                 pairs, max_workers, total_threads);
     std::printf("Duration:  %.1fs sustained (+%.1fs untimed warmup) | send cap: %llu | watchdog: %.0fs\n",
                 duration_s, warmup_s, static_cast<unsigned long long>(kMaxTotalSent), kWatchdogCeilingS);
+    std::printf("ADR-038 cooperative eviction: probe_limit=%u ack_spin_limit=%u (0 = shipped default,"
+                " byte-identical to pre-ADR-038 behavior)\n",
+                drain_owner_steal_probe_limit, drain_owner_steal_ack_spin_limit);
     if (total_threads > 4) {
         std::printf("WARNING: %u threads exceeds this repo's standing 4-thread multi-thread-stress "
                     "cap (CLAUDE.md). Only run this deliberately, ramped up from a smaller pair "
@@ -179,7 +199,14 @@ int main(int argc, char** argv) {
 
     // Paired topology: one shard/worker per pair, producer[i] only ever talks to actor[i] —
     // mirrors quark_mpsc_sharded_bench.cpp, sustained instead of a fixed op count.
-    Engine eng(EngineConfig{pairs, pairs, 64, 1024});
+    Engine eng(EngineConfig{
+        .worker_count = pairs,
+        .shard_count = pairs,
+        .drain_budget = 64,
+        .busy_spin_limit = 1024,
+        .drain_owner_steal_probe_limit = drain_owner_steal_probe_limit,
+        .drain_owner_steal_ack_spin_limit = drain_owner_steal_ack_spin_limit,
+    });
     detail::MessagePool pool{4096, pairs};
     std::vector<ActorId> aids;
     aids.reserve(pairs);

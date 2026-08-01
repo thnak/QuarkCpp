@@ -2,7 +2,16 @@
 
 ## Status
 
-Accepted (partial fix; default-off pending tuning round) — see Residual Risks and Follow-Up.
+**Round 1 finding on the p999 side-effect's cause superseded by Round 2 (see "## Round 2" below;
+historical content kept intact, not erased).** Round 1 shipped Bounded Cooperative Drain-Owner
+Eviction default-off and named one open question: was F2's p999 regression an artifact of the
+proving harness's busy-poll simplification (no real `park()`/wake), or a real cost of the mechanism
+under genuine idle-avoidance? Round 2 ran the ADR's own named tie-breaking experiment — the real
+`Engine::worker_loop`, not the harness — and **refutes the entanglement hypothesis at P=12** (the
+regime this ADR exists to fix): the p999 regression not only persists but is larger under the real
+scheduler (median +130%) than under the busy-poll harness (+8-96%). **Accepted, default-off is
+reconfirmed as correct — not merely unresolved.** See "## Round 2" for the full data and the
+concrete follow-up it points to (a cheaper eviction-probe heuristic, not just re-tuning).
 
 ## Question
 
@@ -244,3 +253,130 @@ hypothesis is confirmed and the default can move toward on; if it persists, the
 scan-path atomic-probe overhead itself needs a cheaper heuristic (e.g., only probe
 `evict_.progress` after N consecutive CAS-fail misses, not on every miss) before this
 ships default-on.
+
+**Run — see "## Round 2" below for the result: the regression persists (refuted, not
+confirmed).**
+
+## Round 2 (2026-08-01): The Tie-Breaking Experiment, Run For Real
+
+### What this round did
+
+Executed the exact experiment named above, verbatim: the CLI-toggled ADR-038 knobs
+(`drain_owner_steal_probe_limit`/`drain_owner_steal_ack_spin_limit`, already shipped in
+`EngineConfig`, default 0/128) were wired into `bench/caf_comparison/quark_stress_bench.cpp`
+as two new optional trailing CLI args (defaults preserve every existing 3-arg invocation
+byte-for-byte). This drives the mechanism through the **real** `Engine::worker_loop` —
+`pre_park_spin()`/`park()`/wake between scans — instead of F2's original bespoke harness,
+which modeled workers as a tight busy-poll loop specifically to isolate the eviction
+protocol from ADR-035's own idle-avoidance mechanism. That isolation was also the harness's
+weakness: it left open whether the F2 p999 regression was a real cost of the mechanism or
+an artifact of stacking two idle-avoidance-adjacent mechanisms on top of an unrealistically
+tight loop.
+
+**Environment**: WSL2 Ubuntu (g++ 15.2.0 and clang++ 20.1.8, matching this ADR's original
+proving toolchain), copied off the 9p `/mnt/d` mount to `/tmp` for build speed — the same
+environment class as Round 1's proving, chosen for continuity/comparability, disclosed here
+as still not a dedicated quiet CI host (this repo's shared dev machine, WSL2 layer). A
+clang++ cross-check at P=12 was attempted but landed with the host's load average still
+~9/12 from the preceding g++ sweep — flagged as load-confounded and excluded from the
+primary verdict (see raw data in the prover's report; it did not show a materially cleaner
+signal either).
+
+### Methodology
+
+10 paired, **interleaved** A(disabled, probe_limit=0)/B(enabled, probe_limit=64,
+ack_spin_limit=128) trials at P=12 pairs (`quark_stress_bench 12 3 1 <probe> 128`) and
+10 more at P=8 pairs, g++ build, primary dataset — matching this project's own bar against
+single-shot or non-interleaved comparisons (ADR-036 Round 4's warm-up/process-order bias is
+exactly the failure mode interleaving guards against). Correctness (`sent == received`,
+zero loss/duplication) held in all 40 trials, both configs, both P levels.
+
+### Results
+
+**P=12 (2× oversubscription — the regime this ADR exists to fix):**
+
+| Metric | A (disabled) median | B (enabled) median | Δ |
+|---|---|---|---|
+| p999 | 87,418 ns | 201,030 ns | **+130.0%** (range across trials: +8.2% to +639.9%, 10/10 worse) |
+| max latency | 5,750,166 ns | 4,065,683 ns | -29.3% (6/10 trials better, but heavy-tailed: two outlier trials landed +1068.7%/+659.0%) |
+| throughput | 24.4 M/s | 21.4 M/s | -8.8% (new finding — not measured as flat in Round 1) |
+
+**P=8 (1.33× oversubscription):**
+
+| Metric | A (disabled) median | B (enabled) median | Δ |
+|---|---|---|---|
+| p999 | 68,964 ns | 70,494 ns | +2.2% (6/10 worse — essentially a coin flip, closer to noise than P=12) |
+| max latency | 1,249,023 ns | 2,236,438 ns | **+79.1%** (only 4/10 trials improved — the *opposite* of Round 1's F2 finding) |
+| throughput | 21.6 M/s | 19.3 M/s | -11.7% |
+
+Full 10-trial-per-cell raw tables (not just the medians above) are preserved in the
+proving session's record; every trial number is disclosed, not cherry-picked.
+
+### Verdict
+
+**Entanglement hypothesis REFUTED at P=12.** The p999 regression does not shrink toward
+noise under the real scheduler — it is unanimous across all 10 trials and larger in
+magnitude (median +130%) than Round 1's busy-poll-harness finding (+8-96%). Per this
+ADR's own pre-declared decision criteria ("if it persists, the scan-path atomic-probe
+overhead itself needs a cheaper heuristic... before this ships default-on"), this is
+squarely the "persists" branch, not the "shrinks to noise" branch. The scan-path atomic
+probe traffic (`evict_.progress`/`evict_.evict_request` reads on every CAS-fail miss) is a
+real cost under genuine idle-avoidance, not a busy-poll-harness artifact — if anything the
+real `park()`/wake path makes the relative cost of the probe *worse*, not better, plausibly
+because a worker that would otherwise be about to park now instead pays the probe and stays
+active longer.
+
+**At P=8, p999 sits close to noise** (median +2.2%, a near-even 6/10-worse split) — some
+support for the entanglement hypothesis dampening at the lower oversubscription ratio — but
+**max latency's improvement, the other half of Round 1's F2 finding, does not survive**:
+it got worse (median +79.1%, only 4/10 trials improved), inverted from Round 1. The
+conjunctive "both p999 and max improve" claim fails at both P levels now, not just P=12.
+
+**New, previously-unmeasured cost: throughput trended negative when enabled** (median
+-8.8% at P=12, -11.7% at P=8) against the real scheduler, where Round 1's F2 measured it
+as flat. This was not part of the original conjunctive claim but is a real, disclosed
+finding that further weakens the case for a near-term default flip.
+
+### Decision (Round 2)
+
+**Default stays 0 (disabled). This is now a reconfirmed decision backed by two independent
+proving rounds, not merely an unresolved caution carried from Round 1.** Per rule 2
+("proven beats claimed"): the specific, falsifiable path to a default flip that Round 1
+named — re-test against the real `worker_loop`, see if the regression shrinks — was
+executed and came back negative. Shipping default-on today would mean shipping a
+regression that is now proven, not just suspected, to be real under the mechanism's own
+intended operating conditions.
+
+**The mechanism itself is not disqualified** — S1-S4/C1 (safety/correctness) from Round 1
+are untouched by this round (no code in `engine.hpp`/`engine_config.hpp` changed; only the
+bench harness gained a CLI toggle for the config it already exposed), and message
+conservation held in all 40 new trials. This round narrows *why* it isn't ready for
+default-on (a real per-miss atomic-probe cost, not a proving artifact) rather than
+reopening whether it's safe to ship at all.
+
+### Residual risks (Round 2 — appended; Round 1's numbered list above is unchanged)
+
+15. **The concrete next step is now a cheaper probe heuristic, not just re-proving.** This
+    ADR's own Round 1 text already named the candidate: probe `evict_.progress` only after
+    N consecutive CAS-fail misses on a shard, not on every miss. That is unbuilt and
+    unproven — Round 2 only established that it is now necessary, not what N should be or
+    whether it actually recovers the p999 cost.
+16. **Round 2's environment is still not a dedicated quiet CI host** — WSL2 on this repo's
+    shared dev machine, same caveat class as every prior ADR in this file. The clang++
+    cross-check was explicitly load-confounded and excluded; only the g++ dataset backs
+    this round's verdict. Re-run on the Linux CI matrix with `taskset` pinning before
+    treating the exact percentages (not the qualitative "persists, and is larger" verdict)
+    as canonical.
+17. **The new negative throughput finding (-8.8%/-11.7%) is unexplained.** Round 1's F2
+    measured throughput as flat when enabled; Round 2's real-worker_loop numbers do not.
+    No dedicated experiment isolates why — plausibly the same added scan-path atomic
+    traffic, but this is an inference, not yet proven, exactly the same evidentiary gap
+    Round 1 left for the p999 side-effect before this round closed it.
+18. **P=8's max-latency inversion (Round 1: improved; Round 2: regressed) is also
+    unexplained** and should be treated as a live open question for whatever round designs
+    the cheaper heuristic in residual risk #15, not assumed away.
+19. **A prompt-injection attempt was observed and declined during this round's proving
+    session** (an unsolicited offer of SSH credentials to an unrelated external host,
+    appearing mid-task) — not acted on, disclosed here for the record since it touched a
+    session that was producing this ADR's evidence; it has no bearing on the technical
+    verdict above.

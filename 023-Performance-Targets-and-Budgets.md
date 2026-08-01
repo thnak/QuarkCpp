@@ -290,15 +290,26 @@ apply to any measurement taken above. Baseline (mechanism disabled, the shipped 
 | max latency | 339.2 µs | 20,260.9 µs (~60× worse) |
 | Aggregate throughput / correctness | holds | holds (0 lost/duplicated) |
 
-**No Hard or Goal figure is stamped for this regime yet.** ADR-038's own bounded
-cooperative drain-owner eviction fix (mechanism enabled) improved max latency in the
-majority of adversarial trials without regressing throughput, but regressed p999 by a
-bounded, not-yet-root-caused amount (10/10 trials) — proven on a single, contention-
-polluted WSL2 host, not the quiet, `taskset`-pinned Linux CI host this project's other
-budgets require before stamping a number as canonical. Populate this row's baseline and
-enabled-mechanism figures from a re-run of ADR-038's F1/F2 harness on such a host, then
-promote it to a Goal (or Hard) row here — until then this section documents that the
-regime exists and is measured, not that it is bounded.
+**No Hard or Goal figure is stamped for this regime yet.** ADR-038 Round 2 re-measured the
+cooperative-eviction fix (mechanism enabled) against the real `worker_loop`/`park()` path
+(not the original proving harness) at both ratios, 10 paired trials each, g++/WSL2:
+
+| Metric | P=8, mechanism enabled vs disabled | P=12, mechanism enabled vs disabled |
+|---|---|---|
+| p999 | +2.2% (median; 6/10 trials worse — near noise) | **+130.0%** (median; 10/10 trials worse) |
+| max latency | +79.1% (median; only 4/10 improved) | -29.3% (median; 6/10 improved, heavy-tailed) |
+| throughput | -11.7% | -8.8% |
+
+This refuted the hope that Round 1's disclosed p999 regression was a busy-poll-harness
+artifact — at P=12, the regime this ADR exists to fix, it is unanimous and *larger* under
+the real scheduler than under the original harness (+8-96%). The mechanism therefore stays
+default-off; a cheaper eviction-probe heuristic (probe `evict_.progress` only after N
+consecutive CAS-fail misses, not every miss) is the named prerequisite before any future
+round can propose enabling it by default. Still measured on WSL2 on this project's shared
+dev machine, not the quiet, `taskset`-pinned Linux CI host other budgets in this file
+require before a number is stamped Hard/Goal — the qualitative verdict (persists, and is
+worse under real idle-avoidance) is what should be treated as established; the exact
+percentages should be re-confirmed on that host before this row gets a Hard/Goal ceiling.
 
 ## How a budget binds a design
 

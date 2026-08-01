@@ -349,13 +349,15 @@ may be waiting on.** Yield-escalation limited to the general idle-transition pat
 `drain_owner` critical section) was evaluated separately and was not disqualified, but was not
 adopted this round either — see ADR-038's residual risks.
 
-Shipped **default-off**: ADR-038's own proving found a disclosed, not-yet-root-caused p999
-regression (10/10 trials, bounded magnitude) plausibly attributable to the eviction probe's added
-atomic traffic on the busy-poll scan path rather than the handshake itself, measured on a
-contention-polluted proving host. See
-[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md) for the full evidence table,
-the two competing designs it rejected (yield-escalation, oversubscription-gated pre-park backoff —
-the latter *proven counterproductive*, not merely unproven, under real saturation), and the residual
+Shipped **default-off**: Round 1 proving found a disclosed p999 regression (10/10 trials) initially
+attributed to the busy-poll proving harness rather than the mechanism itself. **Round 2 re-ran the
+identical experiment against the real `worker_loop`/`park()` path and refuted that hypothesis**: at
+P=12 (2× oversubscription, the regime this ADR exists to fix) the regression is unanimous and larger
+under the real scheduler (median +130%) than under the harness (+8-96%) — the scan-path eviction
+probe's atomic traffic is a genuine cost under real idle-avoidance, not a proving artifact. See
+[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)'s "Round 2" section for the
+full data, the two competing designs Round 1 rejected (yield-escalation, oversubscription-gated
+pre-park backoff — the latter *proven counterproductive* under real saturation), and the residual
 risks before enabling in production.
 
 ## Broadcast schedules activations, not messages (ADR-019)
