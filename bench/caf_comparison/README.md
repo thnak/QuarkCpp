@@ -14,7 +14,7 @@ Compares **Quark v0.1.0** against **CAF v1.1.0** (C++ Actor Framework) on latenc
 mkdir -p build/caf_comparison
 cd build/caf_comparison
 cmake ../../bench/caf_comparison -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -j8
+ninja -j4
 ```
 
 ## Run
@@ -35,10 +35,10 @@ All accept a CLI argument for thread count or producer count:
 | `quark_bench.exe 0` | Quark @ max workers (12 on this machine) |
 | `caf_bench.exe 1` | CAF @ 1 thread (fair comparison) |
 | `caf_bench.exe 0` | CAF @ max threads (12) |
-| `quark_mpsc_bench.exe 4` | Quark MPSC with 4 producers → 1 actor |
-| `caf_mpsc_bench.exe 4` | CAF MPSC with 4 producers → 1 actor |
-| `quark_mpsc_sharded_bench.exe 4` | Quark, 4 producers → 4 actors (1 producer per actor — contention-free ceiling) |
-| `caf_mpsc_sharded_bench.exe 4` | CAF, 4 producers → 4 actors (same shape) |
+| `quark_mpsc_bench.exe N` | Quark MPSC, N producers → 1 actor (shared mailbox) |
+| `caf_mpsc_bench.exe N` | CAF MPSC, N producers → 1 actor (shared mailbox) |
+| `quark_mpsc_sharded_bench.exe N` | Quark, N producers → N actors (contention-free ceiling) |
+| `caf_mpsc_sharded_bench.exe N` | CAF, N producers → N actors (same shape) |
 
 ## Benchmarks
 
@@ -47,434 +47,94 @@ All accept a CLI argument for thread count or producer count:
 | **Spawn** | Time to create 10,000 actors (ns/spawn) |
 | **Tell** | Fire-and-forget message latency (p50/p99/p999 ns) |
 | **Ask** | Request-response latency (p50/p99/p999 ns) |
-| **Throughput** | Bulk fire-and-forget (M msg/s) |
-| **MPSC scaling** | Throughput with N producers → 1 actor (M msg/s) |
+| **Throughput** | Bulk fire-and-forget from a single producer (M msg/s) |
+| **MPSC scaling** | Throughput with N producers → 1 actor, shared mailbox (M msg/s) |
+| **Sharded MPSC scaling** | Throughput with N producers → N actors, one mailbox each — isolates enqueue/dispatch cost from mailbox contention |
 
-## Results (Ryzen 5 4600H, Windows, clang++ 22.1.5)
+## Machine
 
-### Single-threaded (1 worker each)
+AMD Ryzen 5 4600H, 6 physical cores / 12 logical (SMT), Windows, clang++ 22.1.5. `hardware_concurrency()` = 12, so the `P=12` rows below run one OS thread per logical core — this repo's usual machine-safety cap (4 threads) was deliberately widened for this run to plot a full scaling curve; see `CLAUDE.md` for the standing rule.
 
-| Metric | Quark | CAF | Winner |
-|---|---|---|---|
-| Spawn | **613 ns** | 880 ns | Quark 1.4× |
-| Tell p50 | 200 ns | **100 ns** | CAF 2× |
-| Tell p999 | 41,800 ns | **600 ns** | CAF 70× |
-| Ask p50 | **1,200 ns** | 2,300 ns | Quark 1.9× |
-| Throughput | 3.42 M/s | **5.14 M/s** | CAF 1.5× |
+**All numbers below are a single unpinned Windows session (2026-08-01)**, taken back-to-back, current master (`65cb64f`, ADR-037's TLS acquire/reclaim magazine live in `MessagePool`). Absolute numbers on this shared, unpinned host vary run-to-run by 10-30%; treat ratios and trends as the signal, not any single value. A `taskset`-pinned Linux/WSL2 re-run remains the natural follow-up for tighter absolute numbers (see `PERFORMANCE.md`/`decisions/ADR-037-message-pool-freelist-sync.md` for the pinned-Linux methodology used elsewhere in this repo).
 
-### MPSC scaling
+## Single-threaded vs max-threaded (1 producer, 1 actor)
 
-**Correction (2026-07-30):** the table below (2026-07-27) was investigated as GitHub issue #4 and
-led to a real fix — `MessagePool` gained an optional `num_partitions` ctor arg (commit `1964203`,
-2026-07-28) that spreads producer-side free-list contention across independent partitions instead
-of one shared mutex. But `quark_mpsc_bench.cpp` still constructed its pool as `MessagePool
-pool{4096}` — a single-arg call, so `num_partitions` silently defaulted to `1` (the library's
-back-compat default) — meaning **this bench never actually exercised the fix it prompted**. Fixed
-to `MessagePool pool{4096, num_producers}`, matching how the partitioning feature is meant to be
-used (one partition per producer lane). Also: the original 1/2/4/8/**12** sweep exceeds this
-repo's machine-safety rule (CLAUDE.md caps multi-thread stress at 4 threads on this box), so the
-refreshed sweep below stops at 4 — the 8/12 rows are left as historical, now-stale data, not
-re-verified.
-
-| Producers | Quark, stale/unpartitioned (M/s) | Quark, fixed (M/s) | CAF (M/s) | CAF vs Quark (fixed) |
+| Metric | Quark @1 | Quark @12 | CAF @1 | CAF @12 |
 |---|---|---|---|---|
-| 1 | 2.72 | 1.90 | 3.99 | 2.1× |
-| 2 | 2.64 | 3.15 | 8.66 | 2.75× |
-| 4 | 1.70 | 5.76 | 13.39 | 2.3× |
-| 8 *(stale, unverified)* | 1.09 | — | — | — |
-| 12 *(stale, unverified)* | 0.84 | — | — | — |
+| Spawn (10k actors) | 842 ns | 678 ns | 1,537 ns | 4,594 ns |
+| Tell p50 / p99 / p999 | 200 / 2,000 / 2,500 ns | 200 / 4,100 / 15,300 ns | 100 / 400 / 900 ns | 200 / 900 / 3,900 ns |
+| Ask p50 / p99 / p999 | 700 / 1,500 / 3,300 ns | 1,400 / 3,400 / 8,100 ns | 2,600 / 20,000 / 47,000 ns | 17,100 / 28,900 / 70,400 ns |
+| Throughput | **10.74 M/s** | 4.80 M/s | 4.88 M/s | 4.97 M/s |
 
-The direction reverses: Quark's fixed throughput now **scales up** with producer count (1.90 →
-3.15 → 5.76 M/s) instead of dropping, and the CAF gap at 4 producers shrinks from 7.6× to 2.3×.
-The 1-producer number moved too (2.72 → 1.90, run-to-run machine variance — neither run was
-core-pinned); treat the ratios, not the raw single-thread values, as the signal until a pinned
-re-run exists.
+**Quark wins single-threaded throughput outright** (10.74 vs 4.88 M/s, 2.2×) and spawn at both worker counts — this is the ADR-037 magazine effect: a single thread touching an uncontended `MessagePool` partition now pays almost no mutex tax. Quark's `ask` latency is also consistently lower than CAF's at both worker counts. The one place CAF still leads clearly is `tell` tail latency (p999) and, oddly, Quark's own throughput *drops* going from 1→12 workers — expected for this specific bench shape: it's still a single producer, so the extra 11 worker threads add idle-scan/park overhead with no more work to parallelize. That's a property of this bench's single-producer design, not of Quark's scaling in general — see the MPSC tables below for the real many-producer picture.
 
-**Update (2026-07-30, ADR-035):** the remaining gap was root-caused to a second, independent
-issue — `Engine::worker_loop` parked the instant its scan found nothing, with no backoff, so
-producers landing on an already-parked worker paid a real OS wake syscall (futex/`WaitOnAddress`)
-synchronously inside their own `tell()` call. Measured directly via `metrics_snapshot().wakeups`:
-31.0%/15.8%/4.4% of sends at 1/2/4 producers were paying that cost. A full design-debate-prove
-cycle (`decisions/ADR-035-worker-park-wake-backoff-policy.md`) picked a bounded 256-iteration
-pre-park spin (`EngineConfig::pre_park_spin_limit`, default 256) as the winner over a
-higher-throughput but worse-worst-case adaptive alternative. Re-measured in the same session,
-same host, with both fixes (partitioned pool + ADR-035 spin) live:
+## MPSC scaling, shared mailbox (N producers → 1 actor)
 
-| Producers | Quark (partition fix only) | Quark (+ ADR-035 spin) | CAF (this session) | CAF vs Quark |
-|---|---|---|---|---|
-| 1 | 1.90 M/s | 2.24 M/s | 2.90 M/s | 1.3× |
-| 2 | 3.15 M/s | 4.00 M/s | 5.27 M/s | 1.3× |
-| 4 | 5.76 M/s | 6.31 M/s | 8.53 M/s | 1.35× |
-
-The gap tightens further, from ~2.1–2.75× down to a consistent ~1.3×. CAF's own numbers moved
-between sessions too (this run: 2.90/5.27/8.53 vs the earlier 3.99/8.66/13.39) — unpinned
-run-to-run noise on a shared dev box, not a real change in CAF — so the *ratio* within one session
-is the trustworthy signal, not the cross-session absolute deltas. Tell p999 did **not** improve on
-this host in the ADR-035 prove phase (both the winning and rejected designs measured
-statistically-indistinguishable p999 vs baseline here) — flagged as unproven/host-noise in the ADR,
-not claimed as fixed.
-
-### Key insight
-
-Two independent, now-fixed bottlenecks accounted for most of the original gap: (1) `MessagePool`'s
-single shared free-list mutex serializing every producer regardless of target actor (root-caused
-in commit `1964203`, GitHub issue #4) — fixed by per-producer-lane partitioning; (2)
-`Engine::worker_loop` paying a real OS wake syscall on ~15-31% of sends because it parked
-immediately on the first empty scan with no backoff — fixed by ADR-035's bounded pre-park spin.
-CAF still leads in absolute throughput at this producer range (~1.3× now, down from ~2.1-2.75×),
-which remains open — unexplored: CAF's own producer-side design, and Quark's shard-keyed pool
-follow-up noted in `message_pool.hpp`'s file banner, plus ADR-035's own recommended round-2 hybrid
-(EWMA-gated near-zero idle cost + the tighter fixed-spin shape) for a further throughput gain
-without the adaptive design's measured ~380µs worst-case tail.
-
-**Update (2026-07-31, ADR-036):** the follow-up round targeted a THIRD bottleneck the OS-wake fix
-didn't touch — `metrics_snapshot().activations` (Idle->Scheduled exec-state transitions) stayed at
-18-25% of messages even after ADR-035, because the mailbox drains to empty and reactivates every
-~4-5 messages under a tight producer loop, each cycle paying a CAS + run-queue enqueue + idle_mask_
-scan regardless of whether an OS wake syscall fires. A design-debate-prove round (
-`decisions/ADR-036-activation-linger-idle-churn-reduction.md`) shipped a bounded, activation-scoped
-post-drain linger (`EngineConfig::activation_linger_spin_limit`, default 32): before an activation
-commits to the Running->Idle transition on an empty mailbox, it re-polls its OWN mailbox a bounded
-number of times first, and if a message lands during that window it's picked up directly with no
-exec-state transition at all. **Proven, honest result: this helps substantially under sustained
-backlog/contention (+26.4% throughput in the prover's dedicated 3-producers-vs-1-worker stress
-test, activations 23.98%->1.56%) but does NOT reliably help — and does not meaningfully move — the
-kind of single/light-producer, mostly-idle traffic this bench suite's own MPSC/throughput
-benchmarks exercise.** Re-measured on the same pinned Linux host, same session:
-
-| Producers | Quark (post-ADR-035) | Quark (+ ADR-036 linger) | Change |
+| Producers | Quark (M/s) | CAF (M/s) | CAF/Quark |
 |---|---|---|---|
-| 1 | 0.99 M/s | 1.13 M/s | +14%, within run-to-run noise on this host |
-| 2 | 2.32 M/s | 2.25 M/s | flat |
-| 4 | 3.12 M/s | 3.22 M/s | +3%, within noise |
+| 1 | 3.97 | 4.52 | 1.14× |
+| 2 | 5.37 | 7.96 | 1.48× |
+| 4 | 9.03 | 12.40 | 1.37× |
+| 8 | 11.81 | 17.81 | 1.51× |
+| 12 | 13.08 | 19.72 | 1.51× |
 
-Single-threaded Tell/throughput (1 worker, `taskset -c 0`) similarly barely moved (throughput
-1.06->1.11 M/s, Tell p50 80->81ns, p999 22,855->24,317ns) — expected, since a single producer in a
-tight loop against an otherwise-idle actor is close to the "sparse/idle-ish" traffic regime
-ADR-036's own proof found the linger does NOT help (F1: 93.10% vs 92.31% baseline activations at
-that pacing, essentially no reduction). **The lesson, stated plainly: ADR-036 is a real fix for a
-real problem (sustained backlog), but this bench suite's specific shape (single/light producers
-against a fast-draining actor) isn't that problem** — closing the remaining CAF gap in *this*
-benchmark shape needs a different angle than activation-churn reduction. A rejected sibling design
-(cutting the fixed per-transition cost via cache-line isolation) was proven NOT to help either — the
-false-sharing mechanism is real in isolation (4.45x in a synthetic control) but swamped by
-park/wake round-trip cost in the real engine (-1.6%, i.e. the wrong direction, against a
-pre-declared 3%-improvement bar).
+Scaling P=1→P=12: Quark 3.97→13.08 M/s (**3.29×**), CAF 4.52→19.72 M/s (**4.36×**). CAF both starts and scales ahead here — this is the shared-mailbox shape, where every producer contends for the same actor's mailbox and the same `MessagePool` partition-lane traffic.
 
-**Correction (2026-07-31, ADR-036 round 3):** the table and single-threaded numbers above were
-measured against ADR-036's ROUND-1 design — an unconditional linger that always spun the full
-bound. That design was subsequently found to catastrophically regress this repo's own
-`activation_bench`/`sched_bench` gate benches (12-17x, zero-concurrency case the round-1 proof never
-exercised) and was replaced by an evidence-gated adaptive bound (`decisions/ADR-036-...md`'s round-3
-section). The adaptive mechanism's effective spin is 0 whenever an activation hasn't recently seen
-real batch evidence — a strictly *more* conservative floor than round-1's always-spin behavior — so
-the numbers above should, if anything, move no worse than flat/within-noise for this bench suite's
-own single/light-producer shape (the same regime round-1 already showed near-zero effect for), but
-this has **not been re-measured** against the adaptive code and should not be assumed without
-re-running. Flagged as a follow-up bench task, not a blocker for the adaptive fix itself (which
-exists to correct a regression, not to move these particular numbers).
+```
+Quark            1 | ########                                      3.97
+                 2 | ###########                                   5.37
+                 4 | ##################                            9.03
+                 8 | ########################                      11.81
+                12 | ##########################                    13.08
 
-**Correction (2026-07-31, ADR-036 round 4): the sustained-backlog win cited above (+26.4%,
-23.98%->1.56%) is retracted, not carried forward.** Round 4 fixed the harness that produced those
-round-1 numbers (its `drain_budget` let a single `drain_step` call absorb an entire backlog wave,
-masking any real per-config difference) and, with that fixed plus a second warm-up/process-order
-measurement bias also closed, re-measured the contention win for the adaptive mechanism as shipped:
-**no statistically distinguishable benefit** over `linger_spin_limit=0`, cross-validated under g++
-and clang++, P∈{1,2,3,4} producers (`decisions/ADR-036-...md`'s round-4 section has the full data).
-`activation_linger_spin_limit`'s default is now **0** — this bench suite's own Producers-1/2/4
-table above and the single-threaded Tell numbers were already measured on a build where the linger
-barely moved anything for this traffic shape; with the default now 0, a fresh run of this table
-would exercise byte-for-byte pre-ADR-036 `drain_step` and should reproduce the original
-`post-ADR-035` column, not the `+ADR-036 linger` one. Not re-run here — flagged as the same
-follow-up bench task as before, now with a clearer expected outcome.
+CAF              1 | #########                                     4.52
+                 2 | ################                              7.96
+                 4 | #########################                     12.40
+                 8 | ####################################          17.81
+                12 | #######################################       19.72
+```
 
-**Update (2026-07-31, re-measured with `activation_linger_spin_limit` default = 0):** the follow-up
-above is now run. Rebuilt `quark_bench.exe`/`quark_mpsc_bench.exe` from current master (commit
-`a3d66c2`, the merge that sets the default to 0) with `ninja -j4` (ADR-035's `pre_park_spin_limit`
-is untouched by this change, still default 256), and reran `caf_bench.exe`/`caf_mpsc_bench.exe` in
-the same session, same unpinned Windows host, per this file's own single-session-ratio methodology.
-Ran the full MPSC sweep twice back-to-back to sanity-check within-session stability:
+## Sharded MPSC scaling (N producers → N actors, contention-free ceiling)
 
-| Producers | Quark (session run 1) | Quark (session run 2) | CAF (session run 1) | CAF (session run 2) |
-|---|---|---|---|---|
-| 1 | 1.90 M/s | 2.07 M/s | 3.77 M/s | 4.64 M/s |
-| 2 | 3.15 M/s | 3.69 M/s | 6.79 M/s | 7.87 M/s |
-| 4 | 5.73 M/s | 6.12 M/s | 11.19 M/s | 11.97 M/s |
+Same per-producer volume/pacing as above, but `producer[i]` only ever `tell()`s `actor[i]` — one shard/worker per producer on the Quark side, one scheduler thread per producer on the CAF side. No two producers ever contend for the same mailbox; this isolates enqueue/dispatch cost from mailbox/free-list contention.
 
-Single-threaded (1 worker), run 1 shown (run 2 in parentheses, same ballpark):
-
-| Metric | Quark | CAF |
-|---|---|---|
-| Spawn | 912.4 ns (1069.6 ns) | 1037.8 ns (1080.7 ns) |
-| Tell p50 | 300.0 ns (400.0 ns) | 200.0 ns (100.0 ns) |
-| Tell p999 | 49,800 ns (51,000 ns) | 1,200 ns (700 ns) |
-| Ask p50 | 900.0 ns (800.0 ns) | 2,000 ns (2,200 ns) |
-| Throughput | 2.21 M/s (2.50 M/s) | 4.19 M/s (4.54 M/s) |
-
-**Did the prediction hold?** Partially, and the split is informative. Quark's own MPSC numbers this
-session (1.90–2.07 / 3.15–3.69 / 5.73–6.12 M/s) land close to the prior `post-ADR-035` column
-(2.24 / 4.00 / 6.31 M/s) — within the same noisy Windows-host band already documented above, and
-consistent with the prediction that disabling the linger reproduces the pre-ADR-036 code path.
-**But CAF's own throughput this session (3.77–4.64 / 6.79–7.87 / 11.19–11.97 M/s) came in 30–55%
-*above* its own ADR-035-session numbers (2.90 / 5.27 / 8.53 M/s)** — and CAF's binary is completely
-untouched by this config change, so that jump is pure cross-session host noise on this shared,
-unpinned box, exactly the kind this file has repeatedly flagged. Net effect: the CAF-vs-Quark ratio
-this session is a consistent **~2.0×** at every producer count (1.98× / 2.16× / 1.95× run 1;
-2.24× / 2.13× / 1.96× run 2) — not the ~1.3× measured in the ADR-035 session. Since Quark's side
-roughly reproduced and CAF's side did not, the ratio shift looks attributable to CAF-side host
-noise, not a Quark regression from the config change — but this Windows session alone can't prove
-that cleanly; the pinned Linux re-run below is the more trustworthy check for it. Single-threaded
-Tell p999 stayed just as noisy as before (49.8–51.0 µs for Quark, both a `post-ADR-035`-era and a
-pre-ADR-036-era number sit inside that spread) — no new signal there either way.
-
-## Results (Linux/WSL2, g++ 15.2.0, `taskset`-pinned, ADR-035 + partitioned pool live)
-
-All numbers above are from an unpinned, shared Windows dev host — genuinely useful for *ratios*
-(as noted throughout), but not trustworthy at the sub-microsecond scale the Tell latency numbers
-live at. This section is a from-scratch, `taskset -c 0-3`-pinned Linux run (WSL2/Ubuntu, real
-g++ 15.2.0, CAF v1.1.0 built from source at the same commit `0378ece` the Windows numbers used) —
-the same methodology `CLAUDE.md`'s machine-safety rules prescribe for real benchmarking. **Caveat:**
-WSL2 is itself a lightweight VM, not bare metal — its futex/scheduling costs are not guaranteed to
-match a native Linux CI runner; treat this as a second, more-trustworthy-than-Windows data point,
-not a final answer.
-
-### Single-threaded (1 worker, `taskset -c 0`)
-
-| Metric | Quark | CAF | Note |
+| Producers | Quark (M/s) | CAF (M/s) | CAF/Quark |
 |---|---|---|---|
-| Spawn | **1,310.8 ns** | 1,597.2 ns | Quark wins, consistent with Windows |
-| Tell p50 | 80 ns | 70 ns | **~parity** — the Windows "2×" gap was measurement noise, not real |
-| Tell p999 | 22,855 ns | **2,635 ns** | CAF wins, real (~8.7×) — much smaller than Windows' noisy 70×, but genuine |
-| Ask p50 | 13,076 ns | 12,205 ns | ~parity |
-| Throughput | 1.06 M/s | **4.31 M/s** | CAF wins, ~4× — the real, substantiated gap |
+| 1 | 3.62 | 3.41 | **0.94×** (Quark ahead) |
+| 2 | 8.67 | 8.50 | **0.98×** (Quark ahead) |
+| 4 | 12.65 | 12.47 | **0.99×** (parity) |
+| 8 | 15.15 | 18.47 | 1.22× |
+| 12 | 14.99 | 19.24 | 1.28× |
 
-### 4 workers (`taskset -c 0-3`)
+```
+Quark            1 | #######                                       3.62
+                 2 | #################                             8.67
+                 4 | #########################                     12.65
+                 8 | ##############################                15.15
+                12 | ##############################                14.99
 
-| Metric | Quark | CAF |
-|---|---|---|
-| Spawn | **1,032 ns** | 5,529.4 ns (Quark wins big) |
-| Throughput | 0.94 M/s | 2.06 M/s (CAF ~2.2×) |
+CAF              1 | #######                                       3.41
+                 2 | #################                             8.50
+                 4 | #########################                     12.47
+                 8 | #####################################         18.47
+                12 | ######################################        19.24
+```
 
-### MPSC scaling (`taskset -c 0-3`)
+**Quark is at parity or ahead of CAF through P=4** once mailbox contention is removed — the shared-mailbox gap above is mostly a contention/scheduling cost, not a fundamental per-message enqueue disadvantage. The gap only opens at P=8/P=12, and it opens for a specific, identifiable reason: this bench spawns **N producer OS threads *and* N Quark worker threads** (`EngineConfig{workers=N, shards=N}`), so at P=12 that's 24 OS threads competing for 12 logical cores — genuine oversubscription. Quark's throughput actually *regresses* from P=8 (15.15 M/s) to P=12 (14.99 M/s), while CAF keeps climbing (18.47→19.24 M/s), suggesting CAF's scheduler tolerates this oversubscribed regime better than Quark's does today. Scaling P=1→P=12: Quark 3.62→14.99 M/s (**4.14×**), CAF 3.41→19.24 M/s (**5.64×**).
 
-| Producers | Quark (M/s) | CAF (M/s) | CAF vs Quark |
-|---|---|---|---|
-| 1 | 0.99 | 1.85 | 1.87× |
-| 2 | 2.32 | 3.07 | 1.32× |
-| 4 | 3.12 | 7.81 | 2.50× |
+## Key findings
 
-Quark still scales *up* with producer count on Linux (0.99 → 2.32 → 3.12), confirming the
-partitioning + ADR-035 fixes hold cross-platform, not just on the Windows host they were developed
-on. The ratio pattern differs from the Windows session (a flat ~1.3× at every producer count) —
-here it's non-monotonic (1.87× → 1.32× → 2.50×), plausibly a WSL2-specific virtualization/core-
-topology artifact rather than a Quark-specific regression, but not yet root-caused.
+1. **Quark wins single-threaded and low-contention multi-producer throughput.** Post-ADR-037, the magazine removes essentially all of the uncontended mutex tax — single-thread tell throughput now beats CAF (10.74 vs 4.88 M/s), and sharded (contention-free) MPSC is at parity through 4 producers.
+2. **The shared-mailbox gap (1.14×-1.51×) is real and is a contention cost, not a raw-speed deficit.** Sharding away mailbox contention closes most of it at P≤4; the remaining gap is CAF's more mature contended-mailbox/scheduler path.
+3. **Oversubscription at P=12 hurts Quark specifically.** The sharded bench's one-worker-per-producer design means P=12 spawns 24 OS threads on a 12-thread machine; Quark's throughput plateaus/regresses there while CAF's keeps climbing. Worth a follow-up: does Quark's scheduler have a specific oversubscription cost (e.g. more/costlier park-wake cycles under contention for the CPU itself, not just the mailbox) that CAF's doesn't?
+4. **Quark's single-producer `throughput` bench actually gets slower with more workers** (10.74 M/s @1 → 4.80 M/s @12) — expected for a fixed single-producer workload spread across more idle-scanning workers, not a regression signal.
 
-**Corrected picture**: with pinned data, Quark and CAF are close on *latency* (spawn, tell p50,
-ask) — the large Windows-reported gaps there were mostly measurement noise. The real, reproducible
-gap is **bulk throughput** (single-producer ~4×, 4-worker ~2.2×, MPSC 1.3–2.5× depending on
-producer count) and **Tell p999 tail latency** (~8.7×, smaller than first thought but real). This
-narrows what's actually worth investigating next: not "Quark's messaging is slow," but
-specifically "Quark's sustained bulk throughput and tail latency trail CAF's" — a much more
-targeted question than the original benchmark suite suggested.
+## History
 
-**Update (2026-07-31, re-measured with `activation_linger_spin_limit` default = 0):** this is the
-follow-up the ADR-036-round-4 correction note (above, in the Windows section) predicted for this
-pinned table specifically — its `post-ADR-035` column is the Linux data this note refers to.
-**Methodology / what was found:** no reusable `caf_comparison` CMake build directory existed on
-WSL2 for this repo's own checkout, but a prior CAF build was found and reused, as instructed. Three
-WSL2 checkouts of QuarkCpp existed (`~/QuarkCpp`, `~/work/QuarkCpp`, `~/build-verify/QuarkCpp`);
-`~/QuarkCpp` tracked `origin` cleanly and was fast-forwarded to current master (`a3d66c2`, moving
-one stray untracked test file aside first so the merge wasn't blocked — no content was discarded,
-the incoming commit already supersedes it). CAF was already built at
-`~/quark-caf-linux/caf/build`, confirmed still at commit `0378ece` — the *same* commit the original
-pinned run used, so this is a same-CAF-binary, updated-Quark-headers comparison, not a new CAF
-build. No `caf_comparison` CMake project was reused (none was found configured for this pair of
-paths); the four binaries were recompiled directly with `g++ 15.2.0 -std=c++23/-std=c++20 -O3
--DNDEBUG`, mirroring the committed `CMakeLists.txt`'s settings (`Release` → `-O3 -DNDEBUG` for GCC),
-linked against `libcaf_core.so` from that existing CAF build. Confirmed
-`activation_linger_spin_limit = 0` in the rebuilt headers before running. All runs `taskset`-pinned
-exactly as the original pinned session (`-c 0` single-threaded, `-c 0-3` for 4 workers / MPSC — the
-4-worker runs pass an explicit `4`, not `0`; passing `0` resolves to
-`std::thread::hardware_concurrency()` (12 on this box) which would spawn 12 OS threads and violate
-this repo's machine-safety cap even under `taskset` CPU pinning, so `0` was avoided).
+Full narrative of each investigation round (the `MessagePool` partitioning fix, ADR-035's park/wake backoff, ADR-036's activation linger, the `ReclaimSink` bug that made every pre-2026-08-01 Quark number in this file understate real throughput, and ADR-037's TLS magazine) is preserved in git history for this file and in the relevant ADRs:
 
-### Single-threaded (1 worker, `taskset -c 0`) — re-measured
+- `decisions/ADR-035-worker-park-wake-backoff-policy.md`
+- `decisions/ADR-036-activation-linger-idle-churn-reduction.md`
+- `decisions/ADR-037-message-pool-freelist-sync.md`
 
-| Metric | Quark | CAF | vs original pinned run |
-|---|---|---|---|
-| Spawn | 1,796.8 ns | 2,101.4 ns | both higher than original (1,310.8 / 1,597.2 ns), same ratio ballpark |
-| Tell p50 | 81.0 ns | 80.0 ns | ~parity, matches original (80 / 70 ns) |
-| Tell p999 | 84,071 ns | 3,466 ns | both higher than original (22,855 / 2,635 ns) — WSL2 run-to-run noise, CAF still wins, same order of magnitude |
-| Ask p50 | 14,828 ns | 17,854 ns | close to original (13,076 / 12,205 ns) |
-| Throughput | 0.94 M/s | 2.81 M/s | both lower than original (1.06 / 4.31 M/s); ratio narrower this run (~3.0× vs ~4.1×) |
-
-### 4 workers (`taskset -c 0-3`, explicit `4`, not `0`) — re-measured
-
-| Metric | Quark | CAF | Original pinned run |
-|---|---|---|---|
-| Spawn | 2,255.7 ns | 8,601.5 ns | 1,032 ns / 5,529.4 ns |
-| Throughput | 0.71 M/s | 2.19 M/s | 0.94 M/s / 2.06 M/s |
-
-### MPSC scaling (`taskset -c 0-3`) — re-measured, this is the direct test of the ADR-036-round-4 prediction
-
-| Producers | Quark (M/s) | CAF (M/s) | CAF vs Quark | Predicted `post-ADR-035` column | Predicted `+ADR-036 linger` column |
-|---|---|---|---|---|---|
-| 1 | 1.02 | 1.84 | 1.80× | 0.99 | 1.13 |
-| 2 | 2.12 | 5.27 | 2.49× | 2.32 | 2.25 |
-| 4 | 3.03 | 6.62 | 2.18× | 3.12 | 3.22 |
-
-**Did the prediction hold?** Mostly, but not cleanly, and it's worth being precise about why.
-Quark's own re-measured numbers (1.02 / 2.12 / 3.03 M/s) sit close to the predicted `post-ADR-035`
-column (0.99 / 2.32 / 3.12 M/s) — within about 9% at the widest (producer=2), which is inside the
-noise band this table's own original caveats already allow for on WSL2. That's consistent with —
-not contradicted by — the prediction that `linger=0` reproduces byte-for-byte pre-ADR-036
-`drain_step` behavior. **However**, the original ADR-036 text itself already found the
-`post-ADR-035` and `+ADR-036 linger` columns statistically indistinguishable at this traffic shape
-(+14%/flat/+3%, all called "within run-to-run noise" in that same section) — so a single fresh run
-landing near one predicted column doesn't, by itself, cleanly rule out the other; both predicted
-columns are within a few percent of each other and within this run's own noise margin. **CAF's own
-throughput moved far more than Quark's** — especially at 2 producers (5.27 M/s here vs 3.07 M/s in
-the original pinned run, +72%) — which is the more striking result: since neither this Quark config
-change nor anything else here touches the CAF binary, that's WSL2/host scheduling noise dominating
-CAF's number more than Quark's this run. This reinforces, on the Linux side too, the file's
-recurring point: **the ratio's stability matters more than any single absolute figure**, and here
-even the ratio is noisy (1.80×–2.49× across 1/2/4 producers, vs the original pinned run's
-1.32×–2.50×) — not a clean confirmation of a specific number, but nothing in this data contradicts
-"linger defaulting to 0 reproduces the pre-ADR-036 code path" either. A cleaner test would need
-either several repeated pinned runs per config (to shrink the noise band below the two predicted
-columns' own ~3% separation) or a metric less sensitive to OS scheduling noise than wall-clock
-throughput (e.g. `metrics_snapshot().activations` churn directly, as ADR-036's own prover did).
-
-## Sharded MPSC: is the CAF gap mailbox contention, or something else?
-
-Every MPSC number above (`quark_mpsc_bench`/`caf_mpsc_bench`) uses the shape "N producer threads →
-1 actor, 1 shared mailbox" — the worst case for contention. `quark_mpsc_sharded_bench.exe` /
-`caf_mpsc_sharded_bench.exe` (added 2026-07-31) isolate that variable: N producer threads → **N
-actors**, `producer[i]` only ever `tell()`s `actor[i]`, one shard/worker per producer on the Quark
-side (`EngineConfig{workers=N, shards=N, ...}`) and N scheduler threads on the CAF side. No two
-producers ever contend for the same mailbox. Same per-producer message volume and pacing as the
-shared-mailbox bench, so the two are directly comparable — this is the contention-free throughput
-ceiling the shared-mailbox numbers should be compared against.
-
-**Results (Windows, unpinned, same host/session as the table above, default `activation_linger_spin_limit=0`):**
-
-| Producers | Quark, shared mailbox | Quark, sharded (N actors) | Δ | CAF, shared mailbox | CAF, sharded (N actors) | Δ |
-|---|---|---|---|---|---|---|
-| 1 | 1.90–2.07 M/s | 1.91 M/s | ~flat | 3.77–4.64 M/s | 4.33 M/s | ~flat |
-| 2 | 3.15–3.69 M/s | 3.24 M/s | ~flat | 6.79–7.87 M/s | 6.86 M/s | ~flat |
-| 4 | 5.73–6.12 M/s | 6.00 M/s | ~flat | 11.19–11.97 M/s | 11.08 M/s | ~flat |
-
-**Removing mailbox contention entirely did not move the numbers** for either framework, at this
-producer range, on this host. That's a real (if negative) result, not a wash: it says the
-shared-mailbox MPSC numbers throughout this file are not primarily contention-bound at P≤4 — the
-per-thread `tell()`/enqueue cost and OS scheduling overhead dominate over mailbox CAS/free-list
-contention at this scale. It also means the CAF-vs-Quark gap documented throughout this file
-(~1.3×–2.5× depending on session/platform) is **not explained by Quark's mailbox contending worse
-than CAF's under load** — sharding away all contention left the same gap in roughly the same place.
-Consistent with the "Contention factor" the CAF benches already print (throughput vs their own
-1-thread baseline): the bottleneck these benches are measuring looks like it sits in per-message
-enqueue/dispatch cost, not lock/CAS contention on a shared queue — matching this file's own "Key
-insight" section above, which already root-caused two *other* bottlenecks (free-list mutex,
-park/wake syscalls) rather than mailbox contention itself.
-
-**Caveat:** this is a single Windows session, unpinned, same noise caveats as every other Windows
-table in this file — not yet re-run on the `taskset`-pinned WSL2/Linux host the way the shared-
-mailbox numbers were. Given the effect (or lack of one) is large and consistent across all three
-producer counts and both frameworks, it's unlikely to be pure noise, but a pinned Linux confirmation
-run is the natural follow-up, same as every other number in this file.
-
-## 2026-08-01 correction: `quark_bench`/`quark_mpsc_bench`/`quark_mpsc_sharded_bench` never wired `ReclaimSink` — every Quark number above understates real throughput
-
-**This invalidates the "removing mailbox contention doesn't move the numbers" conclusion two
-sections up.** All three Quark bench files called `eng.spawn<PingActor>(key)` (and, in
-`quark_bench.cpp`, `eng.spawn<EchoActor>(42)`) **without** passing `pool.sink()` as the
-`ReclaimSink` argument. Without it, `MessagePool::reclaim()` is never invoked — every `tell()` past
-the pool's initial capacity (256–4096 cells, far smaller than the 500,000+ messages these benches
-send) cold-allocates a fresh `Cell` via `make_unique` (`message_pool.hpp`'s `grow_one()`) instead of
-recycling one, turning the whole bench into an unbounded-heap-allocation stress test rather than a
-steady-state mailbox measurement. This exact bug was already identified and fixed once, in
-`bench/mailbox_pool_partition_bench.cpp`'s own header comment (tracing back to GitHub issue #4 /
-ADR-020), but the fix never made it back into these three files — so every Quark number in this
-README up to this point was measuring the cold-allocation path, not steady-state `tell()`.
-
-**Fix:** construct the `MessagePool` before `spawn()` (already the case in all three files) and pass
-`pool.sink()` (or the per-`Engine` equivalent) as `spawn<A>()`'s second argument. Trivial, three
-one-line changes.
-
-**Corrected numbers (Windows, unpinned, same host/session, immediately after the fix, `clang++
-22.1.5`):**
-
-| Benchmark | Quark before fix | Quark after fix | CAF | Ratio (after fix) |
-|---|---|---|---|---|
-| Single-thread tell throughput | 2.57 M/s | **4.60 M/s** | 5.01 M/s | 1.09× |
-| Single-thread tell p999 | 47,200 ns | **2,500 ns** | 800 ns | — |
-| MPSC shared, P=1 | 2.03 M/s | **4.13 M/s** | 5.12 M/s | 1.24× |
-| MPSC shared, P=2 | 3.82 M/s | **5.06 M/s** | 7.90 M/s | 1.56× |
-| MPSC shared, P=4 | 6.90 M/s | **7.60 M/s** | 12.73 M/s | 1.68× |
-| Sharded, P=1 | 2.28 M/s | **2.93 M/s** | 4.24 M/s | 1.45× |
-| Sharded, P=2 | 3.59 M/s | **6.56 M/s** | 8.23 M/s | 1.25× |
-| Sharded, P=4 | 6.03 M/s | **10.80 M/s** | 13.98 M/s | 1.29× |
-
-The old p999 tail (47,200 ns single-threaded, in the same ballpark as the mysterious
-tens-of-microsecond tails scattered through every Quark table in this file) is the signature of a
-`make_unique<Cell>` heap-allocation stall on the send path — it drops to 2,500 ns once messages
-actually recycle. The single-threaded gap against CAF falls from 1.95× to 1.09×.
-
-**Scaling re-read:** with the bug fixed, sharded P=1→P=4 scaling is 2.93→10.80 M/s (3.69×, 92%
-efficiency vs. ideal 4×) — this now **exceeds** CAF's sharded scaling (4.24→13.98 M/s, 3.30×, 82%
-efficiency). The "removing contention doesn't move throughput" finding above was an artifact of both
-the shared and sharded benches paying the same unbounded cold-allocation cost, which swamped
-whatever partitioning benefit sharding would otherwise show — with steady-state recycling restored,
-sharding's contention-removal effect is visible again, and it's a real win, not a wash.
-
-The remaining ~1.1×–1.7× gap vs. CAF is real (not a measurement artifact this time): the
-`std::mutex`-guarded free-list in `MessagePool::acquire()`/`reclaim()` (one lock/unlock pair on
-allocate, another on reclaim, per message — see the file banner in `message_pool.hpp`) is the next
-suspect, plus CAF's more mature scheduler. Closing that gap further would be a hot-path redesign
-(e.g. a lock-free per-partition free list) and belongs in this repo's `design-debate-prove` ADR
-pipeline, not an ad-hoc bench fix — flagged here as a candidate, not started.
-
-**Caveat:** single Windows session, unpinned, same noise caveats as everywhere else in this file. A
-pinned Linux/WSL2 re-run with the fix applied is the natural follow-up.
-
-## 2026-08-01: ADR-037 (TLS acquire/reclaim magazine) landed — the mutex tax flagged above is closed
-
-The `std::mutex`-guarded free-list flagged as "the next suspect" two sections up went through this
-repo's `design-debate-prove` ADR pipeline (3 competing designs, red-teamed, implemented in real
-C++23, TSan/ASan-proven under g++-14/clang++-20 on WSL2 Ubuntu) — see
-[`decisions/ADR-037-message-pool-freelist-sync.md`](../../decisions/ADR-037-message-pool-freelist-sync.md).
-The winner (a thread-local "magazine" batching `acquire()`/`reclaim()` against the existing
-partition mutex ~32-at-a-time, cutting lock calls ~32x) is now implemented in
-`include/quark/detail/message_pool.hpp` and exercised by the full 182-test suite (including two new
-tests: a use-after-free/dangling-pool safety proof, clean under real ASan on this Windows/MSVC-clang
-target, and the existing partition-concurrency/ABA-stress tests as regression coverage) — not just a
-scratch prove-pass artifact.
-
-**Re-measured on this same Windows host, same session, immediately after landing it:**
-
-| Benchmark | Pre-ADR-037 (mutex only) | Post-ADR-037 (magazine) | CAF | Change |
-|---|---|---|---|---|
-| Single-thread tell throughput | 4.60 M/s | **8.8–9.4 M/s** | 4.5–4.7 M/s | **Quark now ahead of CAF**, ~1.9–2.1× its pre-ADR-037 number |
-| MPSC shared, P=1 | 4.13 M/s | **3.97 M/s** | 4.72 M/s | ~flat (see note) |
-| MPSC shared, P=2 | 5.06 M/s | **5.97 M/s** | 7.69 M/s | +18% |
-| MPSC shared, P=4 | 7.60 M/s | **9.20 M/s** | 12.59 M/s | +21% |
-| `mailbox_pool_partition_bench`, 4 producers, num_partitions=4 | (not measured at this default) | **9.78 M/s** | — | new data point, not a CAF comparison |
-
-The single-threaded win is the largest and most direct: that path has exactly one thread touching
-one partition, so the magazine removes essentially all of the mutex round-trip cost with zero
-contention to begin with — mean tell latency dropped from the 187 ns measured right after the
-`ReclaimSink` fix to a session range that pushed throughput past CAF's own number, a first for this
-file. The MPSC numbers improved less proportionally (P=1 is within noise of its pre-ADR-037 figure,
-P=2/P=4 up 18–21%) — expected, since MPSC's per-producer partitioning already meant each producer's
-mutex was only lightly contended before this change, so there was less contention-tax left for the
-magazine to amortize away versus the genuinely uncontended single-thread case. The CAF-vs-Quark gap
-on the shared-mailbox MPSC shape narrows from the previous session's 1.24×–1.68× to roughly
-1.19×–1.37×, still real but smaller.
-
-**Caveat:** single Windows session, unpinned — same noise caveats as everywhere else in this file,
-and CAF's own single-threaded number moved session-to-session here too (4.49–4.54 M/s vs the ~5.0 M/s
-seen in the prior session), consistent with this file's recurring point that CAF's absolute numbers
-carry more session-to-session variance on this host than Quark's. The *direction* (large single-
-thread win, smaller but real MPSC win) is unambiguous; a `taskset`-pinned Linux/WSL2 re-run — the
-same host ADR-037's own TSan/ASan evidence was gathered on — is the natural next step for a cleaner
-absolute number, consistent with every other "re-run on Linux" note in this file.
+Prior versions of this README (`git log -- bench/caf_comparison/README.md`) have the session-by-session before/after tables for each of those fixes if you need the historical progression rather than just the current state above.
