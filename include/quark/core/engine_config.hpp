@@ -116,6 +116,25 @@ struct EngineConfig {
     // pre-linger drain_step). Never unbounded — the setter clamps to kLingerSpinLimitMax (4096) to
     // keep the evidence-scaled bound arithmetic overflow-free.
     std::uint32_t activation_linger_spin_limit = 0;
+    // ADR-038: bounded cooperative drain-owner eviction. Under OS-thread oversubscription (worker +
+    // producer thread count > hardware_concurrency()), a worker holding a shard's `drain_owner` can be
+    // preempted mid-drain; every other worker's scan just sees the shard as owned and skips it (never
+    // blocks), so a producer's message is stuck until the OS specifically reschedules the preempted
+    // owner — an OS-reschedule-timescale stall (observed: p999 ~4x and max latency ~60x worse at 2x
+    // oversubscription, bench/caf_comparison/README.md). This knob bounds how many `cpu_relax()`
+    // iterations a contending worker probes the owner's per-activation progress checkpoint before
+    // posting a generation-tagged eviction request; the owner honors it voluntarily at its own next
+    // checkpoint (never mid-activation — see `cooperative_evict()`), never by force. 0 disables it
+    // (byte-for-byte the pre-ADR-038 try_drain_shard/drain_run_queue — proven, ADR-038 F1). Default is
+    // 0: ADR-038 shipped this default-off pending re-measurement of a disclosed p999 side-effect (10/10
+    // trials regressed, bounded magnitude, plausibly-but-not-yet-proven attributable to the eviction
+    // probe's added atomic traffic on the busy-poll path in the proving harness) on a quiet, dedicated
+    // host — see decisions/ADR-038-scheduler-oversubscription-tail-latency.md before enabling.
+    std::uint32_t drain_owner_steal_probe_limit = 0;
+    // Bounded `cpu_relax()`-paced spin a contender waits for the owner's ack after posting an eviction
+    // request, before giving up and falling back to skipping the shard (today's unchanged behavior).
+    // Only consulted when `drain_owner_steal_probe_limit != 0`.
+    std::uint32_t drain_owner_steal_ack_spin_limit = 128;
 
     // --- HOT-LEAF SEEDS (Live). These set the INITIAL packed HotCell word; they are the ONLY fields
     //     here that a later `reconfigure()` may change (via the HotCell, not this struct). ---------
@@ -171,6 +190,14 @@ public:
     ConfigBuilder& pre_park_spin_limit(std::uint32_t n) noexcept { cfg_.pre_park_spin_limit = n; return *this; }
     ConfigBuilder& activation_linger_spin_limit(std::uint32_t n) noexcept {
         cfg_.activation_linger_spin_limit = n;
+        return *this;
+    }
+    ConfigBuilder& drain_owner_steal_probe_limit(std::uint32_t n) noexcept {
+        cfg_.drain_owner_steal_probe_limit = n;
+        return *this;
+    }
+    ConfigBuilder& drain_owner_steal_ack_spin_limit(std::uint32_t n) noexcept {
+        cfg_.drain_owner_steal_ack_spin_limit = n;
         return *this;
     }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }

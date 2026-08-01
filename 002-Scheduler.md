@@ -313,6 +313,51 @@ isolation (4.45× in a synthetic control) but is swamped by park/wake round-trip
 engine (-1.6%, i.e. the wrong direction, against a pre-declared 3%-improvement bar) — not worth
 shipping as a performance change.
 
+### Bounded cooperative drain-owner eviction (ADR-038)
+
+Under OS-thread oversubscription (worker + producer thread count exceeds
+`hardware_concurrency()`), the worker holding a shard's `drain_owner` can be preempted mid-drain;
+every other worker's scan just sees the shard as owned and skips it (never blocks), so a producer's
+message is stuck until the OS specifically reschedules the preempted owner — an OS-reschedule-
+timescale stall, not a spin-loop-timescale one (see "Busy-spin cost under thread oversubscription"
+below for the full symptom). `EngineConfig::drain_owner_steal_probe_limit` (default **0**, disabled)
+adds a **bounded cooperative eviction handshake**, gated end-to-end on this knob so a disabled engine
+is byte-for-byte the pre-ADR-038 `try_drain_shard`/`drain_run_queue` (proven, ADR-038 claim F1): a
+contending worker whose own `try_drain_shard` CAS lost probes the current owner's per-activation
+`progress` checkpoint across a bounded `cpu_relax()` spin; if progress hasn't advanced, it posts a
+generation-tagged `evict_request` and bound-spins (`drain_owner_steal_ack_spin_limit`, default 128)
+for an ack. The owner honors the request **voluntarily**, only at its own next per-activation
+checkpoint — strictly *between* `drain_run_queue`'s calls to `run_activation`, **never mid-activation**
+— releasing `drain_owner`, fencing, and acking before the contender ever re-attempts the ordinary,
+completely unmodified `drain_owner` CAS. The contender itself never touches `run_queue`/`wheel`.
+
+**This is the sanctioned pattern for bounded `drain_owner` staleness detection — a raw
+"timeout-then-force-steal" is explicitly rejected, not merely unconsidered.** ADR-038 built that
+naive alternative as a negative control and ran it under TSan: it caught a real data race on the
+mailbox's documented single-consumer `head_` exactly as predicted (and it segfaulted once under a
+plain build). A contender may only ever *ask* the current owner to release early; it may never take
+`run_queue`/`wheel` access without going back through the pre-existing CAS. Any future change to this
+mechanism must preserve that property.
+
+**Corollary for the "never spin unbounded" principle above:** a bounded iteration count is
+necessary but not sufficient. ADR-038 also evaluated (and rejected) escalating `pre_park_spin()`'s
+`cpu_relax()` to `std::this_thread::yield()` *inside* the sites where a worker holds `drain_owner`'s
+critical section — red-team showed this lengthens exactly the stranding window the eviction mechanism
+exists to close (a yielding owner is even less likely to be rescheduled promptly than a spinning one).
+**A yield-class primitive must never be invoked while holding exclusive drain rights another worker
+may be waiting on.** Yield-escalation limited to the general idle-transition path (outside any
+`drain_owner` critical section) was evaluated separately and was not disqualified, but was not
+adopted this round either — see ADR-038's residual risks.
+
+Shipped **default-off**: ADR-038's own proving found a disclosed, not-yet-root-caused p999
+regression (10/10 trials, bounded magnitude) plausibly attributable to the eviction probe's added
+atomic traffic on the busy-poll scan path rather than the handshake itself, measured on a
+contention-polluted proving host. See
+[ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md) for the full evidence table,
+the two competing designs it rejected (yield-escalation, oversubscription-gated pre-park backoff —
+the latter *proven counterproductive*, not merely unproven, under real saturation), and the residual
+risks before enabling in production.
+
 ## Broadcast schedules activations, not messages (ADR-019)
 
 Best-effort broadcast (`Topic<M>`, [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md))
@@ -460,7 +505,7 @@ here** (002/ADR-010), not a 011 concern — the fix belongs to drain-owner
 acquisition fairness across shards assigned to one worker, not to the timer
 wheel.
 
-### Busy-spin cost under thread oversubscription (tracked, not yet root-caused)
+### Busy-spin cost under thread oversubscription (partially addressed, ADR-038)
 
 Every idle-avoidance spin on this hot path — `pre_park_spin()` (ADR-035 above), `drain_run_queue`'s
 Busy retry, and `run_activation`'s own Busy retry, all `cpu_relax()`-paced and bounded by
@@ -484,17 +529,22 @@ measurement (see that file's Machine section) — real and reproducible in this 
 `drain_owner`-holdup mechanism above is a plausible explanation from reading the code, **not yet
 isolated by a dedicated experiment**.
 
-**Scoped for a future `design-debate-prove` round, not yet run:** does escalating `cpu_relax()` to
-a real yield past some bound (unconditionally, or gated on detected oversubscription) close this gap
-without regressing the ≤core-count case ADR-035/036 already tuned? Is a bounded ownership timeout on
-`drain_owner` needed, or is preemption-while-holding-the-CAS a red herring once yielding is fixed?
-Neither ADR-035 nor ADR-036 measured worker/producer thread counts above the configured
-worker/shard count (== core count in their proving setups) — this is genuinely untested territory
-for both. `CLAUDE.md`'s machine-safety rule caps this repo's normal dev-box thread counts at 4
-specifically to stay clear of this regime; `bench/caf_comparison/README.md`'s P=12 sweep is a
-deliberate, documented exception to plot a full scaling curve, so this gap does not affect any
-normal build/test/bench workflow — only P > core-count topologies, which today only that one bench
-suite exercises.
+**Scoped as a `design-debate-prove` round, now run: [ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md).**
+Three competing designs were built, red-teamed, and proven against real, compiled, sanitizer- and
+benchmark-verified C++: yield-escalation (partial win — helped max latency/throughput, but regressed
+p999 further at 2× oversubscription), an oversubscription-gated pre-park backoff (**rejected — proven
+counterproductive**, max latency got worse in 9/10 trials under the exact regime it targets), and
+**bounded cooperative drain-owner eviction** (winner, see "Bounded cooperative drain-owner eviction
+(ADR-038)" above — directly targets the `drain_owner`-holdup mechanism this section describes, proven
+with a negative control that a raw force-steal is unsafe). The winning mechanism is implemented
+(`EngineConfig::drain_owner_steal_probe_limit`/`drain_owner_steal_ack_spin_limit`,
+`Engine::try_drain_shard_with_steal`/`cooperative_evict`) but shipped **default-off** pending
+re-measurement of a disclosed p999 side-effect on a quiet, dedicated host — this gap is evaluated and
+partially addressed, not fully closed. `CLAUDE.md`'s machine-safety rule caps this repo's normal
+dev-box thread counts at 4 specifically to stay clear of this regime; `bench/caf_comparison/README.md`'s
+P=12 sweep and ADR-038's own proving are both deliberate, documented exceptions to plot/probe this
+regime, so this gap does not affect any normal build/test/bench workflow — only P > core-count
+topologies, and only when the new knob is explicitly enabled.
 
 ## Open questions
 

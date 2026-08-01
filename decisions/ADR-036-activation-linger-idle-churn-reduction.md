@@ -739,6 +739,20 @@ ranking discipline:
     only matter to a caller who opts back into a non-zero `linger_spin_limit`, which is no
     longer the shipped default.
 
+### Forward reference: checkpoint granularity (ADR-038)
+
+**[ADR-038](ADR-038-scheduler-oversubscription-tail-latency.md)** (bounded cooperative drain-owner
+eviction, addressing scheduler tail latency under OS-thread oversubscription) independently converges
+on the same granularity rule this ADR's round 3 established for the activation linger: a checkpoint
+usable by another party (there, a contender's steal probe; here, the linger's own re-poll) may only
+ever land *between* discrete units of work — between one `run_activation`/`drain_step` call and the
+next — **never mid-activation, never mid-handler**. ADR-038's own pathological-activation control
+confirms this honestly: a long, checkpoint-free activation gets zero help from cooperative eviction,
+by design, the same disclosed boundary this ADR's residual risk #9 records for the linger (an
+isolated post-idle-gap burst gets zero benefit until evidence accumulates). Both ADRs treat
+"checkpoint between activations, never inside one" as the load-bearing granularity rule for this hot
+path — a future mechanism on either axis should preserve it rather than re-litigate it.
+
 ### Round 4 verdict summary
 
 **Residual risk #7 is closed.** The F2/F5 harness bug (a backlog workload that was saturated

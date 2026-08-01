@@ -200,6 +200,19 @@ negative control's teeth intact.
    that pursues Design 2 or the hybrid toward production should broaden this coverage
    to match Design 1's boundary-value testing discipline before sign-off.
 
+## Forward references
+
+- **[ADR-038](ADR-038-scheduler-oversubscription-tail-latency.md)** evaluated (and rejected) extending
+  `pre_park_spin()`'s escalation with an oversubscription-gated `std::this_thread::yield()` tail —
+  its F4 claim measured the yield-tail's own wall-clock cost (p50/p99/max) as *worse* than the plain
+  256-iteration `cpu_relax()` baseline it would replace, 5/5 runs across both g++ and clang++. This is
+  a concrete, measured instance of the same SAFE-4-class hazard this ADR identified in rejecting
+  Design 2 (a materially better average case purchased with a worse realistic-workload worst case) —
+  the same discipline applies again, on a different axis (oversubscription rather than burst
+  detection). ADR-038's own winning fix for the P > core-count tail-latency regime is a different
+  mechanism entirely (bounded cooperative `drain_owner` eviction, not a park/wake change) — this
+  ADR's Design 1 choice is reconfirmed, not revisited.
+
 ## Spec-update recommendations
 
 **`002-Scheduler.md`**

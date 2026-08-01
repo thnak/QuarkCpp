@@ -771,6 +771,22 @@ private:
     struct alignas(::quark::cache_line_size) Shard {
         RunQueue<Policy> run_queue;
         QUARK_CACHE_ALIGNED std::atomic<std::uint32_t> drain_owner{kNoOwner};  // null→self per session
+        // ADR-038: bounded cooperative drain-owner eviction state. Own cache line, deliberately
+        // separate from `drain_owner` above. `progress` is owner-only-written (single-writer relaxed,
+        // same discipline as ShardCounters::inc() — bumped once per activation dispatched, strictly
+        // BETWEEN run_activation calls, never mid-activation: the checkpoint granularity floor is
+        // intentional, see try_drain_shard/drain_run_queue below). `evict_request`/`evict_ack` are the
+        // generation-tagged request/ack pair a contending worker and the current owner rendezvous
+        // through; `next_gen` is the shard-scoped monotonic generation source (0 reserved for "no
+        // request"). Every field here is read/written ONLY when
+        // `cfg_.drain_owner_steal_probe_limit != 0` — zero cost (beyond the struct's footprint,
+        // ~64 B/shard, 023-irrelevant) when disabled, the shipped default.
+        struct QUARK_CACHE_ALIGNED EvictState {
+            std::atomic<std::uint64_t> progress{0};
+            std::atomic<std::uint32_t> evict_request{0};  // 0 = none; else a live generation tag
+            std::atomic<std::uint32_t> evict_ack{0};      // owner sets == the honored generation
+            std::atomic<std::uint32_t> next_gen{1};       // shard-scoped monotonic generation source
+        } evict_{};
         ShardCounters metrics;  // 009: this shard's counter block (cold-allocated with the array)
         // ADR-028 Phase 2: the per-shard idle-eviction wheel + its Deactivate-entry pool. Single-
         // writer by construction — only the worker currently holding `drain_owner` for this shard ever
@@ -1018,7 +1034,7 @@ private:
         const auto& order = workers_[wid].scan_order;
         bool any = false;
         for (std::uint32_t sh : order) {
-            if (try_drain_shard(wid, sh)) {
+            if (try_drain_shard_with_steal(wid, sh)) {
                 any = true;
                 return true;  // restart the scan → re-prefer own shards (locality)
             }
@@ -1056,12 +1072,22 @@ private:
 
         bool processed = false;
         for (;;) {
-            drain_run_queue(sid, sh, processed);
+            // ADR-038: `drain_run_queue` returns true iff it vacated early via `cooperative_evict()` —
+            // that call already released `drain_owner`, fenced, and acked, so this session's ordinary
+            // close-out below must NOT run again (it would double-release/double-fence a slot another
+            // worker may already own).
+            if (drain_run_queue(sid, sh, processed)) return processed;
             advance_wheel(sh);  // 011/ADR-028 Phase 2: opportunistic per-shard idle-eviction tick
 
             // Close out the drain session — the {drain_owner, run-queue tail} Dekker vs producers.
             sh.drain_owner.store(kNoOwner, std::memory_order_release);
             pal::store_load_barrier();  // consumer half of the drain-owner Dekker (always a barrier)
+            // ADR-038: also clear a pending request HERE, not only inside `cooperative_evict()` — a
+            // request posted into the narrow window between `drain_run_queue`'s last checkpoint and
+            // this close-out would otherwise be orphaned (a contender's ack-spin would time out even
+            // though the shard is, in fact, already free). Skipped entirely when disabled.
+            if (cfg_.drain_owner_steal_probe_limit != 0)
+                sh.evict_.evict_request.store(0, std::memory_order_release);
             if (!sh.run_queue.has_work()) break;  // truly empty — stay released
 
             // Work appeared in the release window: re-acquire and keep draining, else another
@@ -1076,6 +1102,59 @@ private:
         // for this shard), so the plain non-atomic-RMW inc() is safe.
         if (processed && home_worker(sid) != wid) sh.metrics.steals.inc();
         return processed;
+    }
+
+    // ADR-038: bounded cooperative drain-owner eviction — the CONTENDER's half, reached only when
+    // `try_drain_shard`'s own CAS above already lost (another worker currently owns this shard's
+    // drain). Disabled (`drain_owner_steal_probe_limit == 0`, the shipped default) short-circuits
+    // before touching `evict_` at all — proven byte-identical in effect to calling `try_drain_shard`
+    // alone (ADR-038 F1). When enabled: probe whether the owner's `progress` checkpoint has advanced
+    // across a bounded relax-spin — if it has, the owner is alive and working, back off and do not
+    // interfere (this call never blocks). If it hasn't, post a generation-tagged eviction request and
+    // bound-spin for the owner's ack, which is posted only at the owner's OWN next per-activation
+    // checkpoint (`cooperative_evict()` below) — never forced. On ack, re-attempt the ordinary,
+    // completely unmodified `drain_owner` CAS in `try_drain_shard`; a timeout falls back to today's
+    // "skip, never block" behavior, unchanged. This function never touches `run_queue`/`wheel` itself —
+    // only `try_drain_shard`'s pre-existing CAS ever does, so those single-writer-documented structures
+    // are never touched by two threads at once in any interleaving (ADR-038 S1, proven with a negative
+    // control: the naive "just force-steal after a timeout" alternative was built and TSan caught a
+    // real race on the mailbox's non-atomic `head_` exactly as predicted).
+    bool try_drain_shard_with_steal(std::uint32_t wid, std::uint32_t sid) noexcept {
+        if (try_drain_shard(wid, sid)) return true;
+        if (cfg_.drain_owner_steal_probe_limit == 0) return false;
+
+        Shard& sh = shards_[sid];
+        const std::uint32_t owner = sh.drain_owner.load(std::memory_order_acquire);
+        if (owner == kNoOwner || owner == kBackstopOwner)
+            return false;  // already released, or the backstop's brief window — nothing to evict
+
+        const std::uint64_t p0 = sh.evict_.progress.load(std::memory_order_relaxed);
+        for (std::uint32_t i = 0; i < cfg_.drain_owner_steal_probe_limit; ++i) pal::cpu_relax();
+        if (sh.evict_.progress.load(std::memory_order_relaxed) != p0)
+            return false;  // owner made progress during the probe — alive, back off
+        if (sh.drain_owner.load(std::memory_order_acquire) != owner)
+            return false;  // owner already changed/released — nothing to evict
+
+        std::uint32_t g = sh.evict_.next_gen.fetch_add(1, std::memory_order_relaxed);
+        if (g == 0) g = sh.evict_.next_gen.fetch_add(1, std::memory_order_relaxed);  // 0 == "no request"
+
+        std::uint32_t expected_req = 0;
+        if (!sh.evict_.evict_request.compare_exchange_strong(expected_req, g, std::memory_order_acq_rel,
+                                                              std::memory_order_relaxed))
+            return false;  // another contender already has a request in flight for this shard
+
+        bool acked = false;
+        for (std::uint32_t i = 0; i < cfg_.drain_owner_steal_ack_spin_limit; ++i) {
+            pal::cpu_relax();
+            if (sh.evict_.evict_ack.load(std::memory_order_acquire) == g ||
+                sh.drain_owner.load(std::memory_order_acquire) == kNoOwner) {
+                acked = true;
+                break;
+            }
+        }
+        if (!acked) return false;  // owner never reached a checkpoint in time — fall back, unchanged
+
+        return try_drain_shard(wid, sid);  // ordinary, unmodified acquire CAS
     }
 
     // Cap catch-up ticks per call so a long-idle shard (worker parked, no visits for a while) can't
@@ -1158,15 +1237,33 @@ private:
     }
 
     // Pop and run activations until the run-queue reports Empty (bounded-spin on the non-linearizable
-    // Busy publish window — never unbounded, ADR-010 normative note).
-    void drain_run_queue(std::uint32_t sid, Shard& sh, bool& processed) noexcept {
+    // Busy publish window — never unbounded, ADR-010 normative note). ADR-038: at the top of each
+    // iteration — i.e. strictly BETWEEN activation dispatches, never mid-activation — check for a
+    // pending cooperative-eviction request; honoring one vacates the drain-owner slot early via
+    // `cooperative_evict()` and returns true so `try_drain_shard` skips its own close-out (already
+    // done). Every check below is gated on `cfg_.drain_owner_steal_probe_limit != 0` — 0 (the shipped
+    // default) skips all of it and this loop is byte-identical to the pre-ADR-038 version (proven, F1).
+    // Returns true iff it vacated early via cooperative eviction.
+    bool drain_run_queue(std::uint32_t sid, Shard& sh, bool& processed) noexcept {
         unsigned busy = 0;
         for (;;) {
+            if (cfg_.drain_owner_steal_probe_limit != 0 &&
+                sh.evict_.evict_request.load(std::memory_order_acquire) != 0) {
+                cooperative_evict(sh);
+                return true;
+            }
             const RunResult r = sh.run_queue.select();
             if (r.status == RunStatus::Item) {
                 processed = true;
                 busy = 0;
                 run_activation(sid, r.item);
+                // ADR-038: the checkpoint a contender's steal probe reads to tell "still making
+                // progress" from "stalled". Single-writer relaxed counter (only the drain-owning
+                // worker ever touches this, same discipline as ShardCounters::inc()) — skipped
+                // entirely when disabled.
+                if (cfg_.drain_owner_steal_probe_limit != 0)
+                    sh.evict_.progress.store(sh.evict_.progress.load(std::memory_order_relaxed) + 1,
+                                              std::memory_order_relaxed);
                 continue;
             }
             if (r.status == RunStatus::Busy) {
@@ -1178,6 +1275,22 @@ private:
             }
             break;  // Empty
         }
+        return false;
+    }
+
+    // ADR-038: the drain-owner's half of the cooperative-eviction handshake. Called only from
+    // `drain_run_queue`, only when a request is pending, only BETWEEN activation dispatches (never
+    // while a `run_activation` call is on the stack) — so this always runs with the same exclusivity
+    // `try_drain_shard`'s ordinary close-out has: release `drain_owner`, THEN fence, THEN ack. A
+    // contender never touches `run_queue`/`wheel` itself — it only ever wins them back through the
+    // pre-existing, unmodified `drain_owner` CAS in `try_drain_shard` — so those single-writer-
+    // documented structures are never touched by two threads at once in any interleaving.
+    void cooperative_evict(Shard& sh) noexcept {
+        const std::uint32_t g = sh.evict_.evict_request.load(std::memory_order_acquire);
+        sh.drain_owner.store(kNoOwner, std::memory_order_release);
+        pal::store_load_barrier();  // same Dekker fence try_drain_shard's ordinary close-out uses
+        sh.evict_.evict_request.store(0, std::memory_order_release);  // durable protocol: owner clears
+        sh.evict_.evict_ack.store(g, std::memory_order_release);
     }
 
     // Run ONE activation exactly as the 001 Activation banner documents.

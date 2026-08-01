@@ -274,6 +274,32 @@ enforced **`(d+1)·K·M`** starvation bound. *Caveat:* RMW counts came from objd
 counting + TSan (`perf_event_paranoid=4` blocked HW counters) — re-confirm with `perf c2c`
 on a `CAP_PERFMON` CI box before stamping the HW-counter form of the gate.
 
+### Scheduler oversubscription tail latency (002, ADR-038)
+
+A **distinct** regime from every ≤core-count budget above: OS thread count (workers +
+producers) exceeding `hardware_concurrency()`. Not gated by any ≤core-count Hard budget
+row — `drain_owner_steal_probe_limit`/`drain_owner_steal_ack_spin_limit` are cold
+`BuildOnly` config, default **0** (disabled), and disabled is proven byte-identical to
+pre-ADR-038 behavior (ADR-038 claim F1), so this section's numbers do not retroactively
+apply to any measurement taken above. Baseline (mechanism disabled, the shipped default),
+`bench/caf_comparison/README.md`'s stress test, single unpinned Windows host:
+
+| Metric | P=8 pairs (16 threads, 1.33× oversub.) | P=12 pairs (24 threads, 2× oversub.) |
+|---|---|---|
+| p999 | 26.4 µs | 106.7 µs (~4× worse) |
+| max latency | 339.2 µs | 20,260.9 µs (~60× worse) |
+| Aggregate throughput / correctness | holds | holds (0 lost/duplicated) |
+
+**No Hard or Goal figure is stamped for this regime yet.** ADR-038's own bounded
+cooperative drain-owner eviction fix (mechanism enabled) improved max latency in the
+majority of adversarial trials without regressing throughput, but regressed p999 by a
+bounded, not-yet-root-caused amount (10/10 trials) — proven on a single, contention-
+polluted WSL2 host, not the quiet, `taskset`-pinned Linux CI host this project's other
+budgets require before stamping a number as canonical. Populate this row's baseline and
+enabled-mechanism figures from a re-run of ADR-038's F1/F2 harness on such a host, then
+promote it to a Goal (or Hard) row here — until then this section documents that the
+regime exists and is measured, not that it is bounded.
+
 ## How a budget binds a design
 
 A budget is only real if something enforces it. Each is wired to the existing
