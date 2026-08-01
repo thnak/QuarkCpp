@@ -77,3 +77,34 @@ target_link_libraries(caf_mpsc_bench PRIVATE "${CAF_LIB}" Threads::Threads)
 if(WIN32)
     target_compile_definitions(caf_mpsc_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# --- Quark sharded MPSC bench (C++23) — N producers -> N actors, contention-free ceiling -----
+add_executable(quark_mpsc_sharded_bench quark_mpsc_sharded_bench.cpp)
+set_target_properties(quark_mpsc_sharded_bench PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(quark_mpsc_sharded_bench PRIVATE
+    "${QUARK_ROOT}"
+    "${QUARK_ROOT}/include"
+)
+target_link_libraries(quark_mpsc_sharded_bench PRIVATE "${QUARK_LIB}" Threads::Threads)
+if(WIN32)
+    target_link_libraries(quark_mpsc_sharded_bench PRIVATE ws2_32 bcrypt mincore)
+    target_compile_definitions(quark_mpsc_sharded_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# --- CAF sharded MPSC bench (C++20) -------------------------------------------
+add_executable(caf_mpsc_sharded_bench caf_mpsc_sharded_bench.cpp)
+set_target_properties(caf_mpsc_sharded_bench PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(caf_mpsc_sharded_bench PRIVATE
+    "${CAF_CORE_DIR}"
+    "${CAF_DIR}/build/libcaf_core"
+)
+target_link_libraries(caf_mpsc_sharded_bench PRIVATE "${CAF_LIB}" Threads::Threads)
+if(WIN32)
+    target_compile_definitions(caf_mpsc_sharded_bench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
