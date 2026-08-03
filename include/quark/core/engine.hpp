@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <new>
 #include <stop_token>
@@ -236,6 +237,7 @@ public:
                                         const ResourceScope* scope = nullptr) {
         static_assert(is_actor<A>, "spawn<A>: A must derive from quark::Actor<A, ...>");
         static_assert(validate_actor_policies<A>(), "spawn<A>: actor policy validation failed");
+        static_assert(validate_supervision_policies<A>(), "spawn<A>: supervision policy validation failed");
         static_assert(priority_band_of<A>() < Policy::bands,
                       "spawn<A>: Priority<P> exceeds the engine's PriorityBands<K> (P < K) — ADR-010");
 
@@ -268,6 +270,7 @@ public:
         const ActorId id = actor_id_of<A>(key);
         register_activation(id, *act, static_cast<std::uint16_t>(priority_band_of<A>()),
                             drain_budget_of<A>(), idle_ticks);
+        wire_escalation<A>(*act, id);  // 007 §Escalation: no-op if no matching supervisor is registered
         owned_actors_.push_back(std::move(actor));       // engine owns instance + Activation lifetime
         owned_activations_.push_back(std::move(act));
         return id;
@@ -295,6 +298,8 @@ public:
                                                      ReclaimSink reclaim = {}) {
         static_assert(is_actor<A>, "declare_lazy<A>: A must derive from quark::Actor<A, ...>");
         static_assert(validate_actor_policies<A>(), "declare_lazy<A>: actor policy validation failed");
+        static_assert(validate_supervision_policies<A>(),
+                      "declare_lazy<A>: supervision policy validation failed");
         static_assert(priority_band_of<A>() < Policy::bands,
                       "declare_lazy<A>: Priority<P> exceeds the engine's PriorityBands<K> (P < K) — "
                       "ADR-010");
@@ -328,6 +333,8 @@ public:
                                                      ReclaimSink reclaim = {}) {
         static_assert(is_actor<A>, "declare_lazy<A>: A must derive from quark::Actor<A, ...>");
         static_assert(validate_actor_policies<A>(), "declare_lazy<A>: actor policy validation failed");
+        static_assert(validate_supervision_policies<A>(),
+                      "declare_lazy<A>: supervision policy validation failed");
         static_assert(priority_band_of<A>() < Policy::bands,
                       "declare_lazy<A>: Priority<P> exceeds the engine's PriorityBands<K> (P < K) — "
                       "ADR-010");
@@ -360,6 +367,39 @@ public:
     [[nodiscard]] PostCourier post_courier() noexcept {
         return PostCourier{this, &resolve_courier, &post_courier_fn, &activate_courier_fn,
                            &passivate_courier_fn};
+    }
+
+    // --- Supervision (007 §Escalation; ADR-009 `Supervision<Node|PerType|Tree<…>>`) ---------
+    // `Supervisor` must `Handles<Supervisor, Escalated>` (handle(const Escalated&)) — a plain 006
+    // actor, spawned/declared like any other. Call BEFORE `spawn<A>()`/`declare_lazy<A>()` for any
+    // escalating actor `A` you want routed (wiring happens once, at `A`'s own registration).
+
+    // Register the engine-wide DEFAULT supervisor (`Supervision<Node>`, the default topology — a
+    // Tree of depth 1, 007 §Escalation). Also answers `Supervision<Tree<Supervisor>>` for the SAME
+    // Supervisor type, naming the SAME entry `set_supervisor<Supervisor>()` would.
+    template <class Supervisor>
+    void set_node_supervisor(ActorId supervisor_id) noexcept {
+        set_supervisor<Supervisor>(supervisor_id);
+        node_supervisor_key_ = type_key_of<Supervisor>();
+        has_node_supervisor_ = true;
+    }
+
+    // Register a supervisor for the NAMED type `Supervisor` — the `Tree<Supervisor>` hop target
+    // (007 §Escalation). Independent of the Node default unless also passed to
+    // `set_node_supervisor<Supervisor>()`.
+    template <class Supervisor>
+    void set_supervisor(ActorId supervisor_id) noexcept {
+        supervisor_registry_[type_key_of<Supervisor>()] =
+            SupervisorEntry{escalation_route_fn<Supervisor>(), supervisor_id};
+    }
+
+    // Register a PER-ESCALATING-ACTOR-TYPE supervisor (`Supervision<PerType>`, 007 §Escalation):
+    // faulting actor `A` escalates to `Supervisor` specifically, independent of the Node default (the
+    // Node default is still the fallback if `A` never gets its own entry here).
+    template <class A, class Supervisor>
+    void set_type_supervisor(ActorId supervisor_id) noexcept {
+        type_supervisors_[type_key_of<A>()] =
+            SupervisorEntry{escalation_route_fn<Supervisor>(), supervisor_id};
     }
 
     // --- On-demand passivation (ADR-028 Phase 8; 006 §passivate) --------------------------
@@ -610,6 +650,106 @@ private:
     // ADR-028 Phase 8: on-demand passivation wrapper.
     static bool passivate_courier_fn(void* eng, ActorId id) noexcept {
         return static_cast<Engine*>(eng)->request_passivate(id);
+    }
+
+    // ========================================================================================
+    // 007 §Escalation (ADR-009 `Supervision<Node|PerType|Tree<…>>`) — TYPE-ERASED escalation
+    // routing. `EscalationRouteFn` captures the concrete Supervisor actor TYPE at REGISTRATION time
+    // (`set_node_supervisor<Supervisor>`/`set_supervisor<Supervisor>`/`set_type_supervisor<A,
+    // Supervisor>`), not at the escalating actor's OWN `spawn<A>()` compile time — so `Node`'s and
+    // `Tree<S>`'s supervisor can be registered independently of any particular escalating actor.
+    // ========================================================================================
+    using EscalationRouteFn = void (*)(void* engine, ActorId supervisor_id, Escalated msg) noexcept;
+
+    template <class Supervisor>
+    [[nodiscard]] static EscalationRouteFn escalation_route_fn() noexcept {
+        static_assert(Handles<Supervisor, Escalated>,
+                      "Supervisor must handle(const Escalated&) to act as a 007 supervisor");
+        return +[](void* engine_erased, ActorId supervisor_id, Escalated msg) noexcept {
+            static_cast<Engine*>(engine_erased)->template route_escalation<Supervisor>(supervisor_id, msg);
+        };
+    }
+
+    // Builds + posts an `Escalated` descriptor via the engine's OWN internal pool/resolve/post path
+    // (mirrors the `Wake` control-descriptor pattern above — never a user-facing `LocalRouter`, which
+    // the fault path — deep inside a worker's `Activation::do_escalate()` — has no access to). Falls
+    // through to the lazy-activation hand-off (`activate()`) if the supervisor was `declare_lazy`'d
+    // but never yet touched; reclaims (silently drops) if the supervisor id is unresolvable at all —
+    // an unregistered/misconfigured supervisor degrades to "escalation lost", never a lane fault.
+    template <class Supervisor>
+    void route_escalation(ActorId supervisor_id, Escalated msg) noexcept {
+        static_assert(sizeof(Escalated) <= detail::MessagePool::kMaxPayload,
+                      "Escalated exceeds the engine's internal pool cell size");
+        detail::MessagePool::Slot slot = broker_pool_.acquire(&detail::destroy_payload<Escalated>);
+        Descriptor* d = slot.desc;
+        ::new (slot.payload) Escalated(msg);
+        d->payload = slot.payload;
+        d->payload_size = static_cast<std::uint32_t>(sizeof(Escalated));
+        d->trace_id = 0;
+        d->deadline_ns = 0;
+        stamp<Supervisor, Escalated>(*d);
+        Schedulable* s = resolve(supervisor_id);
+        if (s == nullptr) {
+            if (!activate(supervisor_id, d, broker_pool_.sink())) broker_pool_.reclaim(d);
+            return;
+        }
+        (void)post(s, d);
+    }
+
+    // The per-escalating-activation binding an `EscalationSink`'s `ctx` points to (which supervisor
+    // to tell, and this activation's OWN id — so `Escalated::source` names who faulted). Stored in
+    // `escalation_bindings_` (a `std::deque`: stable references under push_back, unlike `vector`).
+    struct EscalationBinding {
+        void* engine = nullptr;
+        EscalationRouteFn route = nullptr;
+        ActorId supervisor{};
+        ActorId source{};
+    };
+    struct SupervisorEntry {
+        EscalationRouteFn route = nullptr;
+        ActorId id{};
+    };
+
+    static void escalation_sink_thunk(void* /*self*/, error e, void* ctx) noexcept {
+        auto* b = static_cast<EscalationBinding*>(ctx);
+        b->route(b->engine, b->supervisor, Escalated{b->source, e});
+    }
+
+    // Resolve + wire `A`'s declared `Supervision<…>` topology into `act`'s escalation sink (007
+    // §Escalation). `Node` (default) and `Tree<S>` are resolved against `supervisor_registry_`
+    // (keyed by the SUPERVISOR's own type — `Node` falls back to whichever type was registered as
+    // the engine-wide default via `set_node_supervisor<Supervisor>()`); `PerType` is resolved against
+    // `type_supervisors_` (keyed by the ESCALATING actor A's type), falling back to the Node default
+    // if A has no dedicated entry. No match ⇒ escalation sink stays unset — `do_escalate()`'s
+    // existing default (local Stop) is unchanged, byte-for-byte, exactly as before this feature.
+    // EAGER `spawn<A>()` ONLY in this pass — a `declare_lazy<A>()`'d actor's broker-constructed
+    // Activation does not yet get this wiring (documented residual, README/OpenQuestions).
+    template <class A>
+    void wire_escalation(Activation& act, ActorId id) {
+        using Topology = supervision_topology_of<A>;
+        const SupervisorEntry* e = nullptr;
+        if constexpr (is_per_type_topology_v<Topology>) {
+            if (auto it = type_supervisors_.find(type_key_of<A>()); it != type_supervisors_.end())
+                e = &it->second;
+            else if (has_node_supervisor_) {
+                if (auto it2 = supervisor_registry_.find(node_supervisor_key_);
+                    it2 != supervisor_registry_.end())
+                    e = &it2->second;
+            }
+        } else if constexpr (is_tree_topology_v<Topology>) {
+            using S = tree_first_supervisor_t<Topology>;
+            if (auto it = supervisor_registry_.find(type_key_of<S>()); it != supervisor_registry_.end())
+                e = &it->second;
+        } else {  // Node (default)
+            if (has_node_supervisor_) {
+                if (auto it = supervisor_registry_.find(node_supervisor_key_);
+                    it != supervisor_registry_.end())
+                    e = &it->second;
+            }
+        }
+        if (e == nullptr) return;
+        escalation_bindings_.push_back(EscalationBinding{this, e->route, e->id, id});
+        act.set_escalation_sink(EscalationSink{&escalation_sink_thunk, &escalation_bindings_.back()});
     }
 
     static constexpr std::uint32_t kNoOwner = 0xFFFF'FFFFu;
@@ -1434,6 +1574,14 @@ private:
     std::vector<std::shared_ptr<void>> owned_actors_;        // type-erased actor instances (008 factory)
     std::vector<std::unique_ptr<Activation>> owned_activations_;
     std::unordered_map<ActorId, Schedulable*> by_id_;     // 006 addressing: ActorId → Schedulable
+    // 007 §Escalation (ADR-009 `Supervision<Node|PerType|Tree<…>>`) — see `wire_escalation<A>()`.
+    // `escalation_bindings_` is a `std::deque`, NOT a `vector`: a binding's address is handed to
+    // `Activation::set_escalation_sink` as `ctx` and must stay stable across later push_backs.
+    std::deque<EscalationBinding> escalation_bindings_;
+    std::unordered_map<TypeKey, SupervisorEntry> supervisor_registry_;  // Node default / Tree<S> targets
+    std::unordered_map<TypeKey, SupervisorEntry> type_supervisors_;     // PerType targets (keyed by A)
+    TypeKey node_supervisor_key_{};
+    bool has_node_supervisor_ = false;
     std::vector<std::jthread> threads_;
     std::jthread backstop_;  // 011/ADR-028 Phase 2: the engine-wide idle-shard wheel-advance backstop
     std::atomic<std::uint32_t> idle_mask_{0};  // bit w set ⇒ worker w is parked/parking

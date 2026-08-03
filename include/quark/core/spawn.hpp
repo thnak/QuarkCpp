@@ -35,6 +35,8 @@ template <class A, class Policy>
 Schedulable* register_actor(Engine<Policy>& engine, ActorId id, Activation& act) {
     static_assert(is_actor<A>, "register_actor<A>: A must derive from quark::Actor<A, ...>");
     static_assert(validate_actor_policies<A>(), "register_actor<A>: actor policy validation failed");
+    static_assert(validate_supervision_policies<A>(),
+                  "register_actor<A>: supervision policy validation failed");
     static_assert(priority_band_of<A>() < Policy::bands,
                   "register_actor<A>: Priority<P> exceeds the engine's PriorityBands<K> "
                   "(P must be < K) — ADR-010 §Validation");

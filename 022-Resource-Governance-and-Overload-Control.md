@@ -185,6 +185,32 @@ Cross-node amplification is governed not by subscriber count but by the number o
 **distinct subscriber nodes** — one coalesced frame per node — bounded by 026's
 `relay_cap = ⌈log₂N⌉` when routed through the relay tree.
 
+### 6. `FanOut<M, Policy>` footprint — pre-allocated per lane, not per message
+
+`FanOut<M, Policy>` (006, ADR-039) pays its fan-out cost differently from
+`Topic<M>`: instead of one shared pool amortized across best-effort drops, each
+subscriber owns a dedicated `StreamChannel<FanOutEnvelope<M>>` lane, **pre-
+allocated cold at `subscribe()`**, sized `capacity × sizeof(FanOutEnvelope<M>)`
+(16 B descriptor — pointer + `MessageId` — never `sizeof(M)`). Resident cost per
+`FanOut` instance is `N_subs × capacity × 16 B`, independent of `sizeof(M)`
+(the payload itself is the same single pooled `SharedPayload<M>` cell `Topic<M>`
+uses, amortized across all N lanes exactly as in ADR-019/003).
+
+- `subscribe()` / `unsubscribe()` are **O(N_subs) cold-path COW-vector
+  rebuilds**, mutex-guarded, never touching the `publish()` hot path — the same
+  acknowledged high-churn/large-N limitation class as `Topic<M>` (ADR-019),
+  unmeasured here for high-churn/large-N deployments.
+- `EvictAfter<N>`'s per-lane capacity `N` is a **capacity-planning input, not a
+  self-tuning value** — it needs to be sized against the slowest subscriber's
+  expected lag before production use; not tuned or measured against real
+  workloads in this pass.
+- `Block`'s producer-stall-bounded-by-slowest-live-subscriber is a **liveness**
+  property, not a resource bound this file can shed its way out of — it
+  requires the same external ceiling (007 supervision / deadline-based forced
+  unsubscribe) noted in 017, consistent with this file's posture that no
+  primitive should assume an unbounded internal wait is externally safe without
+  a stated backstop.
+
 ## Self-debate
 
 - **Central limiter vs. per-shard local?** A single global token bucket is a

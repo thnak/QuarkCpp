@@ -385,6 +385,42 @@ The residual **O(N) coherence traffic on the reclaim line** (N cores bouncing th
 draining workers, **off the publisher's critical path** (the publish leg does only
 one `fetch_add` per admitted enqueue and never waits for a decrement).
 
+## `StreamChannel<F>` consumer-only cursor ownership (ADR-039)
+
+`StreamChannel<F>`'s `disp`/`tail` cursors (024) are deliberately **single-writer**
+— `MonotoneCursor` exposes only `load`/`store`, no RMW, so a second writer isn't
+merely discouraged, it's structurally impossible to do atomically. The normative
+rule this buys, made explicit after `FanOut<M, Policy>` (006, ADR-039) needed it:
+
+> Only the ring's **single designated drainer thread**, or its **owning
+> `shared_ptr`'s destructor once uniquely referenced**, may call
+> `StreamChannel`'s consumer-only cursor API (`peek`/`slot_at`/
+> `advance_dispatch`/`advance_tail`). A second thread reaching into those cursors
+> — e.g. a **producer** trying to reclaim a departed subscriber's backlog itself
+> — is a confirmed second-writer violation: the two writers race on the same
+> non-atomic cursor, corrupting the ring (ADR-039's original design ran reclaim
+> on the producer thread and this was caught as a cross-subscriber
+> heap-use-after-free before it shipped).
+
+The correct pattern (proven by `FanOut<M, Policy>`'s `LaneEntry`, mirroring the
+already-proven `BoundedInbox<M>::~BoundedInbox` idiom for the unrelated broadcast
+ring above): wrap the channel in a refcounted handle whose **destructor** drains
+any still-queued items and releases their payload refs. The destructor only runs
+once every reference to the handle — the membership snapshot's and the
+subscriber's own drain handle — has dropped, so by construction no consumer
+(the subscriber) and no producer are still touching the cursors when it runs:
+single-threaded, exactly-once, refcount-gated reclaim, never a live second writer.
+
+`StreamChannel<F>::push_blocking_while(const F&, const std::atomic<bool>&
+keep_going)` (added alongside this rule) is a **departure-aware** blocking push,
+distinctly named rather than an overload of `push_blocking` (an ambiguous
+overload between the two was a reproduced compile defect) — it re-checks
+`keep_going` around the same reverse-Dekker stall/wake protocol so a parked
+producer is released when the party it's blocked on departs, not just when
+credit returns. The departing side must pair a `keep_going` flip with a call to
+the new `notify_departure()` on that same channel, or a producer already asleep
+in `credit_gen_.wait()` has no wakeup to observe.
+
 ## Ownership summary
 
 | Thing | Owned by | Freed when |

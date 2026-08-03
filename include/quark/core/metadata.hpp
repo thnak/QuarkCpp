@@ -293,6 +293,8 @@ template <class A>
 [[nodiscard]] ActorMetadata compile_actor_metadata() noexcept {
     static_assert(is_actor<A>, "compile_actor_metadata<A>: A must derive from quark::Actor<A, ...>");
     static_assert(validate_actor_policies<A>(), "compile_actor_metadata<A>: policy validation failed");
+    static_assert(validate_supervision_policies<A>(),
+                  "compile_actor_metadata<A>: supervision policy validation failed");
     ActorMetadata m{};
     m.key = type_key_of<A>();
     m.dispatch = A::dispatch_table();

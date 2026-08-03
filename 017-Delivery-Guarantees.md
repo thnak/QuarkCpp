@@ -45,10 +45,38 @@ per `(topic, subscriber)`, delivery is 0–1 and drops are **counted, not silent
 - **`MessageId = (sender, seq)` is carried for FIFO/observability only** — never
   for duplicate suppression, unlike the effectively-once dedup watermark above.
 
-Layering `AtLeastOnce` (or `EffectivelyOnce`) *on broadcast* is **out of scope**: a
-per-subscriber ack would reintroduce a publisher stall and violate ADR-019's
-GATE 1 (publisher never blocks). An application that needs reliable fan-out builds
-it from N point-to-point `AtLeastOnce`/`EffectivelyOnce` sends, not from `Topic<M>`.
+Layering `AtLeastOnce` (or `EffectivelyOnce`) *on broadcast itself* is **out of
+scope**: a per-subscriber ack would reintroduce a publisher stall and violate
+ADR-019's GATE 1 (publisher never blocks). An application that needs ordered,
+reliable fan-out to N subscribers uses `FanOut<M, Policy>` (below) instead of
+layering acks onto `Topic<M>`, or N point-to-point `AtLeastOnce`/`EffectivelyOnce`
+sends if per-subscriber effect-commit semantics are also needed.
+
+### Ordered, reliable fan-out is a distinct level: `FanOut<M, Policy>` (ADR-039)
+
+`FanOut<M, Policy>` (006) sits between `Topic<M>`'s `AtMostOnce` and this file's
+point-to-point `EffectivelyOnce` — it is **not** one of the three levels above,
+because its guarantee is conditioned on the `OnSlowSubscriber` policy, not on an
+effect-commit watermark:
+
+- **`OnSlowSubscriber<EvictAfter<N>>` = bounded-lag reliable-until-evicted.**
+  Per `(publisher, subscriber)`, delivery is FIFO and gap-free *while the lane
+  has room*; once full, the newest message for that lane is dropped with an
+  **exactly-once, non-silent** counter bump at the FanOut boundary
+  (`LaneEntry::evicted()`) — never a silent `Topic<M>`-style drop. This is
+  **not an end-to-end delivery guarantee into the subscriber's own mailbox**:
+  `FanOut` only promises the message left the lane in order: whatever
+  backpressure policy the subscriber's own mailbox applies next (`Overflow<…>`,
+  open question above) is a separate, still-open 006 concern.
+- **`OnSlowSubscriber<Block>` = fully reliable, gap-free.** Every message is
+  delivered to every attached subscriber in order, at the cost of a producer
+  stall bounded by the slowest **live** subscriber — a **liveness**, not
+  **time**, bound. A subscriber that stays attached but never drains stalls the
+  publisher indefinitely by design; this requires an external liveness backstop
+  (007 supervision / deadline-based forced unsubscribe), not an internal
+  guarantee `FanOut` itself provides.
+- **`MessageId` is carried for per-(publisher,subscriber) FIFO/observability
+  only**, same as `Topic<M>` — never for duplicate suppression.
 
 ## Message identity, made deterministic
 

@@ -57,11 +57,12 @@ struct MaxRestarts {
 template <class Decision, class... Budget>
 struct OnFailure {};
 
-// --- Adopted D3 knobs (007 §ask reply on Restart / §resource failure) — declared surface. --------
-// `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>`: default `Fail` (the poison ask resolves to a
-// failure value; the runtime already delivers this via the Responder-on-reclaim path). `Retry<N,…>`
-// is opt-in and STATIC-ASSERTs an idempotency fence (ADR-009 residual risk #6 — proven in D3's
-// harness, integration against D1's guard is a gated seam; declared here, not yet auto-wired).
+// --- Adopted D3 knobs (007 §ask reply on Restart / §resource failure) — WIRED (ADR-009 post-
+// decision implementation note; see the extractor `supervision_of<A>()` below, which folds these
+// into `SupervisionPolicy::max_ask_retries`, and `Activation::handle_restart_retry`). ------------
+// `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>`: default `Fail` (the poison message is dead-
+// lettered before Restart runs; the runtime delivers this via the Responder-on-reclaim path).
+// `Retry<N,…>` is opt-in, Sequential + sync-handler only (`validate_supervision_policies<A>()`).
 struct Fail {};
 template <class Key>
 struct IdempotencyKey {
@@ -87,8 +88,12 @@ struct OnResourceFailure {
 };
 
 // `Supervision<Node | PerType | Tree<…>>` (007 §Escalation) — the escalation topology knob. `Node`
-// (default) is a depth-1 tree: a single node supervisor. Runtime topology is a 021/026 seam; the
-// static depth bound is enforced here.
+// (default) is a depth-1 tree: a single node supervisor. WIRED for eager `spawn<A>()` (see
+// `Engine::wire_escalation<A>`, `engine.hpp`) — `Tree<S0,…>` routes a single hop to `S0` only (no
+// chain-forwarding); `declare_lazy<A>()` and the runtime storm guards (`escalation_ttl`, a per-
+// supervisor `MaxRestarts`/`Within`, 022 rate limiting) are documented residuals. The static depth
+// bound is enforced here (compile time); the topology EXTRACTION (`supervision_topology_of<A>`,
+// below) is a pure function of `A`'s policy pack, consumed by `engine.hpp`'s routing.
 struct Node {};
 struct PerType {};
 template <class... Supervisors>
@@ -146,7 +151,29 @@ struct as_on_failure<OnFailure<Decision, MaxRestarts<N, Window>>> {
     static constexpr std::int64_t window_ns = MaxRestarts<N, Window>::window_ns;
 };
 
-// Fold the recovered pack: find the (at most one) OnFailure and lower it to SupervisionPolicy.
+// Per-element matcher: capture the (at most one) `OnRestartAsk<Mode>` in the pack (007 §"ask reply
+// on Restart"). `Fail` (the default when absent) folds to `retry == false`.
+template <class T>
+struct as_on_restart_ask {
+    static constexpr bool present = false;
+    static constexpr bool retry = false;
+    static constexpr std::uint32_t retry_count = 0;
+};
+template <>
+struct as_on_restart_ask<OnRestartAsk<Fail>> {
+    static constexpr bool present = true;
+    static constexpr bool retry = false;
+    static constexpr std::uint32_t retry_count = 0;
+};
+template <std::size_t N, class Key>
+struct as_on_restart_ask<OnRestartAsk<Retry<N, Key>>> {
+    static constexpr bool present = true;
+    static constexpr bool retry = true;
+    static constexpr std::uint32_t retry_count = static_cast<std::uint32_t>(N);
+};
+
+// Fold the recovered pack: find the (at most one) OnFailure/OnRestartAsk and lower them to
+// SupervisionPolicy.
 template <class L>
 struct supervision_traits;
 template <class... Ps>
@@ -171,6 +198,15 @@ struct supervision_traits<PolicyList<Ps...>> {
     static constexpr std::int64_t window_ns =
         (std::int64_t{0} + ... +
          (as_on_failure<Ps>::present ? as_on_failure<Ps>::window_ns : std::int64_t{0}));
+
+    static constexpr std::size_t retry_ask_count =
+        (std::size_t{0} + ... + (as_on_restart_ask<Ps>::present ? 1 : 0));
+    static_assert(retry_ask_count <= 1,
+                  "at most one OnRestartAsk<…> per actor (007 §\"ask reply on Restart\")");
+    static constexpr bool retry_ask = (false || ... || as_on_restart_ask<Ps>::retry);
+    static constexpr std::uint32_t max_ask_retries =
+        (std::uint32_t{0} + ... +
+         (as_on_restart_ask<Ps>::retry ? as_on_restart_ask<Ps>::retry_count : std::uint32_t{0}));
 };
 
 }  // namespace detail
@@ -181,7 +217,147 @@ struct supervision_traits<PolicyList<Ps...>> {
 template <class A>
 [[nodiscard]] consteval SupervisionPolicy supervision_of() noexcept {
     using T = detail::supervision_traits<policies_of<A>>;
-    return SupervisionPolicy{T::decision, T::max_restarts, T::window_ns};
+    return SupervisionPolicy{T::decision, T::max_restarts, T::window_ns,
+                             T::retry_ask ? T::max_ask_retries : std::uint32_t{0}};
 }
+
+// `OnRestartAsk<Retry<N,IdempotencyKey>>` is Sequential-only for now (Activation::
+// handle_restart_retry re-dispatches the SAME faulting message against the freshly-reconstructed
+// actor inline on the fault path, proven only for exactly one in-flight message — mirrors the
+// existing `Transactional<>`/`IdleTimeout<Ms>` Sequential-only restrictions, policies.hpp). Called
+// alongside `validate_actor_policies<A>()` at every registration site (spawn.hpp, engine.hpp,
+// metadata.hpp).
+template <class A>
+consteval bool validate_supervision_policies() noexcept {
+    using T = detail::supervision_traits<policies_of<A>>;
+    static_assert(!(T::retry_ask && is_reentrant_v<A>),
+                  "OnRestartAsk<Retry<N,IdempotencyKey>> is Sequential-only for now: the retry loop "
+                  "re-dispatches the SAME faulting message against the freshly-reconstructed actor "
+                  "inline on the fault path, proven only for exactly one in-flight message (mirrors "
+                  "Transactional<>/IdleTimeout<Ms>'s existing Sequential-only restriction, "
+                  "policies.hpp). Reentrant/MaxConcurrency<N> support is deferred.");
+    return true;
+}
+
+namespace detail {
+
+// Per-element matcher: capture the (at most one) `OnResourceFailure<Mode>` in the pack.
+template <class T>
+struct as_on_resource_failure {
+    static constexpr bool present = false;
+    static constexpr bool degrade = false;
+};
+template <>
+struct as_on_resource_failure<OnResourceFailure<FailMessage>> {
+    static constexpr bool present = true;
+    static constexpr bool degrade = false;
+};
+template <>
+struct as_on_resource_failure<OnResourceFailure<Degrade>> {
+    static constexpr bool present = true;
+    static constexpr bool degrade = true;
+};
+
+template <class L>
+struct resource_failure_traits;
+template <class... Ps>
+struct resource_failure_traits<PolicyList<Ps...>> {
+    static constexpr std::size_t count =
+        (std::size_t{0} + ... + (as_on_resource_failure<Ps>::present ? 1 : 0));
+    static_assert(count <= 1, "at most one OnResourceFailure<…> per actor (004/007 §Validation)");
+    // Absent ⇒ FailMessage (the free default, 004/007 C4).
+    static constexpr bool degrade =
+        (false || ... || (as_on_resource_failure<Ps>::present && as_on_resource_failure<Ps>::degrade));
+};
+
+}  // namespace detail
+
+// True iff `A` declares `OnResourceFailure<Degrade>`; false (FailMessage, the default) otherwise. A
+// handler branches on this to decide whether a failed `PerMessage<T>::acquire()` should proceed
+// degraded (Degrade) or call `ProductGuard::acquire_or_throw()` to fail the message (FailMessage).
+template <class A>
+[[nodiscard]] consteval bool resource_failure_degrades() noexcept {
+    return detail::resource_failure_traits<policies_of<A>>::degrade;
+}
+
+// ============================================================================================
+// 007 §Escalation (ADR-009 `Supervision<Node|PerType|Tree<…>>`) — the standard escalation message a
+// supervisor actor handles, plus the compile-time TOPOLOGY extraction the engine (engine.hpp) uses to
+// route a fault. Routing itself (the type-erased `EscalationRouteFn`, the supervisor registries, and
+// `Engine::route_escalation`) is an engine.hpp concern — this header only exposes what the actor
+// DECLARED, exactly like `placement_of<A>` (policies.hpp) exposes a declared `Placement<…>` without
+// itself knowing how to resolve one.
+// ============================================================================================
+
+// The message a `Supervision<…>` target must `handle(const Escalated&)`. `source` is the ActorId of
+// the actor whose fault escalated; `cause` is the fault's own recorded error (007 §Per-message
+// outcome — the SAME error the dead-letter sink observed).
+struct Escalated {
+    ActorId source{};
+    error cause{};
+};
+
+namespace detail {
+
+// Per-element matcher: capture the (at most one) `Supervision<Topology>` in the pack; default `Node`.
+template <class T>
+struct as_supervision {
+    static constexpr bool present = false;
+    using topology = Node;
+};
+template <class Topology>
+struct as_supervision<Supervision<Topology>> {
+    static constexpr bool present = true;
+    using topology = Topology;
+};
+
+template <class... Ps>
+struct find_supervision {
+    using type = Node;
+};
+template <class P, class... Rest>
+struct find_supervision<P, Rest...> {
+    using type = std::conditional_t<as_supervision<P>::present, typename as_supervision<P>::topology,
+                                    typename find_supervision<Rest...>::type>;
+};
+
+template <class L>
+struct supervision_topology_traits;
+template <class... Ps>
+struct supervision_topology_traits<PolicyList<Ps...>> {
+    static constexpr std::size_t count = (std::size_t{0} + ... + (as_supervision<Ps>::present ? 1 : 0));
+    static_assert(count <= 1, "at most one Supervision<…> per actor (007 §Escalation)");
+    using topology = typename find_supervision<Ps...>::type;
+};
+
+// Structural predicates over a resolved topology TYPE (not the actor pack) — mirrors
+// `placement_info<P>` (policies.hpp).
+template <class T>
+struct is_tree_topology : std::false_type {};
+template <class... Ss>
+struct is_tree_topology<Tree<Ss...>> : std::true_type {};
+
+template <class T>
+struct tree_first_supervisor;
+template <class S0, class... Rest>
+struct tree_first_supervisor<Tree<S0, Rest...>> {
+    using type = S0;
+};
+
+}  // namespace detail
+
+// The actor's resolved escalation topology (`Node` (default) | `PerType` | `Tree<Supervisors...>`).
+template <class A>
+using supervision_topology_of = typename detail::supervision_topology_traits<policies_of<A>>::topology;
+
+template <class Topology>
+inline constexpr bool is_tree_topology_v = detail::is_tree_topology<Topology>::value;
+template <class Topology>
+inline constexpr bool is_per_type_topology_v = std::is_same_v<Topology, PerType>;
+
+// The FIRST supervisor type named by a `Tree<S0, S1, …>` topology (this pass routes a single hop to
+// S0; multi-hop chain-forwarding through S1.. is a documented residual — see ADR-009/README).
+template <class Topology>
+using tree_first_supervisor_t = typename detail::tree_first_supervisor<Topology>::type;
 
 }  // namespace quark

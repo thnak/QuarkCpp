@@ -392,6 +392,16 @@ template <class... Rs>
     return err;
 }
 
+// ---- ResourceFailure (004/007, ADR-009 residual risk #6) — thrown by `ProductGuard::
+// acquire_or_throw()` to route a `PerMessage<T>` factory failure through the 007 handler-boundary
+// guard as `FailureSource::Resource` rather than a generic handler throw (activation.hpp classifies
+// it specifically, both on the sync throw path and via the async frame's captured exception_ptr).
+// A handler that wants `OnResourceFailure<Degrade>` instead calls `guard.acquire()` directly and
+// branches on the `result<void>` itself — `acquire_or_throw()` is the `FailMessage` (default) sugar.
+struct ResourceFailure {
+    error err;
+};
+
 // ---- ProductGuard (004 §Rules / ADR-009) — the guarded per-message region ---------------------
 // RAII over an actor's PerMessage<> members. The engine constructs it in the pre-handler guarded
 // region: `acquire()` produces+checks every product BEFORE the handler body (uniform failure on
@@ -425,6 +435,14 @@ public:
                 return err;
             },
             ps_);
+    }
+
+    // `FailMessage` (default, 007) sugar: acquire every product, throwing `ResourceFailure{err}` on
+    // the first failure instead of returning it — the throw propagates to the 007 handler-boundary
+    // guard exactly like a body throw, but classified as `FailureSource::Resource` (not a generic
+    // handler fault). A handler opting into `OnResourceFailure<Degrade>` calls `acquire()` directly.
+    void acquire_or_throw() {
+        if (result<void> r = acquire(); !r) throw ResourceFailure{r.error()};
     }
 
     ~ProductGuard() {

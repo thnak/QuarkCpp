@@ -55,8 +55,13 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 > as **design-settled with their load-bearing mechanisms proven by the cited ADRs** and their
 > open questions resolved or deferred. **007 is Accepted (x86-64, core)** via
 > [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) — the D1
-> zero-cost guard core is proven while the grafted `Supervision<Tree>` / `OnRestartAsk<Retry>`
-> / `OnResourceFailure<Degrade>` knobs stay Draft pending re-gating against that guard.
+> zero-cost guard core is proven, and the grafted `Supervision<Node|PerType|Tree>` /
+> `OnRestartAsk<Retry>` / `OnResourceFailure<Degrade>` knobs are now WIRED (direct
+> implementation, not re-run through red-team/prove — see ADR-009's "Implementation note
+> (post-decision)"): `OnRestartAsk<Retry<…>>` is Sequential + sync-handler only,
+> `Supervision<…>` covers eager `spawn<A>()` with a single-hop `Tree` and no escalation-storm
+> guards yet, and `OnResourceFailure<…>` is a handler-authored `ProductGuard` call rather than
+> an automatic pre-handler pass — see `007-Failure-and-Supervision.md` for the residuals.
 >
 > The cluster data path is now proven too:
 > [ADR-011](decisions/ADR-011-cluster-relay-and-placement-gate-verification.md) executed the
@@ -76,16 +81,25 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 > (re-measured from a clean build here) with zero committed-reminder loss across crash
 > ([`reminder_service.hpp`](include/quark/core/reminder_service.hpp) + test + bench + sample 14).
 >
-> **006 (Messaging)** grew two proven fan-out axes on top of point-to-point `tell`/`ask`:
+> **006 (Messaging)** grew three proven fan-out axes on top of point-to-point `tell`/`ask`:
 > **outbound streaming replies** — an `ask_stream` that returns a bounded, credit-controlled
 > reply stream (the 024 inbound ring with producer/consumer roles flipped, *no shared counter*)
 > via [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)
-> ([`reply_stream.hpp`](include/quark/core/reply_stream.hpp)); and a **best-effort at-most-once
+> ([`reply_stream.hpp`](include/quark/core/reply_stream.hpp)); a **best-effort at-most-once
 > broadcast** primitive `Topic<M>` — one immutable refcounted payload fanned as N thin descriptors
 > onto each subscriber's verbatim ADR-002 mailbox, publisher never stalls, slow/dead subscribers
 > dropped-and-counted — via [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md)
 > ([`topic.hpp`](include/quark/core/topic.hpp), **Accepted (x86-64) for local fan-out**, cross-node
-> Draft on GATE 7).
+> Draft on GATE 7); and an **ordered, reliable** N-subscriber primitive `FanOut<M, Policy>` — one
+> genuinely-SPSC `StreamChannel<F>` lane per subscriber (ADR-018's ring, reused verbatim) fed by
+> one shared refcounted payload (ADR-019's pool, reused verbatim), with a policy-selected reaction
+> to a slow subscriber (`OnSlowSubscriber<EvictAfter<N>>`: bounded-lag with an exactly-once
+> non-silent drop signal; `OnSlowSubscriber<Block>`: fully reliable, stall bounded by the slowest
+> *live* subscriber) — via
+> [ADR-039](decisions/ADR-039-ordered-reliable-multi-subscriber-fanout.md)
+> ([`fanout.hpp`](include/quark/core/fanout.hpp), **Accepted (x86-64)**; single-producer
+> precondition, ASan/UBSan-clean, TSan not yet re-run for the shipped code — see ADR-039's
+> "Implementation note").
 >
 > **Still Draft (2):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
 > whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
@@ -107,7 +121,8 @@ seam — extending support means filling in a PAL backend, not redesigning the e
   reflection.
 - **Work-stealing scheduler** with priority bands and per-actor mailbox FIFO ordering.
 - **Point-to-point and fan-out messaging** — `tell`/`ask`, credit-controlled streaming replies
-  (`ask_stream`), best-effort at-most-once broadcast (`Topic<M>`).
+  (`ask_stream`), best-effort at-most-once broadcast (`Topic<M>`), and ordered/reliable
+  N-subscriber fan-out with a policy-selected slow-subscriber reaction (`FanOut<M, Policy>`).
 - **Inbound stream ingestion** — per-stream credit-ring, zero-copy, backpressure instead of
   shedding.
 - **Cluster distribution at scale** — HRW/VirtualBins placement, SWIM membership, bounded
@@ -377,7 +392,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-006](decisions/ADR-006-large-scale-cluster-topology.md) | Large-scale cluster topology | **VirtualBins + Bounded Partial-View + DHT-Relay** — O(1) N-independent placement (5–6 ns), O(log N) sockets/gossip, content-addressed determinism, ≤⌈log₂N⌉ relay hops. Three configurable axes; flat clusters pay nothing. D2 Partitioned kept for >10⁴ nodes. Spec: 026 (FIFO-under-relay is the Draft→Accepted gate). |
 | [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md) | Actor-authoring & handler-dispatch API | **JumpTable-Dispatch** (D1) — dense per-actor `.rodata` jump-table keyed by `consteval slot_of<A,M>` over `using protocol = Protocol<…>`; one indexed indirect call, ≈260 B/actor, no RTTI/vtable, beats the 008 scan and ties a hand-switch (uniform+skew). Async-only `ask` (no `ask_sync`), always-typed `ActorRef<A>`, member-field resources, pooled-`ReplyCell` reply ordering. 27/1 proven/disproven; sync tell p99 62 ns, ask p99 130 ns, 0 alloc. Closes 005/006/001 open questions; binds 004/008/023. |
 | [ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md) | Configuration + activation-lifecycle policy | **Frozen-Core + Hot-Leaf** (D3) — every knob declares an override scope (defaults < engine < node < type < instance, resolved once) and a reconfig class (BuildOnly fail-fast vs Live). Live operational read-set packs into one 8-byte atomic word per `(shard × type_index)`: hot read = single `mov + mask`, 0 RMW, no tear; live publish = single relaxed store (67–73 ns, 0 alloc, can't stall drain). Guarded `add_actor_type<T>()` (incremental Validation + release table swap, pre-sized to `max_types`). Idle deactivation rides the 011 wheel on the actor's own lane. Closes 013/008 open questions; binds 005/011/023. |
-| [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) | Failure, supervision & recovery policy | **Minimal / Assert-Intact** (D1) + D3's proven knobs — zero-cost Itanium `try/catch` handler guard (p99 54.4 ns guarded vs 53.5 ns control, 0 alloc); `Resume` assert-intact by default, opt-in Sequential-only `Transactional<>`; `Supervision<Node|PerType|Tree>` bounded by depth + `escalation_ttl` + 022 rate limiter; `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>` (default Fail); deadline/cancel carved out of the restart decision; `PerMessage` factory failure fails the message (checked pre-handler); EventSourced staging fence. 13/0 proven/disproven. Closes 007/004 open questions; binds 015/012/023. |
+| [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) | Failure, supervision & recovery policy | **Minimal / Assert-Intact** (D1) + D3's proven knobs, all now WIRED (2026-08-03) — zero-cost Itanium `try/catch` handler guard (p99 54.4 ns guarded vs 53.5 ns control, 0 alloc); `Resume` assert-intact by default, opt-in Sequential-only `Transactional<>`; `Supervision<Node|PerType|Tree>` (eager `spawn<A>()`, single-hop `Tree`, static depth bound only — no runtime storm guards yet); `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>` (default Fail; `Retry` is Sequential + sync-handler only); deadline/cancel carved out of the restart decision; `PerMessage` factory failure fails the message via a handler-authored `ProductGuard` call; EventSourced staging fence. 13/0 proven/disproven (design); wiring is direct implementation, not re-proven — see ADR-009's post-decision note. Closes 007/004 open questions; binds 015/012/023. |
 | [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md) | Priority & fairness scheduling policy | **K-band per-shard run-queue** (D1) — `Priority<P>` becomes `std::array<ActivationMpsc, K>` bands; `UniformFIFO` (K=1) default objdumps **byte-identical** to today's single MPSC (zero-cost when uniform). Enqueue = compile-time band subscript on the same `tail_.exchange` (0 added RMW); O(K≤8) relaxed top-band probe. Per-actor mailbox FIFO inviolable; high-band p99 ~316× lower. Anti-starvation is a knob: `RotatingReserve<M>` (default, bound `(d+1)·K·M`) or `WeightedDRR<w…>`. EDF-banding evaluated and deferred (degrades below FIFO under overload). 7/0 proven/disproven. Closes the 002 priority open question; binds 005/011/023. |
 | [ADR-011](decisions/ADR-011-cluster-relay-and-placement-gate-verification.md) | Cluster relay & placement gate verification | **Verification record** (not a redesign). **FIFO-under-relay CORRECT** — path-pinning + drain-boundary promotion holds per-`(S,A)` FIFO across a mid-stream variable-hop path change (0 inversions / 100×10⁶ arrivals, unpinned control inverts 88–96%) → **026 Accepted, 010 Accepted (core)**, 023 FIFO cell proven. **Stateless-pool CORRECT** (exactly-once under concurrency, beats hand-rolled 1.5–2.8×). **Weighted-HRW WRONG** — caught a real defect: ADR-006's `weight·H` formula is non-proportional (fix: `w/(−ln H)`, proven proportional + bounded-churn) and the `CoV≤0.2` balance threshold is a uniform-only quantization floor → **025 held Draft** pending the formula/threshold repair (applied) + re-gate. |
 | [ADR-012](decisions/ADR-012-weighted-hrw-distribution-regate.md) | Weighted-HRW re-gate (025) | **Verification record** — re-gate of the corrected log-WRH form. **INCONCLUSIVE**, and it's the honest verdict: the scheme is **demonstrably at the multinomial floor** (WRH within 1.9% of the ideal sampler at every N; churn exact — 0 bins between unchanged nodes) but the decision *band* was still ill-posed (compared p99 vs a mean-level closed-form floor, a band the ideal sampler itself busts). Refused to fake CORRECT (post-hoc widening) or WRONG (blaming the scheme for a threshold defect). Supersedes ADR-011 Gate B's WRONG for the corrected form. 025 stays Draft pending a like-for-like preregistered re-gate (running). |
