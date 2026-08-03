@@ -105,40 +105,55 @@ is removed — otherwise restart could never converge.
 ## Escalation — configurable hierarchy (ADR-009)
 
 `Escalate` (or budget exhaustion) raises the failure up a **configurable supervision
-hierarchy**, `Supervision<Node | PerType | Tree<…>>`:
+hierarchy**, `Supervision<Node | PerType | Tree<…>>` (wired, `Engine::wire_escalation<A>`,
+`engine.hpp` — **eager `spawn<A>()` only**; a `declare_lazy<A>()`'d actor does not yet get this
+wiring, a documented residual):
 
-- **`Node`** — a single node supervisor (a Node-scoped resource, `004`); `Tree` of depth 1.
-  The default.
-- **`PerType`** — a supervisor per actor type.
-- **`Tree<…>`** — a typed supervisor tree.
+- **`Node`** — a single ENGINE-WIDE default supervisor, registered via
+  `Engine::set_node_supervisor<Supervisor>(id)`; `Tree` of depth 1. The default.
+- **`PerType`** — a supervisor registered per ESCALATING actor type, via
+  `Engine::set_type_supervisor<A, Supervisor>(id)` — falls back to the Node default if `A` has no
+  dedicated entry.
+- **`Tree<S0, S1, …>`** — routes to `S0` (registered via `Engine::set_supervisor<S0>(id)`); **this
+  pass wires only the single `S0` hop** — chain-forwarding through `S1..` is NOT implemented. A
+  supervisor that wants to escalate further re-`tell`s the next hop itself, from its own
+  `handle(const Escalated&)`.
 
-The node supervisor's policy may `Stop` the actor, `Stop` a whole shard, or trigger a
-controlled node shutdown. Escalation is the only path by which one actor's failure can
-affect another, and it is **bounded three ways** so it can never storm:
-
-- **static depth** — the tree depth is consteval-bounded (`static_assert ≤ 8`, acyclic by
-  construction);
-- **runtime/reconfig cycles + fan-in** — a per-message `escalation_ttl` and a per-supervisor
-  `MaxRestarts` / `Within` window bound what the consteval check cannot see;
-- **aggregate storms** — capped by 022 **per-shard-local** token buckets (no global atomic,
-  consistent with the 0-cross-core-RMW drain gate).
-
-`escalate()` **tells** the supervisor's lane — a message hop, never a synchronous cross-lane
-touch — so single-executor is preserved (ADR-009 C1/C3, proven: ttl-bounded cycle,
-per-shard rate limiter caps 10k actors, hop depth ≤ chain).
+A supervisor is a plain actor — addressed by `ActorId`, reached via an ordinary `tell` — that
+`handle(const Escalated&)`s a `{source: ActorId, cause: error}` message (not a Node-scoped `004`
+resource, as originally sketched). `escalate()` posts this through the engine's own internal
+descriptor pool (mirrors the `Wake` control-descriptor mechanism, never a user-facing
+`LocalRouter`, which the fault path has no access to) — a message hop, never a synchronous
+cross-lane touch, so single-executor is preserved. The supervisor's OWN policy for what to do with
+an `Escalated` (`Stop` the actor, `Stop` a whole shard, trigger a controlled node shutdown,
+re-escalate further) is ordinary handler code — the engine imposes none of it. Escalation is the
+only path by which one actor's failure can affect another; the **static depth bound**
+(`Tree<…>`'s `static_assert(depth ≤ 8)`) is enforced at compile time, but the runtime storm guards
+this section originally called for are **not yet implemented**: no per-message `escalation_ttl`,
+no per-supervisor `MaxRestarts`/`Within` window, no 022 per-shard token bucket — a hand-written
+re-`tell` chain or a hot re-escalation loop is not yet bounded by the engine. Documented residuals,
+tracked alongside the `declare_lazy<A>()` gap above.
 
 ## `ask` reply on `Restart` (ADR-009)
 
-Knob `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>`:
+Knob `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>` (wired, `Activation::handle_restart_retry`,
+`activation.hpp`):
 
-- **`Fail`** (default) — the in-flight `ask` that triggered the restart resolves to
-  `unexpected(error::restarted)` (a value, single dispatch, never re-run). Proven clean.
-- **`Retry<N, IdempotencyKey>`** — opt-in; **`static_assert`-requires an idempotency fence**
-  (or EventSourced command-dedup). It **reserves the pooled `ReplyCell`** (Armed → Retained
-  CAS) **before** the restart window so a racing deadline/cancel completer cannot recycle the
-  cell, re-stamps a fresh descriptor before the poison is freed, and resets `next_ = nullptr`
-  on re-enqueue (Vyukov contract). Proven UAF/ABA-clean over 2M asks; a fenced retry commits
-  its durable effect **exactly once** (vs twice unfenced).
+- **`Fail`** (default) — the faulting message is dead-lettered before `Restart` runs (`ask` →
+  `unexpected(supervised_stop)`, a value, single dispatch, never re-run).
+- **`Retry<N, IdempotencyKey>`** — opt-in, **Sequential-only** (`validate_supervision_policies<A>()`
+  rejects it on Reentrant/`MaxConcurrency<N>` at registration — mirrors `Transactional<>`/
+  `IdleTimeout<Ms>`'s existing Sequential-only restrictions). On a fault, the message is **held, not
+  dead-lettered**: the actor is restarted (charging the SAME `MaxRestarts` budget `Restart` uses —
+  a retry cannot out-run the actor's own restart budget) and the **same descriptor and payload** —
+  including any embedded `ask` `Responder` — is re-dispatched against the fresh instance, up to `N`
+  times. A retry that completes resolves the message normally: the same `Responder` replies exactly
+  as a first-try success would, so no separate reply-cell reservation/re-stamp machinery is needed
+  (the descriptor is simply never reclaimed until the retry loop concludes). Exhausting the budget
+  falls back to `Fail` semantics. Scoped to **sync handlers only** in this pass — a retry attempt
+  that genuinely suspends (async) abandons the frame (a defined, RAII-safe `.destroy()`, the same
+  operation a dropped-while-suspended `task<>` already performs) and counts as a failed attempt;
+  async retry support is a documented residual.
 
 ## Interaction with execution policies
 
@@ -190,18 +205,20 @@ themselves observable and optionally replayable.
 
 - **State rollback on `Resume`** → default **assert-intact** (zero-cost); opt-in
   Sequential-only `Transactional<Off|Snapshot|Journal>`. See *`Resume` state rollback*.
-- **Escalation granularity** → configurable `Supervision<Node|PerType|Tree<…>>`, bounded by
-  static depth + `escalation_ttl` + per-supervisor `MaxRestarts` + 022 rate limiter. See
+- **Escalation granularity** → configurable `Supervision<Node|PerType|Tree<…>>`, WIRED for eager
+  `spawn<A>()` (static depth bound enforced; runtime `escalation_ttl`/per-supervisor
+  `MaxRestarts`/022 rate-limiting NOT yet implemented; `declare_lazy<A>()` not yet wired). See
   *Escalation*.
 - **`ask` reply on `Restart`** → `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>`, default
-  `Fail`. See *`ask` reply on `Restart`*.
+  `Fail`, WIRED (Sequential + sync-handler only). See *`ask` reply on `Restart`*.
 - **Does `Restart` reload persisted state** → **yes iff `Persistent<…>`** (012): reload via
   `StateStore::load` + fencing-token bump + EventSourced tail replay; non-persistent actors
   reconstruct fresh. Reload returns `std::expected`; a failure escalates. The poison message
   is dead-lettered exactly once either way.
-- **`PerMessage<T>` factory failure (004)** → **fails the message** via this boundary,
-  resolved+checked **before** the handler body (handler never runs degraded); "degrade" stays
-  expressible as the explicit `OnResourceFailure<FailMessage|Degrade>` knob. See `004`.
+- **`PerMessage<T>` factory failure (004)** → **fails the message** via a handler-authored
+  `ProductGuard.acquire_or_throw()` call at this boundary (not an automatic pre-handler pass);
+  "degrade" is the explicit `OnResourceFailure<FailMessage|Degrade>` knob, WIRED via
+  `resource_failure_degrades<A>()`. See `004`.
 
 ## Open questions
 

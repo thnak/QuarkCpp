@@ -42,6 +42,10 @@ public:
         // COLD, async-frame-only cost; it never touches the sync zero-cost hot path (ADR-009 F1/F2).
         void unhandled_exception() noexcept { fault_ = std::current_exception(); }
         [[nodiscard]] bool faulted() const noexcept { return static_cast<bool>(fault_); }
+        // ADR-009 residual risk #6: lets the executor classify WHAT faulted (e.g. a `ResourceFailure`,
+        // resource.hpp, vs. an ordinary handler throw) via rethrow+catch, mirroring the classification
+        // already available for a SYNC throw at the dispatch call site (activation.hpp).
+        [[nodiscard]] std::exception_ptr fault_ptr() const noexcept { return fault_; }
 
         std::exception_ptr fault_{};  // null unless the handler threw (cold; async path only)
     };
@@ -83,6 +87,15 @@ private:
 [[nodiscard]] inline bool async_frame_faulted(std::coroutine_handle<> h) noexcept {
     if (!h) return false;
     return std::coroutine_handle<task<>::promise_type>::from_address(h.address()).promise().faulted();
+}
+
+// The captured `exception_ptr` behind a faulted async frame (null if `h` did not fault). Lets the
+// executor classify WHAT faulted (ADR-009 residual risk #6 — e.g. `resource.hpp`'s `ResourceFailure`
+// vs. an ordinary handler throw) via rethrow+catch, the same way a SYNC throw is classified at its
+// call site.
+[[nodiscard]] inline std::exception_ptr async_frame_fault_ptr(std::coroutine_handle<> h) noexcept {
+    if (!h) return nullptr;
+    return std::coroutine_handle<task<>::promise_type>::from_address(h.address()).promise().fault_ptr();
 }
 
 }  // namespace quark

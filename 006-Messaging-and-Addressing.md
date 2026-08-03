@@ -214,6 +214,56 @@ ticks.unsubscribe(clockRef);           // no delivery after this returns
 - Cross-node fan-out (coalesce one frame per distinct node) is **Draft** pending
   real-transport amplification + dead-node proof (ADR-019 GATE 7).
 
+## Ordered, reliable fan-out — `FanOut<M, Policy>`
+
+**Status: Accepted (x86-64)** ([ADR-039](decisions/ADR-039-ordered-reliable-multi-subscriber-fanout.md)).
+
+`Topic<M>` trades reliability for a never-stalling publisher; `ReplyStream<F>`
+(024) is ordered and reliable but single-consumer. `FanOut<M, Policy>` is the
+third point in that space: **ordered + reliable delivery to N dynamically
+attaching/detaching subscribers**, at the cost of a policy-selected reaction to
+a slow subscriber instead of a silent drop.
+
+```cpp
+quark::FanOut<Tick, quark::OnSlowSubscriber<quark::EvictAfter<256>>> ticks;
+auto lane = ticks.subscribe(clockRef.id());      // this actor's own drain handle
+quark::FanOutReceipt r = ticks.publish(Tick{ .seq = 42 });
+// r = { delivered, evicted, departed }
+Tick t;
+while (lane->try_pop(t)) { /* per-(publisher,subscriber) FIFO */ }
+ticks.unsubscribe(clockRef.id());                // no delivery after this returns
+```
+
+- **Precondition (load-bearing): single-producer.** Exactly one thread/actor
+  calls `publish()` per `FanOut` instance — unlike `Topic<M>`, which is safe
+  under concurrent publishers. Multi-producer fan-in needs an upstream
+  serializing actor; `FanOut` does not arbitrate producers.
+- `OnSlowSubscriber<EvictAfter<N>>` / `OnSlowSubscriber<Block>` are **CRTP
+  policy parameters resolved at compile time** — the same family as
+  `Sequential`/`Priority<P>`/`DrainBudget<N>` — with zero cross-policy symbols
+  in the compiled type (ADR-039 F2).
+  - `EvictAfter<N>`: a full per-subscriber lane (capacity `N`) drops the
+    incoming message for that lane and bumps an exactly-once, non-silent
+    counter (`LaneEntry::evicted()`) — the subscriber stays attached
+    (bounded-lag, not ejection). This is **not** an end-to-end delivery
+    guarantee into the subscriber's own mailbox; see 017.
+  - `Block`: the whole `publish()` call stalls on the slowest **live**
+    subscriber's lane until it drains or departs — fully reliable/gap-free,
+    at the cost of an unbounded-by-time producer stall. A subscriber that
+    stays attached but never drains stalls the producer forever by design;
+    an external liveness backstop (007 supervision / deadline-based forced
+    unsubscribe) is required, not provided.
+- **Mechanism**: one shared refcounted `SharedPayload<M>` per publish (reused
+  verbatim from `Topic<M>`/ADR-019/003); one genuinely-SPSC `StreamChannel<F>`
+  lane per subscriber (reused verbatim from `ReplyStream<F>`/ADR-018), holding
+  thin 16 B `FanOutEnvelope<M>{payload*, id}` descriptors, never `M` itself.
+  Membership is `Topic<M>`'s exact `atomic<shared_ptr<const SubVec>>` COW
+  snapshot + bounded-quiescence `unsubscribe` (ADR-019 GATE 6).
+- `subscribe()` returns the subscriber's own drain handle (`shared_ptr<LaneEntry>`).
+  A departed/evicted lane's still-queued envelopes are reclaimed in that
+  handle's destructor only, once every reference (membership snapshot's +
+  the subscriber's own) has dropped — never on the producer thread.
+
 ## Resolved (ADR-007)
 
 - **`ask` from sync code** → forbidden. `ask` is async-only; off-lane bootstrap uses

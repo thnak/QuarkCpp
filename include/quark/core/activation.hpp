@@ -47,10 +47,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stop_token>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -108,6 +110,12 @@ struct SupervisionPolicy {
     SupervisionDirective decision = SupervisionDirective::Restart;
     std::uint32_t max_restarts = std::numeric_limits<std::uint32_t>::max();  // MaxRestarts<N>
     std::int64_t window_ns = 0;  // Within<…> as ns; 0 ⇒ no window (count never resets)
+    // 007 §"ask reply on Restart" (ADR-009 `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>`). Default 0
+    // == `Fail` — the unconditional dead-letter-before-restart behavior below, byte-for-byte
+    // unchanged when the actor declares no `OnRestartAsk<Retry<…>>`. `Retry<N,…>` sets this to N:
+    // a faulting message is re-dispatched against the freshly-reconstructed actor up to N times
+    // before falling back to Fail semantics (Sequential-only, `validate_supervision_policies<A>()`).
+    std::uint32_t max_ask_retries = 0;
 };
 
 // Reconstruct seam (ADR-009 §Restart): reconstruct the actor instance's state IN PLACE (fresh state
@@ -519,6 +527,9 @@ public:
             try {
                 detail::AmbientContextScope amb(current_ctx_);  // #12: tell/ask from handler inherits
                 o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+            } catch (const ResourceFailure& rf) {
+                on_fault_sequential(d, FailureSource::Resource, rf.err);
+                continue;
             } catch (...) {
                 on_fault_sequential(d, FailureSource::HandlerThrow);
                 continue;  // Resume/Restart drain on; Stop/Escalate flip stopped_ (checked above)
@@ -543,8 +554,9 @@ public:
                 // Async handler completed inline. It may have completed WITH an exception (surfaced
                 // at final_suspend, 007) — probe the promise and route it through the guard.
                 if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {
+                    auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
                     o.frame.destroy();
-                    on_fault_sequential(d, FailureSource::HandlerThrow);
+                    on_fault_sequential(d, fault_src, fault_err);
                     continue;
                 }
                 o.frame.destroy();
@@ -641,6 +653,8 @@ public:
         // Guard the resume: an async handler surfaces its throw at completion (007). A body throw is
         // captured by the promise (probe via async_frame_faulted); a stray propagation is caught too.
         bool faulted = false;
+        FailureSource fault_src = FailureSource::HandlerThrow;
+        error fault_err = error{errc::supervised_stop, "handler_fault"};
 #ifndef QUARK_SUPERVISION_NO_GUARD
         try {
             detail::AmbientContextScope amb(current_ctx_);  // #12: a tell after co_await still inherits
@@ -648,7 +662,10 @@ public:
         } catch (...) {
             faulted = true;
         }
-        if (!faulted && async_frame_faulted(parked_frame_)) faulted = true;
+        if (!faulted && async_frame_faulted(parked_frame_)) {
+            faulted = true;
+            std::tie(fault_src, fault_err) = classify_fault(async_frame_fault_ptr(parked_frame_));
+        }
 #else
         {
             detail::AmbientContextScope amb(current_ctx_);
@@ -659,7 +676,7 @@ public:
         parked_frame_ = {};
         parked_desc_ = nullptr;
         if (QUARK_UNLIKELY(faulted)) {
-            on_fault_sequential(d, FailureSource::HandlerThrow);  // record outcome + supervise
+            on_fault_sequential(d, fault_src, fault_err);  // record outcome + supervise
             return exec_.readmit_from_parked();
         }
         d->complete();
@@ -1052,6 +1069,9 @@ private:
             try {
                 detail::AmbientContextScope amb(current_ctx_);  // #12: tell/ask from handler inherits
                 o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+            } catch (const ResourceFailure& rf) {
+                on_fault_sequential(d, FailureSource::Resource, rf.err);
+                continue;
             } catch (...) {
                 on_fault_sequential(d, FailureSource::HandlerThrow);
                 continue;
@@ -1071,8 +1091,9 @@ private:
             }
             if (o.frame.done()) {
                 if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {
+                    auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
                     o.frame.destroy();
-                    on_fault_sequential(d, FailureSource::HandlerThrow);
+                    on_fault_sequential(d, fault_src, fault_err);
                     continue;
                 }
                 o.frame.destroy();
@@ -1168,6 +1189,10 @@ private:
         try {
             detail::AmbientContextScope amb(f->ctx);  // #12: tell/ask from this frame inherits its ctx
             o = table_.thunks[slot_from(*d)](self_, d, f->ctx);
+        } catch (const ResourceFailure& rf) {
+            rc_->resuming_frame = nullptr;
+            on_fault_reentrant(f, FailureSource::Resource, rf.err);
+            return;
         } catch (...) {
             rc_->resuming_frame = nullptr;
             on_fault_reentrant(f, FailureSource::HandlerThrow);
@@ -1188,7 +1213,8 @@ private:
         f->h = o.frame;
         if (o.frame.done()) {
             if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {  // async completed with a throw (007)
-                on_fault_reentrant(f, FailureSource::HandlerThrow);
+                auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
+                on_fault_reentrant(f, fault_src, fault_err);
                 return;
             }
             complete_and_remove(f);  // async body ran to completion with no real suspension
@@ -1221,8 +1247,13 @@ private:
                 threw = true;
             }
             rc_->resuming_frame = nullptr;
-            if (threw || (f->h.done() && async_frame_faulted(f->h))) {
+            if (threw) {
                 on_fault_reentrant(f, FailureSource::HandlerThrow);
+                continue;
+            }
+            if (f->h.done() && async_frame_faulted(f->h)) {
+                auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(f->h));
+                on_fault_reentrant(f, fault_src, fault_err);
                 continue;
             }
 #else
@@ -1389,11 +1420,36 @@ private:
         reclaim_(d);
     }
 
+    // Classify a captured async-frame exception_ptr (004/007, ADR-009 residual risk #6): a
+    // `ResourceFailure` (resource.hpp) is `FailureSource::Resource` with its OWN error (the factory's
+    // `unexpected` propagates unchanged); anything else is an ordinary `FailureSource::HandlerThrow`.
+    // Cold path only — called only once a fault is already known to have happened.
+    [[gnu::cold]] static std::pair<FailureSource, error> classify_fault(std::exception_ptr ep) noexcept {
+        if (ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const ResourceFailure& rf) {
+                return {FailureSource::Resource, rf.err};
+            } catch (...) {
+            }
+        }
+        return {FailureSource::HandlerThrow, error{errc::supervised_stop, "handler_fault"}};
+    }
+
     // Sequential fault entry. The actor is at a quiescent point (its one in-flight message faulted),
-    // so the decision applies synchronously.
-    [[gnu::cold]] void on_fault_sequential(Descriptor* d, FailureSource src) noexcept {
+    // so the decision applies synchronously. `e` is the outcome recorded to dead-letter — defaults to
+    // the generic handler-fault error; a `FailureSource::Resource` call site passes the factory's own
+    // error (004/007) so the dead-letter observes the real cause, not a generic label.
+    [[gnu::cold]] void on_fault_sequential(
+        Descriptor* d, FailureSource src,
+        error e = error{errc::supervised_stop, "handler_fault"}) noexcept {
         ++faults_;
-        dead_letter_and_reclaim(d, error{errc::supervised_stop, "handler_fault"});  // outcome first
+        if (sup_.max_ask_retries > 0 && sup_.decision == SupervisionDirective::Restart &&
+            src != FailureSource::Deadline && src != FailureSource::Cancellation) {
+            handle_restart_retry(d, e);
+            return;
+        }
+        dead_letter_and_reclaim(d, e);  // outcome first
         if (src == FailureSource::Deadline || src == FailureSource::Cancellation)
             return;  // TRANSIENT carve-out (ADR-009 C5): Resume, no restart charge
         switch (sup_.decision) {
@@ -1404,16 +1460,109 @@ private:
         }
     }
 
+    // 007 §"ask reply on Restart" (ADR-009 `OnRestartAsk<Retry<N,IdempotencyKey>>`, Sequential-only —
+    // `validate_supervision_policies<A>()` rejects it on a Reentrant/MaxConcurrency<N> actor at
+    // registration). Instead of the unconditional dead-letter-then-Restart the non-retry path takes,
+    // HOLD the faulting descriptor (its payload — and any embedded `ask` `Responder`, 006/ADR-007 —
+    // stays intact, NOT dead-lettered/reclaimed yet) and re-dispatch it against the freshly-
+    // reconstructed actor up to `sup_.max_ask_retries` times. A retry that completes cleanly resolves
+    // the message NORMALLY: the same payload is re-run, so an embedded `Responder` replies exactly as
+    // it would on a first-try success — no new ReplyCell machinery needed (mirrors ADR-009 D3's
+    // proven "re-stamp before the poison is freed" shape without inventing a second reply path).
+    // Each attempt charges the SAME `MaxRestarts` budget `do_restart()` uses (`charge_restart()`), so
+    // a poison message cannot out-run the actor's own restart budget via retries. A retry attempt
+    // that genuinely SUSPENDS (async, out of scope for this pass — parking mid-retry would need the
+    // same `exec_.park()` + `DrainOutcome::Suspended` contract the caller's `continue` cannot honor)
+    // abandons the frame (`.destroy()` — defined behavior, unwinds live locals via their destructors,
+    // the same operation `~task()` already performs on a dropped-while-suspended frame) and counts as
+    // a failed attempt, bounded by the same loop.
+    [[gnu::cold]] void handle_restart_retry(Descriptor* d, error first_error) noexcept {
+        error last_error = first_error;
+        for (std::uint32_t attempt = 0; attempt < sup_.max_ask_retries; ++attempt) {
+            if (!charge_restart()) {
+                dead_letter_and_reclaim(d, last_error);  // outcome recorded before the escalated fate
+                do_escalate();
+                return;
+            }
+            ++restarts_total_;
+            if (metrics_) metrics_->restarts.inc();  // lane-only (fault path is drain-owned)
+            reconstruct_now();
+            if (stopped_) {  // reconstruct_now()'s own re-wire failure escalated -> Stop mid-retry;
+                              // reconstruct_now() never touches `d`, so ordering here is immaterial.
+                dead_letter_and_reclaim(d, last_error);
+                return;
+            }
+
+            current_ctx_.deadline_ns = d->deadline_ns;
+            current_ctx_.trace_id = d->trace_id;
+            DispatchOutcome o;
+            bool retry_faulted = false;
+#ifndef QUARK_SUPERVISION_NO_GUARD
+            try {
+                detail::AmbientContextScope amb(current_ctx_);
+                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+            } catch (const ResourceFailure& rf) {
+                retry_faulted = true;
+                last_error = rf.err;
+            } catch (...) {
+                retry_faulted = true;
+                last_error = error{errc::supervised_stop, "handler_fault"};
+            }
+#else
+            {
+                detail::AmbientContextScope amb(current_ctx_);
+                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+            }
+#endif
+            if (!retry_faulted) {
+                if (o.kind == HandlerKind::Sync) {
+                    d->complete();
+                    reclaim_(d);
+                    if (metrics_) metrics_->messages_processed.inc();
+                    return;  // retry succeeded
+                }
+                if (o.frame.done()) {
+                    if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {
+                        auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
+                        (void)fault_src;
+                        o.frame.destroy();
+                        retry_faulted = true;
+                        last_error = fault_err;
+                    } else {
+                        o.frame.destroy();
+                        d->complete();
+                        reclaim_(d);
+                        if (metrics_) metrics_->messages_processed.inc();
+                        return;  // retry succeeded (async, completed inline — no real suspension)
+                    }
+                } else {
+                    o.frame.destroy();  // abandon: genuine suspension is out of scope (see banner)
+                    retry_faulted = true;
+                    last_error = error{errc::internal, "retry_async_unsupported"};
+                }
+            }
+            // Reached only when this attempt's dispatch failed (a success returns above): count it
+            // as its own fault, distinct from the initial fault the caller already counted.
+            ++faults_;
+        }
+        // Retry budget exhausted: fall back to ordinary Fail semantics. The actor is already on
+        // fresh post-restart state from the LAST attempt above — matches "the poison message is
+        // dead-lettered exactly once either way" (007 §Restart budget) — no further do_restart().
+        dead_letter_and_reclaim(d, last_error);
+    }
+
     // Reentrant fault entry (a suspended/started sibling faulted). Record THIS sibling's outcome,
     // drop it from the in-flight set, then apply the decision — Restart runs quiesce(Cancel) and the
     // reconstruct is deferred until the siblings drain (finish_restart_if_drained).
-    [[gnu::cold]] void on_fault_reentrant(ReFrame* f, FailureSource src) noexcept {
+    [[gnu::cold]] void on_fault_reentrant(
+        ReFrame* f, FailureSource src,
+        error e = error{errc::supervised_stop, "handler_fault"}) noexcept {
         ++faults_;
         if (f->h) {
             f->h.destroy();  // faulted async frame is at final_suspend (done) ⇒ destroyable
             f->h = {};
         }
-        dead_letter_and_reclaim(f->desc, error{errc::supervised_stop, "handler_fault"});
+        dead_letter_and_reclaim(f->desc, e);
         remove_live(f);
         if (src == FailureSource::Deadline || src == FailureSource::Cancellation) {
             finish_restart_if_drained();

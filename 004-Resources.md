@@ -49,16 +49,22 @@ thread.
   a single message (e.g. a DB session, a scratch buffer) is produced by an
   Activation-scoped factory and destroyed at the end of the message. The factory
   is the cached Activation resource; the product is the per-message resource.
-- **A factory failure fails the message** (ADR-009). Each `PerMessage<T>` product is
-  **resolved and checked inside the guarded region *before* the handler body runs**, so a
-  factory that **throws** and one that **returns `std::unexpected`** are handled uniformly:
-  dispatch is skipped, the 007 boundary fires (`ask` → `unexpected(resource_error)`, `tell`
-  → dead-letter), and the handler **never runs with a null/degraded resource** (proven,
-  D1 C4). A partially-acquired external resource is released by the **product's RAII guard**
-  — `Cached<>`-pool checkouts must be RAII-scoped subobjects of the product, not left to
-  state rollback. Callers who genuinely want degradation opt into
-  `OnResourceFailure<Degrade>` (007), which fires on both the throwing and `unexpected`
-  channels (both tagged `FailureSource::Resource`).
+- **A factory failure fails the message, via a handler-authored guard** (ADR-009, wired). Std
+  C++23 cannot enumerate an actor's members (the same constraint `Protocol`/`wire_resources`
+  already live with), so this is NOT an automatic pre-handler pass: the handler constructs a
+  `ProductGuard` over its `PerMessage<T>` members and calls `guard.acquire_or_throw()` as the
+  first line of the handler body. A factory that **throws** and one that **returns
+  `std::unexpected`** are handled uniformly — `acquire_or_throw()` throws `ResourceFailure{err}`,
+  which the 007 handler-boundary guard classifies as `FailureSource::Resource` (not a generic
+  handler fault) carrying the factory's OWN error, so an `ask` resolves to `unexpected(err)` and
+  a `tell` dead-letters with that same error — the rest of the handler body never runs with a
+  null/degraded resource. A partially-acquired external resource is released by the **product's
+  RAII guard** (`~ProductGuard()` runs every already-acquired product's destructor on unwind) —
+  `Cached<>`-pool checkouts must be RAII-scoped subobjects of the product, not left to state
+  rollback. Callers who genuinely want degradation call `guard.acquire()` directly and branch on
+  the `result<void>` themselves — `OnResourceFailure<Degrade>` (007) is the declared knob
+  (`resource_failure_degrades<A>()`), but the degrade behavior itself is handler code the engine
+  does not enforce.
 - **Ambient values are never "resolved."** Cancellation, deadline, trace id, and
   headers travel inside the `MessageContext` (see below). Handlers read them
   directly; they are not looked up.
@@ -194,8 +200,9 @@ generation-gated `gen_state` CAS (001/003), not a `stop_source` at all.
 ## Open questions
 
 - *(Factory error handling: resolved — a `PerMessage<T>` factory failure **fails the
-  message** via the 007 boundary, checked before the handler body; degrade is the explicit
-  `OnResourceFailure<Degrade>` opt-in. See the factory rule above, ADR-009.)*
+  message** via a handler-authored `ProductGuard.acquire_or_throw()` call at the 007 boundary
+  (not an automatic pre-handler pass); degrade is the explicit `OnResourceFailure<Degrade>`
+  opt-in, wired via `resource_failure_degrades<A>()`. See the factory rule above, ADR-009.)*
 - *(Node/Shard resolution ordering: resolved — Node- and Shard-scoped resources
   are resolved eagerly, for every configured shard, synchronously inside the
   Engine's construction/`build()` cold phase (008), strictly before any worker

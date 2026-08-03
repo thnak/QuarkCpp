@@ -184,6 +184,50 @@ public:
         }
     }
 
+    // Blocking, lossless push with DEPARTURE awareness (ADR-039 §FanOut Block policy): identical
+    // reverse-Dekker stall/wake protocol as push_blocking, but re-checks `keep_going` before parking
+    // and again after arming the stall edge, so a producer stalled against a subscriber that then
+    // DEPARTS is released instead of hanging forever. Distinctly named — NOT an overload of
+    // push_blocking (an ambiguous-overload compile defect between the two was reproduced and is why
+    // this is a separate name, ADR-039). The departing side must pair this with notify_departure() on
+    // this same channel (bump + wake credit_gen_) once `keep_going` is cleared, or a producer already
+    // asleep in credit_gen_.wait() has no wakeup to observe — the departure signal alone does not wake
+    // a parked waiter (ADR-039 S1: firing control that removes this wake reproducibly hangs).
+    // Returns false iff `keep_going` went false before the frame could be pushed (caller drops this
+    // lane); true once the frame is pushed.
+    [[nodiscard]] bool push_blocking_while(const F& frame, const std::atomic<bool>& keep_going) noexcept {
+        for (;;) {
+            if (!keep_going.load(std::memory_order_acquire)) return false;
+            if (try_push(frame)) return true;
+            stalls_.fetch_add(1, std::memory_order_relaxed);
+            const std::uint32_t g = credit_gen_.load(std::memory_order_acquire);  // capture BEFORE arming
+            stalled_.store(true, std::memory_order_release);
+            std::atomic_thread_fence(std::memory_order_seq_cst);  // StoreLoad (producer Dekker half)
+            if (!keep_going.load(std::memory_order_acquire)) {
+                stalled_.store(false, std::memory_order_relaxed);
+                return false;
+            }
+            if (credit_available() > 0) {
+                stalled_.store(false, std::memory_order_relaxed);
+                continue;
+            }
+            credit_gen_.wait(g, std::memory_order_acquire);  // sleep until a credit-return OR departure wake
+            stalled_.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // Force-wake a producer parked in push_blocking_while against a lane that is departing (unsubscribe
+    // / eviction). Mirrors poll_unstall()'s disarm-and-wake, but triggered by departure rather than a
+    // credit-return — a departure clears `keep_going` (caller's flag) but that alone does not touch
+    // this channel's futex word, so a producer already asleep in credit_gen_.wait() would never notice.
+    // Off the hot path (called O(departures), never per frame).
+    void notify_departure() noexcept {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        stalled_.store(false, std::memory_order_relaxed);
+        credit_gen_.fetch_add(1, std::memory_order_acq_rel);
+        credit_gen_.notify_all();
+    }
+
     // ---- Consumer side (single drainer; the exec-state CAS guarantees at-most-one — 001/002) ------
     // Every operation here is plain acquire-load / release-store / relaxed self-read. NO RMW.
 

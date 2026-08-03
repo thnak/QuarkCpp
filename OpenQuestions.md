@@ -266,19 +266,25 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   knobs). The handler-boundary guard is **zero-cost on the success path** (p99 54.4 ns
   guarded vs 53.5 ns no-guard, 0 alloc, objdump no added work). Resolutions: `Resume` =
   **assert-intact** default + opt-in Sequential-only `Transactional<Off|Snapshot|Journal>`;
-  escalation = configurable `Supervision<Node|PerType|Tree>` bounded by static depth +
-  `escalation_ttl` + per-supervisor `MaxRestarts` + 022 per-shard token bucket; ask-on-restart
-  = `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>` (default Fail); `Restart` reloads persisted
+  escalation = configurable `Supervision<Node|PerType|Tree>`; ask-on-restart =
+  `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>` (default Fail); `Restart` reloads persisted
   state iff `Persistent<…>` (reload returns `std::expected`, failure escalates); `PerMessage`
-  factory failure **fails the message** (checked before the handler body; `Degrade` is an
-  explicit opt-in). Plus proven containment: **deadline/cancellation carved out** of the
+  factory failure **fails the message** via a handler-authored `ProductGuard` call (`Degrade`
+  is an explicit opt-in). Plus proven containment: **deadline/cancellation carved out** of the
   restart decision (no transient-overload storm), **EventSourced staging fence** (throwing
   handler commits nothing), single exactly-once descriptor-reclamation join point. Folded into
-  007/004/015/012/023. **Residual (not blocking x86-64):** cold-path unwinder cost on
-  high-throw workloads; large-state `Transactional<>` has no COW yet (Reentrant can't use it —
-  gated on the 015 COW open q); retry idempotency is asserted not verified; ARM64 litmus; the
-  three adopted D3 knobs re-run through the gates against the D1 guard before those paragraphs
-  promote Draft→Accepted.
+  007/004/015/012/023. **All three D3-adopted knobs are now WIRED (2026-08-03)** — direct
+  implementation (not re-run through design-debate-prove), covered by
+  `supervision_resource_failure_test`/`supervision_restart_retry_test`/
+  `supervision_escalation_topology_test`, full suite green under ASan+UBSan. The shipped
+  mechanism diverges from what D3's harness proved for two of the three — see ADR-009's
+  "Implementation note (post-decision)" for the details. **Residual (not blocking x86-64):**
+  cold-path unwinder cost on high-throw workloads; large-state `Transactional<>` has no COW yet
+  (Reentrant can't use it — gated on the 015 COW open q); retry idempotency is asserted not
+  verified; ARM64 litmus; `OnRestartAsk<Retry<…>>` is Sequential + sync-handler only; escalation
+  is eager-`spawn<A>()`-only (not `declare_lazy<A>()`), `Tree<…>` routes a single hop (no
+  chain-forwarding), and the runtime storm guards (`escalation_ttl`, per-supervisor
+  `MaxRestarts`, 022 rate limiting) are not yet implemented.
 
 - **Priority & fairness scheduling** (scheduler 002 + developer model 005 + timers 011 +
   perf 023) — resolved in [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md)
@@ -296,6 +302,44 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   002/005/011/023. **Residual:** ask-chain priority inversion is unmitigated (static
   per-type priority, no donation — `band_of()` is the future extension point); K is a
   build-time constant; HW RMW counters need re-confirming with `perf c2c` on a CI box.
+
+- **Ordered, reliable multi-subscriber fan-out — distinct from best-effort `Topic<M>`** (006, ADR-018,
+  ADR-019) — resolved in [ADR-039](decisions/ADR-039-ordered-reliable-multi-subscriber-fanout.md).
+  Raised by a downstream consumer (AgentEngine, [issue #10](https://github.com/thnak/QuarkCpp/issues/10)):
+  `ReplyStream<F>` is ordered+reliable but single-consumer; `Topic<M>` is N-subscriber but deliberately
+  best-effort/at-most-once. A 2-design `design-debate-prove` pass settled it: **`FanOut<M, Policy>` —
+  N independent per-subscriber SPSC lanes** (one shared refcounted `SharedPayload<M>` per publish,
+  reusing ADR-019's pool verbatim; one ADR-018-shaped `StreamChannel<F>` ring per subscriber; membership
+  = ADR-019's COW snapshot + bounded-quiescence unsubscribe, reused verbatim) beat **`EventLog<M, Policy,
+  Cap>` — one shared append-only ring + independent subscriber cursors**, which was **disqualified by
+  the safety gate**: its subscribe/unsubscribe race-freedom claim proved **WRONG** (5/5 ASan
+  heap-use-after-free, 10/10 TSan data races) even after a first attempted fix, needing a different SMR
+  mechanism entirely (epoch/hazard-pointer, not per-element refcounting) — not a cheap fix, so it stayed
+  disqualified despite 9/10 of its other claims independently proving CORRECT. `FanOut` cleared the gate
+  (one conceded-and-fixed cross-subscriber UAF in its eviction-reclaim path, fixed by moving reclaim into
+  `~LaneEntry()` mirroring the already-proven `BoundedInbox::~BoundedInbox` idiom) and then had all 7
+  surviving claims proven CORRECT under TSan/ASan/UBSan across gcc+clang with load-bearing firing
+  controls: producer `publish()` latency stays flat under one pinned/dead lane (`EvictAfter<N>`,
+  mirrors ADR-019 GATE 1), per-(producer,subscriber) FIFO with 0 inversions, exactly-once non-silent gap
+  signal on eviction, and `Block` policy delivers gap-free history at a stall bounded by the slowest live
+  subscriber. Both policies are CRTP compile-time variants (`OnSlowSubscriber::EvictAfter<N>` /
+  `OnSlowSubscriber::Block`), zero-cost-unused, in the `Sequential`/`Priority<P>`/`DrainBudget<N>` family.
+  **Residual:** single-producer precondition is load-bearing (unsupported/untested with multiple
+  producers); `Block`'s stall bound is conditioned on subscriber *liveness* not *time* — needs an
+  external 007-style forced-unsubscribe backstop for a catatonic subscriber, not yet built; ordering
+  proofs are x86-TSO only (WSL2-virtualized, noisier than ADR-019's bare-metal precedent) pending an
+  ARM64 weak-memory re-gate; `EventLog`'s architecture is not a dead end, only disqualified as specified
+  — worth revisiting if rebuilt on proper epoch/hazard-pointer reclamation.
+  **Implementation (2026-08-03):** `FanOut<M, Policy>` shipped in `include/quark/core/fanout.hpp`
+  (`quark::OnSlowSubscriber<EvictAfter<N>|Block>` — the flat-tag idiom matching `OnRestartAsk<Mode>`
+  rather than the `OnSlowSubscriber::EvictAfter<N>` scoped-name prose above); `push_blocking_while` /
+  `notify_departure` added to `StreamChannel<F>` for the Block policy's departure-wake. One bug was
+  found and fixed during productionization that the design-debate-prove pass's harness had not
+  exercised: `LaneEntry::try_pop()` must call `StreamChannel::poll_unstall()` on every pop, or a
+  `Block`-policy producer parked against an ordinary (never-departing) slow drainer is woken ONLY by
+  `unsubscribe()`'s departure-wake and never by normal draining — a permanent hang, not merely a missed
+  optimization. Covered by `tests/fanout_evict_after_test.cpp`, `fanout_block_test.cpp`,
+  `fanout_subscribe_race_test.cpp`, `fanout_payload_reclaim_test.cpp`.
 
 ## Highest-leverage unresolved questions
 

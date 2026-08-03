@@ -301,6 +301,46 @@ configurable per D3's proven mechanics.
 
 ---
 
+## Implementation note (post-decision, 2026-08-03)
+
+The three knobs residual risk #6 above flagged as "proven in D3's harness, not yet auto-wired" have
+since been implemented directly against the D1 core (not re-run through `design-debate-prove`) and
+are covered by `tests/supervision_resource_failure_test.cpp`,
+`tests/supervision_restart_retry_test.cpp`, and `tests/supervision_escalation_topology_test.cpp` —
+all green under ASan+UBSan (full-suite pass, 186/186). The SHIPPED mechanism for two of the three
+**diverges from what D3's harness proved**; this note records the divergence so the evidence table
+above is read as historical proof of the *design's* soundness, not a description of the as-built
+code path:
+
+- **`OnResourceFailure<FailMessage|Degrade>`** — wired via a HANDLER-AUTHORED `ProductGuard`
+  (`resource.hpp`), not an automatic pre-handler pass: std C++23 cannot enumerate an actor's members
+  (the same constraint `Protocol`/`wire_resources` already live with), so the handler constructs the
+  guard and calls `acquire_or_throw()` (`FailMessage`) or `acquire()` directly (`Degrade`) itself. A
+  failure is classified `FailureSource::Resource` end-to-end — both sync AND async handlers, via a
+  new `task<>::promise_type::fault_ptr()` accessor that lets the executor rethrow+classify a captured
+  async exception the same way a sync throw is classified at its call site — carrying the factory's
+  OWN error, not a generic label.
+- **`OnRestartAsk<Retry<N,IdempotencyKey>>`** — wired WITHOUT the reply-cell CAS-reservation/
+  re-stamp machinery D3's S2 proved: the faulting descriptor is simply held (never dead-lettered or
+  reclaimed) and re-dispatched against the reconstructed actor up to N times, so the SAME embedded
+  `Responder` resolves normally on a successful retry — no second reply path, no `next_` re-reset.
+  Scoped to Sequential actors (a `static_assert` in `validate_supervision_policies<A>()`) and sync
+  handlers only (an async suspension mid-retry abandons the frame via `.destroy()` and counts as a
+  failed attempt) — narrower than D3's proof, which modeled Reentrant siblings.
+- **`Supervision<Node|PerType|Tree<…>>`** — wired for eager `spawn<A>()` only (`declare_lazy<A>()`
+  is not yet covered); `Tree<S0,…>` routes a single hop to `S0` (no chain-forwarding); the runtime
+  storm guards (`escalation_ttl`, per-supervisor `MaxRestarts`/`Within`, the 022 per-shard token
+  bucket) are NOT implemented — only the static `Tree` depth bound is enforced. A supervisor is an
+  ordinary actor reached via the engine's own internal descriptor pool (mirrors the `Wake`
+  mechanism), not a 004 Node-scoped resource as originally sketched.
+
+None of this divergence was re-run through red-team/prove — it is direct implementation, verified by
+the three test files above plus a full-suite build+test+ASan/UBSan pass, per the user's standing
+preference to skip the heavy workflow for incremental engineering work once the design itself is
+settled. The residual gaps this note calls out (async retry, `declare_lazy` wiring, multi-hop `Tree`
+chaining, escalation storm guards) remain open — see `007-Failure-and-Supervision.md`'s Escalation
+and `ask` reply on `Restart` sections for the authoritative, up-to-date description.
+
 ## Status of the debate
 
 Decisive. The winner is empirically established, not a judgement call: D1 leads on every
