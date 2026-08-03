@@ -16,7 +16,7 @@ export const meta = {
 // Defaults to the Mailbox MPSC hot path (specs 002 + 003).
 // ---------------------------------------------------------------------------
 // `args` may arrive as an object or as a JSON string depending on how the run
-// was launched — normalize both to an object so overrides always apply.
+// was launched - normalize both to an object so overrides always apply.
 let T = args
 if (typeof T === 'string') { try { T = JSON.parse(T) } catch (e) { T = {} } }
 if (typeof T !== 'object' || !T) T = {}
@@ -43,7 +43,7 @@ const TARGET = {
 const ANGLES = T.angles || [
   'Intrusive lock-free MPSC (Vyukov-style single-consumer queue): producers CAS a shared tail, the single consumer walks a private head; nodes are pooled descriptors, no per-enqueue allocation.',
   'Segmented bounded ring buffer with atomic head/tail and a fixed-capacity backing array per segment; enqueue is a fetch-add into a slot, drain is a batch sweep; overflow allocates a new segment (measure that it never happens in steady state).',
-  'Hybrid: lock-free multi-producer enqueue onto a stack (LIFO push via CAS) reversed once by the single consumer into a private FIFO drain list — trades a reverse for a cheaper, ABA-resistant producer path.',
+  'Hybrid: lock-free multi-producer enqueue onto a stack (LIFO push via CAS) reversed once by the single consumer into a private FIFO drain list - trades a reverse for a cheaper, ABA-resistant producer path.',
 ]
 const N = Math.min(ANGLES.length, T.designs || 3)
 
@@ -67,7 +67,7 @@ const GROUND = [
 const ARCHITECT_ROLE = [
   `ROLE: systems architect. READ the named spec files in the repo root first and use their exact vocabulary.`,
   `Produce ONE concrete design (not a survey) pushed to its strongest form: real memory layout, atomics + memory orders, a real/near-real C++23 hot path, and how each invariant is upheld.`,
-  `State your position as FALSIFIABLE claims. Each claim is kind fast (measurable by benchmark), safe (checkable by sanitizer/stress), or correct (checkable by test). For EVERY claim give howToFalsify: the concrete runnable experiment that would prove you WRONG. A claim with no falsifying experiment is not a claim — drop it. Be honest in risks.`,
+  `State your position as FALSIFIABLE claims. Each claim is kind fast (measurable by benchmark), safe (checkable by sanitizer/stress), or correct (checkable by test). For EVERY claim give howToFalsify: the concrete runnable experiment that would prove you WRONG. A claim with no falsifying experiment is not a claim - drop it. Be honest in risks.`,
   GROUND,
 ].join('\n\n')
 
@@ -78,20 +78,20 @@ const REBUT_ROLE = [
 
 const REDTEAM_ROLE = [
   `ROLE: red team. Your loyalty is to the running machine, not any design. Steelman the design in one line, then attack its fast/safe/correct claims hardest where they are proud. Check the known failure modes: data races / wrong memory orders / UB / use-after-free of pooled descriptors; ABA on CAS loops and unsafe reclamation; FIFO or single-consumer violations; reorders across co_await; hidden allocations claimed zero (arena growth, std::function, node alloc, pmr upstream fallback); false sharing; "wait-free"/"scales linearly" claims that actually serialize on one cache line; tombstone double-free / skipped-twice.`,
-  `Rate each attack fatal/serious/minor. For each, give executableCheck: the specific test/sanitizer/benchmark that would DEMONSTRATE the flaw. An objection with no such check is an opinion — downgrade it. You may compile small probes yourself to confirm before asserting. Do not invent flaws to seem thorough; a clean design honestly reported is valid.`,
+  `Rate each attack fatal/serious/minor. For each, give executableCheck: the specific test/sanitizer/benchmark that would DEMONSTRATE the flaw. An objection with no such check is an opinion - downgrade it. You may compile small probes yourself to confirm before asserting. Do not invent flaws to seem thorough; a clean design honestly reported is valid.`,
   GROUND,
 ].join('\n\n')
 
 const PROVER_ROLE = [
-  `ROLE: prover — the empirical judge. You do not argue; you run code. Every verdict is backed by a command and its observed output, never reasoning alone.`,
-  `Work in a fresh scratch dir: BUILD="$(mktemp -d /tmp/quark-prove.XXXXXX)"; cd "$BUILD". Never write build artifacts into the repo. Toolchain: g++ (GCC 14) and clang++ (Clang 20), both -std=c++23.`,
-  `Procedure: (1) implement the design faithfully in real C++23 — real atomics, memory orders, pooling; if under-specified make the most charitable choice and note it. (2) Build under BOTH g++ and clang++ with -O2 -Wall -Wextra; if it doesn't compile clean under both, buildOk:false and report errors. (3) Prove each claim with the matching tool: safe -> rebuild with -fsanitize=thread and -fsanitize=address,undefined and run a multi-producer/single-consumer stress loop (sanitizer report = WRONG); fast -> write a benchmark measuring exactly what the claim asserts (ops/s, ns/op, allocation count, producer-count sweep) and pin the number; correct -> an assertion test (FIFO, count conserved, no dup/skip). (4) Verdict per claim CORRECT/WRONG/INCONCLUSIVE with the counterexample/number. (5) Report benchmark numbers even for passing claims — the judge compares designs on them.`,
-  `Rules: no evidence, no CORRECT. Prefer determinism (fixed counts, enough iterations for stable timing, report methodology). Re-run intermittent races many times and report hit rate (still WRONG). If you weakened the design to compile, say so and mark affected claims INCONCLUSIVE. artifactPath = the scratch dir.`,
+  `ROLE: prover - the empirical judge. You do not argue; you run code. Every verdict is backed by a command and its observed output, never reasoning alone.`,
+  `Platform: Windows only. Work in a fresh scratch dir (PowerShell): $BUILD = Join-Path $env:TEMP ("quark-prove-" + [guid]::NewGuid()); New-Item -ItemType Directory -Path $BUILD | Out-Null; run all commands from $BUILD. Never write build artifacts into the repo. Toolchain: MSVC (cl.exe) from the installed Visual Studio, via a Developer PowerShell / "x64 Native Tools" environment, -std:c++23 (or CMake with that standard). This machine has no g++/clang++ on PATH - do not assume a POSIX or GCC/Clang toolchain; do not use taskset, mktemp, or /tmp.`,
+  `Procedure: (1) implement the design faithfully in real C++23 - real atomics, memory orders, pooling; if under-specified make the most charitable choice and note it. (2) Build under MSVC (cl.exe /std:c++23 /W4 /EHsc, or an equivalent CMake config) - if it doesn't compile clean, buildOk:false and report errors. (3) Prove each claim with the matching tool: safe -> rebuild with MSVC's /fsanitize=address (ThreadSanitizer/UBSan are not available on this MSVC toolchain - substitute a targeted concurrency stress test run many times under a debug CRT with /RTC1, and say explicitly that TSan/UBSan coverage is unavailable here rather than silently skipping it) and run a multi-producer/single-consumer stress loop (sanitizer report or a detected race = WRONG); fast -> write a benchmark measuring exactly what the claim asserts (ops/s, ns/op, allocation count, producer-count sweep) and pin the number; correct -> an assertion test (FIFO, count conserved, no dup/skip). (4) Verdict per claim CORRECT/WRONG/INCONCLUSIVE with the counterexample/number. (5) Report benchmark numbers even for passing claims - the judge compares designs on them.`,
+  `Rules: no evidence, no CORRECT. Prefer determinism (fixed counts, enough iterations for stable timing, report methodology). Re-run intermittent races many times and report hit rate (still WRONG). If you weakened the design to compile, or a sanitizer class is unavailable on Windows/MSVC, say so and mark affected claims INCONCLUSIVE rather than CORRECT. artifactPath = the scratch dir.`,
   GROUND,
 ].join('\n\n')
 
 const JUDGE_ROLE = [
-  `ROLE: judge closing the debate. Ranking, in order: (1) Safety is a GATE — any safe/correct claim marked WRONG by the prover disqualifies that design from winning unless a stated cheap fix exists. (2) Proven beats claimed — count only claims that BOTH survived red-teaming AND were proven CORRECT with executed evidence; INCONCLUSIVE carries no weight; disproven counts against. (3) Among safe survivors prefer the best MEASURED hot-path numbers. (4) A design that bends a core invariant does not win.`,
+  `ROLE: judge closing the debate. Ranking, in order: (1) Safety is a GATE - any safe/correct claim marked WRONG by the prover disqualifies that design from winning unless a stated cheap fix exists. (2) Proven beats claimed - count only claims that BOTH survived red-teaming AND were proven CORRECT with executed evidence; INCONCLUSIVE carries no weight; disproven counts against. (3) Among safe survivors prefer the best MEASURED hot-path numbers. (4) A design that bends a core invariant does not win.`,
   `Output: name the winner with a rationale citing specific proven claims and numbers. Write a decision record to decisions/ADR-<nnn>-<slug>.md in the repo (create decisions/ if absent; pick the next number by listing it) containing the question, one-line design summaries, an evidence table (claim -> survived? -> proven? -> number), the decision, and residual risks. List spec recommendations (which spec file changes and how) and residual risks. Be decisive; if evidence is genuinely insufficient, say so and name the single tie-breaking experiment.`,
   GROUND,
 ].join('\n\n')
@@ -167,7 +167,7 @@ const PROOF_SCHEMA = {
   properties: {
     designName: { type: 'string' },
     buildOk: { type: 'boolean' },
-    compilers: { type: 'array', items: { type: 'string' }, description: 'e.g. ["g++ 14", "clang++ 20"]' },
+    compilers: { type: 'array', items: { type: 'string' }, description: 'e.g. ["MSVC 19.44 (VS 2022)"] - Windows only, no GCC/Clang on this machine' },
     verdicts: {
       type: 'array', items: {
         type: 'object', additionalProperties: false,
@@ -223,7 +223,7 @@ const brief = [
 
 const architectPrompt = (angle, i) => [
   ARCHITECT_ROLE, ``, brief, ``,
-  `You are architect #${i + 1}. Your assigned design angle — push THIS to its strongest concrete form (do not converge on the others):`,
+  `You are architect #${i + 1}. Your assigned design angle - push THIS to its strongest concrete form (do not converge on the others):`,
   ``, angle, ``,
   `Produce a single concrete design with falsifiable fast/safe/correct claims, each with a howToFalsify experiment. Be concrete about atomics and memory orders.`,
 ].join('\n')
@@ -237,7 +237,7 @@ const redteamPrompt = (d) => [
 
 const rebutPrompt = (d, attack) => [
   REBUT_ROLE, ``, brief, ``,
-  `You are the author of the design below. The red team attacked it. Concede what is right, rebut what is wrong (with revised design detail where needed), and output the claims that SURVIVE — each with the exact C++ experiment that will prove it.`,
+  `You are the author of the design below. The red team attacked it. Concede what is right, rebut what is wrong (with revised design detail where needed), and output the claims that SURVIVE - each with the exact C++ experiment that will prove it.`,
   ``, '## Your design', ``, JSON.stringify(d, null, 2),
   ``, '## Red-team attack', ``, JSON.stringify(attack, null, 2),
 ].join('\n')
@@ -261,7 +261,7 @@ const judgePrompt = (designs, examined, proofs) => [
 // Run
 // ---------------------------------------------------------------------------
 phase('Design')
-log(`Target: ${TARGET.title} — ${N} competing designs`)
+log(`Target: ${TARGET.title} - ${N} competing designs`)
 const designs = (await parallel(
   Array.from({ length: N }, (_, i) => () =>
     agent(architectPrompt(ANGLES[i], i), {
@@ -273,7 +273,7 @@ const designs = (await parallel(
 if (!designs.length) return { error: 'No designs produced.' }
 log(`${designs.length} designs proposed; cross-examining and proving each`)
 
-// Pipeline per design: attack -> rebut -> prove. No barrier — design 1 can be in
+// Pipeline per design: attack -> rebut -> prove. No barrier - design 1 can be in
 // the Prove phase while design 3 is still being attacked.
 phase('Cross-examine')
 const proofs = await pipeline(
