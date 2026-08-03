@@ -28,6 +28,7 @@ it's hot-path or safety-critical, by an executed proof — see
 - [Quick start](#quick-start)
 - [Usage](#usage)
 - [Performance](#performance-measured)
+- [Comparing to CAF](#comparing-to-caf)
 - [Repository layout](#repository-layout)
 - [Design & verification docs](#design--verification-docs)
 - [Dependency posture](#dependency-posture)
@@ -224,6 +225,63 @@ The machine-independent **invariant** gates — descriptor ≤ 64 B, **0 hot-pat
 **0 cross-core RMW on the drain path**, and the objdump zero-cost parity checks — are pass/fail
 CTest gates in [`tests/`](tests/), not noise-sensitive benchmarks; see PERFORMANCE.md
 §"What this document is not".
+
+## Comparing to CAF
+
+[`bench/caf_comparison/`](bench/caf_comparison/) benchmarks Quark head-to-head against
+**CAF** (the C++ Actor Framework), a mature, general-purpose actor toolkit. **The goal of that
+comparison is to sanity-check Quark's hot-path claims against an established alternative, not to
+crown a universal winner** — the two engines are built for different points on the
+latency-vs-generality spectrum, and the honest comparison reflects that rather than flattening it
+into one number.
+
+> **This is not an apples-to-apples benchmark, and the full writeup says so in detail.** Both
+> engines are exercised through their own idiomatic, real APIs (no artificial handicaps inserted
+> either direction), but three things mean a raw ratio can mislead if read as "engine A is N×
+> faster than engine B" without the context:
+> - **CAF's `ask` runs through a general-purpose actor mailbox** (id-matching, exit/down
+>   supervision checks, runtime type-erased behavior dispatch) **because CAF's actor model is
+>   fully dynamic**; **Quark's `ask` bypasses the mailbox via a dedicated single-shot reply slot**
+>   because its actors are compile-time-typed to one fixed message protocol. Same operation, two
+>   structurally different implementations — the latency gap is real, but a meaningful share of
+>   it is "narrow-and-specialized" vs "general-and-reused," not raw scheduler speed.
+> - **Quark's spawn benchmark never starts its scheduler** (spawn is pure actor-table
+>   registration); **CAF's scheduler is already live** the moment its `actor_system` is
+>   constructed. The two benchmarks don't have a common instant to measure at.
+> - Every number is a **single unpinned Windows session** on a shared dev laptop — absolute
+>   values move meaningfully between sessions (see the file's own re-run history); treat directional
+>   trends and cited mechanisms as the signal, not any one figure.
+>
+> Read **[bench/caf_comparison/README.md](bench/caf_comparison/README.md)** for the full
+> methodology, every disclosed asymmetry with source-line citations, and the complete numbers —
+> don't quote a ratio from this section without that context.
+
+**What the (disclosed, imperfect) numbers currently show**, one same-session snapshot:
+
+| Dimension | Winner | Margin |
+|---|---|---|
+| `ask` latency (p50, 1 & 12 workers) | **Quark** | 3.3× / ~11× |
+| Spawn (10k actors, 1 & 12 workers) | **Quark** | 1.55× / 5.0× (lifecycle asymmetry disclosed above) |
+| Single-threaded throughput | **CAF** | ~1.04× |
+| Shared-mailbox MPSC scaling (2-12 producers) | **CAF**, widening with producer count | 1.24×-1.76× |
+| Tail latency under thread oversubscription | **CAF**, materially more graceful | gap widens sharply past core count ([ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md), open investigation) |
+
+### Which one should you use?
+
+| Choose **Quark** if you need... | Choose **CAF** if you need... |
+|---|---|
+| Predictable, allocation-free, low-latency single-actor operations (`ask`/`tell`) as the primary workload | High aggregate throughput under many concurrent producers/contended mailboxes |
+| Compile-time-typed actors (one fixed protocol per actor, checked at compile time, zero RTTI) | Runtime-flexible messaging — one actor handling many unrelated message shapes, behavior that changes at runtime (`become`/`unbecome`) |
+| Every hot-path/safety claim backed by an executed proof (ADRs: real C++, ASan/UBSan/TSan, benchmarked) | A large existing ecosystem and production track record — mature, widely-deployed, battle-tested at scale |
+| Deterministic simulation testing (014) for fault injection without real time/threads | A mature reactive-streaming toolkit today — CAF ships a full Rx-style `caf::flow` (observables, `merge`/`zip_with`/`buffer`/`retry`/backpressure strategies); Quark's streaming (024) is a narrower, single-producer credit-ring, and its outbound half (`ask_stream`, ADR-018) is still **Draft** |
+| A project still hardening its scheduler under oversubscription/contention — actively being investigated (ADR-038), not yet closed | A scheduler that already degrades gracefully past core count, today |
+| Linux/x86-64 as the verified target (ARM64 CI-covered; Windows/macOS designed-for behind the PAL, not yet shipped) | Broader OS/platform support that's already shipped and battle-tested |
+
+If your workload is dominated by request/reply calls to individually-addressed actors and you can
+build on Linux/x86-64 today, Quark's numbers and its proof discipline are the more direct fit. If
+you need a general-purpose, deeply-featured, already-mature actor toolkit — dynamic messaging,
+reactive streams, wide platform support — CAF is the safer default, and nothing in this
+benchmark suite is trying to argue otherwise.
 
 ## Repository layout
 
