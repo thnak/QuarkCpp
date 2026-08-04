@@ -294,13 +294,30 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   `supervision_resource_failure_test`/`supervision_restart_retry_test`/
   `supervision_escalation_topology_test`, full suite green under ASan+UBSan. The shipped
   mechanism diverges from what D3's harness proved for two of the three — see ADR-009's
-  "Implementation note (post-decision)" for the details. **Residual (not blocking x86-64):**
-  cold-path unwinder cost on high-throw workloads; large-state `Transactional<>` has no COW yet
-  (Reentrant can't use it — gated on the 015 COW open q); retry idempotency is asserted not
-  verified; ARM64 litmus; `OnRestartAsk<Retry<…>>` is Sequential + sync-handler only; escalation
-  is eager-`spawn<A>()`-only (not `declare_lazy<A>()`), `Tree<…>` routes a single hop (no
-  chain-forwarding), and the runtime storm guards (`escalation_ttl`, per-supervisor
-  `MaxRestarts`, 022 rate limiting) are not yet implemented.
+  "Implementation note (post-decision)" for the details. **The runtime escalation-storm guards
+  are now ALSO WIRED (2026-08-04)** — `EscalationGuard` (supervision.hpp), a runtime parameter to
+  `Engine::set_node_supervisor`/`set_supervisor`/`set_type_supervisor` (all-zero default =
+  unbounded, unchanged pre-feature behavior): an aggregate 022 `TokenBucket` cap over all
+  escalations reaching one supervisor regardless of source, a per-source sliding-window cap keyed
+  by the escalating actor's own `ActorId` (bounds a respawn→refault loop independently of
+  aggregate traffic), and a TTL that stamps the posted `Escalated` descriptor's deadline so it can
+  be shed by the EXISTING 018/022 deadline-shed drain path (`enable_governance(...,
+  deadline_shed=true)` on the supervisor) instead of new machinery — required fixing a real,
+  found-not-assumed gap along the way: `route_escalation`'s internal post bypassed `governed_post`,
+  so a governed supervisor's `resident` depth accounting would have silently underflowed on a
+  second governed message; `Activation::post_governed_unconditional` closes it (keeps the
+  accounting consistent without subjecting an already-admitted escalation to a second, unrelated
+  bound/overflow decision). Every shed is counted exactly via `Engine::escalations_shed()` (guard
+  admission) vs. `Activation::governance_sheds()` (deadline-shed drain path) — never a silent
+  drop. Covered by `supervision_escalation_storm_test.cpp` (aggregate cap, per-source
+  independence, TTL shed, zero-guard regression), full suite (196 tests) green. **Residual (not
+  blocking x86-64):** cold-path unwinder cost on high-throw workloads; large-state
+  `Transactional<>` has no COW yet (Reentrant can't use it — gated on the 015 COW open q); retry
+  idempotency is asserted not verified; ARM64 litmus; `OnRestartAsk<Retry<…>>` is Sequential +
+  sync-handler only; escalation is eager-`spawn<A>()`-only (not `declare_lazy<A>()`), `Tree<…>`
+  routes a single hop (no chain-forwarding); the per-source guard's tracking table is bounded (256
+  entries per supervisor, oldest evicted on overflow — not a full LRU); TSan not yet re-run
+  specifically for the new guard's cross-lane mutex (ASan/UBSan clean, full suite green).
 
 - **Priority & fairness scheduling** (scheduler 002 + developer model 005 + timers 011 +
   perf 023) — resolved in [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md)

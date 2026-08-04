@@ -52,7 +52,7 @@ struct Feeder {
 };
 
 int escalate_calls = 0;
-void on_escalate(void*, error, void*) noexcept { ++escalate_calls; }
+void on_escalate(void*, error, void*, std::int64_t) noexcept { ++escalate_calls; }
 
 }  // namespace
 

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stop_token>
 #include <thread>
@@ -41,6 +42,7 @@
 #include "quark/core/actor.hpp"           // ADR-028 Phase 4: Actor<> CRTP base for the internal broker
 #include "quark/core/config.hpp"
 #include "quark/core/engine_config.hpp"  // 013/ADR-008: frozen EngineConfig + ConfigBuilder + Validation
+#include "quark/core/governance.hpp"      // 022: TokenBucket — the escalation-storm aggregate guard
 #include "quark/core/hot_cell.hpp"        // 013/ADR-008: the Live operational-word (0-RMW hot read)
 #include "quark/core/ids.hpp"
 #include "quark/core/metadata.hpp"        // 008: compiled ActorMetadata, factories, typed spawn wiring
@@ -377,30 +379,31 @@ public:
 
     // Register the engine-wide DEFAULT supervisor (`Supervision<Node>`, the default topology — a
     // Tree of depth 1, 007 §Escalation). Also answers `Supervision<Tree<Supervisor>>` for the SAME
-    // Supervisor type, naming the SAME entry `set_supervisor<Supervisor>()` would.
+    // Supervisor type, naming the SAME entry `set_supervisor<Supervisor>()` would. `guard` (007
+    // §Escalation-storm guards) defaults to unbounded — byte-identical to pre-guard behavior.
     template <class Supervisor>
-    void set_node_supervisor(ActorId supervisor_id) noexcept {
-        set_supervisor<Supervisor>(supervisor_id);
+    void set_node_supervisor(ActorId supervisor_id, EscalationGuard guard = {}) {
+        set_supervisor<Supervisor>(supervisor_id, guard);
         node_supervisor_key_ = type_key_of<Supervisor>();
         has_node_supervisor_ = true;
     }
 
     // Register a supervisor for the NAMED type `Supervisor` — the `Tree<Supervisor>` hop target
     // (007 §Escalation). Independent of the Node default unless also passed to
-    // `set_node_supervisor<Supervisor>()`.
+    // `set_node_supervisor<Supervisor>()`. `guard` defaults to unbounded.
     template <class Supervisor>
-    void set_supervisor(ActorId supervisor_id) noexcept {
+    void set_supervisor(ActorId supervisor_id, EscalationGuard guard = {}) {
         supervisor_registry_[type_key_of<Supervisor>()] =
-            SupervisorEntry{escalation_route_fn<Supervisor>(), supervisor_id};
+            make_supervisor_entry<Supervisor>(supervisor_id, guard);
     }
 
     // Register a PER-ESCALATING-ACTOR-TYPE supervisor (`Supervision<PerType>`, 007 §Escalation):
     // faulting actor `A` escalates to `Supervisor` specifically, independent of the Node default (the
-    // Node default is still the fallback if `A` never gets its own entry here).
+    // Node default is still the fallback if `A` never gets its own entry here). `guard` defaults to
+    // unbounded.
     template <class A, class Supervisor>
-    void set_type_supervisor(ActorId supervisor_id) noexcept {
-        type_supervisors_[type_key_of<A>()] =
-            SupervisorEntry{escalation_route_fn<Supervisor>(), supervisor_id};
+    void set_type_supervisor(ActorId supervisor_id, EscalationGuard guard = {}) {
+        type_supervisors_[type_key_of<A>()] = make_supervisor_entry<Supervisor>(supervisor_id, guard);
     }
 
     // --- On-demand passivation (ADR-028 Phase 8; 006 §passivate) --------------------------
@@ -589,6 +592,12 @@ public:
     [[nodiscard]] MetricsSnapshot metrics_snapshot() const { return metrics_.snapshot(); }
     // Prometheus text exposition — pure string formatting, no client library (009 §Export).
     [[nodiscard]] std::string metrics_prometheus() const { return metrics_.to_prometheus(); }
+    // 007 §Escalation-storm guards: total `Escalated` deliveries shed by an `EscalationGuard`
+    // (TTL/aggregate-rate/per-source-rate) before ever reaching a supervisor's mailbox — exact
+    // accounting, never a silent drop (mirrors the `dead_letters()`/`escalations()` idiom).
+    [[nodiscard]] std::uint64_t escalations_shed() const noexcept {
+        return escalations_shed_.load(std::memory_order_relaxed);
+    }
     // Direct registry access (e.g. `set_user_counter_name` before/while the engine is running).
     [[nodiscard]] MetricsRegistry& metrics_registry() noexcept { return metrics_; }
 
@@ -680,14 +689,17 @@ private:
     // Supervisor>`), not at the escalating actor's OWN `spawn<A>()` compile time — so `Node`'s and
     // `Tree<S>`'s supervisor can be registered independently of any particular escalating actor.
     // ========================================================================================
-    using EscalationRouteFn = void (*)(void* engine, ActorId supervisor_id, Escalated msg) noexcept;
+    using EscalationRouteFn = void (*)(void* engine, ActorId supervisor_id, Escalated msg,
+                                        std::int64_t deadline_ns) noexcept;
 
     template <class Supervisor>
     [[nodiscard]] static EscalationRouteFn escalation_route_fn() noexcept {
         static_assert(Handles<Supervisor, Escalated>,
                       "Supervisor must handle(const Escalated&) to act as a 007 supervisor");
-        return +[](void* engine_erased, ActorId supervisor_id, Escalated msg) noexcept {
-            static_cast<Engine*>(engine_erased)->template route_escalation<Supervisor>(supervisor_id, msg);
+        return +[](void* engine_erased, ActorId supervisor_id, Escalated msg,
+                    std::int64_t deadline_ns) noexcept {
+            static_cast<Engine*>(engine_erased)
+                ->template route_escalation<Supervisor>(supervisor_id, msg, deadline_ns);
         };
     }
 
@@ -697,8 +709,12 @@ private:
     // through to the lazy-activation hand-off (`activate()`) if the supervisor was `declare_lazy`'d
     // but never yet touched; reclaims (silently drops) if the supervisor id is unresolvable at all —
     // an unregistered/misconfigured supervisor degrades to "escalation lost", never a lane fault.
+    // `deadline_ns` (0 = none) is `EscalationGuard::ttl_ns` already resolved against the fault's own
+    // clock reading by `escalation_sink_thunk`, below — this function only stamps it onto the
+    // descriptor so the EXISTING 018/022 deadline-aware-shedding path (`activation.hpp`'s drain loop)
+    // can shed it later if it goes stale in a backed-up supervisor mailbox.
     template <class Supervisor>
-    void route_escalation(ActorId supervisor_id, Escalated msg) noexcept {
+    void route_escalation(ActorId supervisor_id, Escalated msg, std::int64_t deadline_ns) noexcept {
         static_assert(sizeof(Escalated) <= detail::MessagePool::kMaxPayload,
                       "Escalated exceeds the engine's internal pool cell size");
         detail::MessagePool::Slot slot = broker_pool_.acquire(&detail::destroy_payload<Escalated>);
@@ -707,33 +723,111 @@ private:
         d->payload = slot.payload;
         d->payload_size = static_cast<std::uint32_t>(sizeof(Escalated));
         d->trace_id = 0;
-        d->deadline_ns = 0;
+        d->deadline_ns = deadline_ns;
         stamp<Supervisor, Escalated>(*d);
         Schedulable* s = resolve(supervisor_id);
         if (s == nullptr) {
             if (!activate(supervisor_id, d, broker_pool_.sink())) broker_pool_.reclaim(d);
             return;
         }
-        (void)post(s, d);
+        // A governed supervisor needs its OWN accounting kept consistent (see
+        // `post_governed_unconditional`'s comment) — this escalation already passed its own
+        // `EscalationGuard` admission decision, so it is never subject to a SECOND, unrelated 022
+        // bound/overflow policy on top of that.
+        if (s->activation->is_governed()) {
+            if (s->activation->post_governed_unconditional(d)) schedule_and_wake(s);
+        } else {
+            (void)post(s, d);
+        }
     }
 
-    // The per-escalating-activation binding an `EscalationSink`'s `ctx` points to (which supervisor
-    // to tell, and this activation's OWN id — so `Escalated::source` names who faulted). Stored in
-    // `escalation_bindings_` (a `std::deque`: stable references under push_back, unlike `vector`).
-    struct EscalationBinding {
-        void* engine = nullptr;
-        EscalationRouteFn route = nullptr;
-        ActorId supervisor{};
-        ActorId source{};
-    };
+    // One supervisor REGISTRATION's routing target plus its escalation-storm guard state (007
+    // §Escalation-storm guards, `EscalationGuard`). Escalations reaching the SAME supervisor arrive
+    // from MANY different escalating actors' lanes concurrently, so — unlike 022's per-shard
+    // single-writer `TokenBucket`s on the admission hot path — this state is genuinely
+    // multi-producer; `guard_mu` serializes the (cold-path-only, `[[gnu::cold]] do_escalate()`)
+    // admit decision. Held behind `std::unique_ptr` in the registries below so the struct (which
+    // contains a non-movable `std::mutex`) is never itself moved/copied, and so `EscalationBinding`
+    // can safely cache a raw `SupervisorEntry*` (stable for the registry's lifetime).
     struct SupervisorEntry {
         EscalationRouteFn route = nullptr;
         ActorId id{};
+        EscalationGuard guard{};
+        TokenBucket bucket{};  // aggregate cap; live iff guard.max_per_sec > 0
+        struct SourceWindow {
+            std::uint32_t count = 0;
+            std::int64_t window_start_ns = 0;
+            // A DEDICATED "no window yet" flag — do NOT overload `window_start_ns == 0`, because 0
+            // is a legitimate timestamp (the 014 virtual clock starts at 0), which would make every
+            // first escalation look like a fresh window forever (the exact bug class `Activation::
+            // charge_restart()`'s own `window_open_` flag, above, was added to avoid).
+            bool open = false;
+        };
+        // Bounded so a flood of DISTINCT one-shot escalating actor ids can't grow this without limit
+        // (a documented residual, not a full LRU — see 007/OpenQuestions.md): once full, an
+        // arbitrary entry is evicted to make room rather than letting the table grow forever.
+        static constexpr std::size_t kMaxTrackedSources = 256;
+        std::unordered_map<ActorId, SourceWindow> per_source;
+        std::mutex guard_mu;
+
+        // Cold path only (an actual escalation firing). Returns false ⇒ shed: caller must not post.
+        bool admit_locked(ActorId source, std::int64_t now_ns) noexcept {
+            if (guard.max_per_sec > 0.0 && bucket.check(now_ns) != Admit::Accept) return false;
+            if (guard.max_per_source > 0) {
+                auto [it, inserted] = per_source.try_emplace(source);
+                if (inserted && per_source.size() > kMaxTrackedSources) per_source.erase(per_source.begin());
+                SourceWindow& w = it->second;
+                if (!w.open || (guard.per_source_window_ns > 0 &&
+                                (now_ns - w.window_start_ns) >= guard.per_source_window_ns)) {
+                    w.window_start_ns = now_ns;
+                    w.open = true;
+                    w.count = 0;
+                }
+                if (w.count >= guard.max_per_source) return false;
+                ++w.count;
+            }
+            return true;
+        }
     };
 
-    static void escalation_sink_thunk(void* /*self*/, error e, void* ctx) noexcept {
+    template <class Supervisor>
+    [[nodiscard]] static std::unique_ptr<SupervisorEntry> make_supervisor_entry(
+        ActorId supervisor_id, const EscalationGuard& guard) {
+        auto e = std::make_unique<SupervisorEntry>();
+        e->route = escalation_route_fn<Supervisor>();
+        e->id = supervisor_id;
+        e->guard = guard;
+        if (guard.max_per_sec > 0.0) e->bucket = TokenBucket(guard.burst, guard.max_per_sec);
+        return e;
+    }
+
+    // The per-escalating-activation binding an `EscalationSink`'s `ctx` points to (which supervisor
+    // entry to charge/tell, and this activation's OWN id — so `Escalated::source` names who
+    // faulted). Stored in `escalation_bindings_` (a `std::deque`: stable references under push_back,
+    // unlike `vector`).
+    struct EscalationBinding {
+        void* engine = nullptr;
+        SupervisorEntry* entry = nullptr;
+        ActorId source{};
+    };
+
+    void note_escalation_shed() noexcept {
+        escalations_shed_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    static void escalation_sink_thunk(void* /*self*/, error e, void* ctx, std::int64_t now_ns) noexcept {
         auto* b = static_cast<EscalationBinding*>(ctx);
-        b->route(b->engine, b->supervisor, Escalated{b->source, e});
+        SupervisorEntry* entry = b->entry;
+        std::int64_t deadline_ns = 0;
+        {
+            std::lock_guard<std::mutex> guard_lock(entry->guard_mu);
+            if (!entry->admit_locked(b->source, now_ns)) {
+                static_cast<Engine*>(b->engine)->note_escalation_shed();
+                return;  // shed: never posted, never pool-acquired (007 §Escalation-storm guards)
+            }
+            if (entry->guard.ttl_ns != 0) deadline_ns = now_ns + entry->guard.ttl_ns;
+        }
+        entry->route(b->engine, entry->id, Escalated{b->source, e}, deadline_ns);
     }
 
     // Resolve + wire `A`'s declared `Supervision<…>` topology into `act`'s escalation sink (007
@@ -748,28 +842,28 @@ private:
     template <class A>
     void wire_escalation(Activation& act, ActorId id) {
         using Topology = supervision_topology_of<A>;
-        const SupervisorEntry* e = nullptr;
+        SupervisorEntry* e = nullptr;
         if constexpr (is_per_type_topology_v<Topology>) {
             if (auto it = type_supervisors_.find(type_key_of<A>()); it != type_supervisors_.end())
-                e = &it->second;
+                e = it->second.get();
             else if (has_node_supervisor_) {
                 if (auto it2 = supervisor_registry_.find(node_supervisor_key_);
                     it2 != supervisor_registry_.end())
-                    e = &it2->second;
+                    e = it2->second.get();
             }
         } else if constexpr (is_tree_topology_v<Topology>) {
             using S = tree_first_supervisor_t<Topology>;
             if (auto it = supervisor_registry_.find(type_key_of<S>()); it != supervisor_registry_.end())
-                e = &it->second;
+                e = it->second.get();
         } else {  // Node (default)
             if (has_node_supervisor_) {
                 if (auto it = supervisor_registry_.find(node_supervisor_key_);
                     it != supervisor_registry_.end())
-                    e = &it->second;
+                    e = it->second.get();
             }
         }
         if (e == nullptr) return;
-        escalation_bindings_.push_back(EscalationBinding{this, e->route, e->id, id});
+        escalation_bindings_.push_back(EscalationBinding{this, e, id});
         act.set_escalation_sink(EscalationSink{&escalation_sink_thunk, &escalation_bindings_.back()});
     }
 
@@ -1610,10 +1704,15 @@ private:
     // `escalation_bindings_` is a `std::deque`, NOT a `vector`: a binding's address is handed to
     // `Activation::set_escalation_sink` as `ctx` and must stay stable across later push_backs.
     std::deque<EscalationBinding> escalation_bindings_;
-    std::unordered_map<TypeKey, SupervisorEntry> supervisor_registry_;  // Node default / Tree<S> targets
-    std::unordered_map<TypeKey, SupervisorEntry> type_supervisors_;     // PerType targets (keyed by A)
+    // SupervisorEntry embeds a non-movable std::mutex (007 §Escalation-storm guards), so it is held
+    // by unique_ptr — never moved/copied — and EscalationBinding/wire_escalation cache the raw
+    // SupervisorEntry* (stable for the map's lifetime: unordered_map never invalidates an existing
+    // element's address across further insert/erase, only its iterators).
+    std::unordered_map<TypeKey, std::unique_ptr<SupervisorEntry>> supervisor_registry_;  // Node / Tree<S>
+    std::unordered_map<TypeKey, std::unique_ptr<SupervisorEntry>> type_supervisors_;     // PerType (keyed by A)
     TypeKey node_supervisor_key_{};
     bool has_node_supervisor_ = false;
+    std::atomic<std::uint64_t> escalations_shed_{0};  // 007 §Escalation-storm guards (cold path)
     std::vector<std::jthread> threads_;
     std::jthread backstop_;  // 011/ADR-028 Phase 2: the engine-wide idle-shard wheel-advance backstop
     std::atomic<std::uint32_t> idle_mask_{0};  // bit w set ⇒ worker w is parked/parking

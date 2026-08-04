@@ -90,10 +90,11 @@ struct OnResourceFailure {
 // `Supervision<Node | PerType | Tree<…>>` (007 §Escalation) — the escalation topology knob. `Node`
 // (default) is a depth-1 tree: a single node supervisor. WIRED for eager `spawn<A>()` (see
 // `Engine::wire_escalation<A>`, `engine.hpp`) — `Tree<S0,…>` routes a single hop to `S0` only (no
-// chain-forwarding); `declare_lazy<A>()` and the runtime storm guards (`escalation_ttl`, a per-
-// supervisor `MaxRestarts`/`Within`, 022 rate limiting) are documented residuals. The static depth
-// bound is enforced here (compile time); the topology EXTRACTION (`supervision_topology_of<A>`,
-// below) is a pure function of `A`'s policy pack, consumed by `engine.hpp`'s routing.
+// chain-forwarding); `declare_lazy<A>()` is a documented residual. The runtime storm guards
+// (`EscalationGuard` below: TTL, aggregate + per-source rate limiting) ARE wired — see
+// `Engine::set_node_supervisor`/`set_supervisor`/`set_type_supervisor`. The static depth bound is
+// enforced here (compile time); the topology EXTRACTION (`supervision_topology_of<A>`, below) is a
+// pure function of `A`'s policy pack, consumed by `engine.hpp`'s routing.
 struct Node {};
 struct PerType {};
 template <class... Supervisors>
@@ -295,6 +296,40 @@ template <class A>
 struct Escalated {
     ActorId source{};
     error cause{};
+};
+
+// ============================================================================================
+// Escalation-storm guards (007 §Escalation residual — see ADR-009's post-decision note). A
+// supervisor is an ordinary actor with an ordinary mailbox: with no bound, a systemic fault (many
+// actors escalating at once) or a respawn→refault loop (a supervisor that restarts its escalated
+// child, which immediately faults again) can flood it at native `tell` throughput. `EscalationGuard`
+// is a RUNTIME parameter to `Engine::set_node_supervisor`/`set_supervisor`/`set_type_supervisor` —
+// not a compile-time actor policy — because it describes the tolerance of one specific supervisor
+// REGISTRATION, not a trait of the escalating actor's type. All-zero (the default) is unbounded:
+// byte-for-byte the pre-existing behavior, so every existing call site is unaffected.
+//
+//   * `ttl_ns` — reuses the EXISTING 018/022 deadline-aware-shedding path (`activation.hpp`'s
+//     drain loop already sheds a doomed, past-deadline message under overload): the escalation
+//     routing stamps the posted `Escalated` descriptor's `deadline_ns` at `now + ttl_ns` instead of
+//     the un-set `0`. A supervisor actor also configured with `ShedThreshold<N>` (022) then sheds a
+//     stale escalation instead of acting on it once it finally reaches the front of a backed-up
+//     mailbox. 0 = never expires (today's behavior).
+//   * `max_per_sec` / `burst` — an aggregate token-bucket (022 `TokenBucket`) admission gate over
+//     ALL escalations reaching this supervisor, regardless of source. 0 = unbounded.
+//   * `max_per_source` / `per_source_window_ns` — a sliding-window cap (the SAME shape as the
+//     per-actor `MaxRestarts<N,Within<…>>` budget above, applied per ESCALATING actor id instead of
+//     per restarting actor) bounding how many escalations from the SAME faulting actor this
+//     supervisor accepts per window — the direct defense against a respawn→refault loop. 0 =
+//     unbounded.
+//
+// A shed escalation is never posted (no pool acquire, no mailbox touch) and is counted exactly via
+// `Engine::escalations_shed()` — never a silent drop.
+struct EscalationGuard {
+    std::int64_t ttl_ns = 0;
+    double max_per_sec = 0.0;
+    double burst = 0.0;
+    std::uint32_t max_per_source = 0;
+    std::int64_t per_source_window_ns = 0;
 };
 
 namespace detail {

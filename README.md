@@ -59,9 +59,12 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 > `OnRestartAsk<Retry>` / `OnResourceFailure<Degrade>` knobs are now WIRED (direct
 > implementation, not re-run through red-team/prove — see ADR-009's "Implementation note
 > (post-decision)"): `OnRestartAsk<Retry<…>>` is Sequential + sync-handler only,
-> `Supervision<…>` covers eager `spawn<A>()` with a single-hop `Tree` and no escalation-storm
-> guards yet, and `OnResourceFailure<…>` is a handler-authored `ProductGuard` call rather than
-> an automatic pre-handler pass — see `007-Failure-and-Supervision.md` for the residuals.
+> `Supervision<…>` covers eager `spawn<A>()` with a single-hop `Tree` (no chain-forwarding yet),
+> and `OnResourceFailure<…>` is a handler-authored `ProductGuard` call rather than an automatic
+> pre-handler pass. **Escalation-storm guards are now WIRED too**: `EscalationGuard` bounds a
+> supervisor's exposure with an aggregate 022 token-bucket cap, a per-source sliding-window cap
+> (bounds a respawn→refault loop), and a TTL reusing the existing 018/022 deadline-shed drain
+> path — see `007-Failure-and-Supervision.md` for the remaining residuals.
 >
 > The cluster data path is now proven too:
 > [ADR-011](decisions/ADR-011-cluster-relay-and-placement-gate-verification.md) executed the

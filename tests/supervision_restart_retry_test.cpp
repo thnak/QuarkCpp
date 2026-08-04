@@ -7,6 +7,7 @@
 //     (dead-lettered exactly once, actor left on fresh post-restart state);
 //   * a retry budget that OUTRUNS the actor's own MaxRestarts window escalates instead of retrying
 //     forever — retries cannot out-run the actor's own restart budget.
+#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -53,7 +54,7 @@ struct BudgetedRetryActor : Actor<BudgetedRetryActor, Sequential, OnFailure<Rest
 void reset_budgeted_actor(void*, void*) noexcept {}
 
 int escalate_calls = 0;
-void on_escalate(void*, error, void*) noexcept { ++escalate_calls; }
+void on_escalate(void*, error, void*, std::int64_t) noexcept { ++escalate_calls; }
 
 struct Feeder {
     std::vector<Descriptor> descs;

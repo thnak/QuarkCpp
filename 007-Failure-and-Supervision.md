@@ -128,11 +128,20 @@ cross-lane touch, so single-executor is preserved. The supervisor's OWN policy f
 an `Escalated` (`Stop` the actor, `Stop` a whole shard, trigger a controlled node shutdown,
 re-escalate further) is ordinary handler code — the engine imposes none of it. Escalation is the
 only path by which one actor's failure can affect another; the **static depth bound**
-(`Tree<…>`'s `static_assert(depth ≤ 8)`) is enforced at compile time, but the runtime storm guards
-this section originally called for are **not yet implemented**: no per-message `escalation_ttl`,
-no per-supervisor `MaxRestarts`/`Within` window, no 022 per-shard token bucket — a hand-written
-re-`tell` chain or a hot re-escalation loop is not yet bounded by the engine. Documented residuals,
-tracked alongside the `declare_lazy<A>()` gap above.
+(`Tree<…>`'s `static_assert(depth ≤ 8)`) is enforced at compile time, and the runtime storm guards
+this section originally called for are now **WIRED (2026-08-04)** as `EscalationGuard` — a runtime
+parameter to `Engine::set_node_supervisor`/`set_supervisor`/`set_type_supervisor` (all-zero default
+= unbounded, unchanged from before this feature): an aggregate 022 token-bucket cap over ALL
+escalations reaching one supervisor (a systemic-fault storm — many actors faulting at once), a
+per-source sliding-window cap keyed by the escalating actor's own `ActorId` (a respawn→refault
+loop — the SAME source escalating repeatedly), and a TTL that stamps the posted `Escalated`
+descriptor's deadline so a supervisor configured with 022 `enable_governance(...,
+deadline_shed=true)` sheds a since-gone-stale escalation via the EXISTING 018/022 deadline-shed
+path rather than new machinery. Every shed is counted exactly via `Engine::escalations_shed()` —
+never a silent drop. Not yet closed: the per-source tracking table is bounded (256 distinct
+tracked sources per supervisor, oldest evicted on overflow — not a full LRU) and
+`declare_lazy<A>()` escalation wiring remains a separate, documented residual. See
+`tests/supervision_escalation_storm_test.cpp`.
 
 ## `ask` reply on `Restart` (ADR-009)
 
@@ -206,8 +215,8 @@ themselves observable and optionally replayable.
 - **State rollback on `Resume`** → default **assert-intact** (zero-cost); opt-in
   Sequential-only `Transactional<Off|Snapshot|Journal>`. See *`Resume` state rollback*.
 - **Escalation granularity** → configurable `Supervision<Node|PerType|Tree<…>>`, WIRED for eager
-  `spawn<A>()` (static depth bound enforced; runtime `escalation_ttl`/per-supervisor
-  `MaxRestarts`/022 rate-limiting NOT yet implemented; `declare_lazy<A>()` not yet wired). See
+  `spawn<A>()` (static depth bound enforced; runtime storm guards — TTL, aggregate + per-source
+  rate limiting — WIRED via `EscalationGuard`; `declare_lazy<A>()` not yet wired). See
   *Escalation*.
 - **`ask` reply on `Restart`** → `OnRestartAsk<Fail | Retry<N, IdempotencyKey>>`, default
   `Fail`, WIRED (Sequential + sync-handler only). See *`ask` reply on `Restart`*.

@@ -30,7 +30,7 @@ struct Poison : Actor<Poison, Sequential> {
 void reconstruct(void*, void*) noexcept {}  // fresh state is a no-op here (stateless poison target)
 
 int escalate_calls = 0;
-void on_escalate(void*, error, void*) noexcept { ++escalate_calls; }
+void on_escalate(void*, error, void*, std::int64_t) noexcept { ++escalate_calls; }
 
 }  // namespace
 
