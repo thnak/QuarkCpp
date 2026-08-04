@@ -117,6 +117,26 @@ public:
     // simply drops the session and waits for the next application send to re-trigger a fresh handshake.
     void set_reset_hook(std::function<void(NodeId)> fn) noexcept { reset_hook_ = std::move(fn); }
 
+    // The connection this peer's session was negotiated on has died. An mTLS session is
+    // per-connection: keep it and the peer (which necessarily lost its own half) silently drops every
+    // frame we seal, forever — and the server-role side can never re-initiate. Dropping it here makes
+    // the client-role side re-handshake on its next send (S2), exactly as on a cold start. Wire this to
+    // `[&secure](NodeId p){ secure.on_peer_disconnected(p); }` via `net::TcpTransport::set_peer_down_hook`.
+    void on_peer_disconnected(NodeId peer) {
+        {
+            std::unique_lock<std::shared_mutex> g(map_mu_);
+            sessions_.erase(peer.value);
+        }
+        {
+            std::lock_guard<std::mutex> g(pending_mu_);
+            pending_.erase(peer.value);
+        }
+        sessions_dropped_on_disconnect_.fetch_add(1, std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t sessions_dropped_on_disconnect() const noexcept {
+        return sessions_dropped_on_disconnect_.load(std::memory_order_relaxed);
+    }
+
     // Phase 6 rotation policy (ADR-040 C5/C15). Defaults are conservative; override per-deployment.
     static constexpr std::uint64_t kDefaultMaxFramesPerKey = 1'000'000;                  // C5
     static constexpr std::int64_t kDefaultRenegotiateIntervalNs = 3600LL * 1'000'000'000;  // 1h idle poll (C15)
@@ -260,6 +280,13 @@ public:
     [[nodiscard]] std::uint64_t handshake_pending_dropped() const noexcept {
         return handshake_pending_dropped_.load(std::memory_order_relaxed);
     }
+    // A parked (in-flight) client-role handshake with no progress for this long is abandoned and
+    // retried from scratch on the next send/inbound Authenticate frame, instead of parking forever —
+    // closes the "a lost opening frame wedges this peer permanently" gap (no timeout previously).
+    void set_handshake_timeout(std::int64_t ns) noexcept { handshake_timeout_ns_ = ns; }
+    [[nodiscard]] std::uint64_t handshakes_timed_out() const noexcept {
+        return handshakes_timed_out_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::size_t pending_handshake_count() const noexcept {
         std::lock_guard<std::mutex> g(pending_mu_);
         return pending_.size();
@@ -354,7 +381,11 @@ private:
         std::unique_ptr<HandshakeEngine> engine;
         {
             std::lock_guard<std::mutex> g(pending_mu_);
-            if (pending_.contains(peer.value)) return;
+            if (const auto it = pending_.find(peer.value); it != pending_.end()) {
+                if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_) return;
+                pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
+                handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
+            }
             engine = handshake_factory_->create(/*is_client=*/true, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
                                                 revoked_snapshot_);
@@ -403,7 +434,7 @@ private:
         }
         {  // WantWrite / WantRead: store BEFORE sending, so a synchronous reentrant reply finds it.
             std::lock_guard<std::mutex> g(pending_mu_);
-            pending_[peer.value] = std::move(engine);
+            pending_[peer.value] = PendingHandshake{std::move(engine), now_ns()};
         }
         if (!out.empty()) send_authenticate_frame(peer, std::move(out));
     }
@@ -413,7 +444,11 @@ private:
         std::unique_ptr<HandshakeEngine> engine;
         {
             std::lock_guard<std::mutex> g(pending_mu_);
-            if (pending_.contains(peer.value)) return;  // already in flight
+            if (const auto it = pending_.find(peer.value); it != pending_.end()) {
+                if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_) return;  // already in flight
+                pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
+                handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
+            }
             engine = handshake_factory_->create(/*is_client=*/true, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
                                                 revoked_snapshot_);
@@ -430,7 +465,15 @@ private:
             std::lock_guard<std::mutex> g(pending_mu_);
             const auto it = pending_.find(peer.value);
             if (it != pending_.end()) {
-                engine = std::move(it->second);
+                // A parked engine past the progress deadline is stale (e.g. it sent its opening
+                // frame, that frame was lost, and the peer is only now retrying with a FRESH engine)
+                // — discard it so the peer's retry meets a fresh server-role engine below, instead of
+                // this stale one silently swallowing the retry's frame with a state machine that no
+                // longer matches what the peer just sent.
+                if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_)
+                    engine = std::move(it->second.engine);
+                else
+                    handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
                 pending_.erase(it);
             }
         }
@@ -554,7 +597,14 @@ private:
     // Handshakes in flight, keyed by peer. Touched only in short, independent critical sections (see
     // drive_handshake's banner) — never held across advance()/inner_->send().
     mutable std::mutex pending_mu_;
-    std::unordered_map<std::uint64_t, std::unique_ptr<HandshakeEngine>> pending_;
+    struct PendingHandshake {
+        std::unique_ptr<HandshakeEngine> engine;
+        std::int64_t last_progress_ns = 0;
+    };
+    std::unordered_map<std::uint64_t, PendingHandshake> pending_;
+    // A parked handshake with no progress for this long is abandoned and retried (set_handshake_timeout
+    // banner above) — closes the "a lost opening frame wedges this peer permanently" gap.
+    std::int64_t handshake_timeout_ns_ = 5'000'000'000;  // 5s
 
     std::atomic<std::uint64_t> sealed_{0};
     std::atomic<std::uint64_t> opened_{0};
@@ -562,6 +612,8 @@ private:
     std::atomic<std::uint64_t> tamper_rejected_{0};
     std::atomic<std::uint64_t> revoked_dropped_{0};
     std::atomic<std::uint64_t> handshake_pending_dropped_{0};
+    std::atomic<std::uint64_t> handshakes_timed_out_{0};
+    std::atomic<std::uint64_t> sessions_dropped_on_disconnect_{0};
     std::atomic<std::uint64_t> revocations_enforced_{0};
     std::atomic<std::uint64_t> renegotiations_attempted_{0};
     std::atomic<std::uint64_t> renegotiations_completed_{0};

@@ -174,6 +174,12 @@ public:
     // mutex-guarded post queue `send`/`close_peer` already use).
     void post(std::function<void()> fn) { io_.post(std::move(fn)); }
 
+    // Fired on the I/O thread when an ESTABLISHED, identified connection to `peer` dies (peer restart,
+    // RST, EOF, network drop) — before any reconnect is armed. `SecureTransport` wires this to
+    // `on_peer_disconnected()` (ADR-040) so a per-connection mTLS session never outlives the
+    // connection it was negotiated on. Set before start(); called on the loop thread.
+    void set_peer_down_hook(std::function<void(NodeId)> fn) { peer_down_hook_ = std::move(fn); }
+
     // --- diagnostic counters (atomic; read from a test thread after a sync point) ---------------
     [[nodiscard]] std::uint64_t frames_received() const noexcept { return frames_received_.load(); }
     [[nodiscard]] std::uint64_t frames_sent() const noexcept { return frames_sent_.load(); }
@@ -477,6 +483,7 @@ private:
     void handle_dead(Conn* c) {
         const NodeId peer = c->peer;
         const bool was_identified = c->identified;
+        const bool was_established = was_open(c);  // captured before unmark_open() clears it below
         salvage_out(c);  // return unsent whole frames to the peer queue BEFORE the fd/state go away
         pal::close_fd(c->fd);
         io_.del_fd(c->fd);
@@ -491,6 +498,7 @@ private:
         auto it = (was_identified) ? conns_.find(peer.value) : conns_.end();
         if (it == conns_.end() || it->second.get() != c) return;
 
+        if (was_established && was_identified && peer_down_hook_) peer_down_hook_(peer);
         const bool suppressed = reconnect_suppressed_.count(peer.value) != 0;
         const bool have_endpoint = peers_.count(peer.value) != 0;
         // Reconnect any peer whose listen endpoint we know (021 §"Reconnect …, capped"). If both ends
@@ -649,6 +657,7 @@ private:
     std::atomic<bool> started_{false};
 
     std::function<void(MessageFrame)> receiver_;  // set before start(); read on the loop thread
+    std::function<void(NodeId)> peer_down_hook_;  // set before start(); called on the loop thread
 
     // Connection state — all loop-thread-owned. conns_: identified peers (keyed by NodeId). pending_in_:
     // accepted connections whose peer NodeId is not yet known (keyed by fd). by_fd_: raw handler lookup.

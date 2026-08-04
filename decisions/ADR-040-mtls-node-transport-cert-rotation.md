@@ -196,6 +196,55 @@ concrete CMake wiring. Import C8's test verbatim as a follow-up before merge.
   path (as opposed to close+redial) has no dedicated executed claim; low severity since the
   fallback path is proven to work correctly and 021's redial machinery is pre-existing and
   separately relied upon.
+- **Two real gaps found exercising the real async transport for the first time (found post-merge,
+  2026-08-04, root-caused, reproduced, and fixed — see below).** A manual 4-container
+  docker experiment (`net::TcpTransport` wrapped by `SecureTransport` with `enable_handshake()`, real
+  mbedTLS 3.6.7) initially appeared to show the CLIENT-role handshake stalling non-deterministically.
+  A follow-up investigation disproved that specific symptom — it was a measurement artifact in the
+  experiment's own harness (it waited for sessions to establish *before* ever calling `send()`, the
+  only trigger that initiates a client-role handshake, so it could never succeed by construction; the
+  0/1/2/3-session "staircase" across nodes was container-start skew, not a real fault). The suspected
+  `FrameKind::Authenticate` partial-record desync is ruled out: `net::wire_codec.hpp`'s `FrameStream`
+  correctly reassembles `[u32 len][body]` before `SecureTransport::deliver()` ever sees a frame, and
+  `MbedtlsHandshakeEngine::advance()` accumulates across calls regardless. This path had, however,
+  ONLY ever been exercised via `tests/adapters/mbedtls_handshake_check.cpp`'s synchronous
+  hand-fed-bytes-between-two-engines harness (zero latency, one complete flight per `advance()` call)
+  before this experiment drove it through the real epoll-driven async transport — and doing so
+  surfaced two genuine, reproduced bugs neither the mock nor the synchronous harness could catch:
+  - **A lost opening handshake frame wedges that peer permanently.**
+    `SecureTransport::ensure_handshake()`/`handle_authenticate_frame()`
+    (`include/quark/core/secure_transport.hpp`) park a client-role engine in `pending_` with no
+    timeout, eviction, or retry; `TcpTransport::send_on_loop` silently drops a frame (no reconnect
+    armed) whenever the peer's endpoint isn't registered yet (021 discovery/SWIM gossip feeds
+    `add_peer` asynchronously, so this is a normal, expected race, not a rare fault). Reproduced with
+    two loopback processes and a 2s-delayed `add_peer`: the client engine parks after `WantWrite`,
+    the frame never arrives, and `sessions=0 pending=1` holds forever — no `Failed` step, no audit
+    record, indistinguishable from a genuine stall.
+  - **An mTLS session outlives the TCP connection it was negotiated on.** `SecureTransport` never
+    drops a session when the underlying connection dies. After a peer restarts: the survivor keeps
+    sealing frames under dead keys (never delivered), the restarted peer has no session so drops
+    everything (S2), and — since the restarted peer is server-role and cannot self-initiate, while
+    the survivor already "has" a session so never re-handshakes — the pair is a permanent
+    bidirectional blackhole until `sweep_rotation`'s 1h idle timer (itself only armed if
+    `SwimMembership::set_sweep_hook` is wired). Reproduced by killing/restarting one of two loopback
+    peers mid-stream: `delivered` freezes permanently on both sides at the pre-restart count.
+
+  Applied: (1) a progress deadline on `pending_` handshakes (default 5s,
+  `SecureTransport::set_handshake_timeout()`/`handshakes_timed_out()`) so a lost opening frame gets
+  abandoned and retried instead of parking forever; (2) `TcpTransport::set_peer_down_hook()` (mirrors
+  the existing `set_reset_hook`/`reset_peer_connection` shape) fires on connection death for an
+  established, identified peer; `SecureTransport::on_peer_disconnected()`
+  (`sessions_dropped_on_disconnect()`) drops that peer's session/pending-handshake so the next send
+  re-triggers a clean handshake instead of sealing into a void. Each fix has a dedicated, deterministic
+  regression test (QueuedFabric + a settable virtual clock, no real sockets/timing needed):
+  `tests/security_secure_transport_handshake_timeout_test.cpp` (a permanently-undelivered opening
+  frame is abandoned and retried only once the virtual clock crosses the deadline, never before) and
+  `tests/security_secure_transport_peer_disconnect_test.cpp` (`on_peer_disconnected()` drops the
+  session, the next send() re-handshakes, and delivery resumes — proving the pair is not permanently
+  blackholed). Verified: full `security_*`/`secure_transport_*`/`tcp_transport_*` test filter passes
+  (MSVC Debug) after the change; the project's normal cross-platform GCC/Clang + sanitizer prove/verify
+  pass (see the "Cross-platform re-verification" item below) still applies before this is considered
+  fully closed.
 - **Cross-platform re-verification.** Both designs were built and proven only under
   Windows/MSVC per this task's explicit constraint; neither has been compiled or sanitizer-run
   under the project's primary GCC/Clang targets. Standard practice per CONVENTIONS.md (dual
