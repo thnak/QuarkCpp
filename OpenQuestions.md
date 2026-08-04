@@ -23,12 +23,28 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   conceded the 023 0-RMW hard gate** (0.00391 RMW/item vs PUSH's measured 0), so it is adopted
   only as a secondary **`ReplyMode::Pull`** for high-RTT links. The **item-transport leg is proven**
   (it is the shipped 024 `StreamChannel`/`StreamActivation` flipped: 8.3× amortization, 0 per-item
-  heap, 0 caller-drain RMW, 5.3–6.4 M/s ≥ the 4M floor). **006 outbound stays Draft** — promotion
-  is gated on the **015 OPEN-cell re-admit** (`co_await` on-lane resume, still stubbed in
-  `detail/reply_cell.hpp`) clearing an ADR-014-grade real-scheduler run; the item leg does not
-  wait on it. Folded into 006/024/017/018/010/004/003/002/001/022/023. **New residual:** the
-  fan-in deriving-reply hazard (017); AArch64 weak-memory re-gate of the flipped ring (inherits
-  024).
+  heap, 0 caller-drain RMW, 5.3–6.4 M/s ≥ the 4M floor). **006 outbound: Accepted (x86-64),
+  2026-08-04.** Promotion was gated on the **015 OPEN-cell re-admit** (`co_await` on-lane resume)
+  clearing an ADR-014-grade real-scheduler run; both legs are now closed. **The re-admit MECHANISM**
+  — `detail/reply_cell.hpp`'s `resolve()` routes through `Activation::complete_parked()` instead of
+  a raw `h.resume()`, proven exactly-once/no-lost-wakeup under a real multi-worker Engine via
+  `tests/ask_coawait_real_scheduler_test.cpp` (`StreamReplyCell` is the SAME template, so the fix
+  applies verbatim), including a genuinely separate lost-wakeup/UB race found and fixed in
+  `complete_parked()` itself along the way (ADR-015 residual #7). **The ask_stream-specific dedicated
+  run** — ADR-018's own tie-breaking experiment, the OPEN handshake proven racing the ring's FIRST
+  pushed item through a real actor handling `AskStream<Q,F>` — is also now done:
+  `ActorRef<A>::ask_stream<F>(Q)` / `LocalRouter::ask_stream` (the missing 006/010 addressing layer)
+  are wired in `actor_ref.hpp`, and `tests/ask_stream_coawait_real_scheduler_test.cpp` proves 2500
+  independent OPEN-vs-first-item races (100 actors × 25 streams) exactly-once, 0 loss, 0 gap, 3/3
+  repeats green. See [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)'s two post-decision
+  updates for the full record. Folded into 006/024/017/018/010/004/003/002/001/022/023/015. **New
+  residual, found while building the ask_stream test:** `ReplyCell::resolve()`'s co_await resume is
+  synchronous and stack-reentrant on the RESOLVING thread (not deferred to a scheduler tick) — a
+  callee handler doing work after `.accept()`/`respond()` must not assume that work happens-before
+  the resumed caller's continuation, since the caller's whole continuation can run to completion
+  nested inside the callee's own call stack first. Documented, not yet mitigated or guarded — see
+  ADR-018's residual risks. Also still open: the fan-in deriving-reply hazard (017); AArch64
+  weak-memory re-gate of the flipped ring (inherits 024).
 
 - **Actor execution vehicle — passive+stackless vs green threads/fibers** (001/002/015/024/023)
   — resolved in [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)
@@ -341,6 +357,27 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   optimization. Covered by `tests/fanout_evict_after_test.cpp`, `fanout_block_test.cpp`,
   `fanout_subscribe_race_test.cpp`, `fanout_payload_reclaim_test.cpp`.
 
+- **`Activation::complete_parked()` lost-wakeup/UB race** (001/002/015, ADR-015) — **found and fixed,
+  2026-08-04**, while scoping 006's `ask`/`ask_stream` `co_await` re-admit wiring (below). Red-teamed
+  and confirmed with an executable repro (429/429 stuck under a 5 µs injected delay against the real
+  `ExecStateCell`): a carrier calling `complete_parked()` before `drain_step`'s suspend tail finished
+  writing `parked_frame_`/`parked_desc_` and calling `exec_.park()` raced those plain fields (UB) and
+  could permanently strand the activation in `Parked` — `readmit_from_parked()`'s CAS fails silently
+  against a still-`Running` state, with no retry. This was dormant in shipped code only because no
+  `blocking<>`/`fiber<>` adapter (the mechanism's intended caller) was ever implemented; the `ask`
+  reply path would have been the first real concurrent caller. Fixed by gating `complete_parked()`'s
+  reads behind an acquire-confirmed observation of `ExecState::Parked` (the standard release/acquire
+  message-passing idiom over the existing `park()` release-store — no new primitive; deliberately NOT
+  the Reentrant path's fence+re-probe+`reacquire_from_parked()` self-heal, which would be unsound here
+  since Sequential's carrier resumes the frame directly rather than queuing it — see the fix-site
+  comment in `activation.hpp` for the full reasoning). Proven with a permanent test + its
+  disable-the-fix control (`tests/activation_park_race_test.cpp` /
+  `activation_park_race_control`): 0/600 stuck fixed vs. 600/600 stuck reverted, full suite green
+  under the default config and ASan+UBSan. **Residual:** TSan unavailable on the proving host
+  (confirmed, not assumed) — a TSan re-run on Linux CI is recommended before any `blocking<>`/
+  `fiber<>` adapter is built on this seam; see [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)'s
+  residual risk #7 for the full record.
+
 ## Highest-leverage unresolved questions
 
 These affect multiple subsystems; resolving one constrains several specs.
@@ -558,9 +595,9 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)** (above). What remains is
   **mostly verification to run**: the `type_key` conformance test (now written — it reports
   a real GCC↔Clang divergence on builtin spellings, item 1), the AArch64 weak-memory proof of
-  the mailbox handoff, and the **015 OPEN-cell re-admit real-scheduler gate** — which now
-  blocks *both* an ordinary `ask`'s co_await resume and 006 outbound's OPEN handshake
-  promotion. **One design question has since reopened**: `type_key` collisions between
+  the mailbox handoff, and the **015 OPEN-cell re-admit real-scheduler gate** — resolved
+  2026-08-04 for both an ordinary `ask`'s co_await resume and 006 outbound's OPEN handshake
+  (see the Resolved section above). **One design question has since reopened**: `type_key` collisions between
   structurally identical Described types (item 2) — the name-free fingerprint that makes
   durable keys toolchain-portable also makes them non-unique, and it contradicts
   `describe.hpp:236`'s stated field-order invariant. That one needs an ADR, not a test.)*

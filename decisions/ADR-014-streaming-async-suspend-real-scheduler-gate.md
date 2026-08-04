@@ -199,10 +199,16 @@ non-blocking residual, consistent with an x86-64-scoped Accepted.
 5. **[extended by [ADR-018](ADR-018-outbound-streaming-replies.md) — outbound reply drain
    needs its own real-scheduler run]** The outbound streaming-reply item-drain **is** this
    gate's item-drain flipped (callee = producer, caller = consumer), and ADR-018 proved that
-   flipped leg CORRECT under the shipped `StreamChannel`/`StreamActivation` headers. But the
-   two seams unique to the reply direction — the single-resolve OPEN `StreamReplyCell`'s **015
-   re-admit** (`co_await` on-lane resume, still unwired in `reply_cell.hpp`) and the two-part
-   **terminal-wake edge** (terminal CAS arms the caller drain **and** bumps `credit_gen`) —
-   were proven only in a wrapper, not against the real 002 scheduler + ADR-007 reply router.
-   Each needs its **own ADR-014-grade real-scheduler run** before 006 outbound streaming
-   promotes Draft→Accepted.
+   flipped leg CORRECT under the shipped `StreamChannel`/`StreamActivation` headers. Of the two
+   seams unique to the reply direction — the single-resolve OPEN `StreamReplyCell`'s **015
+   re-admit** (`co_await` on-lane resume) and the two-part **terminal-wake edge** (terminal CAS
+   arms the caller drain **and** bumps `credit_gen`) — the OPEN re-admit is now fully closed
+   (2026-08-04, see ADR-018's two post-decision updates): both the underlying mechanism (proven
+   via an ordinary `ask`) AND the ask_stream-specific dedicated run (the OPEN handshake racing
+   the ring's first item, through a real actor handling `AskStream<Q,F>`,
+   `tests/ask_stream_coawait_real_scheduler_test.cpp`, 2500/2500 exactly-once) are proven against
+   the real 002 scheduler + dispatch. This closure is what flips 006 outbound streaming
+   Draft→Accepted (x86-64). The **terminal-wake edge remains untouched by this update** — still
+   proven only in a wrapper, not against a mid-stream cancel/deadline race through the real
+   dispatcher; a residual, not a gate on the promotion above (ADR-018 §Promotion only named the
+   OPEN re-admit as the blocker).

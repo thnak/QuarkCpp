@@ -60,6 +60,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sched_no_lost_wakeup_test.cpp")
   add_test(NAME sched_no_lost_wakeup_control COMMAND sched_no_lost_wakeup_control)
 endif()
 
+# ADR-015 park()-vs-complete_parked() lost-wakeup CONTROL (red-teamed): -DQUARK_ACTIVATION_PARK_NO_GATE
+# reverts Activation::complete_parked() to the pre-fix shape (no acquire-gate before touching the
+# plain parked_frame_/parked_desc_ members) and lets drain_step()'s suspend tail call a test-provided
+# hook to deterministically widen the window between the plain writes and exec_.park() (redteam's
+# injected-delay technique). The control MUST reproduce a permanent-stranding lost re-admit (and
+# confirm it is truly permanent) at least once — the binary returns 0 iff it does, same convention as
+# sched_no_lost_wakeup_control above.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/activation_park_race_test.cpp")
+  add_executable(activation_park_race_control activation_park_race_test.cpp)
+  target_link_libraries(activation_park_race_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(activation_park_race_control PRIVATE QUARK_ACTIVATION_PARK_NO_GATE)
+  add_test(NAME activation_park_race_control COMMAND activation_park_race_control)
+endif()
+
 # The 016 fingerprint-mismatch OOB CONTROL (ADR-016 control 4, ASan half): forces the unchecked
 # tagless reader over a tight, exact-sized heap buffer with a longer/mismatched schema, so it
 # over-reads. Under ASan this aborts with a heap-buffer-overflow; WILL_FAIL means a non-zero exit

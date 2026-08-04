@@ -77,6 +77,15 @@ struct TimerEntry;  // timer_wheel.hpp — forward-declared: Activation only eve
 
 namespace quark {
 
+#ifdef QUARK_ACTIVATION_PARK_NO_GATE
+// CONTROL-only seam (tests/activation_park_race_test.cpp's `*_control` target): lets the test
+// deterministically widen the window between drain_step's plain parked-field writes and `exec_.park()`
+// (redteam's injected-delay technique), so the pre-fix race is exercised reliably instead of relying
+// on a true nanosecond-scale timing accident. Declared (not defined) here; the test TU defines it.
+// Does not exist at all outside a -DQUARK_ACTIVATION_PARK_NO_GATE control build (zero cost normally).
+void quark_activation_park_race_test_hook();
+#endif
+
 // ============================================================================================
 // 007-Failure-and-Supervision / ADR-009 — the runtime supervision surface (the type-erased image
 // of the compile-time `OnFailure<Decision, MaxRestarts<N, Within<…>>>` policy; the compile-time
@@ -172,9 +181,13 @@ struct DeactivateFlushSink {
 // Escalation seam (007 §Escalation; ADR-009 `Supervision<Node|PerType|Tree<…>>`). `Escalate` (or a
 // budget-exhausted `Restart`) TELLS the supervisor's lane — never a synchronous cross-lane touch,
 // so single-executor is preserved. Full typed-tree topology is a 021/026 seam; the default node
-// supervisor's action is `Stop`. Default (null) ⇒ escalation degrades to a local `Stop`.
+// supervisor's action is `Stop`. Default (null) ⇒ escalation degrades to a local `Stop`. `now_ns` is
+// THIS activation's own (possibly sim-injected, 014) clock reading at the fault instant — the
+// engine-side storm guard (`EscalationGuard`, supervision.hpp) charges its rate limiters against
+// this SAME reading rather than an independent `pal::now()` call, so guard behavior stays
+// deterministic under 014 simulation exactly like the restart-window budget above.
 struct EscalationSink {
-    void (*fn)(void* self, error e, void* ctx) noexcept = nullptr;
+    void (*fn)(void* self, error e, void* ctx, std::int64_t now_ns) noexcept = nullptr;
     void* ctx = nullptr;
 };
 
@@ -399,6 +412,29 @@ public:
         return {AdmitResult::Admitted, wake};
     }
 
+    // Admission-EXEMPT governed enqueue: for internal engine-originated traffic (007 §Escalation-
+    // storm guards) that has ALREADY passed its OWN independent admission decision (`EscalationGuard`)
+    // and must never be silently re-shed by an UNRELATED 022 bound/overflow policy meant for ordinary
+    // producer traffic. Still keeps the governed depth accounting (`g.enqueued`) consistent so
+    // `resident` stays correct for THIS message's own (018) deadline-shed check and any OTHER
+    // governed traffic's — bypassing that accounting (i.e. reaching a governed actor through the
+    // plain, ungoverned `post()` below) would let `g.drained` outrun `g.enqueued` and underflow the
+    // unsigned `resident` computation in `drain_step_governed_seq`, which is exactly the sharp edge
+    // `post_governed`'s own comment above warns about ("a message posted to a governed actor MUST go
+    // through governed_post"). This is `Engine::route_escalation`'s way of honoring that contract
+    // without ALSO subjecting an already-admitted escalation to a second, unrelated bound/overflow
+    // decision (`post_governed`'s own Block/Shed branches are for ordinary producer overload, not for
+    // a message the caller's OWN guard already decided to admit).
+    QUARK_ALWAYS_INLINE bool post_governed_unconditional(Descriptor* d) noexcept {
+        if (gov_) gov_->enqueued.fetch_add(1, std::memory_order_relaxed);
+        mailbox_.enqueue(d);
+        Mailbox::producer_close_out_fence();
+        if (metrics_) metrics_->mailbox_enqueued.inc_atomic();
+        const bool wake = wake_after_enqueue();
+        if (metrics_ && wake) metrics_->activations.inc_atomic();
+        return wake;
+    }
+
     // ---- Governance observers (009 — every shed/block is counted) --------------------------
     [[nodiscard]] std::uint64_t mailbox_depth() const noexcept { return gov_ ? gov_->depth() : 0; }
     [[nodiscard]] std::uint64_t governance_sheds() const noexcept {
@@ -566,8 +602,15 @@ public:
                 continue;
             }
 
+            // Plain writes, sequenced-before the release store below: the reader (complete_parked())
+            // gates its read of these two fields behind an acquire-confirmed observation of `Parked`
+            // (see complete_parked()'s "Lost-wakeup / UB fix" comment) — that release/acquire pairing
+            // is the ONLY synchronization this handoff needs; do not reorder these three statements.
             parked_frame_ = o.frame;
             parked_desc_ = d;
+#ifdef QUARK_ACTIVATION_PARK_NO_GATE
+            quark_activation_park_race_test_hook();  // CONTROL-only widen — see declaration above
+#endif
             exec_.park();  // Running→Parked (release); seals every admission CAS (ADR-015)
             return DrainOutcome::Suspended;
         }
@@ -648,7 +691,50 @@ public:
     // ---- 001/Sequential completion seam (async / blocking / fiber) ------------------------
     // Minimal single-frame completion the engine (002) drives on the Parked→Scheduled edge. Kept
     // BACKWARD-COMPATIBLE for the Sequential path (engine.hpp, exec_suspend/sched_readmit tests).
+    //
+    // ---- Lost-wakeup / UB fix (park()-vs-complete_parked race, red-teamed) -----------------
+    // A carrier may legitimately be entered here BEFORE drain_step's suspend tail has actually run
+    // `exec_.park()` — e.g. an ask()-style awaiter commits to suspending (its own win-arbitration
+    // already resolved) before control unwinds back into drain_step's loop body and the three plain
+    // statements `parked_frame_ = o.frame; parked_desc_ = d; exec_.park();` execute. Reading
+    // `parked_frame_`/`parked_desc_` before that happened is a data race (UB) on plain, non-atomic
+    // members; worse, it makes the `readmit_from_parked()` CAS below run against a still-`Running`
+    // state, fail silently with no retry, and then get permanently overwritten by drain_step's own
+    // unconditional `park()` store right after — a lost wakeup, sealed forever (confirmed by
+    // red-team's standalone repro against the real ExecStateCell, 429/429 stuck under a 5us-widened
+    // window).
+    //
+    // Fix: gate every read of the parked fields behind an ACQUIRE-confirmed observation of
+    // `ExecState::Parked`. `park()` already release-stores Parked (exec_state.hpp); spinning on the
+    // EXISTING acquire-load `state()` until that store is visible establishes the required
+    // happens-before for the plain writes sequenced before it in drain_step — the textbook
+    // release/acquire message-passing idiom, no new synchronization primitive. The window is a
+    // handful of instructions (the coroutine already committed to suspending; only the plain writes
+    // + the store remain before drain_step returns), so this is a bounded, near-instant spin in
+    // practice, not a stall.
+    //
+    // A Dekker fence + mailbox re-probe + `reacquire_from_parked()` self-heal (drain_step_reentrant's
+    // pattern, activation.hpp ~1176) is deliberately NOT mirrored here: the Sequential model has
+    // exactly one in-flight frame and exactly one carrier by construction (ADR-015). Re-probing the
+    // MAILBOX and self-healing a re-acquire on an unrelated new message would let a worker re-enter
+    // drain_step (and start dequeuing new messages) while `parked_frame_`/`parked_desc_` still hold a
+    // frame THIS function has not yet resumed/cleared — reintroducing the identical race class through
+    // a different door. Reentrant's self-heal is sound there because its carrier never touches shared
+    // frame state directly (it pushes to a mutex-guarded ready-queue, resumed later ON-lane);
+    // Sequential's carrier resumes the frame directly on ITS OWN thread, so the acquire-gate closing
+    // off premature reads is the correct — and sufficient — fix for this shape. Once gated, the
+    // `readmit_from_parked()` CAS below is guaranteed to observe `Parked` (nothing else transitions
+    // this activation's exec-state between `park()` and this function's own CAS in the single-carrier
+    // Sequential model), so it can no longer fail/silently drop the re-admit either.
     bool complete_parked() noexcept {
+#ifndef QUARK_ACTIVATION_PARK_NO_GATE
+        while (exec_.state() != ExecState::Parked) pal::cpu_relax();  // acquire-gate: happens-before park()
+#endif
+        // CONTROL (-DQUARK_ACTIVATION_PARK_NO_GATE): the pre-fix shape — read the parked fields with
+        // NO acquire-gate at all, exactly the red-teamed bug. Exists only so tests/
+        // activation_park_race_test.cpp can prove it has teeth (detects the lost wakeup this fix
+        // closes) without reverting production code out from under the rest of the suite.
+
         Descriptor* d = parked_desc_;
         // Guard the resume: an async handler surfaces its throw at completion (007). A body throw is
         // captured by the promise (probe via async_frame_faulted); a stray propagation is caught too.
@@ -662,6 +748,17 @@ public:
         } catch (...) {
             faulted = true;
         }
+        // CHAINED SUSPENSION (e.g. a second `co_await ask(...)` in the same handler body, resumed via
+        // this same carrier hop): `resume()` returns as soon as the coroutine hits its NEXT co_await,
+        // not only when it truly finishes — `done()==false` here means it re-suspended, not completed.
+        // The frame is still alive and owns valid state (the new awaiter's suspend() already re-armed
+        // whatever it's waiting on); destroying it now would be a use-after-free the moment that NEW
+        // suspension's own carrier later calls .resume() on an already-destroyed handle. Leave
+        // parked_frame_/parked_desc_ and the ORIGINAL message's descriptor `d` exactly as they are
+        // (exec-state never left `Parked` between the two suspensions — no new park()-vs-carrier race
+        // window is opened, see the acquire-gate comment above), and let the NEXT carrier's
+        // complete_parked() call resume it again.
+        if (!faulted && !parked_frame_.done()) return false;
         if (!faulted && async_frame_faulted(parked_frame_)) {
             faulted = true;
             std::tie(fault_src, fault_err) = classify_fault(async_frame_fault_ptr(parked_frame_));
@@ -671,6 +768,7 @@ public:
             detail::AmbientContextScope amb(current_ctx_);
             parked_frame_.resume();
         }
+        if (!parked_frame_.done()) return false;  // see the CHAINED SUSPENSION comment above
 #endif
         parked_frame_.destroy();
         parked_frame_ = {};
@@ -1102,8 +1200,13 @@ private:
                 if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
+            // Same handoff shape/fix as the Sequential drain_step() suspend tail above — see
+            // complete_parked()'s "Lost-wakeup / UB fix" comment; do not reorder these three lines.
             parked_frame_ = o.frame;
             parked_desc_ = d;
+#ifdef QUARK_ACTIVATION_PARK_NO_GATE
+            quark_activation_park_race_test_hook();  // CONTROL-only widen — see declaration above
+#endif
             exec_.park();
             return DrainOutcome::Suspended;
         }
@@ -1661,7 +1764,8 @@ private:
     [[gnu::cold]] void do_escalate() noexcept {
         ++escalations_;
         if (escalate_sink_.fn)
-            escalate_sink_.fn(self_, error{errc::supervised_stop, "escalate"}, escalate_sink_.ctx);
+            escalate_sink_.fn(self_, error{errc::supervised_stop, "escalate"}, escalate_sink_.ctx,
+                               now_ns());
         do_stop();
     }
 

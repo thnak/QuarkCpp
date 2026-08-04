@@ -84,8 +84,16 @@ Confirmation c = co_await t;
   genuine TSan races in the competing designs. Off-lane bootstrap/edge code uses
   `quark::block_on(task)`, which **asserts it is not running on a worker lane**
   (returns `unexpected(on_worker)` if it is).
-- Reply delivery does **not** re-enter the target actor; it re-admits through the 015
-  gate, never inline on the completing lane.
+- Reply delivery does **not** re-enter the target (asking) actor's own exec-state — it
+  re-admits through the 015 Parked→Scheduled/Running gate, so the asker's activation is
+  never concurrently executed twice. That gate does NOT mean the resume happens on a
+  DIFFERENT thread, though: `ReplyCell::resolve()`'s co_await path runs
+  `Activation::complete_parked()` — the asker's ENTIRE resumed continuation — synchronously,
+  inline, on whichever thread calls `resolve()` (ordinarily the replying actor's own worker).
+  A callee handler that keeps doing work AFTER resolving/accepting a reply must not assume
+  that work happens-before the resumed asker observes it (see `ask_stream<F>`'s reentrancy
+  hazard note below and [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)'s residual
+  risks — found while proving `ask_stream`, applies equally to plain `ask`).
 
 ### Reply type and errors
 
@@ -287,16 +295,27 @@ ticks.unsubscribe(clockRef.id());                // no delivery after this retur
   generalized to every exhaustible resource, plus rate limiting, deadline-aware load
   shedding, and circuit breaking — in
   [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md).
-- **Streaming replies** — **resolved in mechanism ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)), Draft pending the 015 OPEN re-admit gate.**
+- **Streaming replies** — **Accepted (x86-64), 2026-08-04**
+  ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)).
   `ask` returning a stream for multi-item responses is the **024 credit-ring flipped**
   (callee = producer, caller = consumer) — see `ask_stream<F>` above. The **inbound**
   direction was already Accepted (a `StreamRef<F>` handle + `handle(StreamBatch<F>&)` drain
   over the credit-ring of
   [024-Streaming-and-Inbound-Streams.md](024-Streaming-and-Inbound-Streams.md)); the
-  **outbound** reply-routing interaction is now specced (three seams: single-resolve
+  **outbound** reply-routing interaction is now fully proven (three seams: single-resolve
   `StreamReplyCell`, the N-item ring, in-band EoS; `producer_seq` identity; monotone
-  credit-return). The **item-transport leg is proven** (it is the shipped 024 ring), but
-  006 outbound stays **Draft** until the **015 OPEN-cell re-admit** (`co_await` on-lane
-  resume) clears an ADR-014-grade real-scheduler gate — the same unfinished seam an
-  *ordinary* `ask`'s OPEN handshake still inherits (`detail/reply_cell.hpp`). *Residual
-  open design item: multi-source fan-in deriving a reply (017).*
+  credit-return). The item-transport leg was already proven (the shipped 024 ring); the
+  remaining blocker — the **015 OPEN-cell re-admit** (`co_await` on-lane resume) clearing an
+  ADR-014-grade real-scheduler gate — is now closed on both legs: the mechanism
+  (`detail/reply_cell.hpp` routing through `Activation::complete_parked()`, proven exactly-once
+  via an ordinary `ask`) AND the ask_stream-specific dedicated run (the OPEN handshake racing
+  the ring's first item through a real actor handling `AskStream<Q,F>` via `ActorRef::
+  ask_stream<F>`/`.accept()`, 2500/2500 exactly-once, 0 loss — see
+  [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)'s second post-decision update).
+  `ActorRef<A>::ask_stream<F>(Q)` / `LocalRouter::ask_stream` (the addressing layer this
+  section's `ask_stream<F>` sketch describes) are now implemented in `actor_ref.hpp`. **New,
+  documented hazard** (see ADR-018's residual risks): a callee `handle(const AskStream<Q,F>&)`
+  that does work AFTER `.accept()` must not assume that work happens-before the resumed
+  caller's continuation — `ReplyCell::resolve()`'s co_await resume is synchronous and
+  stack-reentrant on the resolving (callee's) thread. *Residual open design item: multi-source
+  fan-in deriving a reply (017).*

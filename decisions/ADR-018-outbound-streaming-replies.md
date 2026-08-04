@@ -1,6 +1,7 @@
 # ADR-018 — Outbound streaming replies (an `ask` that returns a stream)
 
-- Status: **Accepted (design direction, x86-64)** for the *mechanism*; **006 outbound-streaming axis stays Draft** (promotion gated — see §Promotion).
+- Status: **Accepted (x86-64)**. The mechanism AND the 006 outbound-streaming axis both promote — see the
+  2026-08-04 update below §Promotion.
 - Date: 2026-07-18
 - Scope: the one remaining pure-design cross-cutting item in `006-Messaging-and-Addressing.md`
   ("Streaming replies", lines 134–138) and `OpenQuestions.md` line 156–157: how the ADR-007
@@ -135,7 +136,9 @@ recommendation. `ReplyMode::Pull` requires its own ADR-014-grade real-scheduler 
 (decider: the F3 RMW measurement) plus the revised S2 unified-exec-state Dekker and C2 two-releaser
 reclaim; it does **not** gate the primary path.
 
-## Promotion — 006 outbound-streaming axis stays **Draft** (`promotes006 = false`)
+## Promotion — 006 outbound-streaming axis: **Draft → Accepted, 2026-08-04** (`promotes006 = true`)
+
+**Historical section (as written 2026-07-18); superseded by the 2026-08-04 update further below.**
 
 The **mechanism** is decided and the item-transport leg is genuinely proven (it is the settled 024
 ring flipped: F1/F2/F3/C1/C4 item-path all CORRECT under the shipped headers). But **006 must NOT be
@@ -219,11 +222,77 @@ the real dispatcher + ADR-007 reply-ordering, 006 outbound-streaming can promote
   (proven), but the OPEN-cell 015 re-admit + the terminal-wake edge need their own ADR-014-grade
   real-scheduler run before 006 outbound promotes.
 
+## Post-decision update (2026-08-04) — the 015 OPEN-cell re-admit blocker is PARTIALLY cleared
+
+While scoping this exact gate, `detail::reply_cell.hpp`'s `ReplyCell<R>::resolve()` was wired to
+route its co_await resume through `Activation::complete_parked()` (exec-state-gated, 015) instead
+of a raw `h.resume()` — and, more consequentially, a genuinely SEPARATE, pre-existing lost-wakeup/
+UB race was found and fixed IN `complete_parked()` itself (a carrier could legitimately race ahead
+of `drain_step`'s own `exec_.park()` store; confirmed with an executable repro, 429/429 stuck under
+a 5 µs injected delay — see [ADR-015](ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)'s
+residual risk #7). Both fixes are proven under a REAL multi-worker Engine via `tests/
+ask_coawait_real_scheduler_test.cpp`: 100 Askers × 25 sequential `co_await ask<int>()` cycles each
+(2500 total, chained suspend/resume through the SAME activation) against a small pool of Answerer
+actors — exactly-once, 0 lost, 0 mismatched, full 199-test suite green.
+
+Since `StreamReplyCell = detail::ReplyCell<Opened>` is the SAME template instantiated on a
+different `R`, this fix applies to it VERBATIM — the underlying mechanism this ADR's gate names is
+no longer broken. At the time of this update, the ask_stream-specific dedicated integration run
+(the ADR's own tie-breaking experiment, below) had not yet been built — that closure follows in the
+next update.
+
+## Post-decision update #2 (2026-08-04, same day) — the tie-breaking experiment is DONE; 006 outbound promotes
+
+`ActorRef<A>::ask_stream<F>(Q)` / `LocalRouter::ask_stream<A,F,Q>` — the addressing layer this ADR's
+own `reply_stream.hpp` comment named as not-yet-built — is now wired (`actor_ref.hpp`), mirroring
+`ask` exactly: `static_assert(Handles<A, AskStream<Query,F>>)`, `make_ask_stream` + the existing
+pooled-descriptor `post_message` path, returning the `OpenStreamFuture<F>`. `dispatch.hpp` needed no
+changes (already generic over message type); `StreamResponder<F>::accept()`/`reject()` became `const`
+(mirroring `Responder<R>`'s existing `mutable armed_` pattern), since `handle(const M&)` is mandatory.
+
+The named tie-breaking experiment itself: `tests/ask_stream_coawait_real_scheduler_test.cpp` runs a
+real 4-worker/4-shard `Engine` with a `Streamer` actor whose `handle(const AskStream<Query,Row>&)`
+accepts and pushes 8 items back-to-back with no delay, and a `Puller` actor whose `task<> handle`
+does `co_await target.ask_stream<Row>(...)`. 100 Pullers × 25 streams each = 2500 independent
+OPEN-vs-first-item races across real worker threads — exactly-once OPEN resume, every item delivered
+FIFO with 0 loss, clean `Closed` termination, no gap, 3/3 repeated runs green, full 200-test suite
+green. **This is the result ADR-018's Tie-breaking experiment section names as sufficient to flip
+006 outbound Draft→Accepted (x86-64).** TSan remains unavailable on the proving host (as for the
+2026-08-04 #1 update); ASan+UBSan + the full suite were used instead.
+
+**A genuinely new finding surfaced while building this test, worth recording as its own residual**
+(below): `ReplyCell::resolve()`'s co_await resume is fully synchronous and stack-reentrant on the
+RESOLVING thread, not deferred to a scheduler tick. A naive first draft of the integration test had
+the Puller busy-spin-drain the ring synchronously inside the same coroutine turn that `co_await`
+resolved in — and every one of the 2500 streams stalled, because `Streamer::handle()`'s call to
+`accept()` does not return (so its own subsequent item pushes cannot happen) until the ENTIRE resumed
+Puller continuation finishes running, nested inside the Streamer's own call stack. This is not a bug
+in the mechanism (it is the intended "transfer, not re-enqueue" no-extra-scheduling-hop design,
+already proven correct for `ask`) — but it is a real, previously-undocumented hazard for anyone
+authoring an `ask_stream` callee handler that does work after `.accept()`. See the new residual risk
+below. The shipped test avoids it by handing the opened `ReplyStream<F>` off to a plain drain-thread
+pool rather than draining inline in the actor's own coroutine turn.
+
 ## Residual risks
 
-- **015 OPEN-cell re-admit unwired (promotion blocker).** The single-shot OPEN handshake inherits
-  `reply_cell.hpp`'s unfinished on-lane `co_await` resume. 006 outbound stays Draft until it clears
-  an ADR-014-grade real-scheduler gate. This is the honest reason `promotes006 = false`.
+- **015 OPEN-cell re-admit + ask_stream-specific integration — CLOSED (2026-08-04).** Both the
+  mechanism (via `ask`'s shared `ReplyCell<R>` template) and the ask_stream-specific dedicated
+  integration run (via `tests/ask_stream_coawait_real_scheduler_test.cpp`) are now proven under a
+  real multi-worker Engine. See the post-decision updates above.
+- **NEW: OPEN-resolve reentrancy is a callee-authoring hazard, not yet mitigated or even a lint.**
+  `StreamResponder::accept()` (and `Responder::operator()` for ordinary `ask`) may synchronously run
+  the ENTIRE resumed caller continuation, inline, on the callee's own thread, nested inside the
+  callee's current call — because `Activation::complete_parked()`'s coroutine resume is unconditionally
+  inline (unlike 024's inbound `StreamActivation`, which deliberately defers via a Parked→Scheduled
+  transfer picked up by a worker's own re-acquire, precisely to avoid this). A callee handler that does
+  meaningful work AFTER resolving/accepting — expecting that work to happen-before the resumed caller
+  observes it — is unsafe if the caller is a suspended waiter; the caller's continuation can run to its
+  next suspension or completion before the callee's own remaining statements execute. No compile-time
+  or runtime guard catches this today; it is a documented hazard, not an enforced invariant. Considering
+  whether `complete_parked()`'s cross-activation resume should defer (transfer-and-let-a-worker-pick-up,
+  mirroring 024's inbound design) instead of running inline is a real open question — it would trade
+  this reentrancy hazard for an extra scheduling hop on every co_await resume, a hot-path cost with its
+  own tradeoffs; not decided or scoped here.
 - **AArch64 / weak-memory re-gate (INCONCLUSIVE, no decision weight).** Every load-bearing order —
   the producer arm-edge `armed.exchange`, the seq_cst Dekker close-out, the terminal-wake fence, the
   cross-node gen-gate — is proven only on x86-TSO. AArch64 needs explicit seq_cst fences/exchanges
@@ -248,11 +317,12 @@ the real dispatcher + ADR-007 reply-ordering, 006 outbound-streaming can promote
   stream FIFO. The fan-in deriving-reply hazard (017) is a real hazard once a reply is forwarded
   through an effectively-once pipeline.
 
-## Tie-breaking experiment (only if the promotion gate is contested)
+## Tie-breaking experiment (only if the promotion gate is contested) — DONE, 2026-08-04
 
 None needed to pick the winner — the F3 0-RMW hard gate is decisive and measured (PUSH 0, PULL
 0.00391/item). The **one** experiment that would unblock promotion: an ADR-014-grade real-scheduler
 run of the **015 OPEN-cell re-admit** (`co_await` on-lane resume) for `StreamReplyCell`, under the
 real 002 scheduler + ASan/TSan, proving the OPEN handshake resolves exactly once with no lost wakeup
-and no UAF when it races the ring's first item. That single result flips 006 outbound Draft→Accepted
-(x86-64).
+and no UAF when it races the ring's first item. **Run and passed** — see Post-decision update #2
+above (`tests/ask_stream_coawait_real_scheduler_test.cpp`, 2500/2500, 0 mismatches, 3/3 repeats). This
+result flips 006 outbound Draft→Accepted (x86-64).

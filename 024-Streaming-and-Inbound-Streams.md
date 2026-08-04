@@ -218,8 +218,16 @@ PUSH*). The item-transport leg is therefore the shipped, proven inbound leg run 
   only path meeting the 023 0-RMW caller-drain gate. `Pull` (`DemandChannel`, demand-gated
   `co_yield`) is a secondary policy for high-RTT / bursty-idle links; it wins cross-node
   teardown by construction but concedes the 0-RMW gate (ADR-018 §Decision).
-- **Promotion.** The item leg is proven; 006 outbound stays **Draft** until the **015
-  OPEN-cell re-admit** clears its real-scheduler gate (same as an ordinary `ask`).
+- **Promotion — Accepted (x86-64), 2026-08-04.** The item leg was already proven; the
+  **015 OPEN-cell re-admit** gate (same as an ordinary `ask`) is now closed on both legs —
+  the re-admit mechanism (proven via the ordinary-`ask` case) AND the ask_stream-specific
+  dedicated run (OPEN racing the ring's first item, through a real actor handling
+  `AskStream<Q,F>` via the now-wired `ActorRef::ask_stream<F>`/`.accept()`, 2500/2500
+  exactly-once) — see [ADR-018](decisions/ADR-018-outbound-streaming-replies.md)'s two
+  post-decision updates. **New documented hazard**: a callee handler doing work after
+  `.accept()` must not assume it happens-before the resumed caller's continuation — the
+  OPEN resolve's co_await resume is synchronous and stack-reentrant on the resolving
+  thread (see ADR-018's residual risks).
 
 ## Self-debate
 

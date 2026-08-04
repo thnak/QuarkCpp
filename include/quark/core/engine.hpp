@@ -51,6 +51,7 @@
 #include "quark/core/supervision.hpp"     // 007: supervision_of<A>() resolved at spawn
 #include "quark/core/timer_wheel.hpp"     // 011/ADR-028 Phase 2: the per-shard idle-eviction wheel
 #include "quark/detail/message_pool.hpp"  // ADR-028 Phase 4: broker_pool_ (Wake control descriptors)
+#include "quark/detail/parked_resume.hpp" // 015: ReplyCell's co_await re-admit ambient seam
 #include "pal/pal.hpp"
 
 namespace quark {
@@ -439,9 +440,29 @@ public:
     // wake. This carries the SAME seq_cst Dekker rendezvous as post() but is a DISTINCT StoreLoad
     // pair (carrier→actor, not producer→consumer — ADR-015).
     bool complete_parked(Schedulable* s) noexcept {
+        // 015 seam: `parked_frame_.resume()` (inside `Activation::complete_parked()`) may run the
+        // coroutine straight into ANOTHER `co_await` (e.g. a second `ask` in the same handler loop) —
+        // that happens on THIS (carrier) thread, not `s`'s own `run_activation` call, so without
+        // re-publishing the ambient here a chained suspend would capture whatever activation this
+        // thread happened to be draining, not `s` — silently routing the NEXT resume to the wrong
+        // Schedulable (a lost wakeup on `s`, found empirically: a 2nd-ask-in-a-loop test hung until
+        // this was added). Same "ACTIVE only for non-Reentrant" contract as run_activation's scope —
+        // complete_parked() is Sequential/governed-Sequential-only by construction (Reentrant never
+        // calls it), so this is always the correct target when this function runs at all.
+        detail::ParkedResumeScope prs(detail::ParkedResumeSink{&parked_resume_thunk, this, s});
         const bool wake = s->activation->complete_parked();
         if (wake) schedule_and_wake(s);
         return wake;
+    }
+
+    // Type-erased trampoline for the `detail::ParkedResumeSink` seam (015 — `ReplyCell`'s co_await
+    // re-admit): a `Responder<R>`/`StreamResponder<F>` resolving a reply on a FOREIGN worker's lane
+    // calls this instead of touching the asker's coroutine directly, routing the resume through the
+    // SAME exec-state-gated `complete_parked()` above. `run_activation` publishes this (scoped to
+    // Sequential/governed-Sequential activations only) around every `drain_step()` call.
+    static void parked_resume_thunk(void* engine_erased, void* schedulable_erased) noexcept {
+        static_cast<Engine*>(engine_erased)
+            ->complete_parked(static_cast<Schedulable*>(schedulable_erased));
     }
 
     // --- Lifecycle -------------------------------------------------------------------------
@@ -1477,6 +1498,17 @@ private:
     void run_activation(std::uint32_t sid, Schedulable* s) noexcept {
         Activation* act = s->activation;
         if (!act->try_acquire()) return;  // Scheduled→Running; false ⇒ skip, never block
+
+        // 015 seam: publish "how to complete_parked() THIS activation" for the duration of the whole
+        // drain (every dispatched message here belongs to the SAME activation, so one scope covers
+        // the loop). ACTIVE only for Sequential/governed-Sequential (`complete_parked()`'s single-slot
+        // `parked_frame_`/`parked_desc_` model) — a Reentrant activation gets an INACTIVE sink, not a
+        // stale one left over from whichever activation this worker drained previously: Reentrant's
+        // own co_await-ask path uses a separate per-frame mechanism, not this seam, and MUST fall back
+        // to ReplyCell's pre-existing direct h.resume() (a documented residual, unchanged by this fix).
+        detail::ParkedResumeScope parked_resume_scope(
+            act->is_reentrant() ? detail::ParkedResumeSink{}
+                                : detail::ParkedResumeSink{&parked_resume_thunk, this, s});
 
         unsigned busy = 0;
         for (;;) {

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "quark/core/error.hpp"
+#include "quark/detail/parked_resume.hpp"
 
 namespace quark::detail {
 
@@ -48,6 +49,7 @@ public:
     // arm: ready the cell for a fresh ask; returns the generation to hand the responder.
     std::uint64_t arm() noexcept {
         cont_ = {};
+        resume_sink_ = {};
         st_.store(kEmpty, std::memory_order_release);
         return gen_.load(std::memory_order_relaxed);
     }
@@ -57,6 +59,8 @@ public:
             value_ptr()->~result<R>();
             has_value_ = false;
         }
+        cont_ = {};
+        resume_sink_ = {};
         gen_.fetch_add(1, std::memory_order_acq_rel);
         st_.store(kEmpty, std::memory_order_release);
     }
@@ -70,11 +74,20 @@ public:
         // Publish the value, then win-arbitrate on st_. release-store publishes `store_`/has_value_.
         const std::uint32_t prev = st_.exchange(kResolved, std::memory_order_acq_rel);
         if (prev == kWaiter) {
-            std::coroutine_handle<> h = cont_;  // published by suspend()'s release-CAS
+            std::coroutine_handle<> h = cont_;              // published by suspend()'s release-CAS
+            const ParkedResumeSink sink = resume_sink_;     // ditto — snapshotted AT suspend() time
             st_.notify_all();
-            if (h) h.resume();  // 015 SEAM: block_on never sets a waiter; the co_await path's
-                                // re-admit-through-the-015-gate is future work — here the awaiter
-                                // is driven off-lane (block_on) or on a standalone test coroutine.
+            // 015 SEAM: a real co_await from inside a Sequential/governed-Sequential handler
+            // captured an ACTIVE sink at suspend() time — route the resume through the engine's
+            // exec-state-gated Activation::complete_parked() so a reply resolving on a DIFFERENT
+            // worker's lane never touches the asker's state directly (001 single-executor). No
+            // ambient (block_on's off-lane wait never calls suspend() at all; a Reentrant asker's
+            // co_await uses its own per-frame mechanism, not this seam; a bare/standalone
+            // coroutine has no Engine) falls back to the pre-existing direct resume — unchanged.
+            if (sink.active())
+                sink();
+            else if (h)
+                h.resume();
             return;
         }
         st_.notify_all();  // resolver won the race; a later suspend() will observe kResolved
@@ -88,6 +101,7 @@ public:
     // value already landed (do not suspend). This CAS is the awaiter half of the win-arbitration.
     [[nodiscard]] bool suspend(std::coroutine_handle<> h) noexcept {
         cont_ = h;
+        resume_sink_ = tl_current_parked_resume;  // snapshot THIS lane's ambient at suspend time
         std::uint32_t expected = kEmpty;
         if (st_.compare_exchange_strong(expected, kWaiter, std::memory_order_acq_rel,
                                         std::memory_order_acquire))
@@ -125,6 +139,7 @@ private:
     std::atomic<std::uint32_t> st_{kEmpty};
     std::atomic<std::uint64_t> gen_{0};
     std::coroutine_handle<> cont_{};
+    ParkedResumeSink resume_sink_{};  // 015 seam — see suspend()/resolve()
     alignas(result<R>) unsigned char store_[sizeof(result<R>)];
     bool has_value_ = false;
 };

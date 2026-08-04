@@ -20,10 +20,16 @@
 // WHAT IS PROVEN vs WHAT IS DRAFT (ADR-018 §Promotion, honestly reproduced here):
 //   * the ITEM-TRANSPORT leg IS the shipped 024 ring flipped — FIFO, 0 per-item heap, 0 caller-drain
 //     cross-core RMW, split-cursor exactly-once-across-suspend all inherited PROVEN.
-//   * the OPEN handshake inherits reply_cell.hpp's 015 seam: the on-lane `co_await` re-admit is
-//     future work; `block_on` (off-lane) is wired. 006 outbound therefore stays DRAFT until the 015
-//     OPEN-cell re-admit clears an ADR-014-grade real-scheduler gate — EXACTLY as an ordinary ask's
-//     OPEN handshake still does. This header does NOT pretend to close that gate.
+//   * the OPEN handshake's on-lane `co_await` re-admit — reply_cell.hpp's 015 seam — is now WIRED
+//     (2026-08-04): `resolve()` routes through `Activation::complete_parked()` instead of a raw
+//     `h.resume()`, proven exactly-once/no-lost-wakeup under a real multi-worker Engine via an
+//     ordinary `ask` (`tests/ask_coawait_real_scheduler_test.cpp` — `StreamReplyCell` is the SAME
+//     `detail::ReplyCell<Opened>` template, so the fix applies verbatim). A genuinely SEPARATE,
+//     pre-existing lost-wakeup/UB race in `complete_parked()` itself was found and fixed along the
+//     way (ADR-015 residual #7). **Still open**: ADR-018's own promotion gate specifically wants the
+//     OPEN handshake proven racing the ring's FIRST pushed item, end-to-end through a real actor
+//     handling `AskStream<Q,F>` — that dedicated integration run has NOT been done. 006 outbound
+//     stays Draft pending it; see ADR-018's post-decision update.
 //
 // x86-TSO ONLY. Every load-bearing order is inherited from the settled 024 ring + reply_cell; the
 // AArch64 weak-memory re-gate defers with 024 (TODO(arm64) there).
@@ -419,7 +425,9 @@ public:
     // Accept the stream: bind the single producer (the 024 single-writer token), resolve OPEN with
     // Opened{}, and hand the callee the producer. Returns the producer on success; a Terminated-only
     // producer if the stream was already torn down (a caller that cancelled before the callee ran).
-    [[nodiscard]] ReplyStreamProducer<F> accept() noexcept {
+    // const: dispatch.hpp mandates `handle(const M&)` (ADR-007), so the callee reaches this through a
+    // const AskStream<Q,F>& — `armed_` is local + handler-lane-only (mutable), mirroring Responder<R>.
+    [[nodiscard]] ReplyStreamProducer<F> accept() const noexcept {
         if (!armed_ || !st_) return ReplyStreamProducer<F>{};
         armed_ = false;
         // Bind the single producer token on the underlying ring (a second bind is a typed 007 error —
@@ -430,7 +438,7 @@ public:
     }
 
     // Reject before producing anything (e.g. authz/validation on the query). Fails OPEN with an error.
-    void reject(error e) noexcept {
+    void reject(error e) const noexcept {
         if (!armed_ || !st_) return;
         armed_ = false;
         st_->latch_terminal(ReplyStreamTerminal::Failed, e);
@@ -451,7 +459,7 @@ private:
 
     std::shared_ptr<ReplyStreamState<F>> st_;
     std::uint64_t open_gen_ = 0;
-    bool armed_ = false;
+    mutable bool armed_ = false;
 };
 
 // The ask_stream envelope the caller posts (mirrors Ask<Q,R>; the StreamResponder is the reply seam).

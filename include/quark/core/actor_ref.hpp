@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -34,6 +35,7 @@
 #include "quark/core/error.hpp"
 #include "quark/core/ids.hpp"
 #include "quark/core/metadata.hpp"  // 008: the durable content-addressed type_key_of<A> / actor_id_of<A>
+#include "quark/core/reply_stream.hpp"
 #include "quark/detail/message_pool.hpp"
 #include "quark/detail/reply_cell.hpp"
 
@@ -180,6 +182,26 @@ public:
         return AskFuture<R>{lease.cell, &cp};
     }
 
+    // --- ask_stream (006 §ask_stream / ADR-018): request/N-item-reply through the flipped 024 ring.
+    // Returns an OpenStreamFuture<F> — co_await/block_on-able exactly like AskFuture<R>, resolving to
+    // a ReplyStream<F> drain handle once the callee `.accept()`s (or an error on reject/no-reply).
+    // `make_ask_stream` builds {envelope, future} the same way `ask`'s body builds them inline above;
+    // the ring is allocated cold, once per call, from `mr` (ordinary heap by default — a per-shard
+    // slab allocator is a separate, unproven 022/ADR-018 residual, not built here).
+    template <class A, class F, class Q>
+    [[nodiscard]] OpenStreamFuture<F> ask_stream(
+        ActorId id, Q&& q, typename ReplyStreamState<F>::Config cfg = {},
+        std::pmr::memory_resource* mr = std::pmr::new_delete_resource()) {
+        using Query = std::remove_cvref_t<Q>;
+        using Envelope = AskStream<Query, F>;
+        static_assert(Handles<A, Envelope>,
+                      "ask_stream: actor must handle AskStream<Q,F> (the reply-stream-carrying envelope)");
+        AskStreamRequest<Query, F> req = make_ask_stream<Query, F>(std::forward<Q>(q), mr, cfg);
+        Schedulable* s = courier_.resolve(id);
+        post_message<A, Envelope>(id, s, std::move(req.envelope));
+        return std::move(req.future);
+    }
+
     // --- passivate (ADR-028 Phase 8; 006 §passivate): on-demand, SOFT actor teardown. ------------
     // Fire-and-forget, matching tell's async nature. Delegates straight to the courier — returns
     // false iff `id` never resolves to a live activation (nothing to passivate); true otherwise
@@ -283,6 +305,15 @@ public:
     template <class R, class Q>
     [[nodiscard]] AskFuture<R> ask(Q&& q) const {
         return router_->template ask<A, R>(id_, std::forward<Q>(q));
+    }
+
+    // ask_stream<F>(q) — request/N-item-reply (006 §ask_stream, ADR-018). async-only; returns an
+    // awaitable OpenStreamFuture<F> that resolves to a ReplyStream<F> drain handle.
+    template <class F, class Q>
+    [[nodiscard]] OpenStreamFuture<F> ask_stream(
+        Q&& q, typename ReplyStreamState<F>::Config cfg = {},
+        std::pmr::memory_resource* mr = std::pmr::new_delete_resource()) const {
+        return router_->template ask_stream<A, F>(id_, std::forward<Q>(q), cfg, mr);
     }
 
     // passivate() — on-demand, SOFT actor teardown (ADR-028 Phase 8; 006 §passivate). Fire-and-
