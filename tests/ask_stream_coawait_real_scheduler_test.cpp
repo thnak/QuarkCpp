@@ -201,13 +201,20 @@ int main() {
     Engine<> eng(*built);
     detail::MessagePool pool(1 << 16);
 
+    // pool.sink() wires each Activation's reclaim to THIS pool, so a completed message's payload
+    // destructor actually runs (MessagePool::reclaim()'s c->destroy(...)) instead of the default
+    // bare Descriptor::release(). Without it, AskStream<Query,Row>'s StreamResponder<Row> (a
+    // shared_ptr<ReplyStreamState<Row>> handle) never gets destroyed on completion, leaking every
+    // stream's control block + ring — LSan-caught, since ask_stream is the first message payload in
+    // this suite to own heap state (ordinary Responder<R>, by contrast, is a non-owning raw pointer
+    // into a pre-allocated ReplyCellPool, so the same missing wiring stays silent there).
     for (int i = 0; i < kStreamers; ++i) {
-        auto id = eng.spawn<Streamer>(static_cast<std::uint64_t>(i));
+        auto id = eng.spawn<Streamer>(static_cast<std::uint64_t>(i), pool.sink());
         check(id.has_value(), "spawn<Streamer>");
     }
     std::vector<ActorId> puller_ids;
     for (int i = 0; i < kPullers; ++i) {
-        auto id = eng.spawn<Puller>(static_cast<std::uint64_t>(i));
+        auto id = eng.spawn<Puller>(static_cast<std::uint64_t>(i), pool.sink());
         check(id.has_value(), "spawn<Puller>");
         puller_ids.push_back(*id);
     }

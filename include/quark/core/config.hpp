@@ -25,11 +25,13 @@ inline constexpr std::size_t max_descriptor_size = 64;
 #define QUARK_UNLIKELY(x) (__builtin_expect(!!(x), 0))
 #define QUARK_ALWAYS_INLINE inline __attribute__((always_inline))
 #define QUARK_NOINLINE __attribute__((noinline))
+#define QUARK_COLD [[gnu::cold]]
 #else
 #define QUARK_LIKELY(x) (x)
 #define QUARK_UNLIKELY(x) (x)
 #define QUARK_ALWAYS_INLINE inline
 #define QUARK_NOINLINE
+#define QUARK_COLD
 #endif
 
 // Cache-line alignment attribute for hot atomics / per-shard single-writer state (002/003).

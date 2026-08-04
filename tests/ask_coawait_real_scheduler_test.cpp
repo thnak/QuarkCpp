@@ -102,13 +102,18 @@ int main() {
     Engine<> eng(*built);
     detail::MessagePool pool(1 << 16);
 
+    // pool.sink() wires each Activation's reclaim to THIS pool, so a completed message's payload
+    // destructor actually runs instead of the default bare Descriptor::release() (see
+    // ask_stream_coawait_real_scheduler_test.cpp for the sibling test where omitting this is a real
+    // leak, not just a latent gap — Responder<R> here is a non-owning raw pointer into
+    // ReplyCellPool, so the missing wiring stays harmless, but the convention is the same).
     for (int i = 0; i < kResponders; ++i) {
-        auto id = eng.spawn<Answerer>(static_cast<std::uint64_t>(i));
+        auto id = eng.spawn<Answerer>(static_cast<std::uint64_t>(i), pool.sink());
         check(id.has_value(), "spawn<Answerer>");
     }
     std::vector<ActorId> asker_ids;
     for (int i = 0; i < kAskers; ++i) {
-        auto id = eng.spawn<Asker>(static_cast<std::uint64_t>(i));
+        auto id = eng.spawn<Asker>(static_cast<std::uint64_t>(i), pool.sink());
         check(id.has_value(), "spawn<Asker>");
         asker_ids.push_back(*id);
     }

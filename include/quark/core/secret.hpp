@@ -123,7 +123,17 @@ public:
         var.reserve(prefix_.size() + name.size());
         var.append(prefix_);
         var.append(name);
+        // std::getenv is the portable, std-only choice here (020 §4's dependency posture); MSVC's
+        // C4996 nudges toward the non-standard _dupenv_s, which we don't want. Not a thread-safety
+        // concern for us: single read, copied into `Secret` immediately, no concurrent setenv in-process.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
         const char* v = std::getenv(var.c_str());
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
         if (v == nullptr) return fail(errc::not_found, "secret not in environment");
         return make_secret(std::string_view(v));
     }

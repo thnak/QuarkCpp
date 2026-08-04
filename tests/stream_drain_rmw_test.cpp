@@ -3,7 +3,7 @@
 // xchg/mfence. Two complementary proofs:
 //   (1) STRUCTURAL: the drain drives `MonotoneCursor`, whose API is load/store ONLY (no fetch_add/
 //       exchange/compare_exchange exists), so a consumer CANNOT issue a cursor RMW even by accident.
-//   (2) OBJDUMP: the `extern "C"` [[gnu::noinline]] `quark_stream_drain_probe` symbol below is
+//   (2) OBJDUMP: the `extern "C"` QUARK_NOINLINE `quark_stream_drain_probe` symbol below is
 //       disassembled by tests/stream_drain_rmw_check.sh (a separate CTest, non-sanitizer builds) and
 //       grep-verified to contain 0 lock/cmpxchg/xadd/xchg-mem/mfence — the ADR-005 method verbatim.
 // Running THIS binary is also a functional drain test (correct checksum). Deterministic, single-thread.
@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <memory_resource>
 
+#include "quark/core/config.hpp"
 #include "quark/core/stream_activation.hpp"
 #include "quark/core/stream_channel.hpp"
 #include "quark/detail/hash.hpp"
@@ -27,8 +28,8 @@ struct Frame {
 
 // The drain inner loop under objdump inspection: pure StreamBatch next()/retire() over MonotoneCursor
 // cursors. Marked noinline + extern "C" so the symbol name is stable and the body is not folded away.
-extern "C" [[gnu::noinline]] std::uint64_t quark_stream_drain_probe(StreamChannel<Frame>* ch,
-                                                                    std::uint32_t budget) noexcept {
+extern "C" QUARK_NOINLINE std::uint64_t quark_stream_drain_probe(StreamChannel<Frame>* ch,
+                                                                  std::uint32_t budget) noexcept {
     std::uint64_t checksum = 0;
     StreamBatch<Frame> batch(*ch, budget);
     while (const Frame* f = batch.next()) {  // dispatch: plain acquire-load + release-store

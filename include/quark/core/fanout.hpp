@@ -72,6 +72,18 @@ struct OnSlowSubscriber {
 namespace detail {
 template <class T>
 concept FanOutHasEvictCapacity = requires { { T::capacity } -> std::convertible_to<std::size_t>; };
+
+// Partial specialization, not `Cond ? Mode::capacity : 256`: a plain ternary requires MSVC to
+// type-check `Mode::capacity` on both branches even when Mode == Block (no `capacity` member) —
+// GCC/Clang tolerate it, MSVC hard-errors. Only the selected specialization is instantiated.
+template <class Mode, bool = FanOutHasEvictCapacity<Mode>>
+struct FanOutLaneCapacity {
+    static constexpr std::size_t value = 256;
+};
+template <class Mode>
+struct FanOutLaneCapacity<Mode, true> {
+    static constexpr std::size_t value = Mode::capacity;
+};
 }  // namespace detail
 
 // The result of one publish (006 §PublishReceipt analogue for the reliable primitive). Under
@@ -97,8 +109,7 @@ class FanOut {
     using Mode = typename Policy::mode;
     using Channel = StreamChannel<FanOutEnvelope<M>>;
 
-    static constexpr std::size_t kDefaultLaneCapacity =
-        detail::FanOutHasEvictCapacity<Mode> ? Mode::capacity : std::size_t{256};
+    static constexpr std::size_t kDefaultLaneCapacity = detail::FanOutLaneCapacity<Mode>::value;
 
 public:
     // ============================================================================================

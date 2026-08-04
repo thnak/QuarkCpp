@@ -8,7 +8,10 @@ if(MSVC)
   # both landed on /std:c++latest — the verified toolset only recognizes c++14/17/20/latest). /W4 is
   # MSVC's closest match to -Wall -Wextra; /permissive- turns off non-conforming-extension leniency;
   # /Zc:preprocessor opts into the conforming preprocessor (needed by some C++23 macro/attribute use).
-  target_compile_options(quark_warnings INTERFACE /W4 /permissive- /Zc:preprocessor /std:c++latest)
+  # /wd4324: "structure was padded due to alignment specifier" fires on every QUARK_CACHE_ALIGNED
+  # hot-path type (Mailbox, MessagePool::Cell, Engine::Worker/Shard, ...) — that padding is the whole
+  # point of the alignas (false-sharing avoidance, 002/003/023), not a defect to fix.
+  target_compile_options(quark_warnings INTERFACE /W4 /wd4324 /permissive- /Zc:preprocessor /std:c++latest)
 
   # QUARK_SANITIZE=address (MSVC only ships ASan; no TSan/UBSan — those stay Linux/arm64-only).
   if(QUARK_SANITIZE MATCHES "address")

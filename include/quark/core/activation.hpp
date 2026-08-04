@@ -645,7 +645,7 @@ public:
     // the caller keeps draining — the racing message dispatches normally); a clean probe commits the
     // eviction (returns false; the caller — nothing does this yet in this pass — would free the
     // actor instance and mark the activation cold for a future reactivation path, Phase 4).
-    [[gnu::cold]] bool close_out_retire() noexcept {
+    QUARK_COLD bool close_out_retire() noexcept {
         retire_requested_ = false;
         // ADR-028 Phase 8: on_deactivate() + the persistence flush run HERE, strictly BEFORE
         // retire_to_dormant()'s release-store below — while this worker still unambiguously holds
@@ -1515,7 +1515,7 @@ private:
     // Record a message's failure outcome at the SINGLE reclamation join point (007): Running→
     // Completed, hand the error to the dead-letter sink, then reclaim — which runs the payload dtor,
     // so an unanswered `ask`'s Responder fails its reply cell (reply-before-teardown, ADR-009 S2).
-    [[gnu::cold]] void dead_letter_and_reclaim(Descriptor* d, error e) noexcept {
+    QUARK_COLD void dead_letter_and_reclaim(Descriptor* d, error e) noexcept {
         ++dead_letters_;
         if (metrics_) metrics_->dead_letters.inc();  // lane-only (every call site is drain-owned)
         d->complete();
@@ -1527,7 +1527,7 @@ private:
     // `ResourceFailure` (resource.hpp) is `FailureSource::Resource` with its OWN error (the factory's
     // `unexpected` propagates unchanged); anything else is an ordinary `FailureSource::HandlerThrow`.
     // Cold path only — called only once a fault is already known to have happened.
-    [[gnu::cold]] static std::pair<FailureSource, error> classify_fault(std::exception_ptr ep) noexcept {
+    QUARK_COLD static std::pair<FailureSource, error> classify_fault(std::exception_ptr ep) noexcept {
         if (ep) {
             try {
                 std::rethrow_exception(ep);
@@ -1543,7 +1543,7 @@ private:
     // so the decision applies synchronously. `e` is the outcome recorded to dead-letter — defaults to
     // the generic handler-fault error; a `FailureSource::Resource` call site passes the factory's own
     // error (004/007) so the dead-letter observes the real cause, not a generic label.
-    [[gnu::cold]] void on_fault_sequential(
+    QUARK_COLD void on_fault_sequential(
         Descriptor* d, FailureSource src,
         error e = error{errc::supervised_stop, "handler_fault"}) noexcept {
         ++faults_;
@@ -1579,7 +1579,7 @@ private:
     // abandons the frame (`.destroy()` — defined behavior, unwinds live locals via their destructors,
     // the same operation `~task()` already performs on a dropped-while-suspended frame) and counts as
     // a failed attempt, bounded by the same loop.
-    [[gnu::cold]] void handle_restart_retry(Descriptor* d, error first_error) noexcept {
+    QUARK_COLD void handle_restart_retry(Descriptor* d, error first_error) noexcept {
         error last_error = first_error;
         for (std::uint32_t attempt = 0; attempt < sup_.max_ask_retries; ++attempt) {
             if (!charge_restart()) {
@@ -1657,7 +1657,7 @@ private:
     // Reentrant fault entry (a suspended/started sibling faulted). Record THIS sibling's outcome,
     // drop it from the in-flight set, then apply the decision — Restart runs quiesce(Cancel) and the
     // reconstruct is deferred until the siblings drain (finish_restart_if_drained).
-    [[gnu::cold]] void on_fault_reentrant(
+    QUARK_COLD void on_fault_reentrant(
         ReFrame* f, FailureSource src,
         error e = error{errc::supervised_stop, "handler_fault"}) noexcept {
         ++faults_;
@@ -1681,7 +1681,7 @@ private:
     }
 
     // Restart dispatch. Sequential reconstructs synchronously; Reentrant opens a restart episode.
-    [[gnu::cold]] void do_restart() noexcept {
+    QUARK_COLD void do_restart() noexcept {
         if (rc_) {
             do_restart_reentrant();
             return;
@@ -1698,7 +1698,7 @@ private:
     // Reentrant Restart = quiesce(Cancel) (015): seal admission, fire in-flight siblings' stop_tokens,
     // then reconstruct once they have all drained (finish_restart_if_drained). The restart-episode
     // marker keeps a MaxRestarts bound honest across concurrently-faulting siblings (ADR-009 S3).
-    [[gnu::cold]] void do_restart_reentrant() noexcept {
+    QUARK_COLD void do_restart_reentrant() noexcept {
 #ifndef QUARK_SUPERVISION_NO_EPISODE_MARKER
         if (rc_->restarting) return;  // absorbed into the in-progress episode: no charge, no nest
 #endif
@@ -1717,7 +1717,7 @@ private:
     // Reconstruct when the in-flight set has drained to empty (reentrant) — the seal is released
     // AFTER every sibling's reply cell has completed (ADR-009 S2), so the lane resumes admitting the
     // survivor mailbox in FIFO order onto fresh state.
-    [[gnu::cold]] void finish_restart_if_drained() noexcept {
+    QUARK_COLD void finish_restart_if_drained() noexcept {
         if (!rc_ || !rc_->restarting) return;
         if (stopped_) {
             rc_->restarting = false;  // an escalate-to-Stop mid-episode wins over reconstruct
@@ -1731,7 +1731,7 @@ private:
     }
 
     // MaxRestarts<N, Within<window>> sliding-window budget. Returns false on exhaustion.
-    [[gnu::cold]] bool charge_restart() noexcept {
+    QUARK_COLD bool charge_restart() noexcept {
         if (sup_.window_ns > 0) {
             const std::int64_t now = now_ns();
             // `window_open_` is a DEDICATED "no window yet" flag — do NOT overload `window_start_ns_
@@ -1750,7 +1750,7 @@ private:
 
     // 007 §Stop: deactivate — remaining/future messages dead-letter (drain-loop `stopped_` gate);
     // fire cooperative stops so in-flight reentrant siblings unwind.
-    [[gnu::cold]] void do_stop() noexcept {
+    QUARK_COLD void do_stop() noexcept {
         stopped_ = true;
         stop_src_.request_stop();
         if (rc_) {
@@ -1761,7 +1761,7 @@ private:
 
     // 007 §Escalate: TELL the supervisor's lane (seam), then the default node-supervisor action —
     // Stop the actor + dead-letter survivors.
-    [[gnu::cold]] void do_escalate() noexcept {
+    QUARK_COLD void do_escalate() noexcept {
         ++escalations_;
         if (escalate_sink_.fn)
             escalate_sink_.fn(self_, error{errc::supervised_stop, "escalate"}, escalate_sink_.ctx,
@@ -1777,7 +1777,7 @@ private:
     // scan over an already-immutable table, so this re-copies already-resolved pointers, never
     // re-resolves anything (004/ADR-021). Both null ⇒ no `wire()` declared, or a caller (SimEngine/
     // TestKit) that never wires at all — skip entirely, byte-for-byte today's behavior.
-    [[gnu::cold]] void reconstruct_now() noexcept {
+    QUARK_COLD void reconstruct_now() noexcept {
         reconstruct_(self_);
         if (wire_ != nullptr && wire_scope_ != nullptr) {
             if (result<void> r = wire_(self_, *wire_scope_); !r) {
