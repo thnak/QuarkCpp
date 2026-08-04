@@ -274,3 +274,27 @@ foreach(_quark_serial_test
     set_tests_properties(${_quark_serial_test} PROPERTIES RUN_SERIAL TRUE)
   endif()
 endforeach()
+
+# ADR-040 Phase 7 (imports Design 1's C8): the DEFAULT build (QUARK_WITH_MBEDTLS=OFF) must link ZERO
+# mbedtls_-prefixed symbols into the core `quark` static library. This is true BY CONSTRUCTION today
+# (cmake/QuarkSecurityAdapters.cmake only links quark_security_mbedtls INTO a consumer that explicitly
+# opts in — never into `quark` itself — and the mbedTLS adapter headers under include/quark/adapters/
+# mbedtls/ are only #included from QUARK_WITH_MBEDTLS-gated test sources) but is proven here EMPIRICALLY
+# against the actual build artifact via dumpbin/symbols (MSVC's `nm` equivalent), so a future accidental
+# #include or link-order mistake in a CORE header cannot silently regress this without a red test.
+#
+# Registered ONLY for the posture it proves (QUARK_WITH_MBEDTLS OFF, the default) and only where
+# dumpbin exists (the MSVC toolchain this repo builds under — CLAUDE.md). A Linux nm-based counterpart
+# is a documented follow-up, not built here.
+if(NOT QUARK_WITH_MBEDTLS)
+  find_program(QUARK_DUMPBIN_EXE dumpbin)
+  if(QUARK_DUMPBIN_EXE)
+    add_test(NAME security_mbedtls_symbol_isolation
+             COMMAND ${CMAKE_COMMAND}
+                     -DDUMPBIN_EXE=${QUARK_DUMPBIN_EXE}
+                     -DTARGET_LIB=$<TARGET_FILE:quark>
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
+  else()
+    message(STATUS "Quark: skipping security_mbedtls_symbol_isolation (dumpbin not found — non-MSVC toolchain)")
+  endif()
+endif()

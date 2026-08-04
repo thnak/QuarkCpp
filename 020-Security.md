@@ -113,15 +113,66 @@ catastrophic vulnerabilities. Therefore:
   single-host or loopback/dev deployment, and it is **named as such** — enabling
   it in a multi-node config emits a loud startup warning (009) and is rejected
   under a `SecurityMode::Strict` config (013).
-- Production secure transport is a **thin adapter** over one vetted library —
-  default recommendation **mbedTLS or BoringSSL** (portable across
-  Linux/Windows/macOS + x86-64/ARM64, small footprint) — behind the
-  `SecureTransport` seam. OpenSSL/schannel/Security.framework are alternatives.
-- The engine core still links **zero** crypto in a single-node build; the adapter
-  is linked only when a secure cluster is configured.
+- Production secure transport is a **thin adapter** over **mbedTLS**
+  (`QUARK_WITH_MBEDTLS`, mirroring `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`'s
+  opt-in-adapter posture — ADR-040), chosen over BoringSSL for this project's
+  Windows/MSVC-primary toolchain: BoringSSL has no stable ABI, ships no
+  official MSVC support, and its build path is Bazel/GN/Go-only, none of which
+  fit a CMake-first, MSVC-primary project. OpenSSL/schannel/Security.framework
+  remain viable alternative adapters behind the same seam.
+- mTLS is used **once per connection, purely as an authenticated key exchange**
+  — a TLS 1.3 mutual handshake, with directional traffic secrets pulled via
+  RFC 8446 §7.5's exporter (or mbedTLS's export callback) — **never as the
+  record layer** for application traffic. The existing AEAD/sequence-number/
+  replay envelope in `secure_transport.hpp` carries every application frame
+  after the handshake completes; the handshake's only job is authenticating
+  the peer and deriving that envelope's per-session directional keys.
+- Per-peer session state (the directional cipher pair, sequence counter,
+  replay high-water mark, key `generation`, and the peer's retained
+  certificate fingerprint) is a `PeerSession`, folded into the transport's
+  existing per-peer lock/map — see
+  [010-Distribution.md](010-Distribution.md)'s Transport seam section for the
+  load-bearing ordering invariant this requires.
+- The engine core still links **zero** crypto in a single-node/default build;
+  the mbedTLS adapter is linked only when `QUARK_WITH_MBEDTLS=ON` — proven by
+  a dedicated build-isolation test that scans the default build's core
+  library for `mbedtls_`-prefixed symbols (ADR-040).
 
 This is the intellectually honest position: minimal-dependency is a principle, not
 a suicide pact, and "don't roll your own crypto" outranks it.
+
+### Rotation and revocation invariants (ADR-040)
+
+Node identity and cluster trust roots are **hot-reloadable**, not fixed at
+process start: `OverlappedMaterial<T>` (current + a grace-windowed previous,
+operator-controlled TTL) lets a node rotate its own certificate, or the
+cluster's trusted CA roots, without a coordinated restart — a fresh handshake
+always signs with the new `current` material; `previous` exists only so an
+already-open session that predates the rotation is not disrupted before its
+grace window elapses.
+
+Compromise is handled separately, and with **no grace window**: a
+`RevocationRegistry` of compromised-key fingerprints gossips over the *same*
+channel 021 already uses for membership convergence (no separate, slower
+propagation path) and is enforced two ways — at handshake time, against a new
+connection attempt, **and** on a bounded sweep tick, against sessions that are
+**already open**. Both enforcement paths are required: checking only at
+handshake time leaves an already-open session usable by a since-revoked peer
+indefinitely.
+
+Two invariants follow, load-bearing (each carries its own test):
+
+- **A revoked peer fingerprint must close any live session to that peer
+  within one sweep-tick interval, independent of whether that session
+  predates the revocation.** Enforcing revocation only against *new*
+  connection attempts and not already-open sessions was a fatal gap found and
+  closed during this ADR's design debate.
+- **AEAD seal/open for an established session never executes while holding a
+  lock shared with any other peer's session.** Any per-session serialization
+  added for ordering correctness (010-Distribution.md's Transport seam
+  section) must be scoped to that one session's own mutex, never a
+  cluster-wide one — otherwise one peer's crypto work stalls every other
+  peer's traffic.
 
 ## 3. Authorization and principal propagation
 
@@ -299,12 +350,20 @@ secure cluster or at-rest encryption is configured. The CSPRNG comes from the PA
 
 ## Open questions
 
-- **Key rotation** for node identities and data-encryption keys without a cluster
-  restart — online rotation vs. drain-and-restart. Interacts with membership (010)
-  and quiescence (015).
-- **Certificate/identity revocation** propagation latency in a decentralized
-  (no-coordinator) cluster — gossip a revocation list over SWIM, or require a
-  short-lived-cert model (SPIFFE-style) that sidesteps revocation?
+- **Key rotation** for data-encryption keys without a cluster restart — online
+  rotation vs. drain-and-restart. Interacts with quiescence (015). (Node
+  *identity* rotation — the transport mTLS certificate — is resolved below,
+  ADR-040.)
+- **Certificate/identity revocation.** Resolved (ADR-040): **both, layered**.
+  Normal-case identity rotation is `OverlappedMaterial<T>`-based (current +
+  grace-windowed previous, operator-controlled TTL, no forced short-lived
+  certs). Compromise-case revocation is a gossiped `RevocationRegistry`
+  (retained peer fingerprints) riding 021's existing membership-convergence
+  channel, enforced against already-open sessions on a bounded sweep tick (see
+  "Rotation and revocation invariants" above) — not just at handshake time.
+  Residual: under a network partition, a node holding a stolen key can still
+  authenticate to peers on the far side until the partition heals and gossip
+  catches up — a measured, not eliminated, propagation-latency window.
 - **Capability model concretely** — ref attenuation, revocation, and non-forgeable
   serialization of an `ActorRef`-as-capability across the wire (016).
 - **Ingress authentication** shape — is there a first-class gateway/edge actor, or

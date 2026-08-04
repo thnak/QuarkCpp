@@ -88,6 +88,10 @@ staged join FSM (placement recomputes only once a node can host work), fenced
 hand-off of live actors, a **stabilization window** that damps flap-induced
 thrash, and graceful drain vs. crash — is
 [021-Cluster-Formation-and-Lifecycle.md](021-Cluster-Formation-and-Lifecycle.md).
+Certificate rotation and compromise-driven revocation of an already-admitted
+node's session are handled separately, without a re-placement or a
+membership-epoch change — see that same file's "Certificate rotation and
+revocation on a live cluster".
 
 ## Transport seam
 
@@ -118,6 +122,23 @@ mutually-authenticated, encrypted `SecureTransport` of
 connection per peer), and node identity established there also gates SWIM
 admission and HRW placement, so an unauthenticated node can never be placed onto.
 
+`SecureTransport` (020, ADR-040)'s per-peer session state — the directional
+cipher pair, sequence counter, replay high-water mark, key `generation`, and
+the peer's retained certificate fingerprint — is a `PeerSession`, folded into
+this transport's existing per-peer lock/map, not a parallel one. This carries
+a load-bearing ordering invariant, with its own adversarial test (a
+`yield()`-hook-injected concurrent-sender + concurrent-rekey stress, per
+CLAUDE.md's "a load-bearing invariant without a test … is not done"):
+**sequence-number assignment, AEAD seal, and the hand-off to the wire
+transport for one peer's session must be ordered atomically with respect to
+other same-session senders.** Assigning `seq` without serializing it through
+to wire submission permits wire-arrival order to diverge from `seq` order
+under concurrent same-session senders, causing genuine, non-replayed frames
+to be spuriously rejected by the strict-monotonic replay guard. The lock this
+requires is scoped to one session's own mutex, never shared cluster-wide (see
+020-Security.md's "Rotation and revocation invariants") — one peer's crypto
+work never blocks another peer's session.
+
 ### Alternatives considered
 
 - **gRPC / HTTP2**: rich but pulls protobuf + a large runtime; overkill for
@@ -141,8 +162,22 @@ What it **does** share: the node's I/O reactor. `TcpTransport::event_loop()` is 
 **one sanctioned extension point** for a sibling seam that needs to share the
 node's already-open `pal::IoContext` instead of standing up a second thread/loop/
 fd-set — `VoiceChannel` is its first (and, by design, only intended) consumer. No
-other public surface should be added to `TcpTransport` for this purpose; a future
-sibling seam should extend `event_loop()`'s usage, not grow a second accessor.
+other public surface should be added to `TcpTransport` for *reactor sharing*; a
+future sibling seam should extend `event_loop()`'s usage, not grow a second
+accessor.
+
+A second, narrower exception exists for a different purpose: `TcpTransport::
+reset_peer_connection(NodeId)` (020, ADR-040) lets `SecureTransport` force-drop
+the live socket to a peer after a failed certificate renegotiation, WITHOUT
+declaring the peer dead — unlike `close_peer()` (021's permanent-death
+teardown, which suppresses reconnect), it leaves reconnect-eligibility
+untouched, so the reconnect/backoff machinery
+[021-Cluster-Formation-and-Lifecycle.md](021-Cluster-Formation-and-Lifecycle.md)
+already specifies immediately redials, and a fresh mTLS handshake carries a
+new generation. This is the one sanctioned exception to "no other public
+surface," scoped narrowly to that one purpose — it is not a general-purpose
+connection-control API, and a future sibling seam should not extend it for
+anything else.
 
 ## Serialization seam
 

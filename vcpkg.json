@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "quark",
+  "version": "0.1.0",
+  "builtin-baseline": "6224e10f5a201e0d575d2c63dd8455786389dd2d",
+  "dependencies": [
+    {
+      "name": "mbedtls",
+      "version>=": "3.6.2"
+    }
+  ]
+}

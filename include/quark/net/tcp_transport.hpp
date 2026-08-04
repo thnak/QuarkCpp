@@ -144,6 +144,28 @@ public:
         });
     }
 
+    // ADR-040 Phase 6: force-drop the LIVE connection to `peer` (e.g. a failed mTLS renegotiation, C2)
+    // WITHOUT declaring the peer dead. Unlike close_peer() above (SWIM's permanent-death teardown, which
+    // suppresses reconnect), this leaves reconnect-eligibility untouched: the ordinary handle_dead() path
+    // salvages any unsent frames and — since the peer is not in reconnect_suppressed_ and its endpoint is
+    // still known — immediately re-arms a reconnect, so a fresh TCP connection (and thus a fresh mTLS
+    // handshake carrying a new generation) begins right away. A no-op if there is no live socket for
+    // `peer` (e.g. already mid-Backoff, or the peer is unknown). Thread-safe (marshals onto the I/O loop
+    // like every other public method here).
+    //
+    // THIS IS A DELIBERATE, NARROW ADDITION to this file's public surface, alongside event_loop() —
+    // see 010-Distribution's "Sibling seams" note (Phase 9 spec update) for why this is sanctioned and
+    // what it does NOT do (it never suppresses reconnect, unlike close_peer()).
+    void reset_peer_connection(NodeId peer) {
+        io_.post([this, peer] {
+            const auto it = conns_.find(peer.value);
+            if (it == conns_.end()) return;
+            Conn* c = it->second.get();
+            if (c->fd == pal::invalid_fd) return;  // already a Backoff husk — nothing live to drop
+            handle_dead(c);
+        });
+    }
+
     // Marshal an arbitrary callback onto the I/O thread — the SAME thread on_receive() callbacks run
     // on. SwimMembership (021 cluster.hpp) documents that tick() and inbound control-frame handling
     // must share one driving thread (all its mutation is unsynchronized by design, matching the

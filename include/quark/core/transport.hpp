@@ -46,7 +46,10 @@ namespace quark {
 // AFTER `payload` so no positional aggregate-init exists to disturb (verified: all call sites assign
 // field-by-field). A node running both planes demuxes inbound frames on this field (see
 // `control_data_demux` in cluster.hpp) — the data sink sees a `Data`-only stream, unchanged.
-enum class FrameKind : std::uint8_t { Data = 0, Control = 1 };
+// `Authenticate` (ADR-040): carries mTLS handshake bytes between two peers' `SecureTransport`
+// instances (handshake.hpp) — `TcpTransport` moves them exactly like any other frame, entirely
+// ignorant of their meaning. No new public surface on the 010 transport is needed for the handshake.
+enum class FrameKind : std::uint8_t { Data = 0, Control = 1, Authenticate = 2 };
 
 // The wire unit handed to a Transport. Owns its serialized bytes; movable. The header is everything
 // the receiving node needs to (a) find the target actor, (b) decode the payload into the right type,

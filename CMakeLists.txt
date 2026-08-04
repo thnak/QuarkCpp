@@ -69,6 +69,11 @@ endif()
 # header-only FileStore need nothing here. `include()` after tests so it can register conformance
 # checks against `enable_testing()`.
 include(QuarkPersistenceAdapters)
+
+# Optional 020 production transport-security backend (mbedTLS, ADR-040). OFF by default — the
+# std-only core keeps MockCipher/no-op handshake as its dev/loopback default; see
+# cmake/QuarkSecurityAdapters.cmake for enabling instructions.
+include(QuarkSecurityAdapters)
 if(QUARK_BUILD_BENCH)
   add_subdirectory(bench)
 endif()

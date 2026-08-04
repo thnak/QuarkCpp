@@ -63,19 +63,15 @@
 
 #include "quark/core/ids.hpp"
 #include "quark/core/membership.hpp"
+#include "quark/core/tls_identity.hpp"  // Fingerprint — ADR-040 Phase 5 revocation-gossip piggyback
 #include "quark/core/transport.hpp"
 #include "quark/detail/hash.hpp"
 #include "pal/pal.hpp"  // pal::now() — the canonical suspend-counting clock (018/019)
 
 namespace quark {
 
-// ============================================================================================
-// Cluster identity (021 §1). Opaque; provisioned out of band (013). A mismatch on join is rejected.
-// ============================================================================================
-struct ClusterId {
-    std::uint64_t value = 0;
-    friend constexpr bool operator==(ClusterId, ClusterId) = default;
-};
+// ClusterId (021 §1) now lives in ids.hpp — the mTLS handshake seam (handshake.hpp, ADR-040) binds it
+// from a verified leaf certificate and needs it without pulling in this whole membership header.
 
 // A contact point where a peer MIGHT be reached (021 §2 Discovery). Minimal value type: the NodeId is
 // the stable identity; `addr`/`port` are an opaque, PAL-interpreted locator (a real Endpoint carries a
@@ -166,6 +162,11 @@ struct ControlMsg {
     std::uint64_t subject_incarnation = 0;
     std::uint64_t seq = 0;  // probe correlation
     std::vector<MemberUpdate> updates;
+    // ADR-040 Phase 5: a bounded piggyback of revoked-certificate fingerprints, riding the SAME gossip
+    // channel as `updates` (no new one — matches the ADR record's proven C3 convergence-ratio evidence).
+    // SwimMembership moves these as opaque 32-byte blobs (set_revocation_gossip); it does not interpret
+    // them — that stays 020/RevocationRegistry's job.
+    std::vector<Fingerprint> revocations;
 };
 
 namespace detail {
@@ -202,6 +203,11 @@ struct SwimByteReader {
         for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(u8()) << (8 * i);
         return v;
     }
+    [[nodiscard]] Fingerprint bytes32() noexcept {
+        Fingerprint fp{};
+        for (std::byte& x : fp) x = static_cast<std::byte>(u8());
+        return fp;
+    }
 };
 
 inline std::vector<std::byte> encode_control(const ControlMsg& m) {
@@ -219,6 +225,9 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         put_u64(b, u.incarnation);
         put_u8(b, u.status);
     }
+    put_u16(b, static_cast<std::uint16_t>(m.revocations.size()));
+    for (const Fingerprint& fp : m.revocations)
+        for (std::byte x : fp) put_u8(b, static_cast<std::uint8_t>(x));
     return b;
 }
 
@@ -240,6 +249,9 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         u.status = r.u8();
         out.updates.push_back(u);
     }
+    const std::uint16_t revocation_count = r.u16();
+    out.revocations.clear();
+    for (std::uint16_t i = 0; i < revocation_count && r.ok; ++i) out.revocations.push_back(r.bytes32());
     return r.ok;
 }
 
@@ -380,6 +392,25 @@ public:
         transport_->on_receive([this](MessageFrame f) { on_frame(std::move(f)); });
     }
 
+    // --- ADR-040 Phase 5: revocation gossip piggyback + sweep hook -----------------------------
+    // `pull` supplies a bounded set of fingerprints to attach to each OUTBOUND control frame (from
+    // this node's RevocationRegistry); `merge` absorbs an INBOUND frame's piggybacked set into it.
+    // SwimMembership stays security-ignorant: it moves 32-byte blobs, it does not interpret them —
+    // the header banner above and revocation_registry.hpp's own banner own that distinction.
+    using RevocationPullFn = std::function<std::vector<Fingerprint>(std::size_t max)>;
+    using RevocationMergeFn = std::function<void(const std::vector<Fingerprint>&)>;
+    void set_revocation_gossip(RevocationPullFn pull, RevocationMergeFn merge) {
+        revocation_pull_ = std::move(pull);
+        revocation_merge_ = std::move(merge);
+    }
+
+    // A generic per-tick injection point (same idiom as set_clock/set_link_reachable), called at the
+    // end of every tick() with the current virtual time. Node bootstrap wires this to
+    // SecureTransport::sweep_revocations(registry.snapshot()) (Phase 5) and sweep_rotation(...)
+    // (Phase 6) — SwimMembership itself has no idea what the hook does.
+    using SweepHookFn = std::function<void(std::int64_t now_ns)>;
+    void set_sweep_hook(SweepHookFn fn) { sweep_hook_ = std::move(fn); }
+
     // --- TEST seams (documented; stand in for 019/020 mechanics) -------------------------------
     // A one-way reachability filter for THIS node's outbound control sends — a partial partition. A
     // real partition is observed by the 019 PAL socket layer; this injects it for indirect-ping tests.
@@ -422,6 +453,7 @@ public:
         drive_probe(now);     // resolve/escalate the in-flight probe by virtual time
         start_probe(now);     // begin a new direct probe of the next peer
         gossip_round(now);    // disseminate the member digest to a fanout subset
+        if (sweep_hook_) sweep_hook_(now);  // ADR-040 Phase 5/6: revocation + rotation sweeps
     }
 
     // Observe a specific member's status (tests / 009 observability).
@@ -470,6 +502,7 @@ private:
         m.from = self_;
         m.from_incarnation = self_incarnation_;
         fill_digest(m.updates);
+        if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
         MessageFrame f;
         f.from = self_;
         f.to = to;
@@ -508,7 +541,10 @@ private:
 
         // Absorb piggybacked gossip — but ONLY from a same-cluster frame, so a mismatched Join cannot
         // smuggle its roster in via the digest and defeat the accidental-merge guard below.
-        if (m.cluster == cfg_.cluster_id) merge_digest(m.updates);  // may trigger self-refutation
+        if (m.cluster == cfg_.cluster_id) {
+            merge_digest(m.updates);  // may trigger self-refutation
+            if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
+        }
 
         switch (m.kind) {
             case ControlKind::Ping: {
@@ -785,6 +821,10 @@ private:
     std::function<void(MessageFrame)> data_sink_;
     std::function<bool(NodeId)> link_reachable_;
     bool online_ = true;
+
+    RevocationPullFn revocation_pull_;
+    RevocationMergeFn revocation_merge_;
+    SweepHookFn sweep_hook_;
 
     ClockFn clock_fn_ = &real_steady_ns;
     void* clock_ctx_ = nullptr;

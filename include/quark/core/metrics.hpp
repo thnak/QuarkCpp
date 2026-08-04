@@ -159,6 +159,21 @@ struct QUARK_CACHE_ALIGNED ShardCounters {
     MetricCounter broker_wakes_enqueued;  // Wake control messages posted to this shard's broker
     MetricCounter broker_wakes_handled;   // Wake messages the broker has finished processing
     MetricCounter deactivate_flush_failures;  // ADR-028 Phase 8: best-effort persistence-flush errors
+    // ADR-040 Phase 8 — SecureTransport (020) observability. Unlike the drain-owned counters above,
+    // these are recorded by a single node's SecureTransport (there is one per node, not one per shard);
+    // wire them via SecureTransport::set_metrics() into whichever ShardCounters block the node chooses
+    // to attribute them to (typically shard 0) — the aggregate-on-scrape sum below is still correct as
+    // long as exactly one shard's block receives them. "session-lock contention" (a `PeerSession::
+    // session_mu_` try_lock counter) is deliberately NOT included: cheaply observing it would require
+    // replacing the required-fix's blocking `lock_guard` (secure_transport.hpp's send()/deliver()) with
+    // a try_lock + fallback, which risks disturbing the exact seq-draw+seal+handoff ordering guarantee
+    // that lock exists to provide — not worth it for a diagnostic counter (009's own "if cheaply
+    // observable" escape hatch).
+    MetricCounter security_handshakes_attempted;   // ensure_handshake()/server-side ClientHello response
+    MetricCounter security_handshakes_succeeded;   // Step::Done, NOT a renegotiation (a fresh session)
+    MetricCounter security_handshakes_failed;      // Step::Failed (initial OR renegotiation attempt)
+    MetricCounter security_rotations_completed;    // Step::Done AND a renegotiation (in-place key swap)
+    MetricCounter security_revocations_enforced;   // sweep_revocations() marked an already-open session
     MetricCounter user[kUserCounterSlots];
 
     Histogram message_latency_ns;  // handler start->end latency
@@ -183,6 +198,11 @@ struct MetricsSnapshot {
     std::uint64_t broker_wakes_enqueued = 0;  // ADR-028 Phase 7
     std::uint64_t broker_wakes_handled = 0;   // ADR-028 Phase 7
     std::uint64_t deactivate_flush_failures = 0;  // ADR-028 Phase 8
+    std::uint64_t security_handshakes_attempted = 0;  // ADR-040 Phase 8
+    std::uint64_t security_handshakes_succeeded = 0;  // ADR-040 Phase 8
+    std::uint64_t security_handshakes_failed = 0;     // ADR-040 Phase 8
+    std::uint64_t security_rotations_completed = 0;   // ADR-040 Phase 8
+    std::uint64_t security_revocations_enforced = 0;  // ADR-040 Phase 8
     std::array<std::uint64_t, kUserCounterSlots> user{};
     HistogramSnapshot message_latency_ns{};
     HistogramSnapshot mailbox_depth{};
@@ -238,6 +258,11 @@ public:
             s.broker_wakes_enqueued += sc->broker_wakes_enqueued.load();
             s.broker_wakes_handled += sc->broker_wakes_handled.load();
             s.deactivate_flush_failures += sc->deactivate_flush_failures.load();
+            s.security_handshakes_attempted += sc->security_handshakes_attempted.load();
+            s.security_handshakes_succeeded += sc->security_handshakes_succeeded.load();
+            s.security_handshakes_failed += sc->security_handshakes_failed.load();
+            s.security_rotations_completed += sc->security_rotations_completed.load();
+            s.security_revocations_enforced += sc->security_revocations_enforced.load();
             for (std::size_t i = 0; i < kUserCounterSlots; ++i) s.user[i] += sc->user[i].load();
             s.message_latency_ns.merge(sc->message_latency_ns.snapshot());
             s.mailbox_depth.merge(sc->mailbox_depth.snapshot());
@@ -271,6 +296,11 @@ public:
         counter("broker_wakes_enqueued_total", s.broker_wakes_enqueued);
         counter("broker_wakes_handled_total", s.broker_wakes_handled);
         counter("deactivate_flush_failures_total", s.deactivate_flush_failures);
+        counter("security_handshakes_attempted_total", s.security_handshakes_attempted);
+        counter("security_handshakes_succeeded_total", s.security_handshakes_succeeded);
+        counter("security_handshakes_failed_total", s.security_handshakes_failed);
+        counter("security_rotations_completed_total", s.security_rotations_completed);
+        counter("security_revocations_enforced_total", s.security_revocations_enforced);
         for (std::size_t i = 0; i < kUserCounterSlots; ++i) {
             if (s.user[i] == 0 && user_names_[i].empty()) continue;
             const std::string& nm = user_names_[i];

@@ -16,6 +16,12 @@ struct NodeId {
     friend constexpr bool operator==(NodeId, NodeId) = default;
 };
 
+// Cluster identity (021 §1). Opaque; provisioned out of band (013). A mismatch on join is rejected.
+struct ClusterId {
+    std::uint64_t value = 0;
+    friend constexpr bool operator==(ClusterId, ClusterId) = default;
+};
+
 // Compile-time-stable type identity (008). Produced from a type's metadata fingerprint;
 // used for dispatch, wire type tags, and durable record headers (016).
 struct TypeKey {

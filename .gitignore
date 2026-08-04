@@ -19,6 +19,10 @@ perf_test.log
 .whmcp-tmp/
 *.deb
 
+# vcpkg toolchain (bootstrapped locally, not vendored — see cmake/QuarkSecurityAdapters.cmake)
+/vcpkg/
+vcpkg_installed/
+
 # Editor
 .cache/
 .vscode/

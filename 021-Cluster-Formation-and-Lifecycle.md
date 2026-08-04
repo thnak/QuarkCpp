@@ -83,6 +83,13 @@ its shape is a provisioning choice behind 020's existing `NodeAuthority` seam �
   mounted secret, a cert file, a workload-identity socket). The engine consumes it;
   it never generates or self-signs a root implicitly, because an implicitly
   self-created root is a root no operator chose to trust.
+- Whichever `NodeAuthority` adapter is configured, admission is gated by a
+  real **mTLS mutual handshake** (020, ADR-040): each side authenticates the
+  other's leaf certificate against the cluster's `TrustStore` (an
+  `OverlappedMaterial<TrustedRoots>`, allowing CA-root rotation with an
+  explicit overlap window), and the verified leaf binds both the presenting
+  node's `NodeId` and the cluster id it claims — a mismatch on either is
+  rejected before any session exists, not discovered after.
 
 ### Cluster identity — preventing accidental merges
 
@@ -152,6 +159,38 @@ round-trip:
 
 The AEAD handshake (020) rides the surviving connection; the loser is dropped
 before any application frame flows, so dedup costs nothing steady-state.
+Certificate rotation (see below) also reuses this same reconnect/backoff
+machinery on a failed renegotiation, rather than inventing a parallel rekey
+protocol or a new glare-breaking rule — connection establishment already
+handles this class of race.
+
+### Certificate rotation and revocation on a live cluster
+
+A node's own certificate/key and the cluster's trusted CA roots are
+hot-reloadable via `OverlappedMaterial<T>` (020, ADR-040) — `rotate()` keeps
+the outgoing material usable, as `previous`, for an operator-controlled grace
+window, so already-open sessions are not disrupted the instant an operator
+rotates. A node's session sweep — piggybacked on the same SWIM keepalive tick
+that already drives probing and gossip (§3) — evaluates two independent,
+distinct triggers:
+
+- **Rotation** (no urgency): once the grace window on an outgoing identity
+  elapses, any session still authenticated under the old material either
+  renegotiates in place (a fresh mTLS handshake over the already-open
+  connection) or, if renegotiation fails or times out, is dropped and the
+  connection is closed so the reconnect/redial machinery above brings up a
+  fresh one carrying the new generation. No new wire-level protocol:
+  renegotiation reuses the same handshake machinery as an initial connection,
+  and a failed renegotiation reuses the existing reconnect/backoff — no
+  parallel rekey protocol.
+- **Revocation** (immediate, no grace window): a compromised-key fingerprint
+  closes any live session to that fingerprint within one sweep-tick interval,
+  regardless of how long that session has been open (020's revocation
+  invariant).
+
+Neither path requires a coordinated cluster-wide restart or a cluster-wide
+barrier — both are purely gossip/local-sweep driven, one node and one session
+at a time.
 
 ### Liveness and teardown
 
