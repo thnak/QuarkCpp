@@ -70,6 +70,7 @@
 #include "quark/core/resource.hpp"  // WireFn/ResourceScope (007 Restart re-wire, "Phase 6" redirected)
 #include "quark/core/task.hpp"  // async_frame_faulted (007 handler-boundary guard, async channel)
 #include "pal/pal.hpp"          // pal::now() — the canonical suspend-counting clock (018/019)
+#include "quark/detail/envelope_pool.hpp"  // ADR-044: envelope_of() — the 4 real dispatch sites
 
 namespace quark::detail {
 struct TimerEntry;  // timer_wheel.hpp — forward-declared: Activation only ever holds a bare pointer
@@ -204,6 +205,18 @@ struct ReclaimSink {
             d->release();
     }
 };
+
+// ADR-044 (C1r fix): the ONE principal-resolution helper every dispatch/redispatch site calls, off
+// the SAME flags word each site's own try_claim()/set_flags() already loaded — zero extra memory
+// load beyond what the site already pays. `flags` is that site's own already-captured word
+// (drain_step/drain_step_governed_seq's `claim_flags` from try_claim(&claim_flags); handle_restart_
+// retry's/admit's freshly-read word — see each call site). A local, envelope-free message (flag
+// unset, the overwhelming default) resolves to a plain register store Principal{} — no envelope
+// memory is EVER touched on that path, and any prior message's stamped principal is unconditionally
+// overwritten (S2r/C2r: no cross-message leak through a reused MessageContext).
+QUARK_ALWAYS_INLINE Principal resolve_principal(Descriptor* d, std::uint16_t flags) noexcept {
+    return (flags & kControlFlagHasEnvelope) ? detail::envelope_of(d).principal : Principal{};
+}
 
 // The 015 quiescence mode (015 §The quiescence primitive).
 enum class QuiesceMode : std::uint8_t {
@@ -551,6 +564,7 @@ public:
 
             current_ctx_.deadline_ns = d->deadline_ns;
             current_ctx_.trace_id = d->trace_id;
+            current_ctx_.principal = resolve_principal(d, claim_flags);  // ADR-044 C1r/S2r
 
             // ==== ADR-009 D1 handler-boundary guard (zero-cost on the no-throw path) ============
             // The ONE try/catch that contains a throwing handler. Itanium ABI: the success path pays
@@ -1161,6 +1175,7 @@ private:
 
             current_ctx_.deadline_ns = d->deadline_ns;
             current_ctx_.trace_id = d->trace_id;
+            current_ctx_.principal = resolve_principal(d, claim_flags);  // ADR-044 C1r/S2r
 
             DispatchOutcome o;
 #ifndef QUARK_SUPERVISION_NO_GUARD
@@ -1266,7 +1281,11 @@ private:
     // in-flight set. The frame is pushed to `live` BEFORE it is started so a carrier that completes
     // it the instant it suspends always finds it registered (no admit/complete race window).
     void admit(Descriptor* d) noexcept {
-        if (!d->try_claim()) {
+        // ADR-044 C1r fix: switched from the no-arg try_claim() to the observed_flags overload this
+        // call was always eligible for — the SAME free flags-word capture drain_step/
+        // drain_step_governed_seq already use, now also reaching the Reentrant/MaxConcurrency<N> path.
+        std::uint16_t claim_flags = 0;
+        if (!d->try_claim(&claim_flags)) {
             reclaim_(d);  // late-cancel tombstone: one free, NO handler runs (001 §Cancellation)
             return;
         }
@@ -1279,6 +1298,11 @@ private:
         f->desc = d;
         f->ctx.deadline_ns = d->deadline_ns;
         f->ctx.trace_id = d->trace_id;
+        // ADR-044 C1r/C2r: a fresh ReFrame default-constructs MessageContext{} (anonymous) for EVERY
+        // admitted message, so this stamp is the only write needed — it cannot inherit a stale
+        // principal from a sibling frame even without an explicit reset (stronger than the reused-
+        // current_ctx_ sites, which need the unconditional resolve_principal() overwrite instead).
+        f->ctx.principal = resolve_principal(d, claim_flags);
         f->stop = std::stop_source{};
         f->ctx.stop = f->stop.get_token();
         rc_->live.push_back(std::move(frame));
@@ -1598,6 +1622,12 @@ private:
 
             current_ctx_.deadline_ns = d->deadline_ns;
             current_ctx_.trace_id = d->trace_id;
+            // ADR-044 C1r fix: handle_restart_retry is QUARK_COLD (a fault-retry path, not the hot
+            // drain) with no fresh try_claim() of its own here — `d` is already claimed (Running) by
+            // the ORIGINAL drain_step/drain_step_governed_seq call that led to this fault, so one
+            // relaxed gen_state flags re-read is the correct (and only) way to recover the same word.
+            current_ctx_.principal =
+                resolve_principal(d, GenState::flags_of(d->gen_state.load(std::memory_order_relaxed)));
             DispatchOutcome o;
             bool retry_faulted = false;
 #ifndef QUARK_SUPERVISION_NO_GUARD

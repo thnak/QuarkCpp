@@ -88,6 +88,14 @@ struct GenState {
 // it via the SAME flags word already captured by try_claim()'s CAS (no extra memory load) and
 // converts it into a private `retire_requested_` flag instead of dispatching to the handler table.
 inline constexpr std::uint16_t kControlFlagDeactivate = 1u << 0;
+// Bit 1 (ADR-044, "Flag-Gated Envelope Pool"): this descriptor was sourced from
+// quark::detail::EnvelopePool, not the plain MessagePool — its memory is a
+// quark::detail::EnvelopePool::Cell, and quark::detail::envelope_of(d) may be called on it to reach
+// the co-located DescriptorEnvelope{Principal}. Set ONLY by EnvelopePool::acquire(), pre-publish
+// (single-writer, mirrors kControlFlagDeactivate's own contract). Read for free off the SAME flags
+// word try_claim()/set_flags() already loaded — zero extra memory load to recognize an enveloped
+// descriptor (mirrors kControlFlagDeactivate's zero-extra-load design).
+inline constexpr std::uint16_t kControlFlagHasEnvelope = 1u << 1;
 
 // The fixed-size, pooled message metadata block. Payload lives SEPARATELY (003): the descriptor
 // only references it. One cache line max — enforced by the static_assert at the bottom.
@@ -223,5 +231,9 @@ static_assert(std::is_pointer_interconvertible_with_class(&Descriptor::link));
 #endif
 static_assert(sizeof(Descriptor) <= quark::max_descriptor_size,
               "descriptor must fit in one cache line (003, 023)");
+// ADR-044 C5: Descriptor stays byte-for-byte unchanged by the Flag-Gated Envelope Pool design — no
+// field was added; kControlFlagHasEnvelope only consumes one previously-unused bit of the already-
+// existing 12-bit flags field. Kept as a permanent regression guard, not just a one-time prove claim.
+static_assert(sizeof(Descriptor) == 56, "ADR-044 C5: Descriptor must remain exactly 56 bytes");
 
 }  // namespace quark

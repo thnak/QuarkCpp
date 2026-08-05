@@ -7,6 +7,20 @@ Supersedes/relates: builds on ADR-002/003/004 (mailbox MPSC hot path); resolves 
 open questions in `005-Developer-Model.md`, `006-Messaging-and-Addressing.md`,
 `001-Actor-Execution-Model.md`.
 
+> **Superseded in part by ADR-044 (2026-08-05).** The `Descriptor::ctx_`-pointer-
+> into-payload-arena mechanism proposed below (§ "Descriptor / ctx_") for carrying
+> ambient `MessageContext` was never implemented; for `Principal` specifically it
+> is superseded by ADR-044's Flag-Gated Envelope Pool, which keeps `Descriptor`
+> at its real, ten-times-proven 56-byte layout instead of growing it to 64.
+> `deadline_ns`/`trace_id` remain inline members, as they are pervasive on local
+> causal chains (009/018) and were never actually moved out despite the text
+> below proposing to. The original `ctx_` proposal is retained below as
+> historical record of a design proven internally consistent (C1–C5, C7, C8 all
+> CORRECT in ADR-044's re-examination) but disqualified by a single proven-WRONG
+> claim (C6: local-tell forwarding silently drops the ambient principal,
+> defeating the design's own motivating multi-hop-delegation use case) with no
+> cheap fix identified.
+
 ---
 
 ## Question

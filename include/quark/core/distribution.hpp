@@ -37,6 +37,8 @@
 #include <utility>
 
 #include "quark/core/actor_ref.hpp"    // LocalRouter, ActorRef, AskFuture (006 send API)
+#include "quark/core/audit.hpp"        // AuditSink (020 §Audit)
+#include "quark/core/authorizer.hpp"   // Authorizer, SecurityDeadLetter, authorize_at_boundary (020 §3)
 #include "quark/core/ids.hpp"
 #include "quark/core/membership.hpp"   // Membership seam + MembershipView
 #include "quark/core/metadata.hpp"     // type_key_of / actor_id_of (008 content-addressed keys)
@@ -72,6 +74,23 @@ public:
     DistributedRouter& operator=(const DistributedRouter&) = delete;
 
     [[nodiscard]] NodeId self() const noexcept { return self_; }
+
+    using ClockFn = std::int64_t (*)(void* ctx) noexcept;  // mirrors Activation::set_clock (014)
+
+    // --- Boundary authorization (020 §3): gate an inbound frame BEFORE it is deserialized/dispatched.
+    // Unset (default) = no check — a deployment that never configures security pays nothing extra on
+    // the receive path (020 core principle). `sec_dl`/`audit` are optional; a denial with both null is
+    // still refused, just unrecorded. `clock`/`clock_ctx` timestamp a denial for the sinks above; a
+    // null clock timestamps denials as 0 rather than pulling in a clock dependency.
+    void set_authorizer(const Authorizer& authz, SecurityDeadLetter* sec_dl = nullptr,
+                        const AuditSink* audit = nullptr, ClockFn clock = nullptr,
+                        void* clock_ctx = nullptr) noexcept {
+        authz_ = &authz;
+        sec_dl_ = sec_dl;
+        audit_ = audit;
+        clock_fn_ = clock;
+        clock_ctx_ = clock_ctx;
+    }
 
     // Resolve identity → a distributed ref (identity + placement context). Never blocks, never
     // touches the network — placement happens at send time against the then-current view.
@@ -118,6 +137,13 @@ public:
 
     // --- Inbound (Transport receiver): decode a frame and re-post it as a local delivery. ---------
     void deliver(const MessageFrame& f) {
+        // Boundary authorization (020 §3) runs FIRST — before the (target,msg) lookup and well before
+        // decode — so a denied frame is never deserialized and never touches actor state.
+        if (authz_ != nullptr &&
+            !authorize_at_boundary(*authz_, f.principal, f.target, f.msg_type, sec_dl_, audit_,
+                                   now_ns())) {
+            return;
+        }
         const auto it = inbound_.find(wire_key(f.target.type, f.msg_type));
         if (it == inbound_.end()) return;  // no such (actor,msg) type registered here → drop (007 seam)
         it->second(*local_, f);
@@ -166,7 +192,8 @@ private:
         } else {
             if (!decode_tagged(f.payload.data(), f.payload.size(), msg)) return;  // malformed → drop
         }
-        local.template deliver_from_wire<A, M>(f.target, std::move(msg), f.deadline_ns, f.trace_id);
+        local.template deliver_from_wire<A, M>(f.target, std::move(msg), f.deadline_ns, f.trace_id,
+                                               f.principal);  // ADR-044: was silently dropped before
     }
 
     // Serialize `m` (016) and hand the frame to the transport. NOT the zero-alloc local hot path —
@@ -185,6 +212,7 @@ private:
         if (const MessageContext* amb = detail::tl_current_ctx) {
             f.trace_id = amb->trace_id;
             f.deadline_ns = amb->deadline_ns;
+            f.principal = amb->principal;  // 020 §3: inherit unchanged across the hop (see principal.hpp)
         }
         if (mode == WireMode::Tagless) {
             f.payload.resize(tagless_size(m));
@@ -203,12 +231,19 @@ private:
         return PeerSchema{tk.value, pal::platform_abi_tag};
     }
 
+    [[nodiscard]] std::int64_t now_ns() const noexcept { return clock_fn_ ? clock_fn_(clock_ctx_) : 0; }
+
     Membership* membership_;
     NodeId self_;
     LocalRouter* local_;
     Transport* transport_;
     std::function<PeerSchema(NodeId, TypeKey)> peer_schema_;
     std::unordered_map<WireKey, InboundFn, WireKeyHash> inbound_;
+    const Authorizer* authz_ = nullptr;
+    SecurityDeadLetter* sec_dl_ = nullptr;
+    const AuditSink* audit_ = nullptr;
+    ClockFn clock_fn_ = nullptr;
+    void* clock_ctx_ = nullptr;
 };
 
 // ============================================================================================

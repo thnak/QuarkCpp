@@ -211,6 +211,34 @@ system. The RFC's preferred long-term direction is **capability-based**: an
 capability model where *possessing a ref is the authorization* fits the actor
 model natively (noted as a future direction, not the v1 default).
 
+**Principal propagation mechanism (ADR-044, Accepted — "Flag-Gated Envelope
+Pool").** A wire-arrived, non-anonymous `Principal` is carried from
+`DistributedRouter::deliver` through `inbound_thunk` (which forwards
+`MessageFrame::principal`) into `LocalRouter::deliver_from_wire`, which routes
+the descriptor through a second, wire-scale pool — `EnvelopePool`
+(`quark::detail::EnvelopePool`/`DescriptorEnvelope`) — instead of the plain
+`MessagePool` whenever `principal.anonymous() == false`. It is resolved into
+`current_context().principal` (or the per-frame `ReFrame::ctx.principal` under
+`Reentrant`/`MaxConcurrency<N>`) via one flag-gated pooled-struct dereference
+at **all four** claim/dispatch sites: plain `Sequential` drain, governed-
+`Sequential` drain, `Reentrant` admit, and supervised-restart redelivery (007).
+A purely local send with an anonymous ambient principal (the default) never
+touches `EnvelopePool` and pays zero extra cost — this is the "a purely
+intra-process tell pays nothing" invariant above, now backed by measured
+evidence (ADR-044 F1) rather than assumed. `Descriptor` itself is untouched by
+this mechanism — it stays at its real, ten-times-proven 56-byte layout; the
+mechanism spends one previously-unused bit of the existing 12-bit `flags`
+subfield instead of growing the descriptor. See ADR-044 for the full design
+debate, the two competing mechanisms it rejected, and the evidence table.
+
+Two residual risks are carried forward, not yet closed: no TSan-capable
+toolchain was available to prove the concurrency-safety claims for real (ASan +
+a coroutine-resume stress substitute came back clean, which is not the same
+guarantee); and `EnvelopePool`'s mutex-guarded acquire is a measured 9–34%
+marginal cost on trivial, control-frame-sized messages (heartbeats, bare acks)
+— real but small in absolute terms (~15–20 ns), and within budget for
+realistic payload sizes.
+
 ## 4. Secrets
 
 013 deferred secrets to "the host's secret source"; this pins the seam. Secrets

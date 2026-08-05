@@ -212,6 +212,15 @@ Exactly-once is **not** offered as a transport property; where it matters it is
 built from at-least-once + idempotent handlers + fenced persistence — the full
 mechanism and its partition proof are in `017-Delivery-Guarantees.md`.
 
+**Principal propagation across the network (ADR-044).** `MessageFrame` carries a
+`Principal` (020 §3), stamped from the sender's ambient context at the wire edge.
+`DistributedRouter::deliver` must thread this field through `inbound_thunk` into
+`LocalRouter::deliver_from_wire` — an earlier integration gap silently dropped it
+here, which ADR-044's evidence run found and fixed. A non-anonymous principal is
+re-established as the receiving actor's ambient `current_context().principal` at
+all four real claim/dispatch sites (`020` §3 names them); an anonymous one (the
+default absent a security config) costs nothing extra on the receive path.
+
 ## Cross-node reply-stream credit-return (ADR-018)
 
 An `ask` that returns a **stream** across nodes runs the 024 credit-ring backward

@@ -173,6 +173,37 @@ touches, not allocated per-pool). Fine at this repo's stated thread-count scale;
 worth revisiting only if the engine grows into a very-high-thread-count deployment
 shape.
 
+**A second pool: `EnvelopePool` (ADR-044).** A wire-arrived, non-anonymous
+`Principal` (020 §3) needs to reach a receiving actor's handler, but growing
+the pooled `Descriptor` to carry it directly was rejected — `Descriptor` is
+already at 56 of its 64-byte hot-path budget, and `Principal` alone needs 16.
+Instead, `quark::detail::EnvelopePool` (`include/quark/detail/envelope_pool.hpp`)
+is a **second, sibling pool**, reusing the exact `Cell`-first-member/
+fixed-offset idiom `MessagePool` uses (a `Descriptor*` IS a `Cell*`, no stored
+back-pointer) so `envelope_of()`'s `reinterpret_cast` is well-founded. Its
+`Cell` additionally carries a `DescriptorEnvelope{Principal}` tail. Unlike
+`MessagePool`, it has no ADR-037 TLS magazine — inbound wire-frame rate is
+bounded by network/connection count, not core-to-core message-passing
+throughput, so one mutex-guarded free list is in-budget (measured cost:
+9–34% marginal tax on trivial control-frame-sized messages, within budget for
+realistic payload sizes — ADR-044 F2r). `Descriptor` itself is byte-for-byte
+unchanged by this design — `sizeof(Descriptor) == 56` remains a permanent,
+enforced invariant; this ADR deliberately did not spend the descriptor's slack
+bytes on `Principal`.
+
+**Reclaim-dispatch obligation.** Because a descriptor may now come from
+*either* pool, any code path that reclaims a `Descriptor` must route through a
+flag-checking dual sink (reads `kControlFlagHasEnvelope` off the already-loaded
+flags word to pick `EnvelopePool::reclaim` vs. `MessagePool::reclaim`), never a
+single pool's `reclaim()` unconditionally. Misrouting an `EnvelopePool`-sourced
+descriptor through `MessagePool`'s reclaim path reads `DescriptorEnvelope::
+principal`'s bytes as `MessagePool::Cell::destroy` — an invalid function
+pointer, a real memory-corruption bug ADR-044's cross-examination found and
+closed (its `S1r`). `LocalRouter` (006/`actor_ref.hpp`) is the shipped example:
+its internal `DualReclaimSink` is what every dependent `Activation`'s
+`ReclaimSink` must be constructed with (`LocalRouter::reclaim_sink()`) if that
+activation may ever receive a principal-carrying message.
+
 ## Cancellation and memory
 
 Cancellation is a **state transition only** — no descriptor is freed early and no
@@ -233,6 +264,20 @@ requirement**: the bit must be **shifted into the flags subfield** (e.g. via
 `GenState::pack`/`with_state`-style masked composition), never a raw `OR` into
 the whole 64-bit word — a real bit-shift bug of exactly this kind was found and
 fixed during ADR-029's proof (S6).
+
+**`gen_state` flags subfield — the two shipped control-flag bits.** Bit 0,
+`kControlFlagDeactivate` (ADR-028 Phase 1), marks a descriptor as a Deactivate
+control message; `drain_step` recognizes it off the same flags word
+`try_claim()`'s winning CAS already captured, converting it into a private
+`retire_requested_` flag instead of dispatching to the handler table. Bit 1,
+`kControlFlagHasEnvelope` (ADR-044, "Flag-Gated Envelope Pool"), marks a
+descriptor as sourced from `quark::detail::EnvelopePool` rather than the plain
+`MessagePool` — its memory is an `EnvelopePool::Cell`, and
+`quark::detail::envelope_of(d)` may be called on it to reach the co-located
+`DescriptorEnvelope{Principal}` (020 §3). Both bits are set only by their
+owning pool's `acquire()`, pre-publish (single-writer), and are read for free
+off the same flags word each dispatch site's own `try_claim()`/`set_flags()`
+call already loaded — neither costs an extra memory load to recognize.
 
 ## Close-out ordering — Dekker fence proven necessary; `ExecStateCell`'s own ordering now independently proven load-bearing (ADR-031 r8, closed by ADR-032 r9)
 

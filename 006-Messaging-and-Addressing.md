@@ -181,6 +181,14 @@ handled-but-unlisted overload is itself a compile error, per 005 Validation).
 | Backpressure | Bounded mailbox → `tell` may block, fail, or shed per policy (open question). |
 | Cancellation | An `ask` observing a fired deadline/stop cancels the queued message (`001`). |
 
+**Principal propagation on a local forward (ADR-044 C3).** The ambient `Principal`
+(`020` §3) a handler is running under propagates to a `tell`/`ask` it issues the
+same way trace id and deadline do — unconditionally, **not** gated on crossing a
+node boundary. A handler that received a message under a non-anonymous principal
+and forwards work to another LOCAL actor carries that principal to the next hop
+automatically, unless it explicitly attenuates. See `020-Security.md` §3 for the
+attenuation rule and `010-Distribution.md` for the cross-node case.
+
 ## Publish/Subscribe (broadcast)
 
 **Status: Accepted (x86-64) for local fan-out · Draft for cross-node**

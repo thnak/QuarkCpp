@@ -34,8 +34,11 @@
 #include "quark/core/engine.hpp"
 #include "quark/core/error.hpp"
 #include "quark/core/ids.hpp"
+#include "quark/core/message_context.hpp"  // tl_current_ctx — ambient Principal (020 §3)
 #include "quark/core/metadata.hpp"  // 008: the durable content-addressed type_key_of<A> / actor_id_of<A>
+#include "quark/core/principal.hpp"
 #include "quark/core/reply_stream.hpp"
+#include "quark/detail/envelope_pool.hpp"  // ADR-044: EnvelopePool, envelope_of, DescriptorEnvelope
 #include "quark/detail/message_pool.hpp"
 #include "quark/detail/reply_cell.hpp"
 
@@ -120,10 +123,39 @@ private:
 template <class A>
 class ActorRef;
 
+// ADR-044 (S1r fix): dispatches reclaim to the RIGHT pool by reading the SAME flags word
+// GenState::flags_of() already exposes — never conflates EnvelopePool's free list with MessagePool's
+// (the bug the design's cross-examination found: reinterpret-casting an EnvelopePool::Cell-backed
+// Descriptor* through MessagePool::cell_of() reads DescriptorEnvelope::principal's bytes as
+// MessagePool::Cell::destroy, an invalid function pointer). Every LocalRouter reclaim-adjacent call
+// site routes through this, not a bare `pool_->reclaim(d)` — including the PERSISTENT sink handed to
+// `courier_.activate()`.
+struct DualReclaimSink {
+    detail::MessagePool* plain = nullptr;
+    detail::EnvelopePool* envelope = nullptr;
+    static void thunk(Descriptor* d, void* self) noexcept {
+        auto* s = static_cast<DualReclaimSink*>(self);
+        const std::uint16_t flags = GenState::flags_of(d->gen_state.load(std::memory_order_relaxed));
+        if (flags & kControlFlagHasEnvelope)
+            s->envelope->reclaim(d);
+        else
+            s->plain->reclaim(d);
+    }
+    void reclaim(Descriptor* d) const noexcept { thunk(d, const_cast<DualReclaimSink*>(this)); }
+    [[nodiscard]] ReclaimSink sink() noexcept { return ReclaimSink{&thunk, this}; }
+};
+
 class LocalRouter {
 public:
+    // ADR-044: `envelope_pool_` is owned internally (zero initial capacity, grows lazily on first
+    // non-anonymous-principal send) rather than injected — this keeps the public constructor
+    // signature unchanged for every existing call site. A deployment that never sets a Principal
+    // never grows it past zero cells, matching 020's "local pays nothing" invariant.
     LocalRouter(PostCourier courier, detail::MessagePool& pool) noexcept
-        : courier_(courier), pool_(&pool) {}
+        : courier_(courier), pool_(&pool), envelope_pool_(0) {
+        dual_.plain = pool_;
+        dual_.envelope = &envelope_pool_;
+    }
 
     LocalRouter(const LocalRouter&) = delete;
     LocalRouter& operator=(const LocalRouter&) = delete;
@@ -152,16 +184,21 @@ public:
     // delivery (same stamp, same pool, same courier), so per-actor FIFO and single-executor hold. If
     // the target is not registered on THIS node (a stale placement / mid-migration) the descriptor is
     // reclaimed (dead-lettered locally, 006/007) — never leaked, never posted to a null Schedulable.
+    // ADR-044: `principal` is the frame's wire-propagated Principal (020 §3) — anonymous() (the
+    // overwhelming default absent a security config) takes the UNMODIFIED plain-pool path byte for
+    // byte; only a non-anonymous principal pays EnvelopePool.
     template <class A, class Msg, class T>
     void deliver_from_wire(ActorId id, T&& msg, std::int64_t deadline_ns,
-                           std::uint64_t trace_id) {
+                           std::uint64_t trace_id, const Principal& principal = Principal{}) {
         static_assert(Handles<A, std::remove_cvref_t<Msg>>,
                       "deliver_from_wire: message type is not in the actor's protocol (unhandled)");
         Schedulable* s = courier_.resolve(id);
-        Descriptor* d = make_descriptor<A, std::remove_cvref_t<Msg>>(std::forward<T>(msg), trace_id,
-                                                                     deadline_ns);
+        Descriptor* d = principal.anonymous()
+            ? make_descriptor<A, std::remove_cvref_t<Msg>>(std::forward<T>(msg), trace_id, deadline_ns)
+            : make_descriptor_enveloped<A, std::remove_cvref_t<Msg>>(std::forward<T>(msg), trace_id,
+                                                                     deadline_ns, principal);
         if (s == nullptr) {
-            pool_->reclaim(d);  // not_found on this node: dead-letter locally (006)
+            dual_.reclaim(d);  // not_found on this node: dead-letter locally (006) — ADR-044 dual-dispatch
             return;
         }
         (void)courier_.post(s, d);
@@ -208,6 +245,14 @@ public:
     // (accepted/already-pending, not a promise the actor has retired yet).
     [[nodiscard]] bool request_passivate(ActorId id) noexcept { return courier_.passivate(id); }
 
+    // ADR-044: the ReclaimSink every spawned actor's Activation must be constructed with in place of
+    // `pool.sink()` IF that activation may ever receive a message with a non-anonymous principal
+    // (a wire arrival, or a local forward from a handler running under one) — its mailbox can then
+    // receive descriptors from EITHER pool, so its reclaim path must dual-dispatch exactly like
+    // LocalRouter's own internal fallback paths do. An activation that never receives one is safe
+    // either way, since it never sees an EnvelopePool-sourced descriptor to misroute.
+    [[nodiscard]] ReclaimSink reclaim_sink() noexcept { return dual_.sink(); }
+
 private:
     // Build the pooled descriptor + inline payload for `msg`, stamping the ADR-007 dense dispatch
     // slot and the {trace_id, deadline_ns} the caller resolved. Shared by the local `tell`/`ask`
@@ -231,6 +276,28 @@ private:
         return d;
     }
 
+    // ADR-044: the enveloped twin of make_descriptor — built through EnvelopePool instead of
+    // MessagePool, stamping Principal into the co-located DescriptorEnvelope tail BEFORE the
+    // descriptor is ever published to a mailbox (single-writer, pre-publish — mirrors
+    // make_descriptor's own trace_id/deadline_ns stamping). Only ever called when `p` is non-anonymous.
+    template <class A, class Msg, class T>
+    [[nodiscard]] Descriptor* make_descriptor_enveloped(T&& msg, std::uint64_t trace_id,
+                                                        std::int64_t deadline_ns, const Principal& p) {
+        static_assert(sizeof(Msg) <= detail::EnvelopePool::kMaxPayload,
+                      "message payload exceeds the envelope pool cell size");
+        static_assert(alignof(Msg) <= detail::EnvelopePool::kPayloadAlign,
+                      "message alignment exceeds the envelope pool cell alignment");
+        detail::EnvelopePool::Slot slot = envelope_pool_.acquire(&detail::destroy_payload<Msg>, p);
+        Descriptor* d = slot.desc;
+        ::new (slot.payload) Msg(std::forward<T>(msg));
+        d->payload = slot.payload;
+        d->payload_size = static_cast<std::uint32_t>(sizeof(Msg));
+        d->trace_id = trace_id;
+        d->deadline_ns = deadline_ns;
+        stamp<A, Msg>(*d);
+        return d;
+    }
+
     // Build the descriptor + inline payload and post it to the target activation. If the id does
     // not resolve, try the ADR-028 Phase 4 lazy-activation hand-off first (`courier_.activate`) — if
     // the target's type was never `declare_lazy`'d (or this courier predates Phase 4, e.g. a
@@ -241,18 +308,27 @@ private:
     template <class A, class Msg, class T>
     void post_message(ActorId id, Schedulable* s, T&& msg) {
         // Ambient propagation (#12): a tell/ask issued FROM a running handler inherits that message's
-        // trace correlation id (009) and — same node, same monotonic clock — its absolute deadline
-        // (018 inheritance: a child call cannot outlive its parent). Outside a handler the ambient is
-        // null ⇒ a fresh trace / no deadline.
+        // trace correlation id (009), its absolute deadline (018 inheritance: a child call cannot
+        // outlive its parent), AND — ADR-044 — its Principal (020 §3: default full inherit; a handler
+        // that wants a downgrade calls `attenuate()` explicitly before sending, out of scope here).
+        // Outside a handler the ambient is null ⇒ a fresh trace / no deadline / anonymous principal.
         std::uint64_t trace_id = 0;
         std::int64_t deadline_ns = 0;
+        Principal principal{};
         if (const MessageContext* amb = detail::tl_current_ctx) {
             trace_id = amb->trace_id;
             deadline_ns = amb->deadline_ns;
+            principal = amb->principal;
         }
-        Descriptor* d = make_descriptor<A, Msg>(std::forward<T>(msg), trace_id, deadline_ns);
+        Descriptor* d = principal.anonymous()
+            ? make_descriptor<A, Msg>(std::forward<T>(msg), trace_id, deadline_ns)
+            : make_descriptor_enveloped<A, Msg>(std::forward<T>(msg), trace_id, deadline_ns, principal);
         if (s == nullptr) {
-            if (!courier_.activate(id, d, pool_->sink())) pool_->reclaim(d);
+            // ADR-044: `courier_.activate()` wires this sink PERSISTENTLY onto the newly-activated
+            // Activation (every FUTURE reclaim for it, not just this one message) — dual_.sink() must
+            // be handed here, not a bare pool_->sink(), or every later enveloped reclaim on this
+            // activation would misroute through MessagePool::cell_of() (the S1r bug).
+            if (!courier_.activate(id, d, dual_.sink())) dual_.reclaim(d);
             return;
         }
         (void)courier_.post(s, d);  // the wake-edge bool is the scheduler's; the sender ignores it
@@ -277,6 +353,9 @@ private:
 
     PostCourier courier_;
     detail::MessagePool* pool_;
+    detail::EnvelopePool envelope_pool_;  // ADR-044: wire-scale, non-anonymous-principal pool
+    DualReclaimSink dual_;                // ADR-044 (S1r): flag-dispatched reclaim — never a bare
+                                           // pool_->reclaim/pool_->sink() call site remains
     std::mutex cp_mu_;
     std::unordered_map<const void*, std::shared_ptr<void>> cell_pools_;
 };
