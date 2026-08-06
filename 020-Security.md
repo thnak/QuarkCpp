@@ -174,6 +174,25 @@ Two invariants follow, load-bearing (each carries its own test):
   cluster-wide one — otherwise one peer's crypto work stalls every other
   peer's traffic.
 
+### Capability gossip decode discipline (ADR-045)
+
+Node capability entries (`ControlMsg.capabilities`, cluster.hpp) piggyback on the
+same control-frame channel as membership `updates` and the revocation gossip above,
+and are decoded with the same adversarial-frame discipline: every field — node id,
+incarnation, `local_seq`, and the per-entry blob — routes through the bounds-checked
+`SwimByteReader` accessors, and a defensive `kMaxDecodedCapabilityBytes` total-
+allocation cap rejects an oversized-but-well-formed frame BEFORE allocating, wholly
+independent of what any individual entry's declared blob length claims. Proven via
+20k fuzzed inputs under ASan+UBSan with zero crashes and zero over-cap/partial
+accepts (ADR-045 S3).
+
+**Residual, not newly introduced, risk:** capability content itself is not
+cryptographically authenticated beyond the cluster's existing mTLS/session trust
+boundary — a compromised or buggy peer already admitted to the cluster can still
+advertise a false capability (e.g. a false `Flag{"gpu"}`). This is the identical
+trust model membership and revocation gossip already operate under; no new gap is
+introduced by capability gossip, and no new mitigation is added for it either.
+
 ## 3. Authorization and principal propagation
 
 Authentication establishes *who* (a **principal** — a service identity, a user, a

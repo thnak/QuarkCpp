@@ -254,27 +254,53 @@ When placement moves actor `X` from old node O to new node N:
    N, per the actor's policy. No store, so no fencing needed — worst case is lost
    volatile state, which an in-memory actor already tolerates on node loss (010).
 
-### Capability gossip beyond placement (025, 028)
+### Capability gossip beyond placement (025, 028, ADR-045)
 
-Node capabilities (025 Part A: `Flag`/`Label`/`Scalar`) ride the same gossiped
-membership content this section specifies, disseminated at ANNOUNCE alongside the
-roster. Every consumer to date has been a **placement** input (025's
-`Require`/`Prefer`/`Weighted`). `Flag{"voice-relay"}` (028) is the first consumer
-that is **not** placement in the mailbox-routed sense — a node's own `VoiceChannel`
-reads it locally to build its voice-relay-eligible `VirtualBins` subset, entirely
-off the actor path. No new gossip mechanism is added; this is the same static,
-rejoin-only capability content 025 already specifies, read by one more consumer.
+Node capabilities (025 Part A: `Flag`/`Label`/`Scalar`) ride the SAME bounded
+piggyback-digest gossip channel `ControlMsg.updates`/ADR-040 `ControlMsg.revocations`
+already use — `ControlMsg.capabilities`, a bounded set of `CapabilityDigestEntry{node,
+incarnation, local_seq, blob}` — NOT the SWIM join payload specifically, and NOT a new
+side-channel. `SwimMembership::set_capability_gossip(pull, merge)` (cluster.hpp) wires
+in `CapabilityRegistry` (capability_registry.hpp), the real, network-backed
+`CapabilityView` producer; SwimMembership itself stays capability-ignorant, moving only
+opaque bytes. A freshly joined node becomes capability-visible within the same
+O(log_fanout N) convergence window as membership itself (empirically 1-2 gossip rounds
+up to N=128), not necessarily atomically at Join/JoinAck. Every consumer to date has
+been a **placement** input (025's `Require`/`Prefer`/`Weighted`). `Flag{"voice-relay"}`
+(028) is the first consumer that is **not** placement in the mailbox-routed sense — a
+node's own `VoiceChannel` reads it locally (via `registry.view(swim.view())`) to build
+its voice-relay-eligible `VirtualBins` subset, entirely off the actor path.
 
-**Mid-session handoff across a capability change.** Capabilities are static for a
-node's lifetime (025) — advertising or withdrawing `Flag{"voice-relay"}` is a
-rejoin, never a live mutation. When a relay's eligibility changes, there is
-deliberately **no** hand-off procedure like the actor hand-off above: each node's
-`VoiceChannel` picks up the new eligible set on its own next
-`on_capability_view_changed` rebuild (bounded by ordinary gossip convergence,
-same as any other membership change), and in-flight datagrams addressed to the
-now-stale relay are simply lost under voice's ordinary best-effort contract. No
-fencing token, no `PathPin` (026) — those exist to protect an ordering/consistency
-guarantee that 028 explicitly does not make.
+**Freshness and conflict resolution.** A capability entry is superseded by a strictly
+higher SWIM incarnation — the same freshness axis membership itself uses, no second
+competing mechanism. Within an unchanged incarnation, `local_seq` (a monotonic counter
+the publishing node bumps on every accepted local republish) breaks the tie, so a
+node's own live republish is never lost to gossip reordering. 025's "capabilities are
+static for a node's lifetime — a change is a rejoin" remains the *recommended* usage
+pattern (the less-exercised path is a live republish), but it is no longer a hard
+requirement: `CapabilityRegistry::publish_local()` makes a live mutation safe and
+deterministic if a caller does need one.
+
+**Mid-session handoff across a capability change.** There is deliberately **no**
+hand-off procedure like the actor hand-off above: each node's `VoiceChannel` picks up
+the new eligible set on its own next `on_capability_view_changed` rebuild (bounded by
+ordinary gossip convergence, same as any other membership change), and in-flight
+datagrams addressed to the now-stale relay are simply lost under voice's ordinary
+best-effort contract. No fencing token, no `PathPin` (026) — those exist to protect an
+ordering/consistency guarantee that 028 explicitly does not make.
+
+**Dead-node eviction.** `CapabilityRegistry::evict_dead(node)` is wired onto
+`SwimMembership::set_sweep_hook` (the same idiom ADR-040 uses for revocation/rotation
+sweeps) from bootstrap code that also watches `status_of(node)`; a node's capability
+entry is purged within one further `tick()` after it is marked Dead. Nothing enforces
+this wiring at compile time or runtime — an unwired node silently leaks dead peers'
+capability entries, a documented operational footgun for node-init code review.
+
+**Known open gap.** `CapabilityRegistry::pull()`'s packing order follows an
+unordered-map iteration order with no staleness/priority weighting, so capability
+propagation fairness for forwarded (non-self) nodes in clusters larger than
+`Config::max_gossip_updates` is proven only under real (non-adversarial) hashing up to
+N=128 (ADR-045), not against adversarial bucket layouts.
 
 ### Anti-flap — damping churn (self-debate)
 

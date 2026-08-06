@@ -179,6 +179,18 @@ surface," scoped narrowly to that one purpose — it is not a general-purpose
 connection-control API, and a future sibling seam should not extend it for
 anything else.
 
+### Capability gossip is control-plane, not data-plane (025, ADR-045)
+
+Node capability dissemination (`CapabilityRegistry`, capability_registry.hpp) lives
+entirely inside `SwimMembership::tick()`/`send_control()`/`handle_control()` on the
+protocol thread — the SAME `FrameKind::Control` frames that already carry membership
+`updates` and ADR-040 `revocations` (`ControlMsg.capabilities`), never a
+`Transport::send`-visible data-plane frame and never reachable from
+mailbox/dispatch/activation headers. A deployment that never calls
+`set_capability_gossip` pays nothing for it; placement policies that DO read a
+`CapabilityView` measured a read-cost delta within noise (-4% to -5%) of the
+pre-existing std-only test double (ADR-045).
+
 ## Serialization seam
 
 Cross-node `tell`/`ask` must turn a message into bytes. The mechanism is the

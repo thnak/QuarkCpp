@@ -46,11 +46,16 @@ The unifying idea:
 ### The capability model
 
 Each node advertises a set of **static, typed capabilities** at startup — declared in
-config (013), carried in the SWIM join payload and gossiped with membership (010,
-021). Capabilities are **static for a node's lifetime**: changing them is a rejoin
-(rolling restart, 021), never a live mutation. This is what keeps them usable in a
-*deterministic* placement function — every node sees the same
-`{NodeId → capabilities}` map from the same gossip state.
+config (013), disseminated over SwimMembership's existing bounded piggyback-digest
+gossip channel (the same `ControlMsg` carrying membership `updates`, cluster.hpp; NOT
+the SWIM join payload specifically — 010, 021, ADR-045). The **recommended** usage
+pattern is still that capabilities are static for a node's lifetime — changing them
+is a rejoin (rolling restart, 021), not a live mutation — because that is what keeps
+them trivially usable in a *deterministic* placement function: every node sees the
+same `{NodeId → capabilities}` map from the same gossip state. It is no longer a hard
+requirement, though: `CapabilityRegistry::publish_local()` (capability_registry.hpp)
+makes a live republish safe and deterministic if a caller does need one, via the same
+incarnation-first freshness axis membership itself uses (ADR-045 C2/C3).
 
 ```cpp
 // node config (013)
@@ -253,8 +258,11 @@ explicitly and the validator enforces (no persistence, no per-key FIFO expectati
   approximate (gossiped load), local-first to avoid round-trips.
 - **Live-migrating stateful actors for load.** Out — stateful placement is stable and
   moves only on membership change.
-- **Dynamic per-node capabilities.** Capabilities are static per node lifetime; a
-  change is a rejoin.
+- **Capabilities as a live load-balancing signal.** A rejoin remains the recommended
+  way to change what a node advertises — capability gossip (ADR-045) is not a
+  substitute for the load-based routing `Stateless<N, ClusterWide>` already provides,
+  and this section's determinism invariant still assumes eligibility churns slowly
+  relative to gossip convergence, not per-request.
 
 ## Open questions
 

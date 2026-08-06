@@ -13,9 +13,11 @@
 //     adapter would implement this same `Membership` interface over the Transport. We do NOT
 //     implement SWIM here; `InProcessMembership` below is a deterministic test double, not a
 //     failure detector.
-//   * 025: static capabilities (labels, flags, capacity `weight`) gossiped in the SWIM join payload,
-//     which a placement policy restricts/biases/weights HRW by. `MembershipView` carries only the
-//     node SET here; the capability map is an additive field a capability-aware view exposes.
+//   * 025: static capabilities (labels, flags, capacity `weight`), which a placement policy
+//     restricts/biases/weights HRW by. `MembershipView` carries only the node SET here; the capability
+//     map is an additive field `CapabilityView` (capabilities.hpp) exposes, kept live by
+//     `CapabilityRegistry`'s continuous piggyback on SwimMembership's own gossip channel — NOT the
+//     SWIM join payload specifically (ADR-045; capability_registry.hpp).
 //
 // A `MembershipView` PINS its node vector by `shared_ptr`, so a concurrent join/leave that publishes
 // a new snapshot never invalidates a view already handed out (no UAF; TSan-clean). Snapshots are

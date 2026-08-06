@@ -24,6 +24,11 @@
 //   * `control_data_demux` — composes a 010 data sink and a 021 control sink over ONE Transport
 //     endpoint, keyed on `MessageFrame::kind`, so the two planes share a transport without the data
 //     path changing (its stream is `Data`-only, byte-for-byte the 010 path).
+//   * `SwimMembership::set_capability_gossip` (ADR-045) — a bounded piggyback of gossiped
+//     `CapabilityDigestEntry` values riding the SAME frame as `updates`/ADR-040 `revocations`, not a
+//     new side-channel. SwimMembership stays capability-ignorant (opaque bytes only); the real
+//     025-static-capability model, encode/decode, and the live network-backed `CapabilityView`
+//     producer are `CapabilityRegistry` (capability_registry.hpp).
 //
 // ============================================================================================
 // SEAMS LEFT EXPLICIT (documented, NOT implemented here — they depend on specs not yet distribution-
@@ -153,6 +158,28 @@ struct MemberUpdate {
     std::uint8_t status = 0;  // MemberStatus
 };
 
+// ADR-045: one gossiped node-capability fact, opaque to SwimMembership. `blob` is an
+// encode_node_capabilities()-produced byte string (capability_registry.hpp) — SwimMembership never
+// decodes it, only carries it, exactly as `revocations` carries opaque Fingerprints. Freshness is
+// `(incarnation, local_seq)`: incarnation strictly-greater wins (the same freshness axis SWIM already
+// uses for membership, no second mechanism); within an unchanged incarnation, `local_seq` — a
+// monotonic counter owned by the publishing node, bumped on every local republish — breaks the tie.
+// `blob` is compared byte-lexicographically ONLY as a last resort for a genuine
+// (node, incarnation, local_seq) collision (a forged/duplicated entry), never on the normal path.
+struct CapabilityDigestEntry {
+    NodeId node{};
+    std::uint64_t incarnation = 0;
+    std::uint32_t local_seq = 0;
+    std::vector<std::byte> blob;
+};
+
+// A defensive, decode-side-only ceiling on the TOTAL capability-blob bytes accepted out of one control
+// frame, independent of what any individual entry's declared length claims (ADR-045 S3) — a malformed
+// or adversarial frame cannot force a large allocation just by declaring large per-entry lengths. Set
+// well above the default per-tick send budget (`Config::max_capability_gossip_bytes`, 4096) so a
+// legitimate frame from a node configured with a larger budget is never itself rejected.
+inline constexpr std::size_t kMaxDecodedCapabilityBytes = 65536;
+
 struct ControlMsg {
     ControlKind kind{};
     ClusterId cluster{};
@@ -167,6 +194,11 @@ struct ControlMsg {
     // SwimMembership moves these as opaque 32-byte blobs (set_revocation_gossip); it does not interpret
     // them — that stays 020/RevocationRegistry's job.
     std::vector<Fingerprint> revocations;
+    // ADR-045: a bounded piggyback of gossiped node capabilities, riding the SAME channel as `updates`/
+    // `revocations` above (NOT a new side-channel — the explicit design mandate). SwimMembership moves
+    // these opaque entries (set_capability_gossip); it does not interpret them — that stays
+    // 025/CapabilityRegistry's job (capability_registry.hpp).
+    std::vector<CapabilityDigestEntry> capabilities;
 };
 
 namespace detail {
@@ -177,6 +209,9 @@ inline void put_u8(std::vector<std::byte>& b, std::uint8_t v) { b.push_back(std:
 inline void put_u16(std::vector<std::byte>& b, std::uint16_t v) {
     put_u8(b, static_cast<std::uint8_t>(v));
     put_u8(b, static_cast<std::uint8_t>(v >> 8));
+}
+inline void put_u32(std::vector<std::byte>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) put_u8(b, static_cast<std::uint8_t>(v >> (8 * i)));
 }
 inline void put_u64(std::vector<std::byte>& b, std::uint64_t v) {
     for (int i = 0; i < 8; ++i) put_u8(b, static_cast<std::uint8_t>(v >> (8 * i)));
@@ -197,6 +232,11 @@ struct SwimByteReader {
         const std::uint16_t lo = u8();
         const std::uint16_t hi = u8();
         return static_cast<std::uint16_t>(lo | (hi << 8));
+    }
+    [[nodiscard]] std::uint32_t u32() noexcept {
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= static_cast<std::uint32_t>(u8()) << (8 * i);
+        return v;
     }
     [[nodiscard]] std::uint64_t u64() noexcept {
         std::uint64_t v = 0;
@@ -228,6 +268,14 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
     put_u16(b, static_cast<std::uint16_t>(m.revocations.size()));
     for (const Fingerprint& fp : m.revocations)
         for (std::byte x : fp) put_u8(b, static_cast<std::uint8_t>(x));
+    put_u16(b, static_cast<std::uint16_t>(m.capabilities.size()));
+    for (const CapabilityDigestEntry& e : m.capabilities) {
+        put_u64(b, e.node.value);
+        put_u64(b, e.incarnation);
+        put_u32(b, e.local_seq);
+        put_u16(b, static_cast<std::uint16_t>(e.blob.size()));
+        for (std::byte x : e.blob) put_u8(b, static_cast<std::uint8_t>(x));
+    }
     return b;
 }
 
@@ -252,6 +300,27 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
     const std::uint16_t revocation_count = r.u16();
     out.revocations.clear();
     for (std::uint16_t i = 0; i < revocation_count && r.ok; ++i) out.revocations.push_back(r.bytes32());
+
+    const std::uint16_t capability_count = r.u16();
+    out.capabilities.clear();
+    std::size_t decoded_capability_bytes = 0;
+    for (std::uint16_t i = 0; i < capability_count && r.ok; ++i) {
+        CapabilityDigestEntry e;
+        e.node.value = r.u64();
+        e.incarnation = r.u64();
+        e.local_seq = r.u32();
+        const std::uint16_t blob_len = r.u16();
+        // Defensive cap BEFORE allocating (ADR-045 S3): a malformed/adversarial declared length can
+        // never force a large allocation, independent of what any single entry claims.
+        decoded_capability_bytes += blob_len;
+        if (!r.ok || decoded_capability_bytes > kMaxDecodedCapabilityBytes) {
+            r.ok = false;
+            break;
+        }
+        e.blob.resize(blob_len);
+        for (std::byte& x : e.blob) x = static_cast<std::byte>(r.u8());
+        out.capabilities.push_back(std::move(e));
+    }
     return r.ok;
 }
 
@@ -353,6 +422,7 @@ public:
         std::uint32_t indirect_k = 2;                        // relay peers for a ping-req
         std::uint32_t gossip_fanout = 3;                     // peers a gossip round targets
         std::uint32_t max_gossip_updates = 32;               // bounded piggyback digest
+        std::uint64_t max_capability_gossip_bytes = 4096;    // ADR-045: bounded capability piggyback
         std::uint64_t seed = 0;                              // deterministic peer/fanout selection
     };
 
@@ -402,6 +472,22 @@ public:
     void set_revocation_gossip(RevocationPullFn pull, RevocationMergeFn merge) {
         revocation_pull_ = std::move(pull);
         revocation_merge_ = std::move(merge);
+    }
+
+    // --- ADR-045: capability gossip piggyback + a live network-backed CapabilityView -----------
+    // `pull` supplies a bounded set of `CapabilityDigestEntry` to attach to each OUTBOUND control frame
+    // (from this node's CapabilityRegistry, up to `Config::max_capability_gossip_bytes`); `merge`
+    // absorbs an INBOUND frame's piggybacked set into it. Identical shape to `set_revocation_gossip`
+    // above — SwimMembership stays capability-ignorant: it moves `CapabilityDigestEntry` values, it
+    // does not interpret the blobs inside them — that stays 025/CapabilityRegistry's job
+    // (capability_registry.hpp).
+    using CapabilityPullFn =
+        std::function<std::vector<CapabilityDigestEntry>(NodeId self, std::uint64_t self_incarnation,
+                                                          std::uint64_t max_bytes)>;
+    using CapabilityMergeFn = std::function<void(const std::vector<CapabilityDigestEntry>&)>;
+    void set_capability_gossip(CapabilityPullFn pull, CapabilityMergeFn merge) {
+        capability_pull_ = std::move(pull);
+        capability_merge_ = std::move(merge);
     }
 
     // A generic per-tick injection point (same idiom as set_clock/set_link_reachable), called at the
@@ -503,6 +589,8 @@ private:
         m.from_incarnation = self_incarnation_;
         fill_digest(m.updates);
         if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
+        if (capability_pull_)
+            m.capabilities = capability_pull_(self_, self_incarnation_, cfg_.max_capability_gossip_bytes);
         MessageFrame f;
         f.from = self_;
         f.to = to;
@@ -544,6 +632,7 @@ private:
         if (m.cluster == cfg_.cluster_id) {
             merge_digest(m.updates);  // may trigger self-refutation
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
+            if (capability_merge_ && !m.capabilities.empty()) capability_merge_(m.capabilities);
         }
 
         switch (m.kind) {
@@ -824,6 +913,8 @@ private:
 
     RevocationPullFn revocation_pull_;
     RevocationMergeFn revocation_merge_;
+    CapabilityPullFn capability_pull_;
+    CapabilityMergeFn capability_merge_;
     SweepHookFn sweep_hook_;
 
     ClockFn clock_fn_ = &real_steady_ns;

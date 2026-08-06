@@ -3,11 +3,14 @@
 // `Weighted` strategy consumes the `weight` scalar declared here).
 //
 // A node advertises a set of STATIC, typed capabilities at startup (013 config): boolean `Flag`s,
-// string `Label`s, and numeric `Scalar`s (notably `weight` = relative capacity). Capabilities are
-// static for a node's lifetime — a change is a rejoin (021), never a live mutation — which is exactly
-// what lets eligibility/weight be a PURE FUNCTION of the gossiped state: every node computes the same
+// string `Label`s, and numeric `Scalar`s (notably `weight` = relative capacity). Which lets
+// eligibility/weight be a PURE FUNCTION of the gossiped state: every node computes the same
 // `{NodeId → capabilities}` map and therefore the same placement, with no coordinator (same property
-// that makes HRW coordinator-free, placement.hpp).
+// that makes HRW coordinator-free, placement.hpp). "Capabilities are static for a node's lifetime — a
+// change is a rejoin, never a live mutation" is the RECOMMENDED usage pattern for callers (the less-
+// exercised path is a live republish), not a hard requirement: the real gossip adapter
+// (`CapabilityRegistry`, capability_registry.hpp, ADR-045) makes a live `publish_local()` republish
+// safe and deterministic via a same-node monotonic `local_seq`, should a caller need one.
 //
 // WHAT THIS FILE IS (025 Part A std-only core):
 //   * Flag / Label / Scalar   — the advertised capability VALUE types (the 013 node-config vocabulary).
@@ -22,12 +25,15 @@
 //
 // ============================================================================================
 // SEAMS LEFT EXPLICIT (documented, NOT implemented here — each names the downstream owner):
-//   * CAPABILITY WIRE GOSSIP — carrying the per-node capability set in the SWIM join payload and
-//     disseminating it with membership  → 021 / 010. This file builds the MODEL + the LOCAL
-//     eligibility/weight computation; the wire (encode caps into the join, gossip, decode into the
-//     annotated view) is a `Membership`/Transport adapter behind the 010/021 seam. `CapabilityView`
-//     is the object such an adapter would publish; `InProcessCapabilityView` below is the std-only
-//     test double (no network), exactly as `InProcessMembership` stands in for SWIM.
+//   * CAPABILITY WIRE GOSSIP — carrying the per-node capability set and disseminating it. This file
+//     builds the MODEL + the LOCAL eligibility/weight computation only. The real adapter is
+//     `CapabilityRegistry` (capability_registry.hpp, ADR-045): it disseminates capabilities
+//     CONTINUOUSLY via SwimMembership's existing bounded piggyback-digest gossip channel (the same
+//     `ControlMsg` carrying membership `updates`, cluster.hpp) — NOT the SWIM join payload specifically
+//     — so a freshly joined node becomes capability-visible within the same O(log_fanout N) convergence
+//     window as membership itself. `CapabilityView` is the object it publishes; `make_capability_view`
+//     below is the std-only, no-network TEST DOUBLE, exactly as `InProcessMembership` stands in for
+//     SWIM.
 //   * LIVE LOAD (queue depth / CPU) is NOT a capability — it is a 009 observability signal consumed
 //     ONLY by stateless-pool routing (025 Part C, stateless_pool.hpp); it MUST NOT enter this model
 //     or the deterministic hash (025 §determinism invariant).
@@ -127,6 +133,16 @@ public:
     [[nodiscard]] double weight() const noexcept {
         const double w = scalar(kWeightScalar, 1.0);
         return w > 0.0 ? w : 1e-9;
+    }
+
+    // Enumeration accessors (ADR-045) — the whole advertised set, for a wire encoder (capability_
+    // registry.hpp) or any other adapter that needs every fact, not just a named lookup.
+    [[nodiscard]] std::span<const std::string> flags() const noexcept { return flags_; }
+    [[nodiscard]] std::span<const std::pair<std::string, std::string>> labels() const noexcept {
+        return labels_;
+    }
+    [[nodiscard]] std::span<const std::pair<std::string, double>> scalars() const noexcept {
+        return scalars_;
     }
 
 private:
