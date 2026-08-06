@@ -284,15 +284,36 @@ single-node build.
 ## Status
 
 **Accepted (x86-64, core)** — the placement + cross-node **FIFO data path** is proven
-(HRW/VirtualBins by ADR-006; FIFO-under-relay by ADR-011). The one remaining item that keeps
-010 from *full* Accepted is the **cross-node backpressure** design question below — it is a
-data-plane flow-control design, not a defect in the proven placement/FIFO core.
+(HRW/VirtualBins by ADR-006; FIFO-under-relay by ADR-011). **Cross-node backpressure is now
+resolved** ([ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md), below).
 
 ## Open questions
 
-- **Cross-node backpressure (the named residual for full acceptance)**: how a remote full
-  mailbox (006) signals the sender without head-of-line blocking the shared connection. Needs
-  its own gate before 010's backpressure path promotes.
+- *(Cross-node backpressure — resolved in
+  [ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md): a **coarse
+  per-peer-node `TokenBucket`** gates admission at (sender-node, receiver-node) granularity —
+  not per-destination-actor — with an edge-triggered `Congested` control frame (piggybacked on
+  the existing gossip/control channel, `FrameKind::Control`, no new socket) sized off the
+  receiver's periodically-advertised aggregate `resident_total`. Fast path is one relaxed
+  atomic load (no allocation, no RMW, no round trip) when uncongested; the cold path reuses
+  022's `TokenBucket`/`Admit` under a per-peer mutex. A TTL self-heals a dropped `Congested`
+  signal — no explicit "clear" frame is needed. This is a **soft, latency-hiding front-end**
+  to 006's hard local mailbox bound, which remains the sole correctness guarantee independent
+  of whether the gossip path is wired. Proven: 0/20 over-admission trials post-fix (vs. 16/20
+  pre-fix), 0 ADR-011 FIFO inversions/duplicates under concurrent congestion toggling, and the
+  `Congested` frame itself proven not head-of-line-blocked behind the peer's own reverse-
+  direction data backlog (a two-queue control-ahead-of-data write-priority discipline, now a
+  required property of any 010-conformant Transport carrying this mechanism). **Disclosed,
+  accepted cost**: coarse per-peer-node granularity means a healthy co-located actor is shed at
+  the same rate as the one actually causing congestion (a precision/fairness trade, not a
+  correctness gap — no admitted frame is ever queued behind or delayed by the congested one).
+  A finer per-(peer,actor) credit design was debated and disqualified by the safety gate (a
+  reentrant self-deadlock in its own required locking discipline, no cheap fix found) — see the
+  ADR's residual risks for the named restructuring that would need to precede revisiting it.
+  Also surfaced, not fixed, by the same debate: `Activation::post` reached via
+  `deliver_from_wire` is currently **ungoverned** in production (022's `Overflow`/`post_governed`
+  has no reachable caller from the real inbound-wire path) — flagged as its own follow-up ADR,
+  independent of this mechanism.)*
 - *(Split-brain policy under network partition: resolved for `EffectivelyOnce` actors —
   HRW gives deterministic placement, but two partitions may still each activate the "same"
   actor; the store accepts only the higher fencing token at commit, so the zombie
