@@ -26,8 +26,10 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -38,7 +40,9 @@
 #include <vector>
 
 #include "pal/net.hpp"
+#include "pal/pal.hpp"                // pal::now() — ADR-046 gate's own clock
 #include "quark/core/cluster.hpp"    // Endpoint, dial_winner, keep_local_dial (021 §2 — the dedup RULE)
+#include "quark/core/governance.hpp"  // PeerCongestionTable (ADR-046 backpressure gate)
 #include "quark/core/transport.hpp"  // Transport seam + MessageFrame
 #include "quark/detail/hash.hpp"     // splitmix64 (deterministic reconnect jitter — no random_device)
 #include "quark/net/wire_codec.hpp"  // encode_frame + FrameStream (the "stream" reassembler)
@@ -134,6 +138,17 @@ public:
             receiver_ = std::move(cb);
     }
 
+    // ADR-046 cross-node backpressure. Runs synchronously on the CALLER's thread (not `io_`'s loop
+    // thread) — called directly by DistributedRouter/SwimMembership before send() is ever invoked,
+    // which is what lets a congested peer be shed BEFORE a frame is even posted onto the I/O loop.
+    // `congestion_` has its own internal locking (governance.hpp), independent of `io_`'s thread.
+    [[nodiscard]] bool admit_send(NodeId peer) noexcept override {
+        return congestion_.admit(peer, now_ns());
+    }
+    void mark_congested(NodeId peer, std::int64_t remaining_ns) noexcept override {
+        congestion_.mark_congested(peer, now_ns() + remaining_ns);
+    }
+
     // 021 §"Teardown on death": SWIM declares `peer` dead ⇒ close its connection and stop reconnecting.
     // Buffered outbound frames are dropped (dead-lettered locally, 010). Thread-safe.
     void close_peer(NodeId peer) {
@@ -210,11 +225,25 @@ private:
         std::vector<std::byte> hello_in_;            // accumulates the peer's hello (may straddle recvs)
         bool peer_hello_read = false;                // have we consumed the peer's 14-byte hello?
 
-        std::vector<std::byte> out;   // concatenated WHOLE frames pending write (FIFO, one sender)
+        std::vector<std::byte> out;   // the ONE whole frame currently being written (never a splice
+                                      // point mid-frame — send_some may return a partial byte count at
+                                      // ANY offset, so priority can only rotate BETWEEN whole frames,
+                                      // never inside one; see `load_next_frame`/ADR-046 S4)
         std::size_t out_sent = 0;     // bytes of `out` already handed to the kernel
         FrameStream in;               // inbound byte-stream reassembler (partial reads / coalescing)
         std::uint32_t backoff_attempt = 0;
         std::uint32_t interest = 0;   // current epoll interest mask (avoid redundant mod_fd)
+    };
+
+    // ADR-046 S4 fix: per-peer queues of WHOLE, still-unstarted frames, split by FrameKind, so a
+    // `Congested` control frame (or any SWIM control traffic) is never head-of-line-blocked behind a
+    // peer's own Data backlog. Queues of FRAMES, not concatenated bytes — `load_next_frame` only ever
+    // rotates `Conn::out` to a new frame once the previous one is fully sent, so control can jump
+    // ahead of not-yet-started data, but never preempts a frame whose transmission has already begun
+    // (a raw byte splice at an arbitrary `out_sent` offset can land mid-frame and corrupt the stream).
+    struct PeerQueue {
+        std::deque<std::vector<std::byte>> control;
+        std::deque<std::vector<std::byte>> data;
     };
 
     // ---- send path (loop thread) ----------------------------------------------------------------
@@ -227,34 +256,46 @@ private:
             drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        const std::vector<std::byte> bytes = encode_frame(frame);
-        auto& q = outq_[to.value];
-        q.insert(q.end(), bytes.begin(), bytes.end());
+        std::vector<std::byte> bytes = encode_frame(frame);
+        std::deque<std::vector<std::byte>>& dst =
+            (frame.kind == FrameKind::Control) ? outq_[to.value].control : outq_[to.value].data;
+        dst.push_back(std::move(bytes));
         frames_sent_.fetch_add(1, std::memory_order_relaxed);
         // Flows now only if this connection has won dedup and is up; otherwise the frame waits in the
         // peer queue until a confirmed connection pumps it (on confirm / on writable / on reconnect).
         if (c->confirmed && c->st == St::Open) pump(c);
     }
 
-    // Move the peer's queued frames onto this (confirmed) connection's socket buffer and flush.
-    void pump(Conn* c) {
-        auto qit = outq_.find(c->peer.value);
-        if (qit != outq_.end() && !qit->second.empty()) {
-            c->out.insert(c->out.end(), qit->second.begin(), qit->second.end());
-            qit->second.clear();
+    // Rotate `c->out` to the NEXT whole, not-yet-started frame — called only once the previous frame
+    // has fully drained (`out_sent == out.size()`). Control is preferred over data (ADR-046 S4): this
+    // is the ONLY place priority is decided, and it only ever happens BETWEEN frames, never mid-frame.
+    void load_next_frame(Conn* c) {
+        if (c->out_sent < c->out.size()) return;  // a frame is still in flight — do not touch it
+        c->out.clear();
+        c->out_sent = 0;
+        const auto qit = outq_.find(c->peer.value);
+        if (qit == outq_.end()) return;
+        PeerQueue& q = qit->second;
+        if (!q.control.empty()) {
+            c->out = std::move(q.control.front());
+            q.control.pop_front();
+        } else if (!q.data.empty()) {
+            c->out = std::move(q.data.front());
+            q.data.pop_front();
         }
-        flush(c);
     }
 
-    // A connection is dying: return its queued-but-UNSENT whole frames to the FRONT of the peer queue so
-    // the next confirmed connection re-sends them. A partially-sent leading frame (out_sent>0) is torn
-    // and cannot resume, so that buffer is dead-lettered (010 at-most-once) — the untouched peer queue is
-    // unaffected either way.
+    // Kick the (confirmed) connection to pick up whatever is newly queued and flush.
+    void pump(Conn* c) { flush(c); }
+
+    // A connection is dying: the ONE frame currently loaded into `c->out`, if not yet started
+    // (`out_sent == 0`), is returned to the FRONT of the peer's control queue so the next confirmed
+    // connection retries it first — a torn, partially-sent frame (out_sent>0) cannot resume and is
+    // dead-lettered (010 at-most-once). Every OTHER not-yet-started frame was never removed from
+    // `outq_[peer]` in the first place (`load_next_frame` only pops one at a time), so nothing else
+    // needs salvaging here.
     void salvage_out(Conn* c) {
-        if (!c->out.empty() && c->out_sent == 0) {
-            auto& q = outq_[c->peer.value];
-            q.insert(q.begin(), c->out.begin(), c->out.end());
-        }
+        if (!c->out.empty() && c->out_sent == 0) outq_[c->peer.value].control.push_front(std::move(c->out));
         c->out.clear();
         c->out_sent = 0;
     }
@@ -344,10 +385,17 @@ private:
             if (*r == 0) { update_interest(c); return; }
             c->hello_sent += *r;
         }
-        // 2) then the FIFO frame buffer (populated by pump() only for a CONFIRMED connection — 021 §2:
-        // no application frame flows before the dedup loser is dropped). `c->out` is empty until confirm.
+        // 2) then whichever frame is current, rotating to the NEXT one (control preferred — ADR-046
+        // S4) only once each fully drains — populated by pump() only for a CONFIRMED connection (021
+        // §2: no application frame flows before the dedup loser is dropped). `c->out` is empty until
+        // confirm. The rotation happens entirely BETWEEN frames (`load_next_frame`'s own guard), so a
+        // `send_some` partial write landing mid-frame never risks a priority-driven splice corrupting it.
         if (c->confirmed) {
-            while (c->out_sent < c->out.size()) {
+            for (;;) {
+                if (c->out_sent >= c->out.size()) {
+                    load_next_frame(c);
+                    if (c->out.empty()) break;  // nothing else queued right now
+                }
                 auto r = pal::send_some(c->fd, c->out.data() + c->out_sent, c->out.size() - c->out_sent);
                 if (!r) {
                     if (r.error() == pal::would_block()) {
@@ -359,10 +407,6 @@ private:
                 }
                 if (*r == 0) break;
                 c->out_sent += *r;
-            }
-            if (c->out_sent == c->out.size()) {  // fully drained — reclaim and drop EPOLLOUT interest
-                c->out.clear();
-                c->out_sent = 0;
             }
         }
         update_interest(c);
@@ -647,6 +691,13 @@ private:
         return true;
     }
 
+    // ADR-046 gate's own clock — independent of the caller's thread/context, mirrors the
+    // `real_steady_ns` pattern cluster.hpp/secure_transport.hpp already use.
+    [[nodiscard]] static std::int64_t now_ns() noexcept {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(pal::now().time_since_epoch())
+            .count();
+    }
+
     NodeId self_;
     std::uint64_t bind_addr_;
     std::uint16_t bind_port_;
@@ -665,10 +716,11 @@ private:
     std::unordered_map<pal::fd_t, std::unique_ptr<Conn>> pending_in_;
     std::unordered_map<pal::fd_t, Conn*> by_fd_;
     std::unordered_map<std::uint64_t, Endpoint> peers_;  // NodeId → where it listens (for dial/reconnect)
-    std::unordered_map<std::uint64_t, std::vector<std::byte>> outq_;  // per-peer pending frames (survives
-                                                                      // connection churn — see send_on_loop)
+    std::unordered_map<std::uint64_t, PeerQueue> outq_;  // per-peer pending frames (survives connection
+                                                          // churn — see send_on_loop), split control/data
     std::unordered_set<std::uint64_t> reconnect_suppressed_;  // peers SWIM declared dead (close_peer)
     std::unordered_set<Conn*> open_marked_;  // conns counted in conns_open_ (idempotent open/close)
+    PeerCongestionTable congestion_;  // ADR-046 — checked on the CALLER's thread, before send() posts
 
     std::atomic<std::uint64_t> frames_received_{0};
     std::atomic<std::uint64_t> frames_sent_{0};

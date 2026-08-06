@@ -148,6 +148,7 @@ enum class ControlKind : std::uint8_t {
     Join = 6,        // joiner → seed: admit me (carries my ClusterId to validate)
     JoinAck = 7,     // seed → joiner: admitted; snapshot rides the `updates` digest
     JoinReject = 8,  // seed → joiner: cluster-id mismatch, refused (§1 accidental-merge guard)
+    Congested = 9,   // ADR-046: edge-triggered cross-node mailbox backpressure signal
 };
 
 // One gossiped member fact: node, incarnation, status. Higher incarnation wins on merge; a node
@@ -171,6 +172,19 @@ struct CapabilityDigestEntry {
     std::uint64_t incarnation = 0;
     std::uint32_t local_seq = 0;
     std::vector<std::byte> blob;
+};
+
+// ADR-046: one gossiped node-load fact — a node's own aggregate `resident_total` (governed-mailbox
+// depth summed across every activation it hosts, `Engine::resident_total()`), advertised to direct
+// peers every gossip round. Purely informational/observability here (a peer MAY use it to tune its
+// own `PeerCongestionTable` bucket sizing in a future refinement — this ADR does not auto-derive one
+// from the other, per its own "unvalidated operational config" residual risk). The ACTUAL admission
+// throttle is driven exclusively by the separate, edge-triggered `ControlKind::Congested` frame
+// below, never by this periodic gauge.
+struct MailboxPressureEntry {
+    NodeId node{};
+    std::uint64_t incarnation = 0;
+    std::uint64_t resident_total = 0;
 };
 
 // A defensive, decode-side-only ceiling on the TOTAL capability-blob bytes accepted out of one control
@@ -199,6 +213,15 @@ struct ControlMsg {
     // these opaque entries (set_capability_gossip); it does not interpret them — that stays
     // 025/CapabilityRegistry's job (capability_registry.hpp).
     std::vector<CapabilityDigestEntry> capabilities;
+    // ADR-046: a bounded piggyback of the sender's own advertised mailbox pressure (at most one entry
+    // in practice — a node only ever advertises ITS OWN resident_total), riding the SAME channel.
+    std::vector<MailboxPressureEntry> pressure;
+    // ADR-046: for `kind == Congested` only — how much longer (from THIS frame's arrival, in the
+    // receiver's OWN clock domain) the sender should keep throttling `from`. A relative duration, not
+    // an absolute deadline, so no cross-node clock-skew travels on the wire (018-style deadline-travel
+    // reconstruction, reusing 006's existing vocabulary rather than inventing a new one). Unused
+    // (left 0) for every other `ControlKind`.
+    std::int64_t congestion_remaining_ns = 0;
 };
 
 namespace detail {
@@ -276,6 +299,13 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         put_u16(b, static_cast<std::uint16_t>(e.blob.size()));
         for (std::byte x : e.blob) put_u8(b, static_cast<std::uint8_t>(x));
     }
+    put_u16(b, static_cast<std::uint16_t>(m.pressure.size()));
+    for (const MailboxPressureEntry& e : m.pressure) {
+        put_u64(b, e.node.value);
+        put_u64(b, e.incarnation);
+        put_u64(b, e.resident_total);
+    }
+    put_u64(b, static_cast<std::uint64_t>(m.congestion_remaining_ns));
     return b;
 }
 
@@ -321,6 +351,17 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         for (std::byte& x : e.blob) x = static_cast<std::byte>(r.u8());
         out.capabilities.push_back(std::move(e));
     }
+
+    const std::uint16_t pressure_count = r.u16();
+    out.pressure.clear();
+    for (std::uint16_t i = 0; i < pressure_count && r.ok; ++i) {
+        MailboxPressureEntry e;
+        e.node.value = r.u64();
+        e.incarnation = r.u64();
+        e.resident_total = r.u64();
+        out.pressure.push_back(e);
+    }
+    out.congestion_remaining_ns = static_cast<std::int64_t>(r.u64());
     return r.ok;
 }
 
@@ -424,6 +465,13 @@ public:
         std::uint32_t max_gossip_updates = 32;               // bounded piggyback digest
         std::uint64_t max_capability_gossip_bytes = 4096;    // ADR-045: bounded capability piggyback
         std::uint64_t seed = 0;                              // deterministic peer/fanout selection
+        // ADR-046: cross-node backpressure watermarks (resident-message-count hysteresis) and the
+        // Congested signal's TTL. Unvalidated-at-real-workload-scale operational config (ADR's own
+        // disclosed residual risk) — tune per deployment, not derived from anything else here.
+        std::uint64_t congestion_high_watermark = 10'000;   // resident_total crossing ⇒ broadcast
+        std::uint64_t congestion_low_watermark = 5'000;      // must fall below this before a new edge
+        std::int64_t congestion_window_ns = 2'000'000'000;   // 2s — TTL stamped on a Congested frame
+        std::int64_t congestion_refresh_ns = 500'000'000;    // 500ms — re-broadcast while still congested
     };
 
     SwimMembership(NodeId self, Transport& transport, Config cfg)
@@ -490,6 +538,27 @@ public:
         capability_merge_ = std::move(merge);
     }
 
+    // --- ADR-046: mailbox-pressure gossip piggyback + the Congested watermark trigger -----------
+    // `query` reports THIS node's own current `resident_total` (typically `Engine::resident_total()`)
+    // — used both to fill the periodic piggyback below and, internally, to decide when to broadcast a
+    // `Congested` frame (monitor_congestion). `merge` absorbs an INBOUND frame's piggybacked entries
+    // (a peer's own advertised load) — purely observational here, exposed via `pressure_of`. Identical
+    // shape to `set_capability_gossip`/`set_revocation_gossip` above; SwimMembership does not act on
+    // the periodic gauge itself, only on the separate edge-triggered Congested signal (handle_control).
+    using PressureQueryFn = std::function<std::uint64_t()>;
+    using PressureMergeFn = std::function<void(const std::vector<MailboxPressureEntry>&)>;
+    void set_pressure_gossip(PressureQueryFn query, PressureMergeFn merge) {
+        pressure_query_ = std::move(query);
+        pressure_merge_ = std::move(merge);
+    }
+
+    // Last-advertised resident_total for a peer (021 §9 observability; mirrors incarnation_of). 0 for
+    // an unknown peer or one that has never gossiped pressure.
+    [[nodiscard]] std::uint64_t pressure_of(NodeId n) const {
+        const auto it = last_pressure_.find(n.value);
+        return it == last_pressure_.end() ? 0 : it->second;
+    }
+
     // A generic per-tick injection point (same idiom as set_clock/set_link_reachable), called at the
     // end of every tick() with the current virtual time. Node bootstrap wires this to
     // SecureTransport::sweep_revocations(registry.snapshot()) (Phase 5) and sweep_rotation(...)
@@ -539,6 +608,7 @@ public:
         drive_probe(now);     // resolve/escalate the in-flight probe by virtual time
         start_probe(now);     // begin a new direct probe of the next peer
         gossip_round(now);    // disseminate the member digest to a fanout subset
+        monitor_congestion(now);  // ADR-046: watermark-crossing ⇒ broadcast Congested
         if (sweep_hook_) sweep_hook_(now);  // ADR-040 Phase 5/6: revocation + rotation sweeps
     }
 
@@ -591,6 +661,8 @@ private:
         if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
         if (capability_pull_)
             m.capabilities = capability_pull_(self_, self_incarnation_, cfg_.max_capability_gossip_bytes);
+        if (pressure_query_)
+            m.pressure = {MailboxPressureEntry{self_, self_incarnation_, pressure_query_()}};
         MessageFrame f;
         f.from = self_;
         f.to = to;
@@ -633,6 +705,8 @@ private:
             merge_digest(m.updates);  // may trigger self-refutation
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
             if (capability_merge_ && !m.capabilities.empty()) capability_merge_(m.capabilities);
+            for (const MailboxPressureEntry& e : m.pressure) last_pressure_[e.node.value] = e.resident_total;
+            if (pressure_merge_ && !m.pressure.empty()) pressure_merge_(m.pressure);
         }
 
         switch (m.kind) {
@@ -698,6 +772,15 @@ private:
             case ControlKind::JoinAck:
             case ControlKind::JoinReject:
                 break;  // joiner side: snapshot already merged (Ack) / mismatch observed (Reject)
+            case ControlKind::Congested: {
+                // C1 epoch gen-gate (proven): a stale pre-restart signal never advances the throttle —
+                // mirrors apply_update's Alive-branch precedence (strictly-not-older incarnation wins).
+                // `transport_` is the SAME shared instance DistributedRouter sends through (one socket,
+                // one connection per peer, unaffected — 021), so this reaches the real admission gate.
+                if (m.from_incarnation >= incarnation_of(m.from))
+                    transport_->mark_congested(m.from, m.congestion_remaining_ns);
+                break;
+            }
         }
     }
 
@@ -768,6 +851,36 @@ private:
             ControlMsg g;
             g.kind = ControlKind::Gossip;
             send_control(p, g);
+        }
+    }
+
+    // ADR-046: watermark-crossing detection (hysteresis: a new edge cannot re-fire until resident_total
+    // has fallen back below the LOW watermark) plus a periodic refresh while congestion is sustained —
+    // a node stuck above the high watermark for longer than one `congestion_window_ns` re-broadcasts
+    // every `congestion_refresh_ns` so the sender's own TTL-based recovery never fires prematurely.
+    // Edge-triggered, not level-triggered: exactly one broadcast per rising edge, then refreshes only.
+    void monitor_congestion(std::int64_t now) {
+        if (!pressure_query_) return;
+        const std::uint64_t total = pressure_query_();
+        if (total >= cfg_.congestion_high_watermark) {
+            if (!congested_edge_active_ || now >= next_congestion_refresh_ns_) {
+                congested_edge_active_ = true;
+                next_congestion_refresh_ns_ = now + cfg_.congestion_refresh_ns;
+                broadcast_congested(cfg_.congestion_window_ns);
+            }
+        } else if (total < cfg_.congestion_low_watermark) {
+            congested_edge_active_ = false;  // may re-fire on the NEXT rising edge past the high mark
+        }
+    }
+
+    // Fan out a `Congested` signal to every direct, live peer (021: direct-connection-only — not
+    // gossip-relayed the way capability digests are, a named scope limit, not an oversight).
+    void broadcast_congested(std::int64_t remaining_ns) {
+        for (NodeId peer : live_peers_excluding(self_)) {
+            ControlMsg m;
+            m.kind = ControlKind::Congested;
+            m.congestion_remaining_ns = remaining_ns;
+            send_control(peer, m);
         }
     }
 
@@ -916,6 +1029,12 @@ private:
     CapabilityPullFn capability_pull_;
     CapabilityMergeFn capability_merge_;
     SweepHookFn sweep_hook_;
+
+    PressureQueryFn pressure_query_;
+    PressureMergeFn pressure_merge_;
+    std::unordered_map<std::uint64_t, std::uint64_t> last_pressure_;  // node.value → last-advertised total
+    bool congested_edge_active_ = false;
+    std::int64_t next_congestion_refresh_ns_ = 0;
 
     ClockFn clock_fn_ = &real_steady_ns;
     void* clock_ctx_ = nullptr;

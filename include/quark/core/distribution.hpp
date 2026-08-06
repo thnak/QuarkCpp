@@ -29,6 +29,7 @@
 //   * 019 — the real socket/event-loop transport adapter (the loopback here is a test double).
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -74,6 +75,12 @@ public:
     DistributedRouter& operator=(const DistributedRouter&) = delete;
 
     [[nodiscard]] NodeId self() const noexcept { return self_; }
+
+    // ADR-046: frames dropped locally by the cross-node congestion gate before ever reaching the
+    // transport (mirrors GovernanceCore::sheds' observability shape for the local mailbox case).
+    [[nodiscard]] std::uint64_t remote_sheds() const noexcept {
+        return remote_sheds_.load(std::memory_order_relaxed);
+    }
 
     using ClockFn = std::int64_t (*)(void* ctx) noexcept;  // mirrors Activation::set_clock (014)
 
@@ -222,6 +229,14 @@ private:
             f.payload.resize(sz);
             if (!encode_tagged(m, f.payload.data(), sz)) return;  // sized exactly → cannot fail
         }
+        // ADR-046 cross-node backpressure: the sender-side admission gate, checked BEFORE a frame is
+        // handed to the transport at all — a congested peer is locally shed here, never queued onto
+        // the wire. The transport supplies its own clock internally (no dependency on this router's
+        // own, separately-unwired, `clock_fn_` seam below).
+        if (!transport_->admit_send(owner)) {
+            remote_sheds_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         transport_->send(owner, std::move(f));
     }
 
@@ -237,6 +252,7 @@ private:
     NodeId self_;
     LocalRouter* local_;
     Transport* transport_;
+    std::atomic<std::uint64_t> remote_sheds_{0};  // ADR-046: frames locally shed by admit_send()
     std::function<PeerSchema(NodeId, TypeKey)> peer_schema_;
     std::unordered_map<WireKey, InboundFn, WireKeyHash> inbound_;
     const Authorizer* authz_ = nullptr;

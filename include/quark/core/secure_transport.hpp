@@ -249,6 +249,15 @@ public:
         inner_->on_receive([this](MessageFrame frame) { this->deliver(std::move(frame)); });
     }
 
+    // ADR-046 cross-node backpressure: SecureTransport is a pure decorator here — it seals/unseals
+    // frames but owns no outbound backlog of its own (that lives one layer down, in `inner_`'s own
+    // per-peer queue). Forward both calls unchanged rather than duplicating a second congestion
+    // table that would track nothing real.
+    [[nodiscard]] bool admit_send(NodeId peer) noexcept override { return inner_->admit_send(peer); }
+    void mark_congested(NodeId peer, std::int64_t remaining_ns) noexcept override {
+        inner_->mark_congested(peer, remaining_ns);
+    }
+
     // --- Test/diagnostic counters -------------------------------------------------------------
     [[nodiscard]] std::uint64_t sealed() const noexcept { return sealed_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t opened() const noexcept { return opened_.load(std::memory_order_relaxed); }

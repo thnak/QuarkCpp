@@ -302,6 +302,43 @@ propagation fairness for forwarded (non-self) nodes in clusters larger than
 `Config::max_gossip_updates` is proven only under real (non-adversarial) hashing up to
 N=128 (ADR-045), not against adversarial bucket layouts.
 
+### Mailbox pressure gossip + cross-node backpressure (010, ADR-046)
+
+`ControlKind::Congested` and a bounded `MailboxPressureEntry{node, incarnation,
+resident_total}` piggyback (`ControlMsg.pressure`) join the control-frame
+catalogue above (`ControlKind::Ping/Ack/PingReq/PingReqAck/Gossip/Join/JoinAck/
+JoinReject`, `ControlMsg.updates`/ADR-040 `revocations`/ADR-045 `capabilities`) —
+riding the SAME bounded gossip channel, not a new one.
+`SwimMembership::set_pressure_gossip(query, merge)` wires a node's own
+`Engine::resident_total()` (governed-mailbox depth summed across every activation
+it hosts) into the periodic piggyback, mirroring `set_capability_gossip`'s shape
+exactly; SwimMembership stays load-ignorant beyond that one gauge.
+
+The **actual admission throttle** is a SEPARATE mechanism from the periodic
+piggyback above: an edge-triggered `ControlKind::Congested` frame, unicast to
+every direct live peer when a node's own `resident_total` crosses
+`Config::congestion_high_watermark` (hysteresis against `congestion_low_watermark`
+before a new edge can re-fire; refreshed every `congestion_refresh_ns` while
+sustained). A receiving node validates `from_incarnation` against its own
+membership table before acting (the same strictly-not-older-incarnation
+precedence `apply_update` already uses for refutation) — a stale pre-restart
+signal never advances the peer's throttle. The frame carries a *relative*
+`congestion_remaining_ns`, not an absolute deadline, so no cross-node clock-skew
+travels on the wire; the receiving sender reconstructs its own deadline against
+its own clock and self-heals via that TTL with **no explicit "clear" frame**.
+
+**Explicit scope limit — direct-connection-only, not gossip-relayed.**
+Unlike the capability digest above, `Congested` reaches only a node's direct,
+currently-open connections (`SwimMembership::live_peers_excluding`) — it is
+**not** transitively relayed. Under a `BoundedPartialView`/Gateway topology (026),
+a node outside the congested node's direct view never learns of it via this path
+at all (absent, not delayed). 006's hard local `Overflow` bound is the
+correctness backstop for those nodes regardless; only the soft, latency-hiding
+benefit is lost there. Extending propagation to 026 relay topologies is a named,
+explicit follow-on, mirroring ADR-019's own cross-node-broadcast Draft status —
+not silently assumed to already work at that scale. 021's one-connection-per-peer
+invariant is unaffected either way: no new socket, same shared control channel.
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping

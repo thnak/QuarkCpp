@@ -59,6 +59,7 @@ predictably. The rest of the spec is about **hitting bounds gracefully**.
 | `ask` in-flight to a target | circuit breaker | send time |
 | Inbound stream memory (024) | per-stream **credit window** (`capacity × slot`) | producer credit check |
 | Outbound reply-stream memory (ADR-018) | per-stream reply **credit window** + concurrent-streaming-ask **admission cap** | callee (producer) credit check + `ask_stream` admission |
+| Cross-node send admission (010, ADR-046) | per-peer-node `TokenBucket`, gated by an edge-triggered `Congested` signal | `DistributedRouter::send_remote`, before the transport |
 
 **The stream credit window is the per-stream backpressure lever** (024). The ring
 bounds resident memory; a fast producer **stalls via credit depletion** — lossless,
@@ -210,6 +211,48 @@ uses, amortized across all N lanes exactly as in ADR-019/003).
   unsubscribe) noted in 017, consistent with this file's posture that no
   primitive should assume an unbounded internal wait is externally safe without
   a stated backstop.
+
+### 7. Cross-node backpressure — `PeerCongestionGate` (ADR-046)
+
+010's Transport seam is fire-and-forget with one multiplexed connection per peer;
+a remote full mailbox has no return code to signal the sender. **`PeerCongestionGate`**
+is the named checkpoint that resolves this, alongside `FairShare`/`CircuitBreaker`
+above — same `Admit`/`Cost` vocabulary, same O(1)/no-allocation shape:
+
+```cpp
+class PeerCongestionGate {  // one per remote peer-node, not per destination actor
+    Admit admit(std::int64_t now_ns, Cost cost = {});   // fast path: relaxed load, no lock
+    void mark_congested(std::int64_t until_ns);         // edge-triggered, from a Congested frame
+};
+```
+
+- **Granularity is per-peer-node, not per-destination-actor** — a deliberate,
+  proven O(1)-bookkeeping trade (consistent with this spec's general preference for
+  cheap, approximate, per-shard-local governance over exact global accounting): a
+  healthy actor co-located with a congesting one on the same peer is shed at the
+  same rate. A finer per-(peer,actor) credit design was debated and disqualified
+  during ADR-046's design-debate-prove cycle by the safety gate (a reentrant
+  self-deadlock in its own required locking discipline, no cheap fix found).
+- **Memory-order discipline for any future multi-writer-shared checkpoint of this
+  shape**: `TokenBucket` itself stays documented single-writer (§1); a bucket
+  reachable from concurrently-calling sender threads needs an **explicit mutex**
+  around its check-and-consume step (`PeerCongestionTable`'s `bucket_mu_`, one per
+  peer) — a relaxed atomic load alone is only safe for a field that guards no other
+  memory (the fast-path `congested_until_ns`), never for the bucket's own internal
+  read-modify-write. ADR-046's own red-team found an unsynchronized shared bucket
+  reproducibly over-admits 19–70% beyond configured capacity; the mutex fix
+  measured 0/20 over-admission trials post-fix vs. 16/20 pre-fix.
+- **Soft signal, hard backstop (006)**: this is a latency-hiding front-end to the
+  local `Overflow` bound above, never a substitute for it — proven independent of
+  whether the gossip/`Congested` path is wired, partitioned, or dropped.
+- **Separately flagged, not fixed by ADR-046**: `Activation::post` reached via
+  `deliver_from_wire → PostCourier → Engine::post` is currently **ungoverned** in
+  production — `Overflow`/`post_governed` has no reachable caller from the real
+  inbound-wire path today (only test code and `stateless_pool.hpp` call it
+  directly). This means the bound-every-resource discipline this file opens with
+  is not actually enforced on remote message arrival yet, independent of anything
+  `PeerCongestionGate` does. Wiring `post_governed` (or equivalent) into the real
+  inbound-wire path is an open follow-up, not addressed here.
 
 ## Self-debate
 

@@ -23,6 +23,7 @@
 // give, ADR-011). Determinism, not performance, is its job.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -31,9 +32,11 @@
 #include <utility>
 #include <vector>
 
+#include "quark/core/governance.hpp"  // Admit/PeerCongestionTable (ADR-046 backpressure gate)
 #include "quark/core/ids.hpp"
 #include "quark/core/principal.hpp"  // Principal — the ambient identity carried across a node↔node hop
 #include "quark/core/wire.hpp"  // WireMode (016 negotiation result carried on the frame)
+#include "pal/pal.hpp"  // pal::now() — ADR-046 gate's own clock, independent of the caller's
 
 namespace quark {
 
@@ -84,6 +87,19 @@ public:
     // Register the inbound sink for THIS node's transport endpoint. Frames addressed to this node are
     // handed to `cb` (the distributed router's `deliver`).
     virtual void on_receive(std::function<void(MessageFrame)> cb) = 0;
+
+    // ADR-046 cross-node backpressure — the 010 open question this resolves. Called by
+    // `DistributedRouter::send_remote` BEFORE `send()`, on the CALLER's thread, so a congested peer
+    // is stalled/shed before a frame is even constructed for the wire. Default: never throttle — a
+    // Transport that never wires congestion (e.g. an unrelated test's `LoopbackTransport` instance,
+    // or a build that never calls `mark_congested`) costs nothing extra (010/022 opt-in principle).
+    [[nodiscard]] virtual bool admit_send(NodeId /*peer*/) noexcept { return true; }
+
+    // Record that `peer` signalled `Congested`; self-heals after `remaining_ns` with no explicit
+    // "clear" (a relative duration, not an absolute deadline — each side reconstructs its own
+    // deadline against its own clock, avoiding cross-node clock-skew, 018-style deadline travel).
+    // Default: no-op.
+    virtual void mark_congested(NodeId /*peer*/, std::int64_t /*remaining_ns*/) noexcept {}
 };
 
 // ============================================================================================
@@ -150,9 +166,35 @@ public:
         fabric_->attach(self_, std::move(cb));
     }
 
+    // ADR-046: the in-memory test double carries the same congestion gate a real socket transport
+    // does, so cross-node backpressure is exercisable deterministically without sockets.
+    [[nodiscard]] bool admit_send(NodeId peer) noexcept override {
+        return congestion_.admit(peer, now_ns());
+    }
+    void mark_congested(NodeId peer, std::int64_t remaining_ns) noexcept override {
+        congestion_.mark_congested(peer, now_ns() + remaining_ns);
+    }
+
+    // Clock injection (014 idiom, mirrors SwimMembership::set_clock) — a test drives the gate's TTL
+    // recovery with virtual time instead of a real sleep. Default: the real steady clock.
+    using ClockFn = std::int64_t (*)(void* ctx) noexcept;
+    void set_clock(ClockFn fn, void* ctx) noexcept {
+        clock_fn_ = fn;
+        clock_ctx_ = ctx;
+    }
+
 private:
+    static std::int64_t real_steady_ns(void*) noexcept {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(pal::now().time_since_epoch())
+            .count();
+    }
+    [[nodiscard]] std::int64_t now_ns() const noexcept { return clock_fn_(clock_ctx_); }
+
     LoopbackFabric* fabric_;
     NodeId self_;
+    PeerCongestionTable congestion_;
+    ClockFn clock_fn_ = &real_steady_ns;
+    void* clock_ctx_ = nullptr;
 };
 
 }  // namespace quark

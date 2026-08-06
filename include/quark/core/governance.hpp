@@ -17,10 +17,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 
 #include "quark/core/error.hpp"
+#include "quark/core/ids.hpp"
 
 namespace quark {
 
@@ -231,6 +237,89 @@ private:
     std::array<GovernanceKey, MaxKeys> keys_{};
     std::array<double, MaxKeys> weights_{};
     std::array<TokenBucket, MaxKeys> buckets_{};
+};
+
+// ============================================================================================
+// PeerCongestionGate — the sender-side per-peer-node admission checkpoint for cross-node
+// backpressure (ADR-046, 022 named checkpoint alongside FairShare/CircuitBreaker). Granularity is
+// per-PEER-NODE, not per-destination-actor: a proven, disclosed cost (a healthy co-located actor
+// is shed at the same rate as the one actually congesting the peer) traded for O(1) bookkeeping.
+//
+// Fast path (uncongested — the overwhelming common case): ONE relaxed atomic load, no lock, no
+// RMW, predicted-not-taken branch. Cold path (only reached while `congested_until_ns_` is in the
+// future) falls back to a `TokenBucket::check` under `bucket_mu_`. ADR-046's own red-team found an
+// unsynchronized bucket shared by concurrent sender threads reproducibly over-admits 19-70% beyond
+// capacity; a bucket shared this way needs an explicit mutex around its check-and-consume step —
+// `TokenBucket` itself stays documented single-writer, this is what supplies the missing lock.
+// `mark_congested` is a release store; `admit`'s fast-path load is relaxed (it guards no other
+// memory — the cold path's own mutex is what makes the bucket's internal state safe).
+// ============================================================================================
+class PeerCongestionGate {
+public:
+    constexpr PeerCongestionGate() noexcept = default;
+    constexpr PeerCongestionGate(double capacity, double refill_per_sec) noexcept
+        : bucket_(capacity, refill_per_sec) {}
+
+    // Edge-triggered: called when a peer's `Congested` control frame arrives (or refreshes the
+    // TTL while the peer remains congested). `until_ns` is this caller's OWN clock domain — the
+    // wire carries a relative `remaining_ns` precisely so no cross-node clock-skew travels here.
+    void mark_congested(std::int64_t until_ns) noexcept {
+        congested_until_ns_.store(until_ns, std::memory_order_release);
+    }
+
+    [[nodiscard]] Admit admit(std::int64_t now_ns, Cost cost = {}) noexcept {
+        if (now_ns >= congested_until_ns_.load(std::memory_order_relaxed)) return Admit::Accept;
+        std::lock_guard<std::mutex> g(bucket_mu_);
+        return bucket_.check(now_ns, cost);
+    }
+
+private:
+    std::atomic<std::int64_t> congested_until_ns_{0};
+    mutable std::mutex bucket_mu_;
+    TokenBucket bucket_{};
+};
+
+// ============================================================================================
+// PeerCongestionTable — the concrete per-peer registry a Transport implementation owns to back
+// `Transport::admit_send`/`mark_congested` (ADR-046). Lazily creates one `PeerCongestionGate` per
+// peer under `mu_` (shared lock to find, upgrade to unique to insert on miss) — the same
+// find-then-lazily-construct-under-lock shape `SecureTransport::get_or_create_session` already
+// uses for exactly this "per-peer object, built lazily, read from many caller threads" case.
+// Bucket capacity/refill are fixed at construction (static operational config); ADR-046's own
+// residual risks call auto-sizing from gossiped `resident_total` unvalidated tuning, not
+// implemented here.
+// ============================================================================================
+class PeerCongestionTable {
+public:
+    PeerCongestionTable() = default;
+    explicit PeerCongestionTable(double bucket_capacity, double bucket_refill_per_sec) noexcept
+        : capacity_(bucket_capacity), refill_per_sec_(bucket_refill_per_sec) {}
+
+    [[nodiscard]] bool admit(NodeId peer, std::int64_t now_ns, Cost cost = {}) noexcept {
+        return gate_for(peer).admit(now_ns, cost) == Admit::Accept;
+    }
+
+    void mark_congested(NodeId peer, std::int64_t until_ns) noexcept {
+        gate_for(peer).mark_congested(until_ns);
+    }
+
+private:
+    [[nodiscard]] PeerCongestionGate& gate_for(NodeId peer) noexcept {
+        {
+            std::shared_lock<std::shared_mutex> g(mu_);
+            const auto it = gates_.find(peer.value);
+            if (it != gates_.end()) return *it->second;
+        }
+        std::unique_lock<std::shared_mutex> g(mu_);
+        auto [it, inserted] = gates_.try_emplace(peer.value, nullptr);
+        if (inserted) it->second = std::make_unique<PeerCongestionGate>(capacity_, refill_per_sec_);
+        return *it->second;
+    }
+
+    double capacity_ = 64.0;
+    double refill_per_sec_ = 32.0;
+    mutable std::shared_mutex mu_;
+    std::unordered_map<std::uint64_t, std::unique_ptr<PeerCongestionGate>> gates_;
 };
 
 // ============================================================================================

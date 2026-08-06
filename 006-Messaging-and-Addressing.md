@@ -303,6 +303,17 @@ ticks.unsubscribe(clockRef.id());                // no delivery after this retur
   generalized to every exhaustible resource, plus rate limiting, deadline-aware load
   shedding, and circuit breaking — in
   [022-Resource-Governance-and-Overload-Control.md](022-Resource-Governance-and-Overload-Control.md).
+  This local, per-actor bound is the sole correctness guarantee, unconditionally
+  enforced regardless of anything below. A REMOTE sender's own admission decision
+  ([ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md)'s
+  `PeerCongestionGate`, resolving 010's cross-node variant of this same open
+  question) is strictly a soft, latency-hiding front-end to it — proven (C3) to
+  compose with, never substitute for, this section's bound whether or not the
+  cross-node congestion gossip is wired, partitioned, or dropped. The wire
+  `ControlKind::Congested` payload's `from_incarnation`/`congestion_remaining_ns`
+  fields reuse this same deadline vocabulary (018-style deadline-travel
+  reconstruction — a relative duration each side reconstructs against its own
+  clock) rather than inventing a new one.
 - **Streaming replies** — **Accepted (x86-64), 2026-08-04**
   ([ADR-018](decisions/ADR-018-outbound-streaming-replies.md)).
   `ask` returning a stream for multi-item responses is the **024 credit-ring flipped**

@@ -601,6 +601,17 @@ public:
     // Direct registry access (e.g. `set_user_counter_name` before/while the engine is running).
     [[nodiscard]] MetricsRegistry& metrics_registry() noexcept { return metrics_; }
 
+    // ADR-046: this node's aggregate governed-mailbox depth — sums `Activation::mailbox_depth()`
+    // (0 for an ungoverned activation, zero extra state) across every activation this Engine owns.
+    // The function a node's bootstrap code wires into `SwimMembership::set_pressure_gossip`'s query
+    // callback. Off the hot path (protocol-tick frequency, not per-message); O(actors-per-node) — the
+    // ADR's own disclosed residual risk for very large per-node actor populations, not addressed here.
+    [[nodiscard]] std::uint64_t resident_total() const noexcept {
+        std::uint64_t total = 0;
+        for (const auto& act : owned_activations_) total += act->mailbox_depth();
+        return total;
+    }
+
     // --- 004/ADR-021 Node/Shard resources ---------------------------------------------------
     // The fully-resolved, immutable `ResourceScope` for shard `sid` — every Node-scoped resource
     // (shared pointer, same across every shard) plus that shard's own Shard-scoped resources, both
