@@ -6,7 +6,7 @@ The runtime owns optimization; developers express only intent.
 [![CI](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg)](CONVENTIONS.md#target--scope)
+[![Platform](https://img.shields.io/badge/platform-Linux%20x86--64%20%7C%20arm64-lightgrey.svg)](CONVENTIONS.md#target--scope)
 
 Quark gives you actors — units of state and sequential behavior addressed by id — with a
 zero-cost, header-first C++23 core ([`include/quark/`](include/quark)): a work-stealing
@@ -14,9 +14,9 @@ scheduler, hybrid sync/async handlers, point-to-point and streaming messaging, c
 distribution to 10³–10⁴ nodes, durable persistence, and failure supervision, all expressed
 through compile-time CRTP policies instead of runtime configuration.
 
-It's backed by a **153-test** correctness suite ([`tests/`](tests)) verified clean under
+It's backed by a **194-test** correctness suite ([`tests/`](tests)) verified clean under
 ASan/UBSan/TSan, a benchmark harness ([`bench/`](bench)) that turns every hot-path performance
-claim into a pass/fail gate, and **16 runnable samples** ([`samples/`](samples)) from a single
+claim into a pass/fail gate, and **22 runnable samples** ([`samples/`](samples)) from a single
 local actor to multi-node TCP clusters. Every subsystem is backed by a written design and, where
 it's hot-path or safety-critical, by an executed proof — see
 [Design & verification docs](#design--verification-docs).
@@ -104,11 +104,60 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 > precondition, ASan/UBSan-clean, TSan not yet re-run for the shipped code — see ADR-039's
 > "Implementation note").
 >
-> **Still Draft (2):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
+> The **mailbox hot path kept being re-challenged and kept winning**: rounds 5 through 11
+> ([ADR-020](decisions/ADR-020-mailbox-mpsc-hot-path-r5.md),
+> [027](decisions/ADR-027-mailbox-mpsc-hot-path-r6.md),
+> [029](decisions/ADR-029-mailbox-mpsc-hot-path-r7-judgment.md),
+> [031](decisions/ADR-031-mailbox-mpsc-hot-path-r8-judgment.md),
+> [032](decisions/ADR-032-mailbox-mpsc-hot-path-r9-judgment.md),
+> [033](decisions/ADR-033-mailbox-mpsc-hot-path-r10-judgment.md),
+> [041](decisions/ADR-041-mailbox-mpsc-hot-path-r11-judgment.md)) each pit the intrusive Vyukov
+> MPSC against a purpose-built challenger aimed at a specific residual (oldest-message-discovery
+> cost, multi-producer scaling, hazard-pointer reclamation); every challenger has been
+> disqualified on safety or a falsified throughput claim, and the incumbent has survived all
+> eleven rounds with only host-noise-conditional misses, none safety-affecting. Eleven other
+> subsystem-level gates
+> ([ADR-021](decisions/ADR-021-node-shard-resource-resolution-ordering.md)-[025](decisions/ADR-025-simengine-interleaving-exploration-strategy.md),
+> [028](decisions/ADR-028-lazy-activation-idle-timeout-eviction.md),
+> [034](decisions/ADR-034-on-demand-actor-passivation.md)-[039](decisions/ADR-039-ordered-reliable-multi-subscriber-fanout.md))
+> settled resource-resolution ordering (004), metric cardinality (009), timer-wheel tiering
+> (011), compaction cadence (012), `SimEngine` exploration strategy (014), lazy activation +
+> idle-timeout eviction and on-demand `passivate()` (011/012), worker park/wake backoff and
+> activation-linger tuning (002), the `MessagePool` free-list synchronizer (003), and
+> `FanOut<M, Policy>` ordered multi-subscriber delivery (006/017); one — scheduler tail latency
+> under thread oversubscription
+> ([ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md)) — closed
+> **unresolved**, its own re-measurement showing the shared/unpinned host's noise floor exceeds
+> the effect sizes being chased, deferred to a dedicated CI host rather than another same-noise
+> round.
+>
+> **Security (020) hardened further**: mTLS node-to-node transport with live certificate
+> rotation and already-open-session revocation
+> ([ADR-040](decisions/ADR-040-mtls-node-transport-cert-rotation.md)) and wire-arrived
+> `Principal` propagation into handler `MessageContext` via a flag-gated second envelope pool
+> ([ADR-044](decisions/ADR-044-principal-propagation-envelope-pool.md), now wired into the real
+> receive path) are both **Accepted** and shipped. **Distribution (010) gained IPv6**: a
+> tagged-union `pal::IpAddr` widens `Endpoint` (24 B → 32 B) with a converting constructor that
+> reproduces legacy IPv4 decoding exactly, so existing call sites recompile unchanged
+> ([ADR-042](decisions/ADR-042-ipv6-endpoint-locator-widening.md), **Accepted (x86-64)**);
+> `scope_id` for link-local addresses and a v6-carrying gossip wire format remain open.
+>
+> **New in this round: 028 (Voice/UDP media channel)**, a best-effort, unordered UDP sibling
+> seam to `Transport` for real-time voice — sharing the existing PAL `IoContext` event loop,
+> AEAD-sealed on the 020 session key, relay-node placement via a capability-gossiped
+> `VirtualBins` generalization
+> ([ADR-030](decisions/ADR-030-voice-udp-datagram-channel.md)). **028 is Draft**: the design
+> is pinned and proven CORRECT end-to-end, but only against a mock cipher (no production AEAD
+> wired yet) and only over loopback (no real-network loss/reorder/jitter run yet).
+>
+> **Still Draft (3):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
 > whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
-> Zen4/SPR reference re-baseline and the ARM64 ratio. *Accepted (x86-64)* means the design is
-> settled and backed on the current support target; ARM64 promotion waits on the weak-memory
-> proof ([OpenQuestions.md](OpenQuestions.md)).
+> Zen4/SPR reference re-baseline and the ARM64 ratio; **028 (Voice channel)** is Draft pending
+> a production AEAD and a real-network proof (above). *Accepted (x86-64)* means the design is
+> settled and backed on the current support target; ARM64 promotion of the mailbox's `seq_cst`
+> Dekker close-out waits on a formal weak-memory re-gate
+> ([OpenQuestions.md](OpenQuestions.md)) even though ARM64 already runs the full correctness
+> matrix in CI on real hardware today.
 
 </details>
 
@@ -129,15 +178,23 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 - **Inbound stream ingestion** — per-stream credit-ring, zero-copy, backpressure instead of
   shedding.
 - **Cluster distribution at scale** — HRW/VirtualBins placement, SWIM membership, bounded
-  partial-view + DHT-relay for 10³–10⁴-node topologies.
+  partial-view + DHT-relay for 10³–10⁴-node topologies, IPv4 and IPv6 endpoints
+  ([ADR-042](decisions/ADR-042-ipv6-endpoint-locator-widening.md)).
 - **Durable persistence and reminders** — snapshot & event-sourced durability, at-least-once
   wall-clock scheduled wake-ups that flatten mass-due waves to a steady drain rate.
 - **Failure supervision** — zero-cost guarded handler core, restart/resume/stop/escalate
   policies.
 - **Resource governance** — rate limiting, deadline-aware load shedding, circuit breaking.
+- **Node security** — mTLS node-to-node transport with live certificate rotation and
+  already-open-session revocation, wire-arrived principal propagation into handler
+  `MessageContext` ([ADR-040](decisions/ADR-040-mtls-node-transport-cert-rotation.md)/[044](decisions/ADR-044-principal-propagation-envelope-pool.md)).
 - **Deterministic simulation testing** (014) for fault injection without real time or threads.
-- **Cross-platform by design** via a thin Platform Abstraction Layer (PAL); verified today on
-  Linux/x86-64, CI-covered on Linux/ARM64.
+- **Real-time voice/media channel** (028, Draft) — best-effort UDP sharing the existing PAL
+  event loop, capability-placed relay nodes, AEAD-sealed on the 020 session key.
+- **Cross-platform by design** via a thin Platform Abstraction Layer (PAL); the full
+  correctness matrix (gcc/clang, Release/ASan+UBSan/TSan) runs on both Linux/x86-64 and
+  Linux/ARM64 in CI today, on real ARM64 hardware — Windows/x86-64 has its own PAL backend;
+  macOS is designed-for but unbuilt.
 
 ## Quick start
 
@@ -147,7 +204,7 @@ Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 20
 # Build + run the full correctness gate (Release)
 cmake -S . -B build
 cmake --build build -j4                          # -j4, never -j$(nproc) — see note
-ctest --test-dir build -j4 --output-on-failure   # 153 / 153
+ctest --test-dir build -j4 --output-on-failure   # 194 / 194
 
 # Sanitizers (the same suite, minus by-design exclusions — counts in VERIFICATION.md)
 cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined"   # ASan + UBSan
@@ -293,7 +350,7 @@ into one number.
 | Every hot-path/safety claim backed by an executed proof (ADRs: real C++, ASan/UBSan/TSan, benchmarked) | A large existing ecosystem and production track record — mature, widely-deployed, battle-tested at scale |
 | Deterministic simulation testing (014) for fault injection without real time/threads | A mature reactive-streaming toolkit today — CAF ships a full Rx-style `caf::flow` (observables, `merge`/`zip_with`/`buffer`/`retry`/backpressure strategies); Quark's streaming (024) is a narrower, single-producer credit-ring (its outbound half, `ask_stream`, ADR-018, is **Accepted (x86-64)** as of 2026-08-04) |
 | A project still hardening its scheduler under oversubscription/contention — actively being investigated (ADR-038), not yet closed | A scheduler that already degrades gracefully past core count, today |
-| Linux/x86-64 as the verified target (ARM64 CI-covered; Windows/macOS designed-for behind the PAL, not yet shipped) | Broader OS/platform support that's already shipped and battle-tested |
+| Linux/x86-64 and Linux/ARM64 both running the full correctness matrix on real hardware in CI (ARM64's weak-memory re-gate of the mailbox close-out still open; Windows/macOS designed-for behind the PAL, not yet shipped) | Broader OS/platform support that's already shipped and battle-tested |
 
 If your workload is dominated by request/reply calls to individually-addressed actors and you can
 build on Linux/x86-64 today, Quark's numbers and its proof discipline are the more direct fit. If
@@ -310,11 +367,11 @@ include/quark/adapters/ opt-in persistence/reminder backends (SQLite, RocksDB)
 include/quark/detail/   internals (message pool, reply cell, hashing)
 pal/                    Platform Abstraction Layer — the single OS seam (019)
 src/                    non-template translation units
-tests/                  153-test correctness gate (CTest)
+tests/                  194-test correctness gate (CTest)
 bench/                  benchmark harness — the 023 budget verdicts
-samples/                16 runnable programs over the public developer surface
+samples/                22 runnable programs over the public developer surface
 decisions/              ADRs — the design → red-team → prove → judge records
-NNN-*.md                the 27 RFC specification documents
+NNN-*.md                the 28 RFC specification documents
 ```
 
 The core is **std-only C++23** and **header-first** — the hot path (mailbox, scheduler,
@@ -338,11 +395,12 @@ A few decisions are locked project-wide: **C++23** (no RTTI/reflection on the ho
 **hybrid handler model** (sync by default, opt-in `quark::task<>` coroutines for async I/O),
 **CRTP policy types** for zero-cost intent declaration (no attributes, no reflection), and a
 **cross-platform target** (Linux/Windows/macOS, x86-64 + ARM64) behind the PAL — with
-**Linux/x86-64 as the currently supported and verified target**. There is no .NET /
-managed-runtime vocabulary anywhere in the design — see the glossary below.
+**Linux/x86-64 and Linux/ARM64 both running the full correctness matrix in CI on real hardware
+today**, Windows/x86-64 with its own PAL backend, and macOS designed-for but not yet built.
+There is no .NET / managed-runtime vocabulary anywhere in the design — see the glossary below.
 
 <details>
-<summary><strong>Reading order — the 27 RFC specification documents</strong></summary>
+<summary><strong>Reading order — the 28 RFC specification documents</strong></summary>
 
 | # | Document | Covers | Maturity |
 |---|---|---|---|
@@ -374,6 +432,7 @@ managed-runtime vocabulary anywhere in the design — see the glossary below.
 | 025 | [025-Placement-Policies-and-Stateless-Workers.md](025-Placement-Policies-and-Stateless-Workers.md) | Node capabilities, capability/affinity/weighted placement modifiers, stateless worker pools (cross-cutting) | **Accepted** (x86-64) |
 | 026 | [026-Large-Scale-Cluster-Topology.md](026-Large-Scale-Cluster-Topology.md) | Scaling to 10³–10⁴ nodes: VirtualBins O(1) placement, bounded partial-view, DHT-relay; configurable topology/connection/cache axes (cross-cutting) | **Accepted** (x86-64) |
 | 027 | [027-Reminders.md](027-Reminders.md) | Durable, wall-clock, at-least-once scheduled wake-ups on the 012 `Store` seam; SEGSTREAM token-bucket drain flattens mass-due (10⁶-at-9PM) to `peak == fire_rate` (cross-cutting) | **Accepted** (x86-64) |
+| 028 | [028-Voice-Datagram-Channel.md](028-Voice-Datagram-Channel.md) | Best-effort, unordered UDP voice/media channel sharing `TcpTransport`'s I/O reactor; capability-gossiped relay placement via a `VirtualBins` generalization, AEAD-sealed on the existing 020 session key | Draft |
 
 </details>
 
@@ -395,7 +454,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-006](decisions/ADR-006-large-scale-cluster-topology.md) | Large-scale cluster topology | **VirtualBins + Bounded Partial-View + DHT-Relay** — O(1) N-independent placement (5–6 ns), O(log N) sockets/gossip, content-addressed determinism, ≤⌈log₂N⌉ relay hops. Three configurable axes; flat clusters pay nothing. D2 Partitioned kept for >10⁴ nodes. Spec: 026 (FIFO-under-relay is the Draft→Accepted gate). |
 | [ADR-007](decisions/ADR-007-actor-authoring-and-handler-dispatch-api.md) | Actor-authoring & handler-dispatch API | **JumpTable-Dispatch** (D1) — dense per-actor `.rodata` jump-table keyed by `consteval slot_of<A,M>` over `using protocol = Protocol<…>`; one indexed indirect call, ≈260 B/actor, no RTTI/vtable, beats the 008 scan and ties a hand-switch (uniform+skew). Async-only `ask` (no `ask_sync`), always-typed `ActorRef<A>`, member-field resources, pooled-`ReplyCell` reply ordering. 27/1 proven/disproven; sync tell p99 62 ns, ask p99 130 ns, 0 alloc. Closes 005/006/001 open questions; binds 004/008/023. |
 | [ADR-008](decisions/ADR-008-engine-actor-configuration-and-activation-lifecycle-policy.md) | Configuration + activation-lifecycle policy | **Frozen-Core + Hot-Leaf** (D3) — every knob declares an override scope (defaults < engine < node < type < instance, resolved once) and a reconfig class (BuildOnly fail-fast vs Live). Live operational read-set packs into one 8-byte atomic word per `(shard × type_index)`: hot read = single `mov + mask`, 0 RMW, no tear; live publish = single relaxed store (67–73 ns, 0 alloc, can't stall drain). Guarded `add_actor_type<T>()` (incremental Validation + release table swap, pre-sized to `max_types`). Idle deactivation rides the 011 wheel on the actor's own lane. Closes 013/008 open questions; binds 005/011/023. |
-| [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) | Failure, supervision & recovery policy | **Minimal / Assert-Intact** (D1) + D3's proven knobs, all now WIRED (2026-08-03) — zero-cost Itanium `try/catch` handler guard (p99 54.4 ns guarded vs 53.5 ns control, 0 alloc); `Resume` assert-intact by default, opt-in Sequential-only `Transactional<>`; `Supervision<Node|PerType|Tree>` (eager `spawn<A>()`, single-hop `Tree`, static depth bound only — no runtime storm guards yet); `OnRestartAsk<Fail|Retry<N,IdempotencyKey>>` (default Fail; `Retry` is Sequential + sync-handler only); deadline/cancel carved out of the restart decision; `PerMessage` factory failure fails the message via a handler-authored `ProductGuard` call; EventSourced staging fence. 13/0 proven/disproven (design); wiring is direct implementation, not re-proven — see ADR-009's post-decision note. Closes 007/004 open questions; binds 015/012/023. |
+| [ADR-009](decisions/ADR-009-failure-supervision-and-recovery-policy-model.md) | Failure, supervision & recovery policy | **Minimal / Assert-Intact** (D1) + D3's proven knobs, all now WIRED (2026-08-03) — zero-cost Itanium `try/catch` handler guard (p99 54.4 ns guarded vs 53.5 ns control, 0 alloc); `Resume` assert-intact by default, opt-in Sequential-only `Transactional<>`; `Supervision<Node\|PerType\|Tree>` (eager `spawn<A>()`, single-hop `Tree`, static depth bound only — no runtime storm guards yet); `OnRestartAsk<Fail\|Retry<N,IdempotencyKey>>` (default Fail; `Retry` is Sequential + sync-handler only); deadline/cancel carved out of the restart decision; `PerMessage` factory failure fails the message via a handler-authored `ProductGuard` call; EventSourced staging fence. 13/0 proven/disproven (design); wiring is direct implementation, not re-proven — see ADR-009's post-decision note. Closes 007/004 open questions; binds 015/012/023. |
 | [ADR-010](decisions/ADR-010-priority-and-fairness-scheduling-policy.md) | Priority & fairness scheduling policy | **K-band per-shard run-queue** (D1) — `Priority<P>` becomes `std::array<ActivationMpsc, K>` bands; `UniformFIFO` (K=1) default objdumps **byte-identical** to today's single MPSC (zero-cost when uniform). Enqueue = compile-time band subscript on the same `tail_.exchange` (0 added RMW); O(K≤8) relaxed top-band probe. Per-actor mailbox FIFO inviolable; high-band p99 ~316× lower. Anti-starvation is a knob: `RotatingReserve<M>` (default, bound `(d+1)·K·M`) or `WeightedDRR<w…>`. EDF-banding evaluated and deferred (degrades below FIFO under overload). 7/0 proven/disproven. Closes the 002 priority open question; binds 005/011/023. |
 | [ADR-011](decisions/ADR-011-cluster-relay-and-placement-gate-verification.md) | Cluster relay & placement gate verification | **Verification record** (not a redesign). **FIFO-under-relay CORRECT** — path-pinning + drain-boundary promotion holds per-`(S,A)` FIFO across a mid-stream variable-hop path change (0 inversions / 100×10⁶ arrivals, unpinned control inverts 88–96%) → **026 Accepted, 010 Accepted (core)**, 023 FIFO cell proven. **Stateless-pool CORRECT** (exactly-once under concurrency, beats hand-rolled 1.5–2.8×). **Weighted-HRW WRONG** — caught a real defect: ADR-006's `weight·H` formula is non-proportional (fix: `w/(−ln H)`, proven proportional + bounded-churn) and the `CoV≤0.2` balance threshold is a uniform-only quantization floor → **025 held Draft** pending the formula/threshold repair (applied) + re-gate. |
 | [ADR-012](decisions/ADR-012-weighted-hrw-distribution-regate.md) | Weighted-HRW re-gate (025) | **Verification record** — re-gate of the corrected log-WRH form. **INCONCLUSIVE**, and it's the honest verdict: the scheme is **demonstrably at the multinomial floor** (WRH within 1.9% of the ideal sampler at every N; churn exact — 0 bins between unchanged nodes) but the decision *band* was still ill-posed (compared p99 vs a mean-level closed-form floor, a band the ideal sampler itself busts). Refused to fake CORRECT (post-hoc widening) or WRONG (blaming the scheme for a threshold defect). Supersedes ADR-011 Gate B's WRONG for the corrected form. 025 stays Draft pending a like-for-like preregistered re-gate (running). |
@@ -406,6 +465,30 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-017](decisions/ADR-017-durable-reminder-mass-due-scale-gate.md) | Durable reminder mass-due scale gate (027) | **CORRECT.** A `design → debate → prove` loop ran 3 competing durable-reminder designs through red-team + executed C++23. Winner **SEGSTREAM** models the due-wave as a stream: a due-segment binds to ONE bounded 024 StreamChannel drained under a 022 fire-rate token bucket — spread is the *drain rate*, peak in-flight is the *credit window*, not N. The 10⁶-at-9 PM wave flattens to `peak == fire_rate` (re-measured from a clean build), per-tick scan O(due-now), zero committed-reminder loss across crash, owner-sharded no-duplicate-fire. → **027 Accepted (x86-64)**. |
 | [ADR-018](decisions/ADR-018-outbound-streaming-replies.md) | Outbound streaming replies — an `ask` that returns a stream (006) | **Reply-Credit-Ring** (PUSH). `ask_stream<F>` returns a bounded, pre-allocated, credit-controlled SPSC ring = the **024 inbound ring with producer/consumer roles flipped** (callee = `head` producer, caller = `disp`/`tail` consumer); credit flows caller→callee for free through the same derived `capacity−(head−tail)` — **no shared counter**. Single-resolve `StreamReplyCell` + N-item ring + in-band EoS; caller drains one batch per activation turn via `StreamActivation<F>::drain` verbatim from ADR-014. Cancellation/deadline (018) teardown returns credit, leaks no ring, delivers nothing after teardown; exactly-once (017) per-item dedup watermark; reply-UAF gate extended to multi-resolve. **Accepted (x86-64)**, mechanism AND the 006 outbound-streaming *axis* both — **2026-08-04**: the named promotion gate's re-admit MECHANISM was wired + proven via an ordinary `ask`, then `ActorRef::ask_stream<F>`/`LocalRouter::ask_stream` (the addressing layer) were wired and the ask_stream-specific dedicated integration run (`tests/ask_stream_coawait_real_scheduler_test.cpp`, 2500/2500 OPEN-vs-first-item races exactly-once) closed the gate — see ADR-018's two post-decision updates. New documented hazard found along the way: `ReplyCell::resolve()`'s co_await resume is synchronous/stack-reentrant on the resolving thread — a callee handler doing work after `.accept()`/`respond()` must not assume it happens-before the resumed caller. |
 | [ADR-019](decisions/ADR-019-best-effort-broadcast-publish-primitive.md) | Best-effort broadcast / publish primitive — `Topic<M>`, at-most-once fan-out (006) | **`Topic<M>`, D-A.** A subscriber-agnostic one-to-many primitive whose load-bearing semantic is **best-effort at-most-once**: the publisher **never blocks and never stalls** on any subscriber; a slow/full/dead subscriber is DROPPED (per-subscriber, counted) — the deliberate opposite of ADR-018's backpressure. Membership = `atomic<shared_ptr<const SubVec>>` copy-on-write snapshot + `active` flag + bounded-quiescence unsubscribe; ONE immutable refcounted `SharedPayload<M>` fanned as N thin descriptors onto each subscriber's **verbatim ADR-002 mailbox**; cross-node coalesced to one frame per node. 8/8 gates CORRECT for local fan-out (1 copy/pub amortized N×, publisher-never-stalls, exact at-most-once accounting, per-(pub,sub) FIFO, ASan/UBSan/TSan clean). D-B's hand-rolled refcount-through-mutable-pointer took a **heap-UAF on clean build** (GATE 6), proving the `atomic<shared_ptr>` SMR load-bearing. → **006 broadcast Accepted (x86-64) for LOCAL fan-out**; cross-node fan-out **Draft on GATE 7**; ARM/weak-memory deferred. |
+| [ADR-020](decisions/ADR-020-mailbox-mpsc-hot-path-r5.md) | Mailbox MPSC hot path (round 5) | Winner **unchanged** (5th round) — Intrusive Vyukov MPSC. Segmented Linear-Chunk Ring disqualified (allocates forever under sustained throughput, ~1/512 msgs); REX-BIR Treiber-push disqualified (p999 10×–600× over the 50µs hard ceiling). 13/14 incumbent claims CORRECT (1 fast-only miss: P=4 scaling 1.36–1.48× vs claimed ≥3×). |
+| [ADR-021](decisions/ADR-021-node-shard-resource-resolution-ordering.md) | Node/Shard resource resolution ordering vs. cold-shard activation (004) | **Eager-Everywhere** wins. Every Node/Shard resource resolved once, synchronously, in `Engine::build()`, strictly before any worker thread exists — the multi-shard race is dissolved by ordering, not arbitrated by CAS/lock. 8/8 proven CORRECT, zero atomics on `Cached<T>::get()` (byte-identical objdump across Activation/Node/Shard scope). Trade-off: `build()` scales linearly in shard_count×resource_count (proven R²>0.999). |
+| [ADR-022](decisions/ADR-022-histogram-bucket-layout-and-metric-cardinality.md) | Histogram bucket layout & metric cardinality (009) | **Per-metric configurable buckets + opt-in per-instance cardinality (bounded critical-arena).** Per-actor-type block always exists; per-instance is strictly opt-in via `PerInstanceMetrics<N>`, multiplying the *same* bucket layout into more physical blocks, backed by one engine-wide prefix-sum arena + per-(shard,type) freelist. 9/10 proven CORRECT (1 marginal fast miss). Two default-only competitors (FGT, per-type grid) both had a proven regression on their always-on hot path (FGT +2.6ns/op; per-type grid up to −89% throughput on clang) and neither answers the per-instance axis at all. |
+| [ADR-023](decisions/ADR-023-timer-wheel-tiering-and-drift-bound.md) | Timer-wheel tick/tier scheme & timekeeper drift bound (011) | **Fine-Base Cascading Wheel + Adaptive-Poll Timekeeper (D2)** — 5 tiers × 64 slots on a 64µs base tick (~19h span); busy-shard `advance_to()` is near gap-independent (100× larger gap costs only 1.24× more, vs 78× a naive model predicts); timekeeper publishes one `next_due_hint_` and sleeps to the global next-due minimum instead of polling. 9/9 proven CORRECT, zero disproven — the only one of three designs with none. Residual: exposed an unrelated 002 shard-fairness starvation gap (a saturated shard can starve siblings' timer advance 497–591ms), tracked, not fixed here. |
+| [ADR-024](decisions/ADR-024-eventsourced-compaction-cadence-and-checkpoint-mode.md) | EventSourced compaction cadence & checkpoint blocking mode (012) | **012-B: wall-clock `CompactEvery<T>` + background `CompactionJob`/`CompactionApplied` close-out.** Checkpoint I/O is provably asynchronous and orthogonal to `PersistMode` (on-lane handler duration flat 4–48µs regardless of injected store delay 0–100ms); idle-deactivation is a required secondary trigger to bound starvation. Fixed-N synchronous design is a documented fallback for a hard replay-count bound, but spikes triggering-message latency 34–94µs even under Batched mode. A third adaptive-byte-threshold design was disqualified — its own admission-deferral fix deterministically deadlocks the actor's single FIFO mailbox. |
+| [ADR-025](decisions/ADR-025-simengine-interleaving-exploration-strategy.md) | SimEngine interleaving exploration strategy (014) | **BMC-DPOR** (bounded model checking + Dynamic Partial Order Reduction) replaces pure random search as the `Chooser` policy default target. Deterministic 100/100 detection of a planted bug within a stated bound (vs. random search's honestly-probabilistic 66–72% hit rate); DPOR reduction 13.3× fewer runs / 9.6× less wall-clock at k=6, advantage growing with actor-graph size. `SimEngine` becomes `template<ChoicePolicy Chooser=RandomChoicePolicy>`, zero-cost, default-unchanged. SeedFarm's corpus/fingerprint mechanism is adopted as a complementary, orthogonal tier regardless. |
+| [ADR-026](decisions/ADR-026-pal-vectored-io-registered-buffers.md) | PAL vectored I/O + registered buffers surface shape & support matrix (019) | **Two-tier PAL I/O surface.** Tier 1 (`submit_recv`/`submit_send`, mandatory, trivially emulatable everywhere incl. sim) + Tier 2 (`IoContext::advanced_io()`, one named capability object, queried once and cached — real bodies on io_uring/IOCP, trivial `unexpected` bodies elsewhere). Vectored send (`submit_send_v`) proves a genuine win: ~35–42% p50 latency cut, exact 2×→1× SQE halving for a header+body frame. Registered buffers proven a **niche** win only at ≈1MiB+ transfers, flat-to-worse at ordinary actor-frame sizes — documented as such, not the default path. Linux io_uring floor: kernel 5.1. |
+| [ADR-027](decisions/ADR-027-mailbox-mpsc-hot-path-r6.md) | Mailbox MPSC hot path (round 6) | Winner **unchanged** (6th round) — Intrusive Vyukov MPSC. Both challengers (Segmented Bounded-Ring; BSR bounded-segment Treiber-push) disqualified on safety/correctness (a TSan-caught close-out race; 8,632/1M FIFO violations + a deterministic hang). Zero WRONG verdicts across the incumbent's ten claims. One hardening adopted: `Descriptor::complete()` moves from a plain store to a CAS-gated `Running→Completed` transition, closing a sanitizer-invisible TOCTOU. |
+| [ADR-028](decisions/ADR-028-lazy-activation-idle-timeout-eviction.md) | Lazy activation-on-first-message + idle-timeout deactivate eviction | **Broker-Actor Serialization** — a per-shard `ActivationBroker` actor reuses the single-executor guarantee itself to arbitrate first-touch/reactivation, instead of inventing new CAS/RCU machinery; a new `Dormant` ExecState reuses the existing seq_cst mailbox-close-out Dekker fence verbatim. Zero disproven safety/correctness claims, hot path within noise of baseline. A competing pre-sized CAS slot-table design is disqualified (steady-state regression +47–167%); a generation-tagged identity-word design is disqualified (message loss 3 separate ways). |
+| [ADR-029](decisions/ADR-029-mailbox-mpsc-hot-path-r7-judgment.md) | Mailbox MPSC hot path (round 7) | Winner **unchanged** (7th round) — Intrusive Vyukov MPSC, r7-hardened (debug-only double-enqueue guard, zero-cost dequeue prefetch). SBR-Mailbox disqualified — its generation-tagged claim word produced deterministic cross-actor message injection (3/3 repeats). REX-CAS/B disqualified — mechanism-identical to ADR-020's already-rejected REX-BIR, conceded fatal in the debate itself. 27 CORRECT / 4 WRONG / 1 INCONCLUSIVE across all three designs combined. |
+| [ADR-030](decisions/ADR-030-voice-udp-datagram-channel.md) | UDP datagram channel for real-time voice/media + relay-node placement (new spec 028) | **VoiceChannel, shared-loop / capability-placed (reuse-maximalist)** — a NEW sibling seam to `Transport`, sharing `TcpTransport`'s existing `pal::IoContext` via one additive `event_loop()` accessor; room→relay placement is a generalized `VirtualBins` over gossiped `Flag{"voice-relay"}` capability; AEAD-sealed, HKDF sub-key off the existing 020 session key. 13/13 proven CORRECT, zero WRONG — the only one of three designs with a clean record. Mailbox/`GovernanceCore` proven byte-identical/untouched when voice is unused. → **028 Draft** (mock-cipher + loopback-only proof so far). |
+| [ADR-031](decisions/ADR-031-mailbox-mpsc-hot-path-r8-judgment.md) | Mailbox MPSC hot path (round 8) | Winner **unchanged** (8th round) — Intrusive Vyukov MPSC. SBR-v4 disqualified — never reached Prove (conceded rewrite, zero executed evidence). REX-CAS/C disqualified — its own FIFO claim came back INCONCLUSIVE via a harness later shown methodologically unsound, despite winning on raw throughput at low P. Multi-producer scaling regression (P1→P4) mechanistically isolated for the first time to shared-`tail_`-cache-line contention via an independent-cache-line control (2.5–2.6× vs 0.73–0.88×). |
+| [ADR-032](decisions/ADR-032-mailbox-mpsc-hot-path-r9-judgment.md) | Mailbox MPSC hot path (round 9) | Winner **unchanged** (9th round) — Intrusive Vyukov MPSC. Both challengers purpose-built to bound oldest-message-discovery cost, both disqualified: SBR-v5 proven WRONG on its own central global-ordering claim (up to 858,983 inversions once its overflow valve engages); SEG-REX disqualified on safety — reproducible unsigned-underflow/deadlock, sanitizer-invisible. Incumbent 10/10 CORRECT; newly closed a standing open question (`ExecStateCell`'s acquire/release proven independently load-bearing). |
+| [ADR-033](decisions/ADR-033-mailbox-mpsc-hot-path-r10-judgment.md) | Mailbox MPSC hot path (round 10) | Winner **unchanged** (10th round) — Intrusive Vyukov MPSC. SEG-HP (hazard-pointer-paired segmented descendant) disqualified — a new bug class: `try_dequeue()` returns spurious `Empty` at an ordinary segment-rotation boundary (97.5% isolated repro), plus a 370–400× p999 regression under contention. `DeliveryMode<OrderFirst\|ThroughputFirst<K>\|LatencyFirst>` passes the safety gate but its throughput claim (≥3× at P=K=8) falls to 1.2–2.7×, structurally capped by the single-executor invariant — banked as a finding, not adopted as default. |
+| [ADR-034](decisions/ADR-034-on-demand-actor-passivation.md) | On-demand actor passivation — `ActorRef<A>::passivate()` (011/012) | **Adopted as designed**, assembled from already-proven mechanisms. `passivate()` funnels through the *same* `close_out_retire()` call site the automatic idle-timeout wheel uses (ADR-028) via the same `Deactivate` control descriptor, guarded by a new `DeactivateToken{Idle,Posted}` CAS interlock against the two independent triggers double-posting the one non-pooled descriptor. Adds `on_deactivate()` (opt-in) plus a best-effort persistence flush, fixing a real pre-existing gap (the broker never acquired a fencing token). Full suite passes unmodified. |
+| [ADR-035](decisions/ADR-035-worker-park-wake-backoff-policy.md) | Worker park/wake backoff policy (002) | **Bounded read-only pre-park spin** (fixed 256-iteration `cpu_relax()` before `park()`) adopted as default. Cuts OS-wake-syscall rate from ~10–32% of sends to 0.01–0.26% at N=1/2/4, zero heap alloc. A materially faster EWMA-gated adaptive design (+15–20% throughput) was **rejected** despite clearing every safety claim — its exponential-doubling worst case measured ~380µs per spin round, ~9× worse than the OS-wake latency the effort targets, violating "never spin unbounded." |
+| [ADR-036](decisions/ADR-036-activation-linger-idle-churn-reduction.md) | Activation idle-churn reduction — post-drain linger vs. `wake_one()` cost cuts (002) | **Four-round arc, net result: `activation_linger_spin_limit` defaults to 0 (mechanism shipped but disabled).** Round 1's flat unconditional linger regressed the 023 bench-gate 17×/12.7× (a Hard-floor violation). Round 3's evidence-gated adaptive linger closed that to within 1–3% of baseline. Round 4 fixed the proof harness and **refuted** the original contention-win claim — no config beats `spin_limit=0` within noise, so the default moved to 0. A cache-line-isolation competitor was rejected outright (its headline claim measured WRONG). |
+| [ADR-037](decisions/ADR-037-message-pool-freelist-sync.md) | MessagePool free-list synchronization (003) | **TLS acquire/reclaim magazine** over the existing mutex+free_head. Thread-local, fixed-capacity batches amortize the partition mutex to ~1/32 of calls; 1.27–3.0× measured round-trip throughput at P∈{1,2,4}, TSan-clean. 8/8 claims CORRECT — the cleanest record of three designs. A lock-free Treiber-stack free-list was 15–25% *slower* uncontended; a per-worker-lane SPSC return-ring needed a new cross-subsystem contract and also missed its own round-trip claim. New lifetime contract: callers must call `flush_current_thread_message_caches()` before pool teardown for exact conservation. |
+| [ADR-038](decisions/ADR-038-scheduler-oversubscription-tail-latency.md) | Scheduler busy-spin tail latency under thread oversubscription (002) | **Four-round investigation, closed unresolved — no default changes.** Bounded Cooperative Drain-Owner Eviction shipped default-off; an Oversubscription-Gated Pre-Park Backoff design was rejected outright (made max latency *worse* in 9/10 trials, 5–20×). The decision-relevant finding: re-measuring the *identical* config in a fresh session flipped sign (+9.9% worse → −1.0% better), proving the shared/unpinned host's noise floor exceeds the effect sizes being chased. A quiet, dedicated CI host is the stated next step. |
+| [ADR-039](decisions/ADR-039-ordered-reliable-multi-subscriber-fanout.md) | Ordered, reliable multi-subscriber fan-out — `FanOut<M,Policy>` (006/017) | **`FanOut<M,Policy>`** — N independent per-subscriber SPSC lanes (ADR-018's ring + ADR-019's COW membership/pool, reused verbatim), supporting `OnSlowSubscriber<EvictAfter<N>>` (bounded buffer, evict-with-gap-signal) and `OnSlowSubscriber<Block>` (blocks on the slowest live subscriber) as zero-cost-unused compile-time policies. 7/7 proven CORRECT after two conceded-and-fixed defects. A competing shared-append-only-ring design (`EventLog`) is disqualified — its SMR produced 100% ASan UAF / 10/10 TSan races. |
+| [ADR-040](decisions/ADR-040-mtls-node-transport-cert-rotation.md) | mTLS node-to-node transport with live certificate rotation (020) | **mTLS-A2: Hot-Reload Identity + Dual-Cert/Root Overlap**, over mbedTLS-as-key-exchange-only (chosen over BoringSSL for Windows/MSVC-primary — no stable ABI, Bazel/Go-only build). mTLS runs once per connection as an authenticated handshake; the existing AEAD/replay envelope carries all traffic. Identity/trust-root rotation via `OverlappedMaterial<T>` (current + grace-windowed previous); compromise-case revocation enforced against **already-open** sessions on a bounded sweep tick, not just at handshake. 14/14 proven CORRECT vs. a competing in-band-rekey design's 12/13. |
+| [ADR-041](decisions/ADR-041-mailbox-mpsc-hot-path-r11-judgment.md) | Mailbox MPSC hot path (round 11) | Winner **unchanged** (11th round, incumbent's 11th survival). SegRing-LCRQ (purpose-built to fix three prior challengers' defects) disqualified — a *third*, previously-unseen UAF window surfaced during Prove on already-once-revised reclamation code, plus a livelock as submitted. ReversingTreiber/BR (7th defeat of this lineage) conceded fatal pre-Prove: 100% reversed dispatch order, p999 breaches the 50µs ceiling. Incumbent 11/12 proven CORRECT (1 INCONCLUSIVE — host-conditional latency reporting, not a falsified number). |
+| [ADR-042](decisions/ADR-042-ipv6-endpoint-locator-widening.md) | IPv6 support — PAL network seam + cluster `Endpoint` locator widening (010/019) | **Tagged-Union `IpAddr`** — `pal::IpAddr{family; 16-byte array}` becomes `Endpoint::addr`'s type directly (`Endpoint` grows 24B→32B); a converting `IpAddr(uint64_t)` ctor reproduces legacy IPv4 decoding exactly, so every existing call site recompiles with zero source edits; both PAL backends gain a family-branching `to_sockaddr()` codec; `dual_stack` opt-in (default off). 8/8 proven CORRECT, mailbox/dispatch hot path unaffected within noise. A competing always-128-bit/dual-stack-by-default design is **disqualified** — it silently breaks pure-IPv4 deployments on any host with IPv6 restricted at the kernel level. Residual: no `scope_id` yet; SWIM/gossip wire format not yet v6-extended. |
+| [ADR-044](decisions/ADR-044-principal-propagation-envelope-pool.md) | Principal propagation into handler `MessageContext` (020) | **Flag-Gated Envelope Pool** — wire-arrived, non-anonymous `Principal` routes through a second, wire-scale `EnvelopePool` (reusing ADR-037's Cell-first-member/fixed-offset idiom), gated by one previously-unused bit in the existing `gen_state` flags subfield; `Descriptor` itself stays untouched at its real, ten-times-proven 56-byte layout. Wired at all four real dispatch sites (plain/governed Sequential drain, Reentrant admit, 007 supervised-restart redelivery). A retrofit of ADR-007's `ctx_`-pointer-into-payload-arena mechanism is disqualified — its own control proved a same-node local forward silently drops the propagated principal. |
 
 </details>
 
@@ -453,13 +536,15 @@ Remaining cross-cutting design questions are tracked in [OpenQuestions.md](OpenQ
 
 ## Contributing
 
-Every change must follow the RFC specs (`001`–`027`) and the proven decisions
+Every change must follow the RFC specs (`001`–`028`) and the proven decisions
 (`decisions/ADR-*`) — when code and a spec disagree, the spec wins; if the spec is genuinely
 wrong, fix the spec first (RFC-style, backed by an ADR), then the code. Read
 **[CONVENTIONS.md](CONVENTIONS.md)** before opening a PR — it covers target/scope, language and
 dependency rules, and the hot-path rules that are tested, not trusted. CI (`.github/workflows/ci.yml`)
 runs the full correctness matrix (gcc/clang Release, ASan+UBSan, TSan) on both x86-64 and arm64
-and the 023 performance gate on every push and pull request.
+— arm64 blocks merges on the same failures x86-64 does — and the 023 performance gate on every
+push and pull request (the arm64 perf gate is informational-only, `continue-on-error`, pending a
+real ARM64 reference re-baseline).
 
 ## License
 
