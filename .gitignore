@@ -30,3 +30,9 @@ vcpkg_installed/
 *.swp
 *.swo
 *~
+
+# Marketing + wiki site (web/) — deps and the generated doc corpus.
+# The BUILT site in docs/ IS committed: GitHub Pages serves it from there.
+web/node_modules/
+web/public/docs/
+web/.vite/
