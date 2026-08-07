@@ -181,6 +181,23 @@ Because an async handler holds the actor across suspension points, an actor doin
 heavy async I/O naturally serializes its own messages. Use `Reentrant` /
 `MaxConcurrency<N>` (see `005`) to relax this deliberately.
 
+### `task<T>` for non-void `T` — a nested, awaitable inner coroutine (ADR-047)
+
+`quark::task<>`/`task<void>` above is a *handler-level* type: the only type ever
+`detach()`ed to the executor or fed to `async_frame_faulted()`/`async_frame_fault_ptr()`.
+A handler declared to return `task<T!=void>` fails to compile — the dispatch layer's
+`async_handler` concept checks the *exact* type `task<>`.
+
+`quark::task<T>` for `T != void` is a different thing: an ordinary async function (e.g.
+`task<result<Foo>> compute(...)`) that a handler's own `task<void>` frame — or another
+`task<T>` — `co_await`s to get a `T` back. It is `T`'s own awaiter; completing it hands
+control back to whatever awaits it via **symmetric transfer** (same thread/stack, no
+scheduler hop). The single-executor invariant is upheld exactly as before: it is the
+existing exec-state Parked/CAS gate that holds it, not thread affinity, and a nested
+`task<T>` resuming its awaiter never lets two frames of the same activation run
+concurrently. A `task<T>` dropped without ever being awaited is always safe to destroy —
+it is lazy, so it is suspended at its own `initial_suspend` and its body never ran.
+
 **Inbound stream draining obeys the same rule** (024). A stream handler drains a
 *batch* off a per-stream ring inside one activation, under the single-executor
 invariant; a **suspended** stream handler does **not** advance the drain — the

@@ -10,6 +10,8 @@
 // Schedulable pointers) that must never leak into a handler's view.
 #pragma once
 
+#include <coroutine>
+
 namespace quark::detail {
 
 // Type-erased "how to complete_parked() the activation currently draining on THIS lane" — the
@@ -21,13 +23,21 @@ namespace quark::detail {
 // Captured by ReplyCell::suspend() at the moment a co_await commits to suspending — MUST be
 // snapshotted there, not read lazily later: by the time a reply resolves (on a DIFFERENT thread/
 // lane) this thread-local reflects THAT lane's own, unrelated activation, if any.
+//
+// ADR-047: `leaf` carries the coroutine_handle<> ReplyCell::suspend() actually captured — the
+// innermost coroutine syntactically containing the co_await, which may be several nested
+// `task<T>` layers below the activation's own top-level `task<void>` handler frame. Resuming
+// `parked_frame_` (the top-level handle) unconditionally, as this seam did before ADR-047,
+// silently discards which frame really needs to run next whenever a nested task<T> genuinely
+// parks cross-lane — Activation::complete_parked() is the one place that resolves `leaf` against
+// `parked_frame_`; this sink only carries it through.
 struct ParkedResumeSink {
-    void (*fn)(void* engine, void* schedulable) noexcept = nullptr;
+    void (*fn)(void* engine, void* schedulable, std::coroutine_handle<> leaf) noexcept = nullptr;
     void* engine = nullptr;
     void* schedulable = nullptr;
 
     [[nodiscard]] bool active() const noexcept { return fn != nullptr; }
-    void operator()() const noexcept { fn(engine, schedulable); }
+    void operator()(std::coroutine_handle<> leaf = {}) const noexcept { fn(engine, schedulable, leaf); }
 };
 
 // Null outside a Sequential/governed-Sequential handler dispatch — bootstrap code, a Reentrant

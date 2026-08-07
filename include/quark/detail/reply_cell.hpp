@@ -84,8 +84,12 @@ public:
             // ambient (block_on's off-lane wait never calls suspend() at all; a Reentrant asker's
             // co_await uses its own per-frame mechanism, not this seam; a bare/standalone
             // coroutine has no Engine) falls back to the pre-existing direct resume — unchanged.
+            // ADR-047: `h` is the LEAF handle — the innermost coroutine that actually called
+            // suspend() (possibly several nested task<T> layers below the activation's top-level
+            // task<void> frame) — threaded through so complete_parked() resumes the right frame
+            // instead of unconditionally resuming the top-level one.
             if (sink.active())
-                sink();
+                sink(h);
             else if (h)
                 h.resume();
             return;

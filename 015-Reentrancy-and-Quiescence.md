@@ -245,6 +245,27 @@ No allocation on the sequential path; one small waiter frame on the reentrant pa
   win-arbitration** pattern (a `FiberParkCell`): exactly one of {carrier completes, actor
   parks} wins the cell, so a completion that races the park is resolved cleanly (a broken
   arbitration was proven to wedge, `rc124`).
+- **001 (nested `task<T>` cross-lane resume routing, ADR-047):** a `co_await` that
+  genuinely parks on a cross-actor primitive (an `ask`'s `ReplyCell`) may resolve on a
+  DIFFERENT worker's lane than the asker's own; the resume is routed through
+  `detail::ParkedResumeSink` to the exec-state-gated `Activation::complete_parked()`
+  (Sequential/governed-Sequential only — a Reentrant activation's own co_await-ask uses
+  its separate per-frame mechanism above, not this seam). `ParkedResumeSink::fn`/
+  `operator()` carry an explicit `std::coroutine_handle<> leaf` — the handle
+  `ReplyCell::suspend()` actually captured, which may be several nested `task<T>` layers
+  below the activation's own top-level `task<>` handler frame — threaded through
+  `ReplyCell::resolve()`'s fast path to `complete_parked(leaf)`, which resumes `leaf` if
+  present, or the top-level `parked_frame_` otherwise (the untouched case for a handler
+  with no nested `task<T>` in its await chain). Resuming `leaf` drives the identical
+  chain resuming `parked_frame_` directly would have — symmetric transfer inside
+  `task<T>`'s `final_suspend()` unwinds back up through every enclosing `task<T>` exactly
+  as if the top-level frame had been resumed — so `parked_frame_` remains the sole,
+  unchanged signal for `.done()`/`async_frame_faulted()`/`.destroy()`/reclaim: only
+  *which* handle `.resume()` is called on changes, never which handle is read
+  afterward. Before ADR-047, `complete_parked()` unconditionally resumed
+  `parked_frame_` regardless of which frame actually needed to run next — silently
+  correct with no nesting, silently wrong (data corruption / use-after-free) the instant
+  a nested `task<T>` genuinely parked cross-lane.
 - **003 (memory):** payloads have overlapping lifetimes, so they are freed
   **per message** (pool semantics, on the descriptor's transition to
   `Completed`/`Cancelled`), never by bulk drain-step reset. A quiescent point

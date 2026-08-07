@@ -105,6 +105,17 @@ value, not an exception across the boundary:
 std::expected<Confirmation, quark::error> r = co_await order.ask<Confirmation>(q);
 ```
 
+`AskFuture<R>::await_resume()` — the `ask` awaitable above — **returns a `result` in the
+failure state**; it never throws. `quark::task<T>` (`001` §Hybrid handler execution,
+ADR-047), the *separate* nested-coroutine primitive a handler uses to call an ordinary
+async function, instead **rethrows at `co_await`** — the same idiom `task<void>`'s own
+`fault_`/`faulted()`/`fault_ptr()` already uses. This is a deliberate, documented split
+between the two async return shapes in the codebase, not an oversight — don't try to
+unify them without revisiting ADR-047's reasoning. Where `T` is itself `quark::result<U>`
+(e.g. `task<result<ChatResponse>>`), `task<T>::await_resume()` yields exactly `result<U>`
+— unconditional pass-through, never `result<result<U>>`; only a *thrown* exception is
+captured into the fault channel.
+
 ### `ask_stream` — a reply that is a *stream* (ADR-018)
 
 When a reply is **multi-item** (a query answered by many frames, a subscription, a

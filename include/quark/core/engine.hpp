@@ -442,7 +442,12 @@ public:
     // Drive the parked activation's completion and, on the Parked→Scheduled edge, re-enqueue +
     // wake. This carries the SAME seq_cst Dekker rendezvous as post() but is a DISTINCT StoreLoad
     // pair (carrier→actor, not producer→consumer — ADR-015).
-    bool complete_parked(Schedulable* s) noexcept {
+    // ADR-047: `leaf` threads straight through from the `ParkedResumeSink` call site (ultimately
+    // `ReplyCell::resolve()`'s captured suspend()-time handle) to `Activation::complete_parked()`,
+    // which resumes `leaf` if present or falls back to the activation's own top-level `parked_frame_`
+    // otherwise — see that function's comment for why only WHICH handle is resumed changes, never
+    // which handle is read afterward for done()/fault/reclaim.
+    bool complete_parked(Schedulable* s, std::coroutine_handle<> leaf = {}) noexcept {
         // 015 seam: `parked_frame_.resume()` (inside `Activation::complete_parked()`) may run the
         // coroutine straight into ANOTHER `co_await` (e.g. a second `ask` in the same handler loop) —
         // that happens on THIS (carrier) thread, not `s`'s own `run_activation` call, so without
@@ -453,7 +458,7 @@ public:
         // complete_parked() is Sequential/governed-Sequential-only by construction (Reentrant never
         // calls it), so this is always the correct target when this function runs at all.
         detail::ParkedResumeScope prs(detail::ParkedResumeSink{&parked_resume_thunk, this, s});
-        const bool wake = s->activation->complete_parked();
+        const bool wake = s->activation->complete_parked(leaf);
         if (wake) schedule_and_wake(s);
         return wake;
     }
@@ -463,9 +468,10 @@ public:
     // calls this instead of touching the asker's coroutine directly, routing the resume through the
     // SAME exec-state-gated `complete_parked()` above. `run_activation` publishes this (scoped to
     // Sequential/governed-Sequential activations only) around every `drain_step()` call.
-    static void parked_resume_thunk(void* engine_erased, void* schedulable_erased) noexcept {
+    static void parked_resume_thunk(void* engine_erased, void* schedulable_erased,
+                                     std::coroutine_handle<> leaf) noexcept {
         static_cast<Engine*>(engine_erased)
-            ->complete_parked(static_cast<Schedulable*>(schedulable_erased));
+            ->complete_parked(static_cast<Schedulable*>(schedulable_erased), leaf);
     }
 
     // --- Lifecycle -------------------------------------------------------------------------

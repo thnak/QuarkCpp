@@ -6,7 +6,15 @@ progress. The current draft has no error model at all — this defines one.
 ## Failure sources
 
 1. **Handler throws** — a sync handler throws, or an async handler's `task<>`
-   completes with an exception.
+   completes with an exception. A throw inside a **nested** `task<T>` (`001`
+   §`task<T>` for non-void `T`, ADR-047) — an ordinary async function a handler's
+   `task<void>` frame `co_await`s — is caught at *that* frame's own
+   `unhandled_exception()` and is only ever observable by rethrowing it at that
+   frame's own `await_resume()`; it never reaches `Activation`'s fault machinery
+   directly, only by propagating as an ordinary C++ exception up through however
+   many `task<T>` layers await it, until it surfaces at the outermost `task<>`'s
+   own `unhandled_exception()` below — unchanged. Never `std::terminate`, at any
+   nesting depth.
 2. **Deadline exceeded** — the message's `deadline` passes before completion.
 3. **Cancellation** — the message's `std::stop_token` fires (caller `ask`
    abandoned, shutdown).

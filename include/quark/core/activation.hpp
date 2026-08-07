@@ -740,7 +740,19 @@ public:
     // `readmit_from_parked()` CAS below is guaranteed to observe `Parked` (nothing else transitions
     // this activation's exec-state between `park()` and this function's own CAS in the single-carrier
     // Sequential model), so it can no longer fail/silently drop the re-admit either.
-    bool complete_parked() noexcept {
+    // ADR-047: `leaf` is the coroutine_handle<> ParkedResumeSink was actually called with — the
+    // innermost coroutine that committed to suspending (ReplyCell::suspend()'s captured handle),
+    // which may be several nested task<T> layers below `parked_frame_` (the activation's own
+    // top-level task<void> handler frame, unconditionally set by drain_step). Resuming `leaf` when
+    // present drives the SAME chain drain_step's own `parked_frame_.resume()` would have driven —
+    // symmetric transfer inside task<T>'s final_suspend() unwinds the resume back up through every
+    // enclosing task<T> exactly as if the top-level frame had been resumed directly — so
+    // `parked_frame_` remains the sole, unchanged signal for done()/async_frame_faulted()/destroy()/
+    // reclaim_() below: only WHICH handle .resume() is called on changes, never which handle is
+    // read afterward. `leaf` defaults to {} (falls back to `parked_frame_`) for every pre-existing
+    // caller that never threads one — the untouched behavior for a task<void> handler with no
+    // nested task<T> in its await chain.
+    bool complete_parked(std::coroutine_handle<> leaf = {}) noexcept {
 #ifndef QUARK_ACTIVATION_PARK_NO_GATE
         while (exec_.state() != ExecState::Parked) pal::cpu_relax();  // acquire-gate: happens-before park()
 #endif
@@ -750,6 +762,7 @@ public:
         // closes) without reverting production code out from under the rest of the suite.
 
         Descriptor* d = parked_desc_;
+        std::coroutine_handle<> to_resume = leaf ? leaf : parked_frame_;
         // Guard the resume: an async handler surfaces its throw at completion (007). A body throw is
         // captured by the promise (probe via async_frame_faulted); a stray propagation is caught too.
         bool faulted = false;
@@ -758,7 +771,7 @@ public:
 #ifndef QUARK_SUPERVISION_NO_GUARD
         try {
             detail::AmbientContextScope amb(current_ctx_);  // #12: a tell after co_await still inherits
-            parked_frame_.resume();
+            to_resume.resume();
         } catch (...) {
             faulted = true;
         }
@@ -780,7 +793,7 @@ public:
 #else
         {
             detail::AmbientContextScope amb(current_ctx_);
-            parked_frame_.resume();
+            to_resume.resume();
         }
         if (!parked_frame_.done()) return false;  // see the CHAINED SUSPENSION comment above
 #endif
