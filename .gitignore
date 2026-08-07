@@ -36,3 +36,4 @@ vcpkg_installed/
 web/node_modules/
 web/public/docs/
 web/.vite/
+web/*.tsbuildinfo
