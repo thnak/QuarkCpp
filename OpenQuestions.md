@@ -431,6 +431,18 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   same recovery scenario is the concrete tie-breaking experiment owed; no TSan
   leg was available for any design this round (stated MSVC-ABI toolchain
   constraint, substituted per `VERIFICATION.md`'s Windows exclusion policy).
+  **Implemented** in `include/quark/net/tcp_transport.hpp` (`set_relay()`,
+  `resolve_dial_endpoint()` shared by `dial()`/`ensure_conn()`/`do_reconnect()`,
+  the one-shot give-up timer, the out-of-band recovery probe, and the fenced
+  `cutover_to_direct()` with `del_fd` before `add_fd`) and
+  `include/quark/net/fallback_policy.hpp` (`NoRelayFallback` /
+  `DirectThenRelay<TimeoutMs>`), covered by `tests/tcp_relay_fallback_test.cpp`
+  and clean under clang ASan+UBSan. This build's client-side dial/give-up/
+  recovery state machine is real; the relay-side byte-transparent forwarding it
+  assumes (a peer's relay Endpoint must answer with *that peer's own* HELLO) is
+  still no-goal/future work, per this ADR's own deferred non-goals above — the
+  test exercises `set_relay()` pointed straight at a real peer listener as a
+  stand-in, not a real relay process.
 
 ## Highest-leverage unresolved questions
 
