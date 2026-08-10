@@ -79,6 +79,18 @@ Grouped by the spec that consumes it. All fallible calls return
   `VoiceChannel` (028) to register a UDP fd on the same `IoContext` a `Transport`
   already drives, per "the one rule" above — `VoiceChannel` calls these, never a
   raw `<sys/socket.h>`/`<winsock2.h>` symbol.
+- **`IoContext::add_fd`/`del_fd` re-registration is NOT idempotent identically on
+  both backends (ADR-048 finding).** On Linux/epoll, calling `add_fd` on an fd
+  already registered in that epoll instance fails (`EEXIST`) — silently, if the
+  caller discards the return value — while the Windows backend's `add_fd`
+  unconditionally overwrites the stored handler, masking the same bug class.
+  **Caller obligation until this is hardened**: always `del_fd` a live fd before
+  re-`add_fd`-ing it (e.g. swapping a connection's fd during a relay↔direct
+  cutover, 010/ADR-048). Getting this wrong silently mutes the re-registered
+  connection and busy-spins the I/O thread on Linux, while working by accident
+  on Windows — exactly the cross-backend behavioral divergence "the one rule"
+  above exists to prevent. Making `add_fd` idempotent/replace-semantics on both
+  backends is a named follow-on hardening item, not yet done.
 
 ### Advanced I/O tier (ADR-026, proven)
 
@@ -248,3 +260,7 @@ consistent with the whole-RFC posture.
   see "Support matrix" above, ADR-026.)*
 - Whether `SimEngine` uses build-time backend selection or the templated
   `Engine<Pal>` form for in-process coexistence with a real engine in one test.
+- **`IoContext::add_fd`/`del_fd` idempotency hardening** (ADR-048) — make
+  `add_fd` on an already-registered fd either safe-replace or a checked error on
+  both backends, closing the current caller-obligation footgun documented in
+  "2. Async I/O event loop + sockets" above.

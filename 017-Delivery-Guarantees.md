@@ -202,3 +202,27 @@ per-item identity, distinct from a scalar reply's `MessageId`:
   durability claim** across a real callee crash.
 - The **fan-in deriving-reply hazard** above (a forwarded/derived reply through an
   effectively-once pipeline) applies unchanged to reply items and **remains open**.
+
+## Relay-routed peer ordering (ADR-048)
+
+A peer reached only through a relay hop (010's direct↔relay endpoint fallback,
+`TcpTransport`'s `DirectThenRelay<TimeoutMs>`) is still one logical peer for FIFO
+purposes: **its ordering guarantee must be preserved across a recovery-triggered
+cutover from relay back to direct — no reordering, no duplication.** The required
+mechanism shape is a **fenced cutover that never splices mid-frame**, deferred
+until the in-flight relay-hop frame has fully left the wire — an out-of-band
+probe connection proves direct reachability first, then the live `Conn`'s fd is
+swapped in place. A naive "flip the routing decision on the next successful
+reconnect" cutover was proposed, built, and **proven to reorder 50–57% of
+in-flight frames** (ADR-048): any frame enqueued in the window between the
+fallback threshold firing and the routing flip taking effect is queued to the
+stale hop and can arrive after dozens of frames sent correctly on the new hop.
+That failure mode disqualified the design that produced it.
+
+Separately, **a proactive give-up — abandoning a still-`Connecting` direct
+attempt at a wall-clock deadline to redirect to relay — is a new, disclosed
+trigger of this spec's existing at-most-once loss contract, not an exception to
+it.** Today's forever-retrying direct connect never discards an attempt that
+might have completed a moment later; `DirectThenRelay<TimeoutMs>` deliberately
+does, in exchange for a bounded time-to-relay. This is within the delivery-
+guarantee contract as specified, not a new gap in it.

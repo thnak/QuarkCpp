@@ -339,6 +339,35 @@ explicit follow-on, mirroring ADR-019's own cross-node-broadcast Draft status �
 not silently assumed to already work at that scale. 021's one-connection-per-peer
 invariant is unaffected either way: no new socket, same shared control channel.
 
+### Relay transport endpoint fallback (010, ADR-048)
+
+010's `TcpTransport` `DirectThenRelay<TimeoutMs>` policy (ADR-048) answers *how*
+a node falls back from a direct connection to a relay hop and recovers back; it
+deliberately does **not** answer how a peer's designated relay `Endpoint` is
+learned or kept current — that is explicitly deferred to this spec, as a named
+non-goal of ADR-048:
+
+- **Relay-node discovery/advertisement** — static config today (an operator
+  supplies a peer's relay `Endpoint` up front); riding SWIM's existing
+  capability-gossip piggyback channel (ADR-045, "Capability gossip beyond
+  placement" above) is the natural follow-on, so a relay-capable node's
+  advertised capability set gains a `can_relay` flag alongside the existing
+  static label/flag/scalar vocabulary — not yet designed.
+- **Relay-node health/failover** — out of scope today. If the relay itself
+  becomes unreachable while a peer is relay-routed, that peer's frames dead-end
+  at the (forever-retrying) relay `Conn` with no distinct signal beyond
+  `TcpTransport`'s existing `drops_`/`reconnects_` counters — an operator
+  cannot currently distinguish "relay is down" from "peer is down" from
+  diagnostics alone. Multi-relay selection/failover is unbuilt.
+- **Relay trust boundary** — the relay node sees routing metadata (`from`/`to`
+  `NodeId`) for every frame it forwards, even under `SecureTransport`'s AEAD
+  sealing (which protects payload, not routing). Whether relay participation
+  needs authentication beyond ordinary peer mTLS (ADR-040) is undecided.
+
+A future relay-discovery ADR should only need to address these three items —
+the fallback-threshold mechanism itself (`resolve_dial_endpoint()`, the fenced
+relay↔direct cutover) is settled and should not be re-litigated.
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping
@@ -447,3 +476,8 @@ here is compiled into a single-node engine.
   simultaneously unreachable, a *new* node cannot join even though the cluster is
   healthy — is a healthy member promoted to an ad-hoc contact, or is that purely a
   `Discovery`-adapter concern?
+- **Relay-node discovery, health/failover, and trust boundary** (010, ADR-048) —
+  see "Relay transport endpoint fallback" above. The fallback-threshold mechanism
+  is settled; how a peer's relay `Endpoint` is learned/kept current, what happens
+  when the relay itself is unreachable, and the relay's own authentication
+  posture beyond ordinary peer mTLS are open.

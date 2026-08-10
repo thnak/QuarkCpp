@@ -150,6 +150,15 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 > is pinned and proven CORRECT end-to-end, but only against a mock cipher (no production AEAD
 > wired yet) and only over loopback (no real-network loss/reorder/jitter run yet).
 >
+> **Distribution (010) gained a third transport shape: relay fallback for NAT/firewalled peers.**
+> `TcpTransport` picked up `DirectThenRelay<TimeoutMs>` — a wall-clock give-up threshold that
+> redirects a peer's dial target to a designated relay node's `Endpoint` when direct connect
+> never succeeds, with a fenced relay↔direct cutover on recovery — entirely within `TcpTransport`
+> (no new `Transport` subclass; the relay side is a thin forwarding hook)
+> ([ADR-048](decisions/ADR-048-relay-transport-fallback-policy.md), **Accepted**). A competing
+> count-based threshold was disqualified after being proven to reorder frames on recovery.
+> Relay-node discovery, health/failover, and trust boundary remain open (021).
+>
 > **Still Draft (3):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
 > whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
 > Zen4/SPR reference re-baseline and the ARM64 ratio; **028 (Voice channel)** is Draft pending
@@ -489,6 +498,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-041](decisions/ADR-041-mailbox-mpsc-hot-path-r11-judgment.md) | Mailbox MPSC hot path (round 11) | Winner **unchanged** (11th round, incumbent's 11th survival). SegRing-LCRQ (purpose-built to fix three prior challengers' defects) disqualified — a *third*, previously-unseen UAF window surfaced during Prove on already-once-revised reclamation code, plus a livelock as submitted. ReversingTreiber/BR (7th defeat of this lineage) conceded fatal pre-Prove: 100% reversed dispatch order, p999 breaches the 50µs ceiling. Incumbent 11/12 proven CORRECT (1 INCONCLUSIVE — host-conditional latency reporting, not a falsified number). |
 | [ADR-042](decisions/ADR-042-ipv6-endpoint-locator-widening.md) | IPv6 support — PAL network seam + cluster `Endpoint` locator widening (010/019) | **Tagged-Union `IpAddr`** — `pal::IpAddr{family; 16-byte array}` becomes `Endpoint::addr`'s type directly (`Endpoint` grows 24B→32B); a converting `IpAddr(uint64_t)` ctor reproduces legacy IPv4 decoding exactly, so every existing call site recompiles with zero source edits; both PAL backends gain a family-branching `to_sockaddr()` codec; `dual_stack` opt-in (default off). 8/8 proven CORRECT, mailbox/dispatch hot path unaffected within noise. A competing always-128-bit/dual-stack-by-default design is **disqualified** — it silently breaks pure-IPv4 deployments on any host with IPv6 restricted at the kernel level. Residual: no `scope_id` yet; SWIM/gossip wire format not yet v6-extended. |
 | [ADR-044](decisions/ADR-044-principal-propagation-envelope-pool.md) | Principal propagation into handler `MessageContext` (020) | **Flag-Gated Envelope Pool** — wire-arrived, non-anonymous `Principal` routes through a second, wire-scale `EnvelopePool` (reusing ADR-037's Cell-first-member/fixed-offset idiom), gated by one previously-unused bit in the existing `gen_state` flags subfield; `Descriptor` itself stays untouched at its real, ten-times-proven 56-byte layout. Wired at all four real dispatch sites (plain/governed Sequential drain, Reentrant admit, 007 supervised-restart redelivery). A retrofit of ADR-007's `ctx_`-pointer-into-payload-arena mechanism is disqualified — its own control proved a same-node local forward silently drops the propagated principal. |
+| [ADR-048](decisions/ADR-048-relay-transport-fallback-policy.md) | RelayTransport: direct-vs-relay endpoint fallback threshold policy (010) | **`DirectThenRelay<TimeoutMs>`** — a wall-clock give-up threshold (one-shot `io_.post_after` timer armed at first `Connecting`) that redirects a peer's dial target from its own `Endpoint` to a designated relay node's, entirely within `TcpTransport` (no new `Transport` subclass; relay-side forwarding is a thin `on_receive()` hook, decorator-shaped like `SecureTransport`). 7/7 claims proven CORRECT, incl. two real integration bugs found and fixed against the actual source (`do_reconnect()` not wired to the relay resolver; a silent Linux/epoll `EEXIST` on fd cutover). A competing count-based threshold (`DirectThenRelay<MaxAttempts>`) is **disqualified** — proven to reorder 50–57% of in-flight frames on relay→direct recovery. A templated hybrid alternative also fully proved but lost on footprint (requires `TcpTransport<FallbackPolicy>` plus 4 call-site migrations). |
 
 </details>
 

@@ -395,6 +395,43 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   `fiber<>` adapter is built on this seam; see [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)'s
   residual risk #7 for the full record.
 
+- **RelayTransport direct-vs-relay endpoint fallback threshold** (010/019/021,
+  raised while starting an ADR for a third transport shape) — resolved in
+  [ADR-048](decisions/ADR-048-relay-transport-fallback-policy.md) by a 3-design
+  debate-prove (21 CORRECT / 1 disproven, real C++23 + MSVC/clang++ + ASan/UBSan).
+  The architecture was settled up front (not re-litigated in the debate): **no
+  new `Transport` subclass** — client side is an endpoint-fallback policy (which
+  `Endpoint` `TcpTransport` dials for a peer, its own listener vs. a designated
+  relay node's), relay side is a thin `on_receive()` forwarding hook decorator-
+  shaped like `SecureTransport`. The debate settled only the **fallback-threshold
+  policy**: winner is **`DirectThenRelay<TimeoutMs>`**, a wall-clock give-up
+  deadline (`DrainBudget<N>`-style compile-time tag resolved once to a runtime
+  `int64_t`) backstopped by a one-shot `io_.post_after` timer, with a fenced,
+  never-mid-frame relay↔direct recovery cutover. A competing count-based
+  threshold (`DirectThenRelay<MaxAttempts>`) is **disqualified** — proven to
+  reorder 50–57% of in-flight frames across a mid-flight recovery, a direct
+  violation of this ADR's own MUST invariant (a naive "flip on next reconnect"
+  cutover, not a rare race). A templated hybrid alternative also fully proved but
+  lost on architectural fit (requires `TcpTransport<FallbackPolicy>` plus a
+  disclosed migration at 4 existing call sites, where the winner needs zero).
+  Cross-examination against the *real* source (not pseudocode) caught and fixed
+  two integration bugs in the winning design before it could win:
+  `do_reconnect()` wasn't wired to the relay-endpoint resolver, and the fd
+  cutover was missing `del_fd` before `add_fd`, which silently fails (`EEXIST`)
+  on the real Linux/epoll PAL backend — the second finding is now a documented
+  019 PAL invariant/hardening item (see "Per-spec open questions" below).
+  Folded into 010/017/019/021. **Non-goals, deferred to a follow-on ADR:**
+  relay-node discovery/advertisement (static config today; SWIM capability-gossip
+  piggyback per ADR-045 is the natural extension), relay-node health/failover,
+  relay-hop backpressure semantics (hop-local vs. end-to-end through the relay),
+  and the relay node's own trust boundary (it sees routing metadata for every
+  frame it forwards, even under `SecureTransport`'s AEAD sealing). **Residual:**
+  the epoll `EEXIST` mechanism was verified by source inspection, not reproduced
+  directly (no Linux box in the proving session) — a Linux CI leg exercising the
+  same recovery scenario is the concrete tie-breaking experiment owed; no TSan
+  leg was available for any design this round (stated MSVC-ABI toolchain
+  constraint, substituted per `VERIFICATION.md`'s Windows exclusion policy).
+
 ## Highest-leverage unresolved questions
 
 These affect multiple subsystems; resolving one constrains several specs.
@@ -572,7 +609,7 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   configurable compile-time `HistogramSpec`, closed-form bucket lookup, Validation-capped
   `bucket_count`, ADR-022. Cardinality control: resolved — per-type always-on grid + opt-in
   per-instance `PerInstanceMetrics<N>` over a build-time-sized critical-arena, ADR-022.)*
-- **010** — **cross-node backpressure** (the named residual keeping 010 at *Accepted core* rather than full Accepted). *(Cross-node FIFO-under-relay: resolved — proven, ADR-011. Re-placement granularity: resolved, 026. Split-brain effect safety: resolved via fencing, 017; transport per-OS via the PAL; formation/bootstrap/connection-lifecycle/elastic-scale: resolved, 021.)*
+- **010** — **cross-node backpressure** (the named residual keeping 010 at *Accepted core* rather than full Accepted). *(Cross-node FIFO-under-relay: resolved — proven, ADR-011. Re-placement granularity: resolved, 026. Split-brain effect safety: resolved via fencing, 017; transport per-OS via the PAL; formation/bootstrap/connection-lifecycle/elastic-scale: resolved, 021. Direct-vs-relay endpoint fallback for NAT/firewalled peers: resolved — `DirectThenRelay<TimeoutMs>`, ADR-048; relay-node discovery/health/trust boundary remain open, 021.)*
 - **011** — shard-fairness/starvation under `shard_count > worker_count` (tracked against
   002/ADR-010 — not a wheel-design gap; the timekeeper's targeted wake cannot rescue a worker
   that's busy rather than parked). *(Wheel granularity/tier sizing vs. deadline precision, and
@@ -601,7 +638,15 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   scatter-gather I/O and registered-buffer generality: resolved — one mandatory Tier-1
   baseline plus a named Tier-2 extension point (`advanced_io()`/`AdvancedIo`), byte-identical
   caller source across backends, ADR-026. Minimum OS versions and the fallback matrix:
-  resolved, ADR-026.)*
+  resolved, ADR-026.)* `IoContext::add_fd`/`del_fd` idempotency hardening (ADR-048's
+  Linux/epoll `EEXIST`-vs-Windows-overwrite asymmetry finding) is a new, unresolved
+  follow-on item.
+- **021** — relay-node discovery/advertisement, health/failover, and trust boundary
+  for 010's `DirectThenRelay<TimeoutMs>` (ADR-048) — the fallback-threshold mechanism
+  itself is settled; how a peer's relay `Endpoint` is learned/kept current (SWIM
+  capability-gossip piggyback, ADR-045, is the natural extension), relay-down
+  diagnostics, and relay authentication beyond ordinary peer mTLS (ADR-040) remain
+  open. See 021's own "Open questions" for the itemized list.
 
 ## Not yet specced at all
 
