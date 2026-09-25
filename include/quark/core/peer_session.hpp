@@ -15,9 +15,18 @@
 //
 // Directional ciphers (C4): a real mTLS exporter derives distinct client-write/server-write traffic
 // secrets, so send_cipher_ and recv_cipher_ are genuinely different keys, not one shared cipher.
+//
+// PER-LANE SEQUENCE SPACES (issue #16): the send seq and the receive high-water mark are kept once
+// PER LANE (data, control), not once per session. The inner transport may legitimately reorder
+// ACROSS lanes — TcpTransport's ADR-046 S4 control-priority queue sends a later-sealed control frame
+// ahead of an earlier-sealed, still-queued data frame — but preserves FIFO WITHIN a lane. One shared
+// seq space made the strict-monotonic guard reject the overtaken data frame as a "replay"; per-lane
+// spaces restore "seq order == wire-arrival order" exactly where the transport guarantees it.
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -49,15 +58,19 @@ public:
     [[nodiscard]] const Aead& send_cipher() const noexcept { return *send_cipher_; }
     [[nodiscard]] const Aead& recv_cipher() const noexcept { return *recv_cipher_; }
 
-    // Draws the next outbound sequence number. Combined with the caller holding session_mu() across
-    // seal()+wire-handoff, this is what makes seq order and wire-arrival order agree (the required fix).
-    [[nodiscard]] std::uint64_t next_send_seq() noexcept { return ++send_seq_; }
+    // Independent sequence spaces, one per transport lane (banner above). `lane` < kLanes.
+    static constexpr std::size_t kLanes = 2;
 
-    // Per-session strictly-increasing replay guard: accepts iff seq > current high-water mark, and
-    // advances the mark on acceptance. Same semantics as the pre-ADR-040 recv_high_ map entry.
-    [[nodiscard]] bool accept_recv_seq(std::uint64_t seq) noexcept {
-        if (seq <= recv_high_) return false;
-        recv_high_ = seq;
+    // Draws the next outbound sequence number on `lane`. Combined with the caller holding session_mu()
+    // across seal()+wire-handoff, this is what makes seq order and wire-arrival order agree within a
+    // lane (the required fix).
+    [[nodiscard]] std::uint64_t next_send_seq(std::size_t lane) noexcept { return ++send_seq_[lane]; }
+
+    // Per-session, per-lane strictly-increasing replay guard: accepts iff seq > that lane's high-water
+    // mark, and advances the mark on acceptance.
+    [[nodiscard]] bool accept_recv_seq(std::size_t lane, std::uint64_t seq) noexcept {
+        if (seq <= recv_high_[lane]) return false;
+        recv_high_[lane] = seq;
         return true;
     }
 
@@ -97,8 +110,8 @@ public:
         recv_cipher_ = std::move(recv_cipher);
         generation_ = generation;
         peer_fingerprint_ = peer_fingerprint;
-        send_seq_ = 0;
-        recv_high_ = 0;
+        send_seq_ = {};
+        recv_high_ = {};
         frames_sealed_on_key_ = 0;
         renegotiated_at_ns_ = now_ns;
     }
@@ -115,8 +128,8 @@ private:
     std::shared_ptr<const Aead> recv_cipher_;
     std::uint64_t generation_;
     Fingerprint peer_fingerprint_;
-    std::uint64_t send_seq_ = 0;
-    std::uint64_t recv_high_ = 0;
+    std::array<std::uint64_t, kLanes> send_seq_{};
+    std::array<std::uint64_t, kLanes> recv_high_{};
     std::uint64_t frames_sealed_on_key_ = 0;
     std::atomic<bool> revoked_{false};
     std::int64_t renegotiated_at_ns_ = 0;

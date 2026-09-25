@@ -11,6 +11,13 @@
 // replace it): 017 dedups at-least-once RETRIES by message id; this rejects an ADVERSARIAL replay at
 // the wire, before decode.
 //
+// PER-LANE SEQ SPACES (issue #16): the seq is strictly increasing PER LANE (data vs control, chosen by
+// `FrameKind`), not per session. The inner transport may reorder ACROSS lanes — TcpTransport's ADR-046
+// S4 queue lets later-sealed control frames (SWIM pings) overtake an earlier-sealed, still-queued
+// data frame — but keeps each lane FIFO, so a single shared seq made the guard drop the overtaken data
+// frame as a "replay". The lane is bound into the AAD (a frame moved to the other lane fails the tag)
+// and into the nonce's top bit (the two lanes never reuse a nonce under the same key).
+//
 // ADR-040's REQUIRED FIX (same-session send-path ordering): per-peer state lives in a `PeerSession`
 // (peer_session.hpp), each with its OWN mutex. `send()` holds that session's lock across seq-draw +
 // AEAD-seal + wire-handoff, so concurrent senders on the SAME session can never have their seq order
@@ -174,8 +181,9 @@ public:
         }
     }
 
-    // Seal the payload and forward. AAD = {from,to,target,msg_type,seq} so a frame replayed to another
-    // target / with a mutated header / mutated seq fails the tag. `seq` is the per-peer session counter.
+    // Seal the payload and forward. AAD = {from,to,target,msg_type,lane,seq} so a frame replayed to
+    // another target / with a mutated header / mutated lane / mutated seq fails the tag. `seq` is the
+    // per-peer session counter for this frame's lane (lane_of).
     //
     // ADR-040 required fix: the session's OWN lock spans seq-draw + seal + wire-handoff, so concurrent
     // senders on this SAME session can never have wire-arrival order diverge from seq order. Different
@@ -198,9 +206,10 @@ public:
             ++revoked_dropped_;
             return;
         }
-        const std::uint64_t seq = session->next_send_seq();
-        const std::uint64_t nonce = nonce_for(self_, to, seq);
-        std::vector<std::byte> aad = build_aad(self_, to, frame, seq);
+        const std::size_t lane = lane_of(frame.kind);
+        const std::uint64_t seq = session->next_send_seq(lane);
+        const std::uint64_t nonce = nonce_for(self_, to, lane, seq);
+        std::vector<std::byte> aad = build_aad(self_, to, frame, lane, seq);
 
         std::vector<std::byte> envelope;
         detail::put_u64_le(envelope, seq);  // seq travels in the clear (it is the nonce) but is AAD-bound
@@ -506,11 +515,12 @@ private:
         }
         const std::uint64_t seq = detail::get_u64_le(std::span<const std::byte>(frame.payload.data(), 8));
         const std::span<const std::byte> sealed(frame.payload.data() + 8, frame.payload.size() - 8);
-        const std::uint64_t nonce = nonce_for(frame.from, self_, seq);
+        const std::size_t lane = lane_of(frame.kind);
+        const std::uint64_t nonce = nonce_for(frame.from, self_, lane, seq);
 
-        // Reconstruct AAD from the RECEIVED header (the exact bytes the sender bound). A mutated header
-        // or seq yields a different AAD ⇒ the tag fails below.
-        std::vector<std::byte> aad = build_aad(frame.from, self_, frame, seq);
+        // Reconstruct AAD from the RECEIVED header (the exact bytes the sender bound). A mutated header,
+        // lane or seq yields a different AAD ⇒ the tag fails below.
+        std::vector<std::byte> aad = build_aad(frame.from, self_, frame, lane, seq);
 
         std::shared_ptr<PeerSession> session;
         if (handshake_factory_) {
@@ -535,9 +545,10 @@ private:
                                    "secure transport: AEAD open failed (tamper/wrong key)", 0});
                 return;
             }
-            // Per-session replay guard: strictly-increasing seq per sender. A replayed frame has seq <=
-            // the high-water mark ⇒ reject (composes with 017 dedup; stops an adversarial wire replay).
-            if (!session->accept_recv_seq(seq)) {
+            // Per-session, per-lane replay guard: strictly-increasing seq per sender per lane. A
+            // replayed frame has seq <= its lane's high-water mark ⇒ reject (composes with 017 dedup;
+            // stops an adversarial wire replay).
+            if (!session->accept_recv_seq(lane, seq)) {
                 replays_rejected_.fetch_add(1, std::memory_order_relaxed);
                 audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, frame.from.value,
                                    "secure transport: replayed sequence number rejected", 0});
@@ -549,23 +560,33 @@ private:
         if (receiver_) receiver_(std::move(frame));
     }
 
-    // A session-scoped nonce: fold the ordered (src,dst) pair with the seq. Both peers derive the same
-    // value from the frame's from/to, so open matches seal. Unique per (session, seq) — seq is strictly
-    // increasing, so a nonce never repeats within a session.
-    [[nodiscard]] static std::uint64_t nonce_for(NodeId src, NodeId dst, std::uint64_t seq) noexcept {
-        return detail::splitmix64(detail::hash_combine(src.value, dst.value)) ^ seq;
+    // The replay/seq lane a frame travels on — must match the inner transport's FIFO lanes (TcpTransport
+    // queues Control apart from everything else). Authenticate frames never reach the seq path.
+    [[nodiscard]] static constexpr std::size_t lane_of(FrameKind kind) noexcept {
+        return kind == FrameKind::Control ? 1 : 0;
     }
 
-    // AAD = the routing header the receiver must be able to trust: from, to, target actor, msg type, and
-    // the replay seq. Authenticated, not encrypted (routing needs it in the clear).
-    [[nodiscard]] static std::vector<std::byte> build_aad(NodeId from, NodeId to,
-                                                          const MessageFrame& f, std::uint64_t seq) {
+    // A session-scoped nonce: fold the ordered (src,dst) pair with (lane, seq), the lane in the top bit.
+    // Both peers derive the same value from the frame's from/to/kind, so open matches seal. Unique per
+    // (session, lane, seq) — seq is strictly increasing within a lane and never reaches 2^63, so the
+    // two lanes' nonce sets are disjoint and a nonce never repeats within a session.
+    [[nodiscard]] static std::uint64_t nonce_for(NodeId src, NodeId dst, std::size_t lane,
+                                                 std::uint64_t seq) noexcept {
+        return detail::splitmix64(detail::hash_combine(src.value, dst.value)) ^
+               (seq | (static_cast<std::uint64_t>(lane) << 63));
+    }
+
+    // AAD = the routing header the receiver must be able to trust: from, to, target actor, msg type, the
+    // seq lane, and the replay seq. Authenticated, not encrypted (routing needs it in the clear).
+    [[nodiscard]] static std::vector<std::byte> build_aad(NodeId from, NodeId to, const MessageFrame& f,
+                                                          std::size_t lane, std::uint64_t seq) {
         std::vector<std::byte> aad;
         detail::put_u64_le(aad, from.value);
         detail::put_u64_le(aad, to.value);
         detail::put_u64_le(aad, f.target.type.value);
         detail::put_u64_le(aad, f.target.key);
         detail::put_u64_le(aad, f.msg_type.value);
+        detail::put_u64_le(aad, static_cast<std::uint64_t>(lane));
         detail::put_u64_le(aad, seq);
         return aad;
     }

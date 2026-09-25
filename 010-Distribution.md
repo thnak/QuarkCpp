@@ -134,7 +134,11 @@ transport for one peer's session must be ordered atomically with respect to
 other same-session senders.** Assigning `seq` without serializing it through
 to wire submission permits wire-arrival order to diverge from `seq` order
 under concurrent same-session senders, causing genuine, non-replayed frames
-to be spuriously rejected by the strict-monotonic replay guard. The lock this
+to be spuriously rejected by the strict-monotonic replay guard. The same
+hazard exists *across* lanes: this transport sends control frames ahead of
+queued data (ADR-046 S4), so `seq` is strictly increasing **per lane**
+(data, control), matching the only order the wire actually preserves — FIFO
+within a lane (issue #16; `security_secure_transport_lane_reorder_test`). The lock this
 requires is scoped to one session's own mutex, never shared cluster-wide (see
 020-Security.md's "Rotation and revocation invariants") — one peer's crypto
 work never blocks another peer's session.

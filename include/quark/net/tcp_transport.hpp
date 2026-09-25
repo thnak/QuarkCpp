@@ -348,7 +348,9 @@ private:
     // connection retries it first — a torn, partially-sent frame (out_sent>0) cannot resume and is
     // dead-lettered (010 at-most-once). Every OTHER not-yet-started frame was never removed from
     // `outq_[peer]` in the first place (`load_next_frame` only pops one at a time), so nothing else
-    // needs salvaging here.
+    // needs salvaging here. Re-queuing a salvaged DATA frame on the control queue is safe for
+    // SecureTransport's per-lane replay guard (issue #16): the receiver picks the lane from the frame's
+    // own `kind`, and the salvaged frame is the OLDEST unsent data frame, so data-lane FIFO still holds.
     void salvage_out(Conn* c) {
         if (!c->out.empty() && c->out_sent == 0) outq_[c->peer.value].control.push_front(std::move(c->out));
         c->out.clear();
