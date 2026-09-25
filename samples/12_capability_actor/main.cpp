@@ -90,8 +90,8 @@ int main() {
         }
         ok &= (off_gpu == 0) && (hit[1] == M);  // all on node 1 (GPU∩eu)
         std::printf("GpuWorker Require<Gpu>+Prefer<eu>: n1=%llu n3=%llu n5=%llu  off-gpu=%llu  (all on n1, the GPU+eu node)\n",
-                    (unsigned long long)hit[1], (unsigned long long)hit[3],
-                    (unsigned long long)hit[5], (unsigned long long)off_gpu);
+                    static_cast<unsigned long long>(hit[1]), static_cast<unsigned long long>(hit[3]),
+                    static_cast<unsigned long long>(hit[5]), static_cast<unsigned long long>(off_gpu));
     }
 
     // ---- 2) Require<Gpu> ALONE (no zone preference): spreads across all GPU nodes {1,3,5}. -----
@@ -105,8 +105,8 @@ int main() {
         }
         ok &= (off_gpu == 0) && hit[1] > 0 && hit[3] > 0 && hit[5] > 0;
         std::printf("Require<Gpu> only:                n1=%llu n3=%llu n5=%llu  off-gpu=%llu  (balanced over all GPU nodes)\n",
-                    (unsigned long long)hit[1], (unsigned long long)hit[3],
-                    (unsigned long long)hit[5], (unsigned long long)off_gpu);
+                    static_cast<unsigned long long>(hit[1]), static_cast<unsigned long long>(hit[3]),
+                    static_cast<unsigned long long>(hit[5]), static_cast<unsigned long long>(off_gpu));
     }
 
     // ---- 3) FpgaWorker: nobody has "fpga" => empty eligible set => a graceful error, not UB. ---
@@ -138,8 +138,8 @@ int main() {
         const double share3 = static_cast<double>(hit[3]) / static_cast<double>(M);
         ok &= (share3 > 0.55 && share3 < 0.78);
         std::printf("Weighted (n3 weight=4x): n1=%llu n2=%llu n3=%llu  (n3 share=%.1f%%, expected ~66.7%%)\n",
-                    (unsigned long long)hit[1], (unsigned long long)hit[2],
-                    (unsigned long long)hit[3], share3 * 100);
+                    static_cast<unsigned long long>(hit[1]), static_cast<unsigned long long>(hit[2]),
+                    static_cast<unsigned long long>(hit[3]), share3 * 100);
     }
 
     std::printf("%s\n", ok ? "OK" : "FAIL");

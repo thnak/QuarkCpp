@@ -130,7 +130,7 @@ inline constexpr std::uint64_t ipv4_loopback = ipv4(127, 0, 0, 1);
 
 inline std::expected<void, std::error_code> set_nonblocking(fd_t s) noexcept {
     u_long mode = 1;
-    if (::ioctlsocket(s, FIONBIO, &mode) != 0) return std::unexpected(last_error());
+    if (::ioctlsocket(s, static_cast<long>(FIONBIO), &mode) != 0) return std::unexpected(last_error());
     return {};
 }
 

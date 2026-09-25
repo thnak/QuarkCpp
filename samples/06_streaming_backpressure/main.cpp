@@ -74,15 +74,15 @@ int main() {
         if (!seen[i]) ++missing;
 
     std::printf("streamed %llu frames through a %u-slot ring\n",
-                (unsigned long long)kFrames, kCapacity);
-    std::printf("  FIFO inversions : %llu  (expected 0)\n", (unsigned long long)inversions);
-    std::printf("  torn payloads   : %llu  (expected 0)\n", (unsigned long long)torn);
-    std::printf("  duplicates      : %llu  (expected 0)\n", (unsigned long long)dup);
-    std::printf("  missing frames  : %llu  (expected 0)\n", (unsigned long long)missing);
+                static_cast<unsigned long long>(kFrames), kCapacity);
+    std::printf("  FIFO inversions : %llu  (expected 0)\n", static_cast<unsigned long long>(inversions));
+    std::printf("  torn payloads   : %llu  (expected 0)\n", static_cast<unsigned long long>(torn));
+    std::printf("  duplicates      : %llu  (expected 0)\n", static_cast<unsigned long long>(dup));
+    std::printf("  missing frames  : %llu  (expected 0)\n", static_cast<unsigned long long>(missing));
     std::printf("  max occupancy   : %llu  (bounded by capacity %u — backpressure held)\n",
-                (unsigned long long)max_occupancy, kCapacity);
+                static_cast<unsigned long long>(max_occupancy), kCapacity);
     std::printf("  backpressure stalls: %llu  (>0 — the producer was throttled, losslessly)\n",
-                (unsigned long long)backpressure_stalls);
+                static_cast<unsigned long long>(backpressure_stalls));
 
     const bool ok = inversions == 0 && torn == 0 && dup == 0 && missing == 0 &&
                     max_occupancy <= kCapacity && backpressure_stalls > 0;

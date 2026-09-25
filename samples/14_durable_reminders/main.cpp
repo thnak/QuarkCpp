@@ -20,6 +20,7 @@
 //
 // Build:  cmake -B build -DQUARK_BUILD_SAMPLES=ON && cmake --build build --target 14_durable_reminders
 // Run  :  taskset -c 0-3 build/samples/14_durable_reminders
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -71,8 +72,11 @@ int main() {
     // --- 3: DURABILITY across a restart ----------------------------------------------------------
     {
         namespace fs = std::filesystem;
-        char tmpl[] = "/tmp/quark_sample14_XXXXXX";
-        const std::string dir = ::mkdtemp(tmpl);
+        // Portable scratch dir (POSIX mkdtemp has no Windows equivalent): OS temp dir + a clock stamp.
+        const std::string dir = (fs::temp_directory_path() /
+            ("quark_sample14_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+            .string();
+        fs::create_directories(dir);
         const std::string path = dir + "/reminders.qrem";
 
         std::printf("3. durability across a restart (FileReminderStore at %s):\n", path.c_str());

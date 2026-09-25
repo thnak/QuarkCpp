@@ -84,7 +84,7 @@ int main() {
         else if (owner.value == 2 && !key_on_2) key_on_2 = k;
     }
     std::printf("placement: key %llu -> node 1, key %llu -> node 2\n",
-                (unsigned long long)key_on_1, (unsigned long long)key_on_2);
+                static_cast<unsigned long long>(key_on_1), static_cast<unsigned long long>(key_on_2));
 
     LoopbackFabric fabric;
     ClusterNode n1(NodeId{1}, fabric, key_on_1);  // node 1 hosts the node-1-owned Logger
@@ -103,7 +103,7 @@ int main() {
         const bool no_wire = fabric.sends() == wire_before;
         ok &= no_wire && n1.dist->is_local(actor_id_of<Logger>(key_on_1));
         std::printf("local  send x%d -> node 1: delivered=%d, wire frames used=%llu  (expected 0 — local fast path)\n",
-                    N, n1.actor.count.load(), (unsigned long long)(fabric.sends() - wire_before));
+                    N, n1.actor.count.load(), static_cast<unsigned long long>(fabric.sends() - wire_before));
     }
 
     // ---- REMOTE: node 1 sends to the node-2-owned Logger. Serialized, crosses the transport. ----
@@ -120,7 +120,7 @@ int main() {
             if (n2.actor.got[static_cast<std::size_t>(i)] != i) ordered = false;
         ok &= ordered;
         std::printf("remote send x%d -> node 2: delivered=%d, wire frames used=%llu  (expected %d), FIFO=%s\n",
-                    N, n2.actor.count.load(), (unsigned long long)used, N, ordered ? "intact" : "BROKEN");
+                    N, n2.actor.count.load(), static_cast<unsigned long long>(used), N, ordered ? "intact" : "BROKEN");
     }
 
     n1.eng.stop();

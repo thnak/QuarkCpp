@@ -74,7 +74,7 @@ int main() {
         auto recovered = recover_snapshot<AccountState>(store, id, AccountState{});
         ok &= recovered.has_value() && recovered->state == live;
         std::printf("[snapshot]  recovered balance=%llu owner=%s txns=%zu  (bit-identical: %s)\n",
-                    (unsigned long long)recovered->state.balance, recovered->state.owner.c_str(),
+                    static_cast<unsigned long long>(recovered->state.balance), recovered->state.owner.c_str(),
                     recovered->state.txns.size(), (recovered->state == live) ? "yes" : "NO");
     }
 
@@ -100,8 +100,8 @@ int main() {
         ok &= rec.has_value() && rec->state.balance == online.balance &&
               rec->state.applied == online.applied;
         std::printf("[events]    committed %d events; replayed balance=%lld applied=%llu  (== online %lld: %s)\n",
-                    N, (long long)rec->state.balance, (unsigned long long)rec->state.applied,
-                    (long long)online.balance,
+                    N, static_cast<long long>(rec->state.balance), static_cast<unsigned long long>(rec->state.applied),
+                    static_cast<long long>(online.balance),
                     (rec->state.balance == online.balance) ? "yes" : "NO");
     }
 
@@ -121,7 +121,7 @@ int main() {
         const bool fenced = !a_stale.has_value() && a_stale.error().code == errc::unavailable;
         ok &= fenced && b_ok.has_value();
         std::printf("[fencing]   A=token%llu B=token%llu; stale A write refused: %s; B write ok: %s\n",
-                    (unsigned long long)a.value, (unsigned long long)b.value,
+                    static_cast<unsigned long long>(a.value), static_cast<unsigned long long>(b.value),
                     fenced ? "yes (errc::unavailable)" : "NO (double-write!)",
                     b_ok.has_value() ? "yes" : "NO");
     }

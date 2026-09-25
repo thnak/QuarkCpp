@@ -17,17 +17,17 @@ using namespace quark;
 namespace {
 
 struct Compute {
-    long token;  // caller identity — the reply must echo f(token), never another caller's
+    long long token;  // caller identity — the reply must echo f(token), never another caller's
 };
 
 struct Server : Actor<Server, Sequential> {
-    using protocol = Protocol<Ask<Compute, long>>;
+    using protocol = Protocol<Ask<Compute, long long>>;
     // A pure per-request transform: the reply is uniquely determined by the request token, so any
     // cross-caller misroute is detectable by the caller comparing against its own expected value.
-    void handle(const Ask<Compute, long>& m) noexcept { m.respond(m.query.token * 2654435761L + 7L); }
+    void handle(const Ask<Compute, long long>& m) noexcept { m.respond(m.query.token * 2654435761LL + 7LL); }
 };
 
-constexpr long expected_for(long token) noexcept { return token * 2654435761L + 7L; }
+constexpr long long expected_for(long long token) noexcept { return token * 2654435761LL + 7LL; }
 
 }  // namespace
 
@@ -55,8 +55,8 @@ int main() {
     for (int t = 0; t < kThreads; ++t) {
         callers.emplace_back([&, t] {
             for (int i = 0; i < kPerThread; ++i) {
-                const long token = static_cast<long>(t) * 1'000'000L + i;
-                result<long> r = block_on(ref.ask<long>(Compute{token}));
+                const long long token = static_cast<long long>(t) * 1'000'000LL + i;
+                result<long long> r = block_on(ref.ask<long long>(Compute{token}));
                 if (!r.has_value()) {
                     failures.fetch_add(1, std::memory_order_relaxed);
                 } else if (r.value() != expected_for(token)) {

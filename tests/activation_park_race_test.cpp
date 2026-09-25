@@ -235,9 +235,10 @@ int main() {
             (ok && teeth_ok) ? "OK (correctly reproduced the race — teeth confirmed)" : "FAIL", kIters,
             widened, resumed_ok, stuck);
         return (ok && teeth_ok) ? 0 : 1;
+    } else {
+        std::printf(
+            "activation_park_race_test: %s  (iters=%d widened=%d resumed_ok=%d STUCK=%d)\n",
+            ok ? "OK" : "FAIL", kIters, widened, resumed_ok, stuck);
+        return ok ? 0 : 1;
     }
-    std::printf(
-        "activation_park_race_test: %s  (iters=%d widened=%d resumed_ok=%d STUCK=%d)\n",
-        ok ? "OK" : "FAIL", kIters, widened, resumed_ok, stuck);
-    return ok ? 0 : 1;
 }
