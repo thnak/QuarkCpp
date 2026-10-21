@@ -106,6 +106,25 @@ The TCP-transport and cluster-relay tests (`tcp_frame_codec_test`, `tcp_transpor
 `cluster_dial_dedup_test`) are present and green in **every** config above, including under TSan — the
 default TCP transport (010/019/021) is race-free, leak-free, and UB-free over real loopback sockets.
 
+**Impaired-network runs (2026-10-21, bare-metal Ubuntu 26.04, 28 cores, g++ 15.2; Clang 21.1 also
+208/208).** `tests/netem/run_matrix.sh` runs the 10 real-socket tests (`tcp_*`, the three
+SecureTransport socket tests, `security_rotation_sweep_test`, `voice_channel_loopback_test`) in a
+fresh network namespace per test. It applies `tc netem` to that namespace's private loopback, so the
+tests run unchanged and the host's network is untouched. All 9 profiles passed 10/10 in each of 3
+runs: baseline, 5 ms±2 ms, 50 ms±10 ms, 1% loss, 5% loss, 25% reordering, 1% duplicate + 0.1%
+corrupt, 1 Mbit, and a WAN mix (80 ms±20 ms, 0.5% loss, 2% reorder). Two harness fixes came out of the
+first pass. `tcp_transport_control_priority_test` now fails only on a 10 s stall in delivery, not
+after a flat 30 s, because its ~8 MiB backlog needs ~67 s on a 1 Mbit link; even when it timed out,
+the control frame had arrived **first** (index 0). The fresh namespace per test is needed because
+packets left queued in a rate-limited qdisc by one test delayed the next one's connection setup,
+which once made `tcp_transport_dial_dedup_test` look like it failed. Limit: Linux TCP retransmits and
+reorders below the transport, so these profiles exercise the transport's timing, reconnect and
+priority behavior, not frame parsing on a damaged stream.
+
+**Multi-process SWIM (2026-10-21).** `tests/netem/run_swim_chaos.sh` (5 processes, one per namespace,
+iptables partitions). Cluster formation and a 20%-loss flaky link pass. Partition heal and asymmetric
+link cuts **fail**: two SWIM defects, recorded under 021 in `OpenQuestions.md`, pending an ADR.
+
 The outbound-streaming-reply suite (`reply_stream_backpressure_test`, `reply_stream_concurrency_test`,
 `reply_stream_credit_merge_test`, `reply_stream_exactly_once_test`, `reply_stream_teardown_test`, ADR-018)
 and the broadcast suite (`topic_at_most_once_test`, `topic_payload_reclaim_test`,

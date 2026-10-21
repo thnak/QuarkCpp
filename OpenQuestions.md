@@ -602,6 +602,29 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   baseline plus a named Tier-2 extension point (`advanced_io()`/`AdvancedIo`), byte-identical
   caller source across backends, ADR-026. Minimum OS versions and the fallback matrix:
   resolved, ADR-026.)*
+- **021** — **two SWIM defects found 2026-10-21 by the first multi-process, real-packet-drop
+  harness** (`tests/netem/run_swim_chaos.sh`: 5 `swim_chaos_node` processes, one per Linux network
+  namespace, faults made with iptables/netem in the kernel). Neither shows up in the `cluster_swim_*`
+  unit tests. Those use a transport whose replies arrive in the same call stack, plus the
+  `set_link_reachable`/`set_online` switches, so they never see a delayed reply or a stale view
+  arriving after a heal.
+  1. **Healing a partition breaks the whole cluster (contradicts §1's "rejoining after a partition").**
+     `apply_update` lets `Dead` win over `Alive` at an *equal* incarnation, and `Dead` is terminal.
+     When a cut-off node heals, it gossips its stale "everyone is Dead" entries. Healthy nodes
+     accept those about *each other* before the subject can refute them. Measured: isolating
+     node 5 for 10 s, then healing, left node 1 at `*DDDD` within 3 s. A {1,2}|{3,4,5} split ended
+     with only the 4–5 pair still seeing each other. Separately, the `Join` handler's
+     `apply_update(subject, 0, Alive)` is a no-op for a node already marked `Dead`, so the healed
+     node can never get back in, even when it re-sends Join every 2 s.
+  2. **Indirect ping (`PingReq` relay) never works over a real transport.** The relay sends a Ping
+     and then checks `relay_got_ack_` straight away ("subject's Ack lands in this same call stack
+     (loopback)"). Over TcpTransport the Ack arrives later, after `relay_active_` has already been
+     reset, so it is dropped. Measured: with only the 1↔2 link cut and relays 3/4/5 healthy, nodes
+     1 and 2 kept suspecting and refuting each other about once a second (incarnation 1 → 31 in
+     22 s). The 1 s suspicion window is all that stops them being declared Dead.
+  Both change SWIM safety rules, so the fix goes through `design-debate-prove` → ADR, with
+  `run_swim_chaos.sh` as the acceptance test (every scenario must end with all nodes alive).
+  This is also the first concrete step on 014's multi-process distribution test tier.
 
 ## Not yet specced at all
 

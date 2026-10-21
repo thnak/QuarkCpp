@@ -312,3 +312,11 @@ if(NOT QUARK_WITH_MBEDTLS)
     message(STATUS "Quark: skipping security_mbedtls_symbol_isolation (dumpbin not found — non-MSVC toolchain)")
   endif()
 endif()
+
+# Multi-process SWIM chaos node (tests/netem/): one process per node, each in its own network
+# namespace, driven by tests/netem/run_swim_chaos.sh (needs sudo). Built but NOT registered with
+# CTest — partitions need root, which the correctness suite must not require.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(swim_chaos_node netem/swim_chaos_node.cpp)
+  target_link_libraries(swim_chaos_node PRIVATE quark::quark quark_warnings Threads::Threads)
+endif()
