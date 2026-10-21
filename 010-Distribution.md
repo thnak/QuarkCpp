@@ -71,6 +71,14 @@ suspicion. Excluding on suspicion would migrate actors off a node on every
 transient blip, the very thrash the stabilization window (021) exists to damp.
 A `Dead` node is excluded; a refuted node (higher incarnation) stays.
 
+Since [ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md) the view is
+precisely the **non-tombstone** set (`Alive`/`Suspect`). `Dead` is adopted only from a
+node's own suspicion timer, never from gossip; `Left` is a separate, authoritative
+graceful departure. The indirect ping is asynchronous: the correlation travels in the
+frames and relays keep no state, so a reply may arrive on any later frame. The relay
+round trip is 4 hops and must fit within `indirect_timeout_ns`. The full rule set is
+021 §3 "SWIM failure-detector rules".
+
 ### Alternatives considered
 
 - **External coordinator (etcd / Consul / ZooKeeper)**: strong consistency, but a
@@ -286,6 +294,8 @@ single-node build.
 **Accepted (x86-64, core)** — the placement + cross-node **FIFO data path** is proven
 (HRW/VirtualBins by ADR-006; FIFO-under-relay by ADR-011). **Cross-node backpressure is now
 resolved** ([ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md), below).
+SWIM membership now survives partition heals and runs its indirect ping over a real
+transport ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).
 
 ## Open questions
 

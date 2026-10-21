@@ -104,6 +104,20 @@ Beyond *node* identity, the cluster carries a **cluster id** and a monotonic
   on membership snapshots so a node rejoining after a partition can tell *stale*
   from *current* rather than resurrecting a departed view.
 
+**Rejoin semantics ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).**
+These rules are what make "a node rejoining after a partition can tell stale from
+current" hold:
+
+- **Dead is first-hand only.** A node writes Dead only from its own suspicion timer.
+  A Dead learned from gossip is a *hint*: it becomes Suspect and is checked with a
+  direct verify ping, so a healed node's stale "everyone is Dead" view cannot make
+  healthy nodes declare each other dead.
+- Dead and Left are **tombstones**, kept for `tombstone_ttl_ns` and then erased. A
+  tombstone is lifted only by an Alive/Suspect at a **strictly higher**
+  incarnation, or by a **Join whose subject is its sender**. The seed re-admits the
+  joiner at `max(presented, tombstone + 1)` and returns that incarnation in
+  `JoinAck`, so a restarted process (incarnation 1) rejoins in one round.
+
 ---
 
 ## 2. Connections — realizing "one connection per peer"
@@ -339,6 +353,48 @@ explicit follow-on, mirroring ADR-019's own cross-node-broadcast Draft status �
 not silently assumed to already work at that scale. 021's one-connection-per-peer
 invariant is unaffected either way: no new socket, same shared control channel.
 
+### SWIM failure-detector rules (ADR-048)
+
+The precedence and relay rules `SwimMembership` enforces, chosen in
+[ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md) after two defects
+were found on real separate processes (`tests/netem/run_swim_chaos.sh`): a healed
+partition broke the whole cluster apart, and the indirect ping never worked over
+`TcpTransport`.
+
+- **R1/R1b — first-hand Dead.** Only this node's suspicion timer writes Dead. A
+  second-hand Dead about a live peer is downgraded to Suspect and re-checked with one
+  direct verify ping (at most `verify_ping_budget` per tick).
+- **R2 — direct-contact veto.** A second-hand accusation at the *same* incarnation is
+  ignored if this node heard from the subject itself within `suspicion_timeout`.
+- **R3 — tombstones need a strictly higher incarnation.** An equal-incarnation Alive
+  never lifts a Dead/Left; a Join from the subject does (§1).
+- **R4' — accusation-targeted digest.** Each frame's digest carries the receiver's own
+  entry first (so an accusation reaches its subject, who refutes), then the sender's
+  self entry, then recently changed entries (Suspect first, each piggybacked on
+  `3·⌈log2(n+1)⌉` frames), then a rotating cursor over the sorted roster. At least
+  `⌈(max_gossip_updates − 2)/2⌉` slots are reserved for the cursor so a burst of
+  changes cannot starve coverage.
+- **R5' — probe-backs.** Up to `tombstone_probe_budget` Dead tombstones per tick are
+  re-pinged, each at least `tombstone_probe_interval_ns` apart, so a node that was
+  declared dead during a partition learns it on heal and refutes.
+- **R6' — Left band.** A graceful leave writes Left at `incarnation + 2^32`, which
+  outranks anything the node had before. A self-leave is never refuted.
+- **R7 — bounded tombstones.** Tombstones expire after `tombstone_ttl_ns` (default
+  60 s) and are capped at `max_tombstones` (Dead evicted before Left, oldest first).
+  **`tombstone_ttl_ns` must exceed the longest partition the deployment tolerates**:
+  once a tombstone expires, a stale Alive held by a long-partitioned peer can re-admit
+  the node until it is detected again.
+- **Stateless indirect ping.** A relay keeps no per-request state. It stamps the Ping
+  it forwards with the requester id and a keyed token; the subject echoes both in its
+  Ack, which may arrive on any later frame; the relay re-derives the token and only
+  then sends the PingReqAck. The relay round trip is 4 hops and must fit within
+  `indirect_timeout_ns` (default: `ack_timeout_ns`), measured as
+  `4d < ⌈indirect/tick⌉·tick` for one-way delay `d` — raise it on a WAN.
+
+All of these timers read the injected clock (018). Measured on the 5-process
+network-namespace rig: an isolated node and a {1,2}|{3,4,5} split both heal in about
+1 s; with only the 1↔2 link cut, nodes 1 and 2 never suspect each other.
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping
@@ -356,7 +412,8 @@ invariant is unaffected either way: no new socket, same shared control channel.
 - **Graceful drain (planned).** A leaving node announces intent → is removed from
   placement candidacy (no *new* actors land on it) → drains mailboxes and hands off
   its actors (above) → departs membership. In-flight work completes; nothing is
-  dead-lettered that didn't have to be.
+  dead-lettered that didn't have to be. Departing membership writes an authoritative
+  **Left** tombstone (R6' above); only the node's own Join re-admits it.
 - **Crash (unplanned).** SWIM detects (010), placement re-computes, actors
   re-activate elsewhere from the store (persistent) or cold (in-memory). The loss
   window is whatever the actor's `Delivery` (017) and `PersistMode` (012) allow —
@@ -373,6 +430,10 @@ the roll:
   without a flag day.
 - **Membership-protocol compatibility** — SWIM's on-wire format is versioned and
   back-compatible within a supported window (a support-policy open question).
+  **ADR-048 is outside that window:** it adds wire status 3 (Left) and relay-echo
+  fields in Ack. An older node treats Left as live, and an older subject does not echo
+  the relay token, so its indirect pings stay inert. Rolling across ADR-048 needs a
+  SWIM wire-version gate (not built yet) or a flag-day restart.
 
 The stabilization window above also means the brief per-node absence during its
 restart does not thrash placement across the rest of the cluster.
@@ -447,3 +508,8 @@ here is compiled into a single-node engine.
   simultaneously unreachable, a *new* node cannot join even though the cluster is
   healthy — is a healthy member promoted to an ad-hoc contact, or is that purely a
   `Discovery`-adapter concern?
+- **Tombstone TTL vs. longest tolerated partition (ADR-048).** `tombstone_ttl_ns`
+  (60 s) must exceed the longest partition a deployment rides out, or an expired
+  tombstone lets stale gossip briefly re-admit a departed node. Should the engine
+  assert it at startup against `2·(ack + indirect + suspicion)`, derive it from a
+  declared partition budget, or leave it as operational config?

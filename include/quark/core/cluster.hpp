@@ -1,5 +1,6 @@
 // Implements 021-Cluster-Formation-and-Lifecycle §1 (cluster identity + epoch), §2 (Discovery seam,
 // dial-dedup), §3 (SWIM failure detection, incarnation refutation, gossip, stabilization / anti-flap).
+// SWIM precedence, tombstones, rejoin and the stateless indirect-ping relay: ADR-048.
 // This is the std-only, in-process-testable CORE — the control-plane lifecycle that sits ON the 010
 // distribution seams (membership.hpp `Membership`, transport.hpp `Transport`) exactly as 010's own
 // core (distribution.hpp) split "std-only core + explicit adapter seams".
@@ -54,10 +55,12 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -137,7 +140,10 @@ private:
 // always has the sender's latest self-view (the substrate for refutation), plus a bounded piggybacked
 // gossip digest (`updates`).
 // ============================================================================================
-enum class MemberStatus : std::uint8_t { Alive = 0, Suspect = 1, Dead = 2 };
+// Dead and Left are TOMBSTONES (ADR-048): kept for `tombstone_ttl_ns` so stale gossip cannot resurrect
+// the node, then erased. Dead is adopted only first-hand (this node's own suspicion timer); Left is an
+// authoritative graceful departure (leave()), lifted only by the subject's own Join.
+enum class MemberStatus : std::uint8_t { Alive = 0, Suspect = 1, Dead = 2, Left = 3 };
 
 enum class ControlKind : std::uint8_t {
     Ping = 1,        // direct probe: are you alive?
@@ -458,7 +464,7 @@ public:
 
     struct Config {
         ClusterId cluster_id{};
-        std::int64_t ack_timeout_ns = 200'000'000;         // direct/indirect ack deadline
+        std::int64_t ack_timeout_ns = 200'000'000;         // direct ack deadline
         std::int64_t suspicion_timeout_ns = 1'000'000'000;  // Suspect → Dead with no refutation
         std::uint32_t indirect_k = 2;                        // relay peers for a ping-req
         std::uint32_t gossip_fanout = 3;                     // peers a gossip round targets
@@ -472,11 +478,29 @@ public:
         std::uint64_t congestion_low_watermark = 5'000;      // must fall below this before a new edge
         std::int64_t congestion_window_ns = 2'000'000'000;   // 2s — TTL stamped on a Congested frame
         std::int64_t congestion_refresh_ns = 500'000'000;    // 500ms — re-broadcast while still congested
+        // ADR-048: indirect-ping window, tombstone lifetime/cap, and the per-tick budgets for verify
+        // pings (a second-hand Dead re-checked directly) and probe-backs (a Dead tombstone re-pinged so
+        // a healed node learns it was declared dead and refutes). All timers use the injected clock.
+        // The relay round trip is 4 hops and must fit within the indirect window — raise it on a WAN.
+        std::int64_t indirect_timeout_ns = 0;                    // 0 ⇒ ack_timeout_ns
+        std::int64_t tombstone_ttl_ns = 60'000'000'000;          // must exceed the longest tolerated partition
+        std::uint32_t max_tombstones = 256;                      // hard cap; Dead evicted before Left
+        std::int64_t tombstone_probe_interval_ns = 500'000'000;  // min spacing per tombstone
+        std::uint32_t tombstone_probe_budget = 2;                // probe-backs per tick
+        std::uint32_t verify_ping_budget = 16;                   // verify pings per tick
     };
 
+    // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
+    // node could have had before it (ADR-048 R6'). u64 allows ~2^32 leave/rejoin cycles per identity.
+    static constexpr std::uint64_t kLeftBand = std::uint64_t{1} << 32;
+
     SwimMembership(NodeId self, Transport& transport, Config cfg)
-        : self_(self), transport_(&transport), cfg_(cfg) {
-        members_[self_.value] = Member{cfg.cluster_id, self_incarnation_, MemberStatus::Alive, 0};
+        : self_(self), transport_(&transport), cfg_(sanitize(cfg)) {
+        relay_key_ = detail::splitmix64(cfg_.seed ^ self_.value ^ 0x5E1A7ULL);
+        Member me{};
+        me.cluster = cfg_.cluster_id;
+        me.incarnation = self_incarnation_;
+        members_[self_.value] = me;
         republish();
         transport_->on_receive([this](MessageFrame f) { on_frame(std::move(f)); });
     }
@@ -577,10 +601,15 @@ public:
 
     // --- Join (021 §1/§3). Admit `joiner` iff its presented cluster id matches (accidental-merge
     // guard) — the in-process form of the join gate the 020 AUTHENTICATE step precedes. Returns true
-    // and advances the epoch on admission; false on cluster-id mismatch. Unit-testable directly. -----
+    // and advances the epoch on admission; false on cluster-id mismatch. Unit-testable directly. Uses
+    // the same re-admission rule as a Join frame (above any tombstone), so admit after leave()/Dead
+    // works (ADR-048). -----------------------------------------------------------------------------
     [[nodiscard]] bool admit(NodeId joiner, ClusterId presented) {
         if (presented != cfg_.cluster_id) return false;  // §1 reject: wrong cluster
-        apply_update(joiner, 0, MemberStatus::Alive);     // new Alive member ⇒ roster grows, epoch++
+        std::uint64_t inc = 0;
+        if (auto it = members_.find(joiner.value); it != members_.end() && is_tomb(it->second.status))
+            inc = it->second.incarnation + 1;
+        apply_update(joiner, inc, MemberStatus::Alive, Src::Join, now_ns());  // roster grows, epoch++
         return true;
     }
 
@@ -596,7 +625,20 @@ public:
 
     // Graceful leave (021 §3 scale-down): remove `who` from the roster (epoch++). Self-leave marks this
     // node departed; a real drain/hand-off (015/012/017) is a documented seam this does not perform.
-    void leave(NodeId who) { apply_update(who, self_incarnation_ + 1, MemberStatus::Dead); }
+    // Writes an authoritative Left tombstone at incarnation + kLeftBand (ADR-048 R6'). A self-left
+    // node is never refuted; its Left spreads as the sender's self entry in every frame it sends.
+    void leave(NodeId who) {
+        if (who == self_) {
+            Member& me = members_[self_.value];
+            self_incarnation_ = me.incarnation + kLeftBand;
+            me.incarnation = self_incarnation_;
+            me.status = MemberStatus::Left;
+            self_left_ = true;
+            republish();
+            return;
+        }
+        apply_update(who, incarnation_of(who) + kLeftBand, MemberStatus::Left, Src::Local, now_ns());
+    }
 
     // --- The SWIM protocol period (021 §3). One call = one protocol tick. Reads the injected clock; a
     // test advances virtual time between ticks to drive ping→miss→indirect→suspect→dead deterministic-
@@ -605,8 +647,11 @@ public:
         if (!online_) return;
         const std::int64_t now = now_ns();
         reap_suspects(now);   // Suspect → Dead once the suspicion timeout lapses with no refutation
+        reap_tombstones(now);  // erase tombstones older than tombstone_ttl_ns
         drive_probe(now);     // resolve/escalate the in-flight probe by virtual time
         start_probe(now);     // begin a new direct probe of the next peer
+        send_verifies();      // directly re-check peers that gossip (not we) reported Dead
+        probe_tombstones(now);  // re-ping Dead tombstones so a healed node learns and refutes
         gossip_round(now);    // disseminate the member digest to a fanout subset
         monitor_congestion(now);  // ADR-046: watermark-crossing ⇒ broadcast Congested
         if (sweep_hook_) sweep_hook_(now);  // ADR-040 Phase 5/6: revocation + rotation sweeps
@@ -622,13 +667,26 @@ public:
         return it == members_.end() ? 0 : it->second.incarnation;
     }
     [[nodiscard]] std::uint64_t self_incarnation() const noexcept { return self_incarnation_; }
+    // Tombstone diagnostics (driving thread only; 009 observability / ADR-048 tests).
+    [[nodiscard]] std::uint32_t tombstone_count() const noexcept { return tomb_count_; }
+    [[nodiscard]] bool is_known(NodeId n) const { return members_.contains(n.value); }
 
 private:
+    // Where an update came from — precedence depends on it (ADR-048): only Local may create a Dead
+    // tombstone; a Gossip Dead is downgraded to Suspect and verified; Join may lift a tombstone.
+    enum class Src : std::uint8_t { Local, Gossip, Direct, Join, JoinSnapshot };
+    static constexpr std::int64_t kNever = std::numeric_limits<std::int64_t>::min();
+
     struct Member {
-        ClusterId cluster{};
         std::uint64_t incarnation = 0;
+        std::int64_t suspect_deadline_ns = 0;  // when Suspect becomes Dead (valid iff Suspect)
+        std::int64_t death_ns = 0;             // when the tombstone was written (valid iff Dead|Left)
+        std::int64_t last_direct_ns = kNever;  // last frame received from this node itself (R2 veto)
+        std::int64_t last_probe_ns = kNever;   // last tombstone probe-back (R5' pacing)
+        ClusterId cluster{};
         MemberStatus status = MemberStatus::Alive;
-        std::int64_t suspect_deadline_ns = 0;  // when Suspect becomes Dead
+        std::uint8_t tx_left = 0;              // frames left to piggyback this entry on (R4')
+        bool verify_pending = false;           // a second-hand Suspect awaiting a verify ping (R1b)
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -640,6 +698,24 @@ private:
         std::uint64_t seq = 0;
         bool acked = false;
     };
+
+    static Config sanitize(Config c) noexcept {
+        if (c.ack_timeout_ns <= 0) c.ack_timeout_ns = 1;  // bucket() divides by indirect_ns()
+        if (c.indirect_timeout_ns < 0) c.indirect_timeout_ns = 0;
+        return c;
+    }
+    static constexpr bool is_tomb(MemberStatus s) noexcept {
+        return s == MemberStatus::Dead || s == MemberStatus::Left;
+    }
+    [[nodiscard]] std::int64_t indirect_ns() const noexcept {
+        return std::max<std::int64_t>(1, cfg_.indirect_timeout_ns ? cfg_.indirect_timeout_ns
+                                                                  : cfg_.ack_timeout_ns);
+    }
+    // How many frames a changed entry is piggybacked on: 3·⌈log2(n+1)⌉, SWIM's dissemination bound.
+    [[nodiscard]] std::uint8_t piggyback_count() const noexcept {
+        const unsigned v = 3u * static_cast<unsigned>(std::bit_width(members_.size()));
+        return static_cast<std::uint8_t>(std::min(v, 255u));
+    }
 
     // Canonical PAL monotonic clock (018/019 — CLOCK_BOOTTIME class, counts suspend). SWIM ping
     // deadlines ride pal::now() so a node suspended mid-probe treats the probe as timed out on
@@ -657,7 +733,7 @@ private:
         m.cluster = cfg_.cluster_id;
         m.from = self_;
         m.from_incarnation = self_incarnation_;
-        fill_digest(m.updates);
+        fill_digest(to, m.updates);
         if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
         if (capability_pull_)
             m.capabilities = capability_pull_(self_, self_incarnation_, cfg_.max_capability_gossip_bytes);
@@ -671,15 +747,67 @@ private:
         transport_->send(to, std::move(f));
     }
 
-    // Bounded gossip digest: the current member table (small for the target scale here). Real SWIM
-    // gossips a decaying recent-update list; full-table digest converges cleanly for small clusters and
-    // the decay/priority list is a documented optimization (026 path-change boundary).
-    void fill_digest(std::vector<MemberUpdate>& out) {
+    // Bounded gossip digest (ADR-048 R4'), in priority order:
+    //   1. the receiver's own entry — an accusation reaches its subject first, so it can refute;
+    //   2. the sender's self entry;
+    //   3. recently changed entries (Suspect first), each piggybacked on piggyback_count() frames;
+    //   4. a rotating cursor over the sorted roster, so every entry is eventually re-sent.
+    // At least ⌈(cap-2)/2⌉ slots are reserved for (4), so a burst of changes cannot starve coverage.
+    void fill_digest(NodeId to, std::vector<MemberUpdate>& out) {
         out.clear();
-        for (const auto& [id, m] : members_) {
-            if (out.size() >= cfg_.max_gossip_updates) break;
+        const std::size_t cap = cfg_.max_gossip_updates;
+        if (cap == 0) return;
+        auto push = [&](std::uint64_t id, Member& m) {
             out.push_back(MemberUpdate{id, m.incarnation, static_cast<std::uint8_t>(m.status)});
+            if (m.tx_left) set_tx(m, static_cast<std::uint8_t>(m.tx_left - 1));
+        };
+        if (to != self_)
+            if (auto it = members_.find(to.value); it != members_.end()) push(it->first, it->second);
+        if (out.size() < cap) push(self_.value, members_[self_.value]);
+        const std::size_t fixed = out.size();
+        const std::size_t others = members_.size() - fixed;
+        const std::size_t reserved = std::min(others, cap > 2 ? (cap - 1) / 2 : std::size_t{0});
+        const std::size_t piggy_cap = cap - reserved;
+        for (int pass = 0; pass < 2 && tx_pending_ > 0 && out.size() < piggy_cap; ++pass) {
+            for (auto& [id, m] : members_) {
+                if (out.size() >= piggy_cap) break;
+                if (id == to.value || id == self_.value || m.tx_left == 0) continue;
+                if ((m.status == MemberStatus::Suspect) != (pass == 0)) continue;
+                push(id, m);
+            }
         }
+        if (out.size() >= cap) return;
+        refresh_sorted_ids();
+        const std::size_t n = sorted_ids_.size();
+        const std::size_t start = static_cast<std::size_t>(
+            std::upper_bound(sorted_ids_.begin(), sorted_ids_.end(), digest_cursor_) - sorted_ids_.begin());
+        for (std::size_t k = 0; k < n && out.size() < cap; ++k) {
+            const std::uint64_t id = sorted_ids_[(start + k) % n];
+            if (id == to.value || id == self_.value) continue;
+            bool already = false;
+            for (std::size_t i = fixed; i < out.size() && !already; ++i) already = out[i].node == id;
+            if (already) continue;
+            const Member& m = members_.find(id)->second;
+            out.push_back(MemberUpdate{id, m.incarnation, static_cast<std::uint8_t>(m.status)});
+            digest_cursor_ = id;
+        }
+    }
+
+    // Every tx_left write goes through here so tx_pending_ (entries still to piggyback) stays exact;
+    // when it is 0 — the steady state — fill_digest skips the piggyback passes entirely.
+    void set_tx(Member& m, std::uint8_t v) noexcept {
+        if (m.tx_left == 0 && v != 0) ++tx_pending_;
+        else if (m.tx_left != 0 && v == 0) --tx_pending_;
+        m.tx_left = v;
+    }
+
+    // The cursor's sorted id list, rebuilt only when an entry is added or erased (not per frame).
+    void refresh_sorted_ids() {
+        if (!ids_dirty_) return;
+        sorted_ids_.clear();
+        for (const auto& [id, m] : members_) sorted_ids_.push_back(id);
+        std::sort(sorted_ids_.begin(), sorted_ids_.end());
+        ids_dirty_ = false;
     }
 
     // --- inbound ------------------------------------------------------------------------------
@@ -694,15 +822,40 @@ private:
         handle_control(m);
     }
 
+    // Stateless relay correlation (ADR-048): a relay remembers nothing about a PingReq. It stamps the
+    // Ping it forwards with the requester id (`subject`) and a keyed token (`subject_incarnation`); the
+    // subject echoes both in its Ack, and the relay re-derives the token to authenticate the echo before
+    // forwarding a PingReqAck. The token is bucketed by the indirect window (current or previous bucket
+    // accepted), so a late Ack older than ~2 windows is ignored. Bit 0 is forced on: a token is never 0,
+    // which is what a reply to this node's OWN probe carries.
+    [[nodiscard]] std::uint64_t relay_token(NodeId req, NodeId subj, std::uint64_t seq,
+                                            std::int64_t bucket) const noexcept {
+        return detail::splitmix64(relay_key_ ^
+                                  mix(req.value, subj.value, seq ^ static_cast<std::uint64_t>(bucket))) |
+               1u;
+    }
+    [[nodiscard]] std::int64_t bucket(std::int64_t now) const noexcept { return now / indirect_ns(); }
+
     void handle_control(const ControlMsg& m) {
         // Join is the ONE control that legitimately crosses a cluster-id boundary (it is how a mismatch
         // is detected). Every other control from a foreign cluster is dropped (accidental-merge guard).
         if (m.kind != ControlKind::Join && m.cluster != cfg_.cluster_id) return;
+        const std::int64_t now = now_ns();
 
         // Absorb piggybacked gossip — but ONLY from a same-cluster frame, so a mismatched Join cannot
         // smuggle its roster in via the digest and defeat the accidental-merge guard below.
         if (m.cluster == cfg_.cluster_id) {
-            merge_digest(m.updates);  // may trigger self-refutation
+            // A frame from a known peer is first-hand evidence it is alive (R2 veto), recorded BEFORE
+            // the digest is merged so a stale accusation in this same frame cannot override it.
+            if (m.from != self_) {
+                if (auto it = members_.find(m.from.value); it != members_.end()) {
+                    it->second.last_direct_ns = now;
+                    apply_update(m.from, m.from_incarnation, MemberStatus::Alive, Src::Direct, now);
+                }
+            }
+            for (const MemberUpdate& u : m.updates)  // may trigger self-refutation
+                apply_update(NodeId{u.node}, u.incarnation, static_cast<MemberStatus>(u.status), Src::Gossip,
+                             now);
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
             if (capability_merge_ && !m.capabilities.empty()) capability_merge_(m.capabilities);
             for (const MailboxPressureEntry& e : m.pressure) last_pressure_[e.node.value] = e.resident_total;
@@ -714,45 +867,46 @@ private:
                 ControlMsg ack;
                 ack.kind = ControlKind::Ack;
                 ack.seq = m.seq;
+                ack.subject = m.subject;  // echo the relay correlation verbatim (opaque to us)
+                ack.subject_incarnation = m.subject_incarnation;
                 send_control(m.from, ack);  // carries our (possibly just-refuted) incarnation
                 break;
             }
             case ControlKind::Ack: {
-                if (probe_.active && probe_.target == m.from && m.seq == probe_.seq) probe_.acked = true;
-                // If we are mid-relay (handling a PingReq for someone else), THIS ack from the subject
-                // is what we forward back as a PingReqAck — record it for the enclosing PingReq handler.
-                if (relay_active_ && m.from == relay_subject_ && m.seq == relay_seq_)
-                    relay_got_ack_ = true;
-                apply_update(m.from, m.from_incarnation, MemberStatus::Alive);
+                apply_update(m.from, m.from_incarnation, MemberStatus::Alive, Src::Direct, now);
+                if (m.subject_incarnation == 0) {  // reply to OUR probe (or a seq-0 verify/probe-back)
+                    if (probe_.active && probe_.target == m.from && m.seq == probe_.seq) probe_.acked = true;
+                } else {  // reply to a Ping we forwarded as a relay: authenticate, then report back
+                    const std::int64_t b = bucket(now);
+                    const NodeId requester = m.subject;
+                    if (requester != self_ &&
+                        (m.subject_incarnation == relay_token(requester, m.from, m.seq, b) ||
+                         m.subject_incarnation == relay_token(requester, m.from, m.seq, b - 1))) {
+                        ControlMsg rep;
+                        rep.kind = ControlKind::PingReqAck;
+                        rep.subject = m.from;
+                        rep.subject_incarnation = m.from_incarnation;
+                        rep.seq = m.seq;
+                        send_control(requester, rep);
+                    }
+                }
                 break;
             }
             case ControlKind::PingReq: {
-                // Relay: ping `subject` on the requester's behalf; if it acks (synchronously over the
-                // loopback), report back with PingReqAck. Correlate the requester+seq for the report.
-                relay_active_ = true;
-                relay_requester_ = m.from;
-                relay_seq_ = m.seq;
-                relay_subject_ = m.subject;
-                relay_got_ack_ = false;
+                // Relay: ping `subject` on the requester's behalf. Nothing is remembered — the subject's
+                // Ack may arrive on any later on_frame and carries the correlation back (relay_token).
                 ControlMsg ping;
                 ping.kind = ControlKind::Ping;
                 ping.seq = m.seq;
-                send_control(m.subject, ping);  // subject's Ack lands in this same call stack (loopback)
-                if (relay_got_ack_) {
-                    ControlMsg rep;
-                    rep.kind = ControlKind::PingReqAck;
-                    rep.subject = m.subject;
-                    rep.subject_incarnation = incarnation_of(m.subject);
-                    rep.seq = m.seq;
-                    send_control(m.from, rep);
-                }
-                relay_active_ = false;
+                ping.subject = m.from;
+                ping.subject_incarnation = relay_token(m.from, m.subject, m.seq, bucket(now));
+                send_control(m.subject, ping);
                 break;
             }
             case ControlKind::PingReqAck: {
                 if (probe_.active && probe_.target == m.subject && m.seq == probe_.seq)
                     probe_.acked = true;
-                apply_update(m.subject, m.subject_incarnation, MemberStatus::Alive);
+                apply_update(m.subject, m.subject_incarnation, MemberStatus::Alive, Src::Gossip, now);
                 break;
             }
             case ControlKind::Gossip:
@@ -761,17 +915,37 @@ private:
                 ControlMsg reply;
                 if (m.cluster != cfg_.cluster_id) {
                     reply.kind = ControlKind::JoinReject;  // §1 reject: wrong cluster id
+                } else if (m.subject != m.from) {
+                    return;  // a node may only (re)admit itself
                 } else {
-                    apply_update(m.subject, 0, MemberStatus::Alive);  // admit ⇒ roster grows, epoch++
-                    reply.kind = ControlKind::JoinAck;                // snapshot rides fill_digest()
+                    // Re-admit above any tombstone (ADR-048): max(presented, tombstone + 1). The
+                    // assigned incarnation rides back in JoinAck so the joiner adopts it.
+                    std::uint64_t inc = m.subject_incarnation;
+                    if (auto it = members_.find(m.subject.value);
+                        it != members_.end() && is_tomb(it->second.status))
+                        inc = std::max(inc, it->second.incarnation + 1);
+                    apply_update(m.subject, inc, MemberStatus::Alive, Src::Join, now);  // epoch++
+                    reply.kind = ControlKind::JoinAck;  // snapshot rides fill_digest()
+                    reply.subject_incarnation = incarnation_of(m.subject);
                 }
                 reply.subject = m.subject;
                 send_control(m.from, reply);
                 break;
             }
-            case ControlKind::JoinAck:
+            case ControlKind::JoinAck: {
+                // Joiner side: adopt the incarnation the seed assigned, and take the seed's Alive
+                // entries from the snapshot (a Dead we hold for one of them is re-tested, not trusted).
+                if (m.subject == self_ && !self_left_ && m.subject_incarnation > self_incarnation_) {
+                    self_incarnation_ = m.subject_incarnation;
+                    members_[self_.value].incarnation = self_incarnation_;
+                }
+                for (const MemberUpdate& u : m.updates)
+                    if (static_cast<MemberStatus>(u.status) == MemberStatus::Alive)
+                        apply_update(NodeId{u.node}, u.incarnation, MemberStatus::Alive, Src::JoinSnapshot, now);
+                break;
+            }
             case ControlKind::JoinReject:
-                break;  // joiner side: snapshot already merged (Ack) / mismatch observed (Reject)
+                break;  // joiner side: mismatch observed
             case ControlKind::Congested: {
                 // C1 epoch gen-gate (proven): a stale pre-restart signal never advances the throttle —
                 // mirrors apply_update's Alive-branch precedence (strictly-not-older incarnation wins).
@@ -791,19 +965,24 @@ private:
             probe_.active = false;
             return;
         }
+        // Target tombstoned or erased meanwhile: abandon (a Suspect here would re-create it).
+        if (auto it = members_.find(probe_.target.value); it == members_.end() || is_tomb(it->second.status)) {
+            probe_.active = false;
+            return;
+        }
         if (now < probe_.deadline_ns) return;  // still within the ack window
         if (probe_.phase == Phase::Direct) {
             // Missed direct ack → indirect ping-req via k random relays BEFORE any suspicion (SWIM's
-            // core false-positive reducer). A relay that reaches the target reports PingReqAck, which
-            // sets probe_.acked in the same call stack over the loopback.
+            // core false-positive reducer). A relay that reaches the target reports PingReqAck on a
+            // later frame (asynchronously over a real transport; inline over the loopback).
             probe_.phase = Phase::Indirect;
-            probe_.deadline_ns = now + cfg_.ack_timeout_ns;
+            probe_.deadline_ns = now + indirect_ns();
             send_indirect(probe_.target, probe_.seq, now);
             if (probe_.acked) probe_.active = false;  // a relay already vouched for it
         } else {
             // Missed indirect ack too → declare Suspect (not yet Dead). Refutation or a later ack can
             // still rescue it before suspicion_timeout.
-            apply_update(probe_.target, incarnation_of(probe_.target), MemberStatus::Suspect);
+            apply_update(probe_.target, incarnation_of(probe_.target), MemberStatus::Suspect, Src::Local, now);
             probe_.active = false;
         }
     }
@@ -839,6 +1018,49 @@ private:
             send_control(relay, req);
             ++sent;
             if (probe_.acked) break;  // a relay already reported success
+        }
+    }
+
+    // R1b: one direct verification Ping per second-hand Suspect, at most verify_ping_budget per tick.
+    // The pending flag is the queue — no allocation beyond the per-tick target list.
+    void send_verifies() {
+        if (cfg_.verify_ping_budget == 0) return;
+        std::vector<NodeId> targets;
+        for (auto& [id, m] : members_) {
+            if (targets.size() >= cfg_.verify_ping_budget) break;
+            if (!m.verify_pending) continue;
+            m.verify_pending = false;
+            if (m.status == MemberStatus::Suspect && id != self_.value) targets.push_back(NodeId{id});
+        }
+        for (NodeId t : targets) {  // ids collected first: inline (loopback) delivery may mutate members_
+            ControlMsg ping;
+            ping.kind = ControlKind::Ping;
+            ping.seq = 0;  // probe seqs start at 1, so this can never satisfy a probe
+            send_control(t, ping);
+        }
+    }
+
+    // R5': up to tombstone_probe_budget probe-backs per tick to Dead (not Left) tombstones, least
+    // recently probed first, each at least tombstone_probe_interval_ns apart. The Ping's digest leads
+    // with the receiver's own entry — "you are Dead@inc" — so a healed node refutes at inc+1.
+    void probe_tombstones(std::int64_t now) {
+        if (tomb_count_ == 0 || cfg_.tombstone_probe_budget == 0) return;
+        std::vector<std::pair<std::int64_t, std::uint64_t>> cand;
+        for (const auto& [id, m] : members_) {
+            if (m.status != MemberStatus::Dead || id == self_.value) continue;
+            if (m.last_probe_ns != kNever && now - m.last_probe_ns < cfg_.tombstone_probe_interval_ns) continue;
+            cand.emplace_back(m.last_probe_ns, id);
+        }
+        if (cand.empty()) return;
+        const std::size_t k = std::min<std::size_t>(cand.size(), cfg_.tombstone_probe_budget);
+        std::partial_sort(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(k), cand.end());
+        cand.resize(k);
+        for (const auto& [lp, id] : cand) members_.find(id)->second.last_probe_ns = now;
+        for (const auto& [lp, id] : cand) {
+            ControlMsg ping;
+            ping.kind = ControlKind::Ping;
+            ping.seq = 0;
+            send_control(NodeId{id}, ping);
         }
     }
 
@@ -885,73 +1107,165 @@ private:
     }
 
     // --- merge / state transitions ------------------------------------------------------------
-    void merge_digest(const std::vector<MemberUpdate>& updates) {
-        for (const MemberUpdate& u : updates)
-            apply_update(NodeId{u.node}, u.incarnation, static_cast<MemberStatus>(u.status));
-    }
-
-    // The SWIM precedence + refutation core. Applies (node, incarnation, status) iff it supersedes what
-    // we know. Refutation: a Suspect/Dead of OURSELVES with incarnation ≥ ours makes us re-broadcast
-    // Alive at a strictly higher incarnation (higher incarnation wins ⇒ the false suspicion loses).
-    void apply_update(NodeId node, std::uint64_t incarnation, MemberStatus status) {
+    // The SWIM precedence + refutation core (ADR-048 R1–R3, R6', R7). Applies (node, incarnation,
+    // status) iff it supersedes what we know. Refutation: a Suspect/Dead of OURSELVES with
+    // incarnation ≥ ours makes us re-broadcast Alive at a strictly higher incarnation (higher
+    // incarnation wins ⇒ the false suspicion loses). Tombstone rules:
+    //   * a Dead/Left is never CREATED second-hand — only by this node (Local);
+    //   * a second-hand Dead about a live peer is downgraded to Suspect and verified directly (R1/R1b),
+    //     unless we heard from that peer within suspicion_timeout at the same incarnation (R2 veto);
+    //   * a tombstone is lifted only by a strictly higher incarnation (R3) or a Join;
+    //   * a Left is authoritative and is never refuted by its own node.
+    void apply_update(NodeId node, std::uint64_t inc, MemberStatus st, Src src, std::int64_t now) {
+        if (static_cast<std::uint8_t>(st) > static_cast<std::uint8_t>(MemberStatus::Left)) return;  // wire range
         if (node == self_) {
-            if (status != MemberStatus::Alive && incarnation >= self_incarnation_) {
-                self_incarnation_ = incarnation + 1;  // refute: strictly higher incarnation wins
-                members_[self_.value].incarnation = self_incarnation_;
-                members_[self_.value].status = MemberStatus::Alive;
+            if (self_left_ || st == MemberStatus::Left) return;  // a departure is never refuted
+            if (st != MemberStatus::Alive && inc >= self_incarnation_) {
+                self_incarnation_ = inc + 1;  // refute: strictly higher incarnation wins
+                Member& me = members_[self_.value];
+                me.incarnation = self_incarnation_;
+                me.status = MemberStatus::Alive;
             }
             return;  // we never mark ourselves Suspect/Dead
         }
 
-        const auto it = members_.find(node.value);
-        const bool known = it != members_.end();
-        if (known && it->second.status == MemberStatus::Dead) return;  // Dead is terminal (rejoin only)
-
-        bool supersedes;
-        if (!known) {
-            supersedes = true;  // first we hear of this node
-        } else {
-            const Member& cur = it->second;
-            switch (status) {
-                case MemberStatus::Alive:
-                    supersedes = incarnation > cur.incarnation;
-                    break;
-                case MemberStatus::Suspect:
-                    supersedes = incarnation > cur.incarnation ||
-                                 (incarnation == cur.incarnation && cur.status == MemberStatus::Alive);
-                    break;
-                case MemberStatus::Dead:
-                    supersedes = incarnation >= cur.incarnation;
-                    break;
-                default:
-                    supersedes = false;
-                    break;
+        auto it = members_.find(node.value);
+        if (it == members_.end()) {
+            if (is_tomb(st) && src != Src::Local) return;  // never create a tombstone second-hand
+            if (st == MemberStatus::Suspect) return;       // never create an unknown node as Suspect
+            Member m{};
+            m.cluster = cfg_.cluster_id;
+            m.incarnation = inc;
+            m.status = st;
+            set_tx(m, piggyback_count());
+            if (is_tomb(st)) {
+                m.death_ns = now;
+                m.last_probe_ns = now;
+                ++tomb_count_;
             }
+            members_.emplace(node.value, m);
+            ids_dirty_ = true;
+            if (!is_tomb(st)) republish();  // first we hear of this node ⇒ roster grows, epoch++
+            enforce_tomb_cap();
+            return;
         }
-        if (!supersedes) return;
 
-        const bool was_live = known && it->second.status != MemberStatus::Dead;
-        Member& m = members_[node.value];
-        m.cluster = cfg_.cluster_id;
-        m.incarnation = incarnation;
-        m.status = status;
-        if (status == MemberStatus::Suspect)
-            m.suspect_deadline_ns = now_ns() + cfg_.suspicion_timeout_ns;
-
-        // Roster (non-Dead set) membership changed? join (new live) or dead (live→dead) ⇒ epoch++.
-        const bool now_live = status != MemberStatus::Dead;
-        if (!known || was_live != now_live) republish();
+        Member& cur = it->second;
+        const bool was_live = !is_tomb(cur.status);
+        MemberStatus next = st;
+        bool take = false;
+        switch (st) {
+            case MemberStatus::Alive:
+                if (src == Src::JoinSnapshot && cur.status == MemberStatus::Dead && inc >= cur.incarnation) {
+                    next = MemberStatus::Suspect;  // the seed says alive: re-test, don't trust blindly
+                    take = true;
+                } else {
+                    take = inc > cur.incarnation;  // a tombstone needs STRICTLY higher (R3)
+                }
+                break;
+            case MemberStatus::Suspect:
+                take = inc > cur.incarnation || (inc == cur.incarnation && cur.status == MemberStatus::Alive);
+                break;
+            case MemberStatus::Dead:
+                if (src == Src::Local) {
+                    take = cur.status != MemberStatus::Left && inc >= cur.incarnation;
+                    break;
+                }
+                if (!was_live) break;  // a second-hand Dead never touches a tombstone
+                if (inc == cur.incarnation && cur.status == MemberStatus::Alive &&
+                    cur.last_direct_ns != kNever && now - cur.last_direct_ns < cfg_.suspicion_timeout_ns)
+                    break;  // R2: we heard from it directly, recently — veto the accusation
+                next = MemberStatus::Suspect;  // R1: downgrade, re-derive locally
+                take = inc > cur.incarnation || (inc == cur.incarnation && cur.status == MemberStatus::Alive);
+                break;
+            case MemberStatus::Left:
+                take = cur.status == MemberStatus::Left ? inc > cur.incarnation : inc >= cur.incarnation;
+                break;
+        }
+        if (!take) return;
+        if (cur.incarnation != inc || cur.status != next) set_tx(cur, piggyback_count());
+        cur.incarnation = inc;
+        cur.status = next;
+        cur.verify_pending = false;
+        if (next == MemberStatus::Suspect) {
+            cur.suspect_deadline_ns = now + cfg_.suspicion_timeout_ns;
+            cur.verify_pending = (src == Src::Gossip || src == Src::JoinSnapshot);  // R1b
+        }
+        const bool now_live = !is_tomb(next);
+        if (!now_live) {
+            cur.death_ns = now;
+            if (was_live) cur.last_probe_ns = now;
+        }
+        if (was_live && !now_live) ++tomb_count_;
+        if (!was_live && now_live) --tomb_count_;
+        // Roster (non-tombstone set) membership changed? join (new live) or dead (live→dead) ⇒ epoch++.
+        if (was_live != now_live) republish();
+        enforce_tomb_cap();  // may erase entries: `cur` is NOT touched after this line
     }
 
+    // Suspect → Dead once the suspicion timeout lapses with no refutation — the ONLY producer of an
+    // inferred Dead (gossip never writes one).
     void reap_suspects(std::int64_t now) {
         bool changed = false;
+        const std::uint8_t tx = piggyback_count();
         for (auto& [id, m] : members_) {
             if (m.status == MemberStatus::Suspect && now >= m.suspect_deadline_ns) {
-                m.status = MemberStatus::Dead;  // suspicion timeout lapsed with no refutation
+                m.status = MemberStatus::Dead;
+                m.death_ns = now;
+                m.last_probe_ns = now;
+                set_tx(m, tx);
+                m.verify_pending = false;
+                ++tomb_count_;
                 changed = true;
             }
         }
         if (changed) republish();
+        enforce_tomb_cap();
+    }
+
+    // R7: erase tombstones older than tombstone_ttl_ns (injected clock). After this a stale Alive can
+    // re-admit the node, so the TTL must exceed the longest partition the deployment tolerates.
+    void reap_tombstones(std::int64_t now) {
+        if (tomb_count_ == 0) return;
+        const std::uint64_t self_id = self_.value;
+        const std::size_t erased = std::erase_if(members_, [&](const auto& kv) {
+            const Member& m = kv.second;
+            const bool expired = kv.first != self_id && is_tomb(m.status) && now - m.death_ns >= cfg_.tombstone_ttl_ns;
+            if (expired && m.tx_left) --tx_pending_;
+            return expired;
+        });
+        if (erased) {
+            tomb_count_ -= static_cast<std::uint32_t>(erased);
+            ids_dirty_ = true;
+        }
+    }
+
+    // Hard cap on tombstones: evict Dead before Left, oldest death first (ties by lower id).
+    void enforce_tomb_cap() {
+        while (tomb_count_ > cfg_.max_tombstones) {
+            auto victim = members_.end();
+            for (auto it = members_.begin(); it != members_.end(); ++it) {
+                if (it->first == self_.value || !is_tomb(it->second.status)) continue;
+                if (victim == members_.end()) {
+                    victim = it;
+                    continue;
+                }
+                const bool victim_dead = victim->second.status == MemberStatus::Dead;
+                const bool it_dead = it->second.status == MemberStatus::Dead;
+                if (it_dead != victim_dead) {
+                    if (it_dead) victim = it;
+                    continue;
+                }
+                if (it->second.death_ns < victim->second.death_ns ||
+                    (it->second.death_ns == victim->second.death_ns && it->first < victim->first))
+                    victim = it;
+            }
+            if (victim == members_.end()) break;
+            if (victim->second.tx_left) --tx_pending_;
+            members_.erase(victim);
+            --tomb_count_;
+            ids_dirty_ = true;
+        }
     }
 
     // --- peer selection (deterministic; seeded splitmix, never wall time / random_device) --------
@@ -960,7 +1274,7 @@ private:
         for (const auto& [id, m] : members_) {
             const NodeId n{id};
             if (n == self_ || n == excl) continue;
-            if (m.status == MemberStatus::Dead) continue;
+            if (is_tomb(m.status)) continue;
             v.push_back(n);
         }
         std::sort(v.begin(), v.end(), [](NodeId a, NodeId b) { return a.value < b.value; });
@@ -969,32 +1283,39 @@ private:
 
     // Shuffled round-robin over the live peers: every peer is probed once per round before any repeat
     // (SWIM's time-bounded-detection property), the per-round order seeded so it is deterministic but
-    // not a fixed bias. Rebuilds when the round is exhausted or the live set changed.
+    // not a fixed bias. Rebuilds when the round is exhausted; peers tombstoned or erased since the
+    // round was built are skipped (one rebuild at most per call).
     [[nodiscard]] std::optional<NodeId> next_probe_target() {
-        if (probe_order_idx_ >= probe_order_.size()) {
-            probe_order_ = live_peers_excluding(self_);
-            // seed-shuffle (Fisher–Yates with a seeded splitmix stream)
-            std::uint64_t r = mix(cfg_.seed, self_.value, probe_round_++);
-            for (std::size_t i = probe_order_.size(); i > 1; --i) {
-                r = detail::splitmix64(r);
-                const std::size_t j = static_cast<std::size_t>(r % i);
-                std::swap(probe_order_[i - 1], probe_order_[j]);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            if (probe_order_idx_ >= probe_order_.size()) {
+                probe_order_ = live_peers_excluding(self_);
+                // seed-shuffle (Fisher–Yates with a seeded splitmix stream)
+                std::uint64_t r = mix(cfg_.seed, self_.value, probe_round_++);
+                for (std::size_t i = probe_order_.size(); i > 1; --i) {
+                    r = detail::splitmix64(r);
+                    const std::size_t j = static_cast<std::size_t>(r % i);
+                    std::swap(probe_order_[i - 1], probe_order_[j]);
+                }
+                probe_order_idx_ = 0;
             }
-            probe_order_idx_ = 0;
+            while (probe_order_idx_ < probe_order_.size()) {
+                const NodeId n = probe_order_[probe_order_idx_++];
+                const auto it = members_.find(n.value);
+                if (it != members_.end() && !is_tomb(it->second.status)) return n;
+            }
         }
-        if (probe_order_.empty()) return std::nullopt;
-        return probe_order_[probe_order_idx_++];
+        return std::nullopt;
     }
 
     static std::uint64_t mix(std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
         return detail::splitmix64(detail::splitmix64(a ^ (b + 0x9E3779B97F4A7C15ULL)) ^ c);
     }
 
-    // Publish an immutable snapshot of the current live (non-Dead) node set and bump the epoch.
+    // Publish an immutable snapshot of the current live (non-tombstone) node set and bump the epoch.
     void republish() {
         std::vector<NodeId> live;
         for (const auto& [id, m] : members_)
-            if (m.status != MemberStatus::Dead) live.push_back(NodeId{id});
+            if (!is_tomb(m.status)) live.push_back(NodeId{id});
         std::sort(live.begin(), live.end(), [](NodeId a, NodeId b) { return a.value < b.value; });
         std::lock_guard<std::mutex> g(mu_);
         snapshot_ = std::make_shared<const std::vector<NodeId>>(std::move(live));
@@ -1013,12 +1334,14 @@ private:
     std::size_t probe_order_idx_ = 0;
     std::uint64_t probe_round_ = 0;
 
-    // Relay correlation for an in-flight PingReq (subject's Ack sets the flag in the same call stack).
-    bool relay_active_ = false;
-    NodeId relay_requester_{};
-    NodeId relay_subject_{};
-    std::uint64_t relay_seq_ = 0;
-    bool relay_got_ack_ = false;
+    // ADR-048 protocol state (protocol-thread owned). The relay itself keeps no per-request state.
+    std::uint64_t relay_key_ = 0;             // keys relay_token()
+    std::uint64_t digest_cursor_ = 0;         // last id the rotating digest cursor sent
+    std::vector<std::uint64_t> sorted_ids_;   // cursor's sorted roster, rebuilt only when ids_dirty_
+    bool ids_dirty_ = true;
+    std::uint32_t tomb_count_ = 0;            // Dead + Left entries, excluding self
+    std::uint32_t tx_pending_ = 0;            // entries with tx_left > 0 (see set_tx)
+    bool self_left_ = false;
 
     std::function<void(MessageFrame)> data_sink_;
     std::function<bool(NodeId)> link_reachable_;

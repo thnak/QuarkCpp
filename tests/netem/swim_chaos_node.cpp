@@ -11,7 +11,7 @@
 //
 // Output, one line every 250 ms (parsed by the runner):
 //   T <ms> node=<id> epoch=<e> inc=<self incarnation> conns=<open> st=<one char per node 1..n>
-// where st is A(live) S(suspect) D(dead or unknown) and '*' for self.
+// where st is A(live) S(suspect) D(dead or unknown) L(left) and '*' for self.
 //
 // Usage: swim_chaos_node <self_id> <n> <seed_id_or_0> [port=7400] [duration_ms=60000] [rejoin=0]
 //   rejoin=1: while this node's roster is short of n, re-send Join to the seed every 2 s.
@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
                 case MemberStatus::Alive: st[i - 1] = 'A'; break;
                 case MemberStatus::Suspect: st[i - 1] = 'S'; break;
                 case MemberStatus::Dead: st[i - 1] = 'D'; break;
+                case MemberStatus::Left: st[i - 1] = 'L'; break;
             }
         }
         std::printf("T %lld node=%llu epoch=%llu inc=%llu conns=%llu st=%s\n", t,

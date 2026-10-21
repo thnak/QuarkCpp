@@ -75,6 +75,22 @@ supervision (007) and distribution (010) are actually exercised:
 
 Each is seeded, so a discovered bug replays exactly.
 
+**Deferred delivery is required for timing-dependent protocol tests
+([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).** The in-process
+`LoopbackTransport` delivers a reply inside the sender's own call, which hid two SWIM
+defects that only appeared on real sockets. Any test whose correctness depends on when
+a reply arrives runs on a transport that never delivers in the sender's call stack
+(`tests/swim_deferred_fabric.hpp`): delivery in waves, seeded reordering, per-directed-link
+drop, a **hold** mode that queues a cut link's frames and releases them in order on heal
+(modelling `TcpTransport`'s outbound queue), and a per-wave clock advance for latency.
+A defect fix must first reproduce the defect failing on the old code.
+
+**Multi-process tier.** `tests/netem/run_swim_chaos.sh` runs one SWIM process per Linux
+network namespace with real kernel packet drops (iptables partitions, `tc netem`); it is
+the acceptance tier for membership changes. `tests/netem/run_matrix.sh` runs the
+real-socket transport tests under `tc netem` impairment. Both need sudo, so they are not
+in CTest.
+
 ## Unit harness (`TestKit`)
 
 For testing one actor without standing up an engine:
@@ -166,7 +182,9 @@ non-hot-path cost by this RFC's own definition of the hot path.
   bounded model checking for systematic exploration. See "Chooser policy" and
   "Bounded exploration (DPOR)" above, ADR-025.)*
 - How much of distribution (010) is simulated in-process vs. requiring a
-  multi-process integration tier.
+  multi-process integration tier. *(Partly answered: membership has a multi-process
+  netns tier, `tests/netem/run_swim_chaos.sh` — see "Fault injection". The data plane
+  and placement still have none.)*
 - Performance-regression testing: deterministic sim gives correctness, not
   throughput. *(Resolved: the benchmark harness + quantified budgets are
   [023-Performance-Targets-and-Budgets.md](023-Performance-Targets-and-Budgets.md),

@@ -602,8 +602,15 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   baseline plus a named Tier-2 extension point (`advanced_io()`/`AdvancedIo`), byte-identical
   caller source across backends, ADR-026. Minimum OS versions and the fallback matrix:
   resolved, ADR-026.)*
-- **021** — **two SWIM defects found 2026-10-21 by the first multi-process, real-packet-drop
-  harness** (`tests/netem/run_swim_chaos.sh`: 5 `swim_chaos_node` processes, one per Linux network
+- **021** — *(Both defects below: resolved, [ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md),
+  merged 2026-10-22 — first-hand-only Dead, expiring tombstones, Join re-admission over a
+  tombstone, an accusation-first digest, and a stateless token relay. `run_swim_chaos.sh`
+  now ends all-alive in all 5 scenarios, healing in about 1 s; `cluster_swim_partition_heal_test`
+  and `cluster_swim_async_relay_test` fail on the old code and pass on the new.)*
+  **Still open:** tombstone TTL vs. the longest tolerated partition (021 open questions),
+  and a SWIM wire-version gate for rolling across ADR-048 (021 §3 "Rolling upgrade").
+  Original finding, kept for the record: **two SWIM defects found 2026-10-21 by the first
+  multi-process, real-packet-drop harness** (`tests/netem/run_swim_chaos.sh`: 5 `swim_chaos_node` processes, one per Linux network
   namespace, faults made with iptables/netem in the kernel). Neither shows up in the `cluster_swim_*`
   unit tests. Those use a transport whose replies arrive in the same call stack, plus the
   `set_link_reachable`/`set_online` switches, so they never see a delayed reply or a stale view
@@ -625,6 +632,27 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   Both change SWIM safety rules, so the fix goes through `design-debate-prove` → ADR, with
   `run_swim_chaos.sh` as the acceptance test (every scenario must end with all nodes alive).
   This is also the first concrete step on 014's multi-process distribution test tier.
+- **010/021** — **TcpTransport fd race (found 2026-10-22 during ADR-048, not fixed).**
+  `close_fd()` runs before `io_.del_fd()` (`tcp_transport.hpp:517-519` and `:625-626`), so
+  between the two calls the kernel can hand the same fd number to a concurrent `accept4`,
+  and `del_fd` then removes the wrong descriptor from epoll. ADR-048's Lifeguard prover saw
+  TSan reports in 3/11 Debug runs over real TcpTransport; the unmodified code reproduces
+  it (1/10). Fix: deregister from epoll first, then close. Needs a TSan regression test
+  that churns connections while accepting.
+- **ADR-019 test teeth** — **`topic_no_quiesce_control` is too weak on a large host (found
+  2026-10-22).** This ASan-only negative control removes the subscribe/quiesce barrier and
+  must be caught by ASan (`WILL_FAIL`). On a 28-core bare-metal Ubuntu box (g++ 15.2,
+  ASan+UBSan Debug) the race fired in only **1 of 20** runs, so the suite reports it as a
+  failure about 95% of the time, and when it does pass it proves little. The positive
+  `topic_subscribe_race_test` is unaffected. The control needs a deterministic way to force
+  the race (e.g. a test-only yield/hook inside the unprotected window), not more iterations.
+- **ADR-046 test** — **`tcp_transport_control_priority_test` is flaky under TSan (found
+  2026-10-22).** Not a data race: the check that the control frame arrives before index 375
+  of 500 fails because TSan changes how much backlog builds up on the sender, so the frame
+  lands around index 350–490. Measured on the 28-core box: 4/10 failures on the unmodified
+  code, 6–7/10 after ADR-048 (the test does not use SwimMembership). Release, Clang and ASan
+  pass. Either measure the backlog actually queued in `Conn::out` when the control frame is
+  sent and assert relative to that, or skip the ordering check under TSan.
 
 ## Not yet specced at all
 

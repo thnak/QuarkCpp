@@ -121,9 +121,21 @@ which once made `tcp_transport_dial_dedup_test` look like it failed. Limit: Linu
 reorders below the transport, so these profiles exercise the transport's timing, reconnect and
 priority behavior, not frame parsing on a damaged stream.
 
-**Multi-process SWIM (2026-10-21).** `tests/netem/run_swim_chaos.sh` (5 processes, one per namespace,
-iptables partitions). Cluster formation and a 20%-loss flaky link pass. Partition heal and asymmetric
-link cuts **fail**: two SWIM defects, recorded under 021 in `OpenQuestions.md`, pending an ADR.
+**Multi-process SWIM.** `tests/netem/run_swim_chaos.sh` (5 processes, one per namespace, iptables
+partitions). On 2026-10-21, formation and a 20%-loss flaky link passed, but partition heal and an
+asymmetric link cut **failed**: two SWIM defects (021 in `OpenQuestions.md`). After the ADR-048 merge
+(2026-10-22) all 5 scenarios end all-alive: an isolated node and a {1,2}|{3,4,5} split each heal about
+1 s after the cut is lifted, and with only the 1↔2 link cut nodes 1 and 2 are never suspected
+(incarnation stays 1; it was 31). In-process regression tests on a deferred-delivery fabric
+(`tests/swim_deferred_fabric.hpp`): `cluster_swim_partition_heal_test` (isolate + split, drop + hold,
+8 seeds: worst heal 600 ms; leave → restart → rejoin 120 ms; a crashed node is still dropped in
+1.08 s and never resurrected) and `cluster_swim_async_relay_test` (1↔2 cut, 0/10/25 ms per hop:
+0 incarnation bumps). Both were run against the old `cluster.hpp` first: the heal test failed
+all 32 heal runs and the relay test showed 363 bumps. Full suites after the merge (same host):
+g++ 15.2 210/210, clang++ 21.1 210/210, ASan+UBSan 209/210, TSan 192/193. The two failures are
+pre-existing test weaknesses unrelated to SWIM: the `topic_no_quiesce_control` negative control
+caught its race in only 1/20 runs, and `tcp_transport_control_priority_test` misses its ordering
+threshold under TSan (4/10 on the unmodified code). Both are recorded in `OpenQuestions.md`.
 
 The outbound-streaming-reply suite (`reply_stream_backpressure_test`, `reply_stream_concurrency_test`,
 `reply_stream_credit_merge_test`, `reply_stream_exactly_once_test`, `reply_stream_teardown_test`, ADR-018)
