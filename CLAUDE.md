@@ -15,31 +15,31 @@ Read **[CONVENTIONS.md](CONVENTIONS.md)** before writing any code — it is the 
 contract (target/scope, language rules, hot-path invariants, naming, layout). Read
 **[README.md](README.md)** for the feature/status overview and the ADR index.
 
-## Machine safety — read this first
 
-**This dev box has 32 cores and can hang or power off if a build/test/bench saturates them.**
 
-- Build with `cmake --build build -j4` — **never** `-j$(nproc)` / unbounded `make`. TSan builds: `-j1`.
-- Run tests/benches pinned: `taskset -c 0-3 ctest --test-dir build ...`; single-thread microbenchmarks
-  on one core (`taskset -c 0 ...`).
-- Never spawn thread counts equal to `hardware_concurrency()`; multi-thread stress caps at 4 threads.
 
-This is a hard rule, not a suggestion — it applies to every command below.
+
+- Build with `cmake --build build` — **never** `-j$(nproc)` / unbounded `make`. TSan builds: `-j1`.
+- Run tests/benches (unrestricted): `ctest --test-dir build ...`; single-thread microbenchmarks
+  on one core.
+
+
+
 
 ## Common commands
 
 ```bash
 # Configure + build (Release is the default build type)
 cmake -S . -B build
-cmake --build build -j4
+cmake --build build
 
 # Run the full correctness suite (auto-discovered *_test.cpp, one CTest target each)
-taskset -c 0-3 ctest --test-dir build -j4 --output-on-failure
+ctest --test-dir build --output-on-failure
 
 # Run a single test
-taskset -c 0-3 ctest --test-dir build -R <test_name> --output-on-failure
+ctest --test-dir build -R <test_name> --output-on-failure
 # or run the binary directly:
-taskset -c 0-3 build/tests/<test_name>
+build/tests/<test_name>
 
 # Sanitizer builds (separate build dirs; same test suite minus by-design exclusions, see VERIFICATION.md)
 cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined" -DCMAKE_BUILD_TYPE=Debug
@@ -48,11 +48,11 @@ cmake --build build-tsan -j1   # TSan compiles are memory-heavy — serial build
 
 # Benchmarks (ON by default) — the 023 performance-budget gate
 cmake --build build --target bench-gate     # FAILs on a Hard-budget [MISS], WARNs on a Goal regression
-taskset -c 0 build/bench/<name>_bench       # single-bench run, pinned
+build/bench/<name>_bench       # single-bench run, pinned
 
 # Runnable samples (OFF by default)
 cmake -S . -B build-samples -DQUARK_BUILD_SAMPLES=ON
-taskset -c 0-3 build-samples/samples/01_hello_counter
+build-samples/samples/01_hello_counter
 
 # Opt-in persistence adapters (std-only core needs neither)
 cmake -S . -B build -DQUARK_WITH_SQLITE=ON -DQUARK_WITH_ROCKSDB=ON

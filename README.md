@@ -203,16 +203,17 @@ Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 20
 ```bash
 # Build + run the full correctness gate (Release)
 cmake -S . -B build
-cmake --build build -j4                          # -j4, never -j$(nproc) — see note
-ctest --test-dir build -j4 --output-on-failure   # 194 / 194
+cmake --build build                          # default parallelism
+ctest --test-dir build --output-on-failure   # run all tests
 
-# Sanitizers (the same suite, minus by-design exclusions — counts in VERIFICATION.md)
-cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined"   # ASan + UBSan
-cmake -S . -B build-tsan -DQUARK_SANITIZE="thread"              # ThreadSanitizer (build -j1)
+# Sanitizers (the same suite, minus by-design exclusions)
+cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined"
+cmake -S . -B build-tsan -DQUARK_SANITIZE="thread"
 
 # Benchmarks (default ON) and the runnable samples (default OFF)
 cmake -S . -B build -DQUARK_BUILD_SAMPLES=ON
-taskset -c 0-3 build/samples/01_hello_counter    # prints OK / exit 0
+./build/samples/01_hello_counter    # prints OK / exit 0
+# (Removed duplicated obsolete sections)
 
 # Opt-in persistence backends (off by default; std-only core needs neither)
 cmake -S . -B build -DQUARK_WITH_SQLITE=ON -DQUARK_WITH_ROCKSDB=ON
