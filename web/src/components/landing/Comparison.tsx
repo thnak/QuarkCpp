@@ -1,19 +1,48 @@
 import { CHOOSE_CAF, CHOOSE_QUARK, COMPARISON_ROWS, REPO_URL } from '../../data/content'
 import { Reveal, SectionHead } from '../primitives'
 import { Ticks } from '../Ticks'
+import { useLang } from '../../hooks/useLang'
+import { TRANSLATIONS } from '../../data/translations'
 
 export function Comparison() {
+  const { lang } = useLang()
+  const t = TRANSLATIONS[lang]
+
+  const chooseQuark = lang === 'vi' ? [
+    'Tải trọng chính là `ask` / `tell` đơn-actor có thể dự đoán được, zero-allocation và latency cực thấp',
+    'Actor định kiểu compile-time — một giao thức cố định cho mỗi actor được trình biên dịch kiểm tra, không RTTI',
+    'Mọi khẳng định an toàn và hot-path đều được chứng minh bằng mã thực thi chứ không phải assertion',
+    'Kiểm thử mô phỏng định tính cho bơm lỗi không cần thời gian thực hay thread thực',
+  ] : CHOOSE_QUARK
+
+  const chooseCAF = lang === 'vi' ? [
+    'Băng thông tổng hợp cao khi có nhiều producer đồng thời và mailbox bị tranh chấp',
+    'Truyền tin linh hoạt runtime — một actor xử lý nhiều dạng bản tin khác nhau, `become` / `unbecome` hệ sinh thái',
+    'Hệ sinh thái lớn có sẵn, lịch sử sử dụng sản xuất thực tế và độ chín qua thử thách',
+    'Bộ công cụ reactive-streaming trưởng thành và hỗ trợ nền tảng rộng rãi',
+  ] : CHOOSE_CAF
+
   return (
     <section className="section compare" id="compare">
       <div className="wrap">
         <SectionHead
-          eyebrow="Honest comparison"
+          eyebrow={lang === 'vi' ? 'So sánh khách quan' : 'Honest comparison'}
           title={
-            <>
-              Head to head with <span className="grad-text">CAF</span> — caveats included.
-            </>
+            lang === 'vi' ? (
+              <>
+                Đối đầu trực tiếp với <span className="grad-text">CAF</span> — minh bạch mọi lưu ý.
+              </>
+            ) : (
+              <>
+                Head to head with <span className="grad-text">CAF</span> — caveats included.
+              </>
+            )
           }
-          lede="The point of the comparison is to sanity-check Quark's hot-path claims against an established alternative, not to crown a universal winner. The two engines sit at different points on the latency-vs-generality spectrum."
+          lede={
+            lang === 'vi'
+              ? 'Mục đích so sánh là kiểm tra các tuyên bố hot-path của Quark đối chiếu với giải pháp phổ biến, không nhằm tuyên bố chiến thắng tuyệt đối. Hai engine đứng ở các điểm khác nhau trên phổ latency-vs-tính tổng quát.'
+              : "The point of the comparison is to sanity-check Quark's hot-path claims against an established alternative, not to crown a universal winner. The two engines sit at different points on the latency-vs-generality spectrum."
+          }
         />
 
         <Reveal className="caveat" delay={60}>
@@ -21,12 +50,10 @@ export function Comparison() {
             !
           </span>
           <div>
-            <strong>This is not an apples-to-apples benchmark, and the writeup says so.</strong> CAF&apos;s{' '}
-            <code>ask</code> runs through a general-purpose, fully dynamic mailbox; Quark&apos;s bypasses the mailbox
-            via a dedicated single-shot reply slot because its actors are compile-time-typed. Quark&apos;s spawn
-            benchmark never starts its scheduler, while CAF&apos;s is live from construction. And every number is a
-            single unpinned Windows session on a shared dev laptop. Treat directional trends and cited mechanisms as
-            the signal — not any one figure.
+            <strong>{lang === 'vi' ? 'Đây không phải bài benchmark khập khiễng, và báo cáo nêu rõ điều đó.' : 'This is not an apples-to-apples benchmark, and the writeup says so.'}</strong>{' '}
+            {lang === 'vi'
+              ? 'Bản ask của CAF chạy qua mailbox đa năng; ask của Quark tối ưu slot phản hồi single-shot riêng biệt nhờ actor định kiểu tại thời điểm biên dịch. Hãy nhìn vào xu hướng và cơ chế cốt lõi.'
+              : 'CAF’s ask runs through a general-purpose, fully dynamic mailbox; Quark’s bypasses the mailbox via a dedicated single-shot reply slot because its actors are compile-time-typed.'}
           </div>
         </Reveal>
 
@@ -42,11 +69,9 @@ export function Comparison() {
 
         <div className="choose-grid">
           <Reveal className="choose choose-quark" delay={60}>
-            <h3>
-              Choose <span className="grad-text">Quark</span> if you need…
-            </h3>
+            <h3>{t.compare.chooseQuarkTitle}</h3>
             <ul>
-              {CHOOSE_QUARK.map((c) => (
+              {chooseQuark.map((c) => (
                 <li key={c}>
                   <Ticks>{c}</Ticks>
                 </li>
@@ -54,9 +79,9 @@ export function Comparison() {
             </ul>
           </Reveal>
           <Reveal className="choose" delay={140}>
-            <h3>Choose CAF if you need…</h3>
+            <h3>{t.compare.chooseCAFTitle}</h3>
             <ul>
-              {CHOOSE_CAF.map((c) => (
+              {chooseCAF.map((c) => (
                 <li key={c}>
                   <Ticks>{c}</Ticks>
                 </li>
@@ -72,7 +97,7 @@ export function Comparison() {
             target="_blank"
             rel="noreferrer noopener"
           >
-            Full methodology, every disclosed asymmetry with source-line citations →
+            {lang === 'vi' ? 'Phương pháp luận đầy đủ và dẫn chứng từng dòng mã nguồn →' : 'Full methodology, every disclosed asymmetry with source-line citations →'}
           </a>
         </Reveal>
       </div>

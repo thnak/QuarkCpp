@@ -1,27 +1,43 @@
 import { useEffect, useState } from 'react'
 import type { DocIndex, DocPage } from '../types'
+import type { Lang } from '../context/LangContext'
 
 const asset = (file: string): string => `${import.meta.env.BASE_URL}docs/${file}`
 
-let indexPromise: Promise<DocIndex> | null = null
+const indexCache = new Map<Lang, Promise<DocIndex>>()
 const pageCache = new Map<string, Promise<DocPage>>()
 
-export function loadIndex(): Promise<DocIndex> {
-  indexPromise ??= fetch(asset('index.json')).then((r) => {
-    if (!r.ok) throw new Error(`docs index: HTTP ${r.status}`)
-    return r.json() as Promise<DocIndex>
-  })
-  return indexPromise
+export function loadIndex(lang: Lang = 'en'): Promise<DocIndex> {
+  let p = indexCache.get(lang)
+  if (!p) {
+    const file = lang === 'en' ? 'index.json' : 'index_vi.json'
+    p = fetch(asset(file)).then((r) => {
+      if (!r.ok) throw new Error(`docs index: HTTP ${r.status}`)
+      return r.json() as Promise<DocIndex>
+    })
+    indexCache.set(lang, p)
+  }
+  return p
 }
 
-export function loadPage(slug: string): Promise<DocPage> {
-  let p = pageCache.get(slug)
+export function loadPage(slug: string, lang: Lang = 'en'): Promise<DocPage> {
+  const cacheKey = `${lang}:${slug}`
+  let p = pageCache.get(cacheKey)
   if (!p) {
-    p = fetch(asset(`${encodeURIComponent(slug)}.json`)).then((r) => {
-      if (!r.ok) throw new Error(`Not found: ${slug}`)
-      return r.json() as Promise<DocPage>
-    })
-    pageCache.set(slug, p)
+    const file = lang === 'en' ? `${encodeURIComponent(slug)}.json` : `${encodeURIComponent(slug)}_vi.json`
+    p = fetch(asset(file))
+      .then((r) => {
+        if (!r.ok && lang !== 'en') {
+          // Fallback to English page if Vietnamese version is missing
+          return fetch(asset(`${encodeURIComponent(slug)}.json`))
+        }
+        return r
+      })
+      .then((r) => {
+        if (!r.ok) throw new Error(`Not found: ${slug}`)
+        return r.json() as Promise<DocPage>
+      })
+    pageCache.set(cacheKey, p)
   }
   return p
 }
@@ -52,7 +68,7 @@ function useAsync<T>(run: () => Promise<T>, deps: unknown[]): Async<T> {
   return state
 }
 
-export const useDocsIndex = (): Async<DocIndex> => useAsync(loadIndex, [])
+export const useDocsIndex = (lang: Lang = 'en'): Async<DocIndex> => useAsync(() => loadIndex(lang), [lang])
 
-export const useDocPage = (slug: string | undefined): Async<DocPage> =>
-  useAsync(() => (slug ? loadPage(slug) : Promise.reject(new Error('no slug'))), [slug])
+export const useDocPage = (slug: string | undefined, lang: Lang = 'en'): Async<DocPage> =>
+  useAsync(() => (slug ? loadPage(slug, lang) : Promise.reject(new Error('no slug'))), [slug, lang])

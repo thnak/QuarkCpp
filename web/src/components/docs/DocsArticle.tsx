@@ -2,16 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { useDocPage } from '../../hooks/useDocs'
 import type { DocIndexEntry } from '../../types'
-
-const CATEGORY_LABEL: Record<string, string> = {
-  guide: 'Guide',
-  reference: 'Reference',
-  spec: 'Specification',
-  adr: 'Decision record',
-}
+import { useLang } from '../../hooks/useLang'
+import { TRANSLATIONS } from '../../data/translations'
 
 export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocIndexEntry[] }) {
-  const { data, error, loading } = useDocPage(slug)
+  const { lang } = useLang()
+  const { data, error, loading } = useDocPage(slug, lang)
+  const t = TRANSLATIONS[lang]
   const { hash } = useLocation()
   const bodyRef = useRef<HTMLDivElement>(null)
   const [activeHeading, setActiveHeading] = useState<string>('')
@@ -40,7 +37,7 @@ export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocInd
       },
       { rootMargin: '-80px 0px -70% 0px', threshold: 0 }
     )
-    targets.forEach((t) => io.observe(t))
+    targets.forEach((tTarget) => io.observe(tTarget))
     return () => io.disconnect()
   }, [data])
 
@@ -61,12 +58,12 @@ export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocInd
   if (error || !data) {
     return (
       <article className="docs-article">
-        <h1>Document not found</h1>
+        <h1>{t.docsUI.missingTitle}</h1>
         <p className="docs-missing">
-          No document is published at <code>{slug}</code>.
+          {t.docsUI.missingText} (<code>{slug}</code>)
         </p>
         <Link className="btn btn-ghost" to="/docs">
-          Back to all documents
+          {t.docsUI.backToDocs}
         </Link>
       </article>
     )
@@ -82,13 +79,15 @@ export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocInd
       <article className="docs-article">
         <header className="docs-article-head">
           <div className="docs-crumbs">
-            <Link to="/docs">Docs</Link>
+            <Link to="/docs">{lang === 'vi' ? 'Tài liệu' : 'Docs'}</Link>
             <span>/</span>
-            <Link to={`/docs?category=${data.category}`}>{CATEGORY_LABEL[data.category] ?? data.category}</Link>
+            <Link to={`/docs?category=${data.category}`}>
+              {t.docsUI.categories[data.category] ?? data.category}
+            </Link>
           </div>
           <div className="docs-meta">
             {data.badge ? <span className="chip">{data.badge}</span> : null}
-            {entry ? <span className="chip">{entry.readMinutes} min read</span> : null}
+            {entry ? <span className="chip">{entry.readMinutes} {t.docsUI.readTime}</span> : null}
             <a className="chip chip-link" href={data.githubUrl} target="_blank" rel="noreferrer noopener">
               {data.origin}
             </a>
@@ -100,7 +99,7 @@ export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocInd
         <nav className="docs-pager">
           {prev ? (
             <Link to={`/docs/${prev.slug}`} className="pager-link prev">
-              <span>← Previous</span>
+              <span>{t.docsUI.prevPage}</span>
               <strong>{prev.title}</strong>
             </Link>
           ) : (
@@ -108,7 +107,7 @@ export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocInd
           )}
           {next ? (
             <Link to={`/docs/${next.slug}`} className="pager-link next">
-              <span>Next →</span>
+              <span>{t.docsUI.nextPage}</span>
               <strong>{next.title}</strong>
             </Link>
           ) : (
@@ -119,7 +118,7 @@ export function DocsArticle({ slug, siblings }: { slug: string; siblings: DocInd
 
       {data.headings.length > 2 ? (
         <aside className="docs-toc">
-          <span className="toc-label">On this page</span>
+          <span className="toc-label">{t.docsUI.onThisPage}</span>
           <ul>
             {data.headings
               .filter((h) => h.level <= 3)

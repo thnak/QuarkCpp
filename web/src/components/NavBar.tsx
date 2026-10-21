@@ -3,21 +3,25 @@ import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { ScrollProgress } from './ScrollProgress'
 import { REPO_URL } from '../data/content'
 import type { Theme } from '../hooks/useTheme'
-
-const SECTIONS = [
-  ['features', 'Features'],
-  ['proof', 'Proof'],
-  ['performance', 'Performance'],
-  ['compare', 'Compare'],
-  ['start', 'Get started'],
-] as const
+import { useLang } from '../hooks/useLang'
+import { TRANSLATIONS } from '../data/translations'
 
 export function NavBar({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => void }) {
   const [scrolled, setScrolled] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const { pathname } = useLocation()
   const navigate = useNavigate()
+  const { lang, toggleLang } = useLang()
+  const t = TRANSLATIONS[lang]
   const onDocs = pathname.startsWith('/docs')
+
+  const sections: Array<[string, string]> = [
+    ['features', t.nav.features],
+    ['proof', t.nav.proof],
+    ['performance', t.nav.performance],
+    ['compare', t.nav.compare],
+    ['start', t.nav.start],
+  ]
 
   useEffect(() => {
     const onScroll = (): void => setScrolled(window.scrollY > 12)
@@ -57,17 +61,27 @@ export function NavBar({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
         </Link>
 
         <nav className={`nav-links ${menuOpen ? 'open' : ''}`.trim()}>
-          {SECTIONS.map(([id, label]) => (
+          {sections.map(([id, label]) => (
             <button key={id} className="nav-link" onClick={() => goToSection(id)}>
               {label}
             </button>
           ))}
           <Link to="/docs" className={`nav-link ${onDocs ? 'active' : ''}`.trim()}>
-            Wiki &amp; docs
+            {t.nav.docs}
           </Link>
         </nav>
 
         <div className="nav-actions">
+          <button
+            className="btn btn-ghost lang-btn"
+            onClick={toggleLang}
+            aria-label={`Switch language to ${lang === 'en' ? 'Vietnamese' : 'English'}`}
+            title={`Switch to ${lang === 'en' ? 'Tiếng Việt' : 'English'}`}
+            style={{ padding: '0.35rem 0.65rem', fontSize: '0.82rem', fontWeight: 600, textTransform: 'uppercase' }}
+          >
+            <GlobeIcon />
+            <span>{lang.toUpperCase()}</span>
+          </button>
           <button className="icon-btn" onClick={onToggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
             {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
           </button>
@@ -88,6 +102,16 @@ export function NavBar({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
       </div>
       <ScrollProgress />
     </header>
+  )
+}
+
+function GlobeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '4px' }}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3.6 9h16.8M3.6 15h16.8" />
+      <path d="M11.5 3a17 17 0 0 0 0 18M12.5 3a17 17 0 0 1 0 18" />
+    </svg>
   )
 }
 
