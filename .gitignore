@@ -19,6 +19,11 @@ perf_test.log
 .whmcp-tmp/
 *.deb
 
+# Command Code local session scratch / env logs (taste preferences are tracked)
+.commandcode/tmp/
+env_after.txt
+vcvars.log
+
 # vcpkg toolchain (bootstrapped locally, not vendored — see cmake/QuarkSecurityAdapters.cmake)
 /vcpkg/
 vcpkg_installed/

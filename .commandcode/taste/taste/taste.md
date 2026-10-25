@@ -1,0 +1,12 @@
+# Taste
+- Uses a remote Linux dev server (`thnak-server`, 192.168.1.7) over SSH as the build/test/benchmark host for this repo, rather than verifying only on the local Windows machine. Confidence: 0.6
+- Session goals are framed as bug hunting plus performance work at large scale; expects defects to be reproduced on real hardware before being called fixed. Confidence: 0.6
+- Security work must be empirical: spin up a real running cluster on the remote server and actually attack it (live processes, real TLS certs, wire-level/MITM clients), rather than reporting issues reasoned from source reading alone. Confidence: 0.6
+- Only proven vectors count: a finding must be reproduced end-to-end to be reported; crashes or oddities caused by the test harness itself must be discarded, not written up as vulnerabilities. Confidence: 0.55
+- Threat model should include the authenticated insider (valid certificate / admitted node abusing trusted inputs), not just anonymous or unauthenticated attackers. Confidence: 0.5
+- Ships straight to `master`: works on the trunk, and when asked to push expects `git push origin master` after integrating any divergent `origin/master` locally — no PR/review-branch ceremony. Confidence: 0.5
+- Fix-as-found over report-only: prefers defects be patched in place with regression coverage and verified (full suite, sanitizers, alternate compiler) on the server, rather than a findings dossier with no code. Confidence: 0.5
+- Prefers complete removal of abandoned subsystems — implementation, tests, RFC spec, ADR, PAL primitives, and generated website docs — over keeping dead code or historical design documents around. Confidence: 0.6
+- Wants open/follow-up work persisted in the repo as a markdown tracking file (prioritized backlog, status markers, acceptance criteria, verification commands) rather than living only in chat summaries. Confidence: 0.6
+- When handed a plan ("follow that plan"), expects the whole thing executed and shipped in one pass — inspected, implemented, tested, committed, pushed, then summarized — not a step-by-step approval loop. Confidence: 0.55
+- Cleans up finished git state too: wants merged scratch/topic branches deleted once integrated rather than left lying around, including the remote (`origin/<branch>`) copy when it's fully merged — not just the local branch. Confidence: 0.6
