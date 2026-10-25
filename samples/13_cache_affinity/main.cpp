@@ -57,7 +57,7 @@ int main() {
             if (owner(u, v) == warmed_on[u]) ++hits;                        // ...lands on the warm node
         ok &= (hits == U);
         std::printf("CASE 1  stable cluster:                repeat-request cache hit rate = %6.2f%%  (expected 100%%)\n",
-                    100.0 * hits / U);
+                    100.0 * static_cast<double>(hits) / static_cast<double>(U));
     }
 
     // ---- CASE 2: a GPU node dies — only ITS users lose their cache; everyone else stays warm. ----
@@ -80,8 +80,8 @@ int main() {
         // Only the ~U/N users that were on node 7 go cold; HRW never moves the others.
         ok &= (cold_from_move == on_dead);
         std::printf("CASE 2  1 of %llu nodes dies:            hit rate = %6.2f%%  (cold = the %llu users on the dead node, %.2f%% ~ 1/N)\n",
-                    (unsigned long long)N, 100.0 * hits / U, (unsigned long long)cold_from_move,
-                    100.0 * cold_from_move / U);
+                    static_cast<unsigned long long>(N), 100.0 * static_cast<double>(hits) / static_cast<double>(U), static_cast<unsigned long long>(cold_from_move),
+                    100.0 * static_cast<double>(cold_from_move) / static_cast<double>(U));
     }
 
     // ---- CASE 3: scale-up — add a node; only ~1/(N+1) users migrate (cold once), rest stay warm. -
@@ -100,7 +100,7 @@ int main() {
         }
         ok &= (moved_between_old == 0);  // HRW: users only ever move TO the new node, never between old ones
         std::printf("CASE 3  scale-up (add 1 node):          hit rate = %6.2f%%  (only %.2f%% ~ 1/(N+1) migrated, 0 moved between old nodes)\n",
-                    100.0 * hits / U, 100.0 * moved / U);
+                    100.0 * static_cast<double>(hits) / static_cast<double>(U), 100.0 * static_cast<double>(moved) / static_cast<double>(U));
     }
 
     // ---- CASE 4: the WRONG way #1 — naive hash % N collapses cache on ANY membership change. -------
@@ -114,8 +114,8 @@ int main() {
         for (std::uint64_t u = 0; u < U; ++u)
             if (mod_owner(u, N - 1) == warmed_on[u]) ++hits;   // one node leaves -> modulus changes
         std::printf("CASE 4  naive hash%%N, 1 node leaves:    hit rate = %6.2f%%  (CATASTROPHE — the modulus reshuffles almost everyone)\n",
-                    100.0 * hits / U);
-        ok &= (100.0 * hits / U) < 10.0;  // demonstrably terrible
+                    100.0 * static_cast<double>(hits) / static_cast<double>(U));
+        ok &= (100.0 * static_cast<double>(hits) / static_cast<double>(U)) < 10.0;  // demonstrably terrible
     }
 
     // ---- CASE 5: the WRONG way #2 — a stateless pool routes by LOAD/rotation, not identity. ------
@@ -127,9 +127,9 @@ int main() {
             const std::uint64_t req2 = detail::splitmix64(u + 0x9E3779B9u) % N;  // request 2: independent
             if (req2 == req1) ++hits;                                        // hit only by coincidence
         }
-        ok &= (100.0 * hits / U) < 5.0;  // ~1/N = 1.56% — cache-hostile
+        ok &= (100.0 * static_cast<double>(hits) / static_cast<double>(U)) < 5.0;  // ~1/N = 1.56% — cache-hostile
         std::printf("CASE 5  stateless load-balanced pool:  hit rate = %6.2f%%  (~1/N — balances load but CACHE-HOSTILE; wrong tool for affinity)\n",
-                    100.0 * hits / U);
+                    100.0 * static_cast<double>(hits) / static_cast<double>(U));
     }
 
     // ---- CASE 6: hotspot check — HRW is balanced, but a SINGLE hot identity pins to ONE node. ----
@@ -140,7 +140,7 @@ int main() {
         std::uint64_t mn = U, mx = 0;
         for (std::uint64_t i = 1; i <= N; ++i) { mn = per_node[i] < mn ? per_node[i] : mn; mx = per_node[i] > mx ? per_node[i] : mx; }
         std::printf("CASE 6  load spread over %llu nodes:      min=%llu max=%llu per node (balanced), BUT one hot user = one node -> shard its key (user+bucket) if it gets too hot\n",
-                    (unsigned long long)N, (unsigned long long)mn, (unsigned long long)mx);
+                    static_cast<unsigned long long>(N), static_cast<unsigned long long>(mn), static_cast<unsigned long long>(mx));
     }
 
     std::printf("%s\n", ok ? "OK" : "FAIL");

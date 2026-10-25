@@ -76,7 +76,7 @@ supervision (007) and distribution (010) are actually exercised:
 Each is seeded, so a discovered bug replays exactly.
 
 **Deferred delivery is required for timing-dependent protocol tests
-([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).** The in-process
+([ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md)).** The in-process
 `LoopbackTransport` delivers a reply inside the sender's own call, which hid two SWIM
 defects that only appeared on real sockets. Any test whose correctness depends on when
 a reply arrives runs on a transport that never delivers in the sender's call stack

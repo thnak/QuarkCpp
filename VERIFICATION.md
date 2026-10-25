@@ -123,7 +123,7 @@ priority behavior, not frame parsing on a damaged stream.
 
 **Multi-process SWIM.** `tests/netem/run_swim_chaos.sh` (5 processes, one per namespace, iptables
 partitions). On 2026-10-21, formation and a 20%-loss flaky link passed, but partition heal and an
-asymmetric link cut **failed**: two SWIM defects (021 in `OpenQuestions.md`). After the ADR-048 merge
+asymmetric link cut **failed**: two SWIM defects (021 in `OpenQuestions.md`). After the ADR-049 merge
 (2026-10-22) all 5 scenarios end all-alive: an isolated node and a {1,2}|{3,4,5} split each heal about
 1 s after the cut is lifted, and with only the 1↔2 link cut nodes 1 and 2 are never suspected
 (incarnation stays 1; it was 31). In-process regression tests on a deferred-delivery fabric

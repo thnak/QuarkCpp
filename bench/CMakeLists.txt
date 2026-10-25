@@ -10,7 +10,7 @@ foreach(src ${QUARK_BENCH_SOURCES})
   get_filename_component(name "${src}" NAME_WE)
   add_executable(${name} "${src}")
   target_link_libraries(${name} PRIVATE quark::quark quark_warnings Threads::Threads)
-  target_compile_options(${name} PRIVATE -O3)
+  target_compile_options(${name} PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)  # MSVC: its Release /O2 already applies
   list(APPEND _quark_bench_targets ${name})
 endforeach()
 
@@ -19,7 +19,7 @@ endforeach()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/supervision_bench.cpp")
   add_executable(supervision_bench_noguard supervision_bench.cpp)
   target_link_libraries(supervision_bench_noguard PRIVATE quark::quark quark_warnings Threads::Threads)
-  target_compile_options(supervision_bench_noguard PRIVATE -O3)
+  target_compile_options(supervision_bench_noguard PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)  # MSVC: its Release /O2 already applies
   target_compile_definitions(supervision_bench_noguard PRIVATE QUARK_SUPERVISION_NO_GUARD)
 endif()
 

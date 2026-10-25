@@ -34,5 +34,14 @@ inline constexpr std::size_t max_descriptor_size = 64;
 #define QUARK_COLD
 #endif
 
+// Empty-member elision. On the MSVC ABI (MSVC, and clang targeting *-windows-msvc) the standard
+// [[no_unique_address]] is ignored (-Wunknown-attributes); [[msvc::no_unique_address]] is the
+// ABI-honoring spelling there.
+#if defined(_MSC_VER)
+#define QUARK_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+#else
+#define QUARK_NO_UNIQUE_ADDRESS [[no_unique_address]]
+#endif
+
 // Cache-line alignment attribute for hot atomics / per-shard single-writer state (002/003).
 #define QUARK_CACHE_ALIGNED alignas(::quark::cache_line_size)

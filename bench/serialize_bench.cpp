@@ -14,6 +14,9 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
 
 #include "quark/core/serialize.hpp"
 #include "pal/pal.hpp"
@@ -37,11 +40,23 @@ double percentile(std::vector<double>& v, double p) {
 }
 
 // Prevent the compiler from eliding the encode / hoisting the input.
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC has no GNU inline asm: escape the value's address through a volatile sink (forces it to be
+// materialized in memory) and fence the compiler with _ReadWriteBarrier (compiler-only, no CPU fence).
+inline char const volatile* volatile g_escape_sink = nullptr;
+template <class T>
+inline void do_not_optimize(T const& value) {
+    g_escape_sink = &reinterpret_cast<char const volatile&>(value);
+    _ReadWriteBarrier();
+}
+inline void clobber() { _ReadWriteBarrier(); }
+#else
 template <class T>
 inline void do_not_optimize(T const& value) {
     asm volatile("" : : "r,m"(value) : "memory");
 }
 inline void clobber() { asm volatile("" : : : "memory"); }
+#endif
 
 QUARK_SERIALIZE(Pod, (1, id), (2, qty), (3, flags), (4, price))
 

@@ -1,8 +1,8 @@
-// Tests ADR-048 (021 §3): SWIM's indirect ping (PingReq relay) works when replies arrive LATER, as
+// Tests ADR-049 (021 §3): SWIM's indirect ping (PingReq relay) works when replies arrive LATER, as
 // they do over TcpTransport. Runs on the deferred-delivery fabric (swim_deferred_fabric.hpp) with a
 // per-wave latency, never delivering in the sender's call stack.
 //
-// Reproduces the 2026-10-21 run_swim_chaos.sh defect: on the pre-ADR-048 code the relay checked for
+// Reproduces the 2026-10-21 run_swim_chaos.sh defect: on the pre-ADR-049 code the relay checked for
 // the subject's Ack before returning from the PingReq handler, so over a real transport no PingReqAck
 // was ever sent. With only the 1<->2 link cut, nodes 1 and 2 suspected and refuted each other about
 // once a second (incarnation 1 → 31 in 22 s) although relays 3/4/5 could reach both.
@@ -54,7 +54,7 @@ int main() {
             check(!ever_dead, "1 and 2 never drop each other while relays 3/4/5 can reach both");
             check(bumps == 0, "no refutation was ever needed: the relays vouched for 1 and 2 every time");
             if (seed == 0)
-                std::printf("  d=%lld ms: incarnation bumps over 1000 ticks = %llu (nodes 1+2; pre-ADR-048 code: 363)\n",
+                std::printf("  d=%lld ms: incarnation bumps over 1000 ticks = %llu (nodes 1+2; pre-ADR-049 code: 363)\n",
                             static_cast<long long>(d_ms), static_cast<unsigned long long>(bumps));
         }
     }

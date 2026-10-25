@@ -56,18 +56,18 @@ int main() {
     }
     ok &= (disagreements == 0);
     std::printf("determinism: %llu/%llu keys agree across 3 roster orderings  (disagreements=%llu)\n",
-                (unsigned long long)(M - disagreements), (unsigned long long)M,
-                (unsigned long long)disagreements);
+                static_cast<unsigned long long>(M - disagreements), static_cast<unsigned long long>(M),
+                static_cast<unsigned long long>(disagreements));
 
     // ---- 2) Balance: spread M actors over 8 nodes, report the coefficient of variation ---------
     std::vector<std::uint64_t> counts(9, 0);  // index by node id 1..8
     for (std::uint64_t k = 0; k < M; ++k) counts[place(actor(k), ascending)->value]++;
     double mean = static_cast<double>(M) / 8.0, var = 0;
-    for (std::uint64_t n = 1; n <= 8; ++n) { const double d = counts[n] - mean; var += d * d; }
+    for (std::uint64_t n = 1; n <= 8; ++n) { const double d = static_cast<double>(counts[n]) - mean; var += d * d; }
     const double cov = std::sqrt(var / 8.0) / mean;
     ok &= (cov < 0.05);
     std::printf("balance: per-node counts");
-    for (std::uint64_t n = 1; n <= 8; ++n) std::printf(" %llu", (unsigned long long)counts[n]);
+    for (std::uint64_t n = 1; n <= 8; ++n) std::printf(" %llu", static_cast<unsigned long long>(counts[n]));
     std::printf("   CoV=%.4f  (well-balanced: <0.05)\n", cov);
 
     // ---- 3) O(1) VirtualBins: deterministic + balanced, quantized (not per-key HRW) ------------
@@ -90,13 +90,13 @@ int main() {
         if (oa && place(actor(k), ascending)->value == oa->value) ++hrw_agreements;  // partial by design
     }
     double vb_mean = static_cast<double>(M) / 8.0, vb_var = 0;
-    for (std::uint64_t n = 1; n <= 8; ++n) { const double d = vb_counts[n] - vb_mean; vb_var += d * d; }
+    for (std::uint64_t n = 1; n <= 8; ++n) { const double d = static_cast<double>(vb_counts[n]) - vb_mean; vb_var += d * d; }
     const double vb_cov = std::sqrt(vb_var / 8.0) / vb_mean;
     ok &= (owner_disagreements == 0) && (bins_a.digest() == bins_b.digest()) && (vb_cov < 0.10);
     std::printf("O(1) VirtualBins: order-independent (digest match=%s, key disagreements=%llu), "
                 "balanced CoV=%.4f\n",
                 (bins_a.digest() == bins_b.digest()) ? "yes" : "NO",
-                (unsigned long long)owner_disagreements, vb_cov);
+                static_cast<unsigned long long>(owner_disagreements), vb_cov);
     std::printf("            (per-key agreement with raw HRW = %.1f%% — the DELIBERATE 026 bin "
                 "quantization, not a bug)\n",
                 100.0 * static_cast<double>(hrw_agreements) / static_cast<double>(M));

@@ -269,7 +269,7 @@ public:
 
 private:
     std::array<ActivationMpsc, K> bands_{};
-    [[no_unique_address]] Anti anti_{};
+    QUARK_NO_UNIQUE_ADDRESS Anti anti_{};
 };
 
 }  // namespace quark

@@ -1,8 +1,8 @@
-// Tests ADR-048 (021 §1/§3): a SWIM cluster heals after a partition, a departed or restarted node can
+// Tests ADR-049 (021 §1/§3): a SWIM cluster heals after a partition, a departed or restarted node can
 // rejoin, and a genuinely crashed node is still detected Dead and is not resurrected by stale gossip.
 // Runs on the deferred-delivery fabric (swim_deferred_fabric.hpp), never in the sender's call stack.
 //
-// Reproduces the 2026-10-21 run_swim_chaos.sh defect: on the pre-ADR-048 code, after the heal, the
+// Reproduces the 2026-10-21 run_swim_chaos.sh defect: on the pre-ADR-049 code, after the heal, the
 // isolated node's stale "everyone is Dead" gossip was accepted by healthy nodes about EACH OTHER (equal
 // incarnation, Dead terminal) and the cluster broke apart; and a Join for a Dead node was a no-op.
 #include <cstdint>

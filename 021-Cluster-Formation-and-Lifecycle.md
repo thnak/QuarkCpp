@@ -104,7 +104,7 @@ Beyond *node* identity, the cluster carries a **cluster id** and a monotonic
   on membership snapshots so a node rejoining after a partition can tell *stale*
   from *current* rather than resurrecting a departed view.
 
-**Rejoin semantics ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).**
+**Rejoin semantics ([ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md)).**
 These rules are what make "a node rejoining after a partition can tell stale from
 current" hold:
 
@@ -347,10 +347,10 @@ explicit follow-on, mirroring ADR-019's own cross-node-broadcast Draft status �
 not silently assumed to already work at that scale. 021's one-connection-per-peer
 invariant is unaffected either way: no new socket, same shared control channel.
 
-### SWIM failure-detector rules (ADR-048)
+### SWIM failure-detector rules (ADR-049)
 
 The precedence and relay rules `SwimMembership` enforces, chosen in
-[ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md) after two defects
+[ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md) after two defects
 were found on real separate processes (`tests/netem/run_swim_chaos.sh`): a healed
 partition broke the whole cluster apart, and the indirect ping never worked over
 `TcpTransport`.
@@ -389,6 +389,35 @@ All of these timers read the injected clock (018). Measured on the 5-process
 network-namespace rig: an isolated node and a {1,2}|{3,4,5} split both heal in about
 1 s; with only the 1↔2 link cut, nodes 1 and 2 never suspect each other.
 
+### Relay transport endpoint fallback (010, ADR-048)
+
+010's `TcpTransport` `DirectThenRelay<TimeoutMs>` policy (ADR-048) answers *how*
+a node falls back from a direct connection to a relay hop and recovers back; it
+deliberately does **not** answer how a peer's designated relay `Endpoint` is
+learned or kept current — that is explicitly deferred to this spec, as a named
+non-goal of ADR-048:
+
+- **Relay-node discovery/advertisement** — static config today (an operator
+  supplies a peer's relay `Endpoint` up front); riding SWIM's existing
+  capability-gossip piggyback channel (ADR-045, "Capability gossip beyond
+  placement" above) is the natural follow-on, so a relay-capable node's
+  advertised capability set gains a `can_relay` flag alongside the existing
+  static label/flag/scalar vocabulary — not yet designed.
+- **Relay-node health/failover** — out of scope today. If the relay itself
+  becomes unreachable while a peer is relay-routed, that peer's frames dead-end
+  at the (forever-retrying) relay `Conn` with no distinct signal beyond
+  `TcpTransport`'s existing `drops_`/`reconnects_` counters — an operator
+  cannot currently distinguish "relay is down" from "peer is down" from
+  diagnostics alone. Multi-relay selection/failover is unbuilt.
+- **Relay trust boundary** — the relay node sees routing metadata (`from`/`to`
+  `NodeId`) for every frame it forwards, even under `SecureTransport`'s AEAD
+  sealing (which protects payload, not routing). Whether relay participation
+  needs authentication beyond ordinary peer mTLS (ADR-040) is undecided.
+
+A future relay-discovery ADR should only need to address these three items —
+the fallback-threshold mechanism itself (`resolve_dial_endpoint()`, the fenced
+relay↔direct cutover) is settled and should not be re-litigated.
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping
@@ -424,9 +453,9 @@ the roll:
   without a flag day.
 - **Membership-protocol compatibility** — SWIM's on-wire format is versioned and
   back-compatible within a supported window (a support-policy open question).
-  **ADR-048 is outside that window:** it adds wire status 3 (Left) and relay-echo
+  **ADR-049 is outside that window:** it adds wire status 3 (Left) and relay-echo
   fields in Ack. An older node treats Left as live, and an older subject does not echo
-  the relay token, so its indirect pings stay inert. Rolling across ADR-048 needs a
+  the relay token, so its indirect pings stay inert. Rolling across ADR-049 needs a
   SWIM wire-version gate (not built yet) or a flag-day restart.
 
 The stabilization window above also means the brief per-node absence during its
@@ -502,8 +531,13 @@ here is compiled into a single-node engine.
   simultaneously unreachable, a *new* node cannot join even though the cluster is
   healthy — is a healthy member promoted to an ad-hoc contact, or is that purely a
   `Discovery`-adapter concern?
-- **Tombstone TTL vs. longest tolerated partition (ADR-048).** `tombstone_ttl_ns`
+- **Tombstone TTL vs. longest tolerated partition (ADR-049).** `tombstone_ttl_ns`
   (60 s) must exceed the longest partition a deployment rides out, or an expired
   tombstone lets stale gossip briefly re-admit a departed node. Should the engine
   assert it at startup against `2·(ack + indirect + suspicion)`, derive it from a
   declared partition budget, or leave it as operational config?
+- **Relay-node discovery, health/failover, and trust boundary** (010, ADR-048) —
+  see "Relay transport endpoint fallback" above. The fallback-threshold mechanism
+  is settled; how a peer's relay `Endpoint` is learned/kept current, what happens
+  when the relay itself is unreachable, and the relay's own authentication
+  posture beyond ordinary peer mTLS are open.

@@ -29,7 +29,6 @@ static ActorId actor(std::uint64_t key) { return ActorId{TypeKey{0xC0FFEE}, key}
 int main() {
     bool ok = true;
     constexpr std::uint64_t K = 200'000;
-    constexpr std::uint64_t N = 8;
 
     InProcessMembership m(NodeId{1}, {NodeId{1}, NodeId{2}, NodeId{3}, NodeId{4}, NodeId{5},
                                       NodeId{6}, NodeId{7}, NodeId{8}});
@@ -57,7 +56,7 @@ int main() {
         ok &= (moved_between_old == 0) && (moved_to_new == moved) && (frac > 0.07 && frac < 0.16);
         std::printf("JOIN(9):  moved=%.3f%%  (ideal 1/9=%.3f%%);  all moved -> node 9: %s;  moved between survivors: %llu\n",
                     frac * 100, 100.0 / 9.0, (moved_to_new == moved) ? "yes" : "NO",
-                    (unsigned long long)moved_between_old);
+                    static_cast<unsigned long long>(moved_between_old));
     }
 
     // Refresh baseline (now a 9-node cluster), then LEAVE a node.
@@ -83,8 +82,8 @@ int main() {
         }
         ok &= (moved == was_on_3) && (moved_not_owned_by_3 == 0) && (re_placed_to_3 == 0);
         std::printf("LEAVE(3): re-placed %llu actors == the %llu that were on node 3;  survivors disturbed: %llu;  any left on 3: %llu\n",
-                    (unsigned long long)moved, (unsigned long long)was_on_3,
-                    (unsigned long long)moved_not_owned_by_3, (unsigned long long)re_placed_to_3);
+                    static_cast<unsigned long long>(moved), static_cast<unsigned long long>(was_on_3),
+                    static_cast<unsigned long long>(moved_not_owned_by_3), static_cast<unsigned long long>(re_placed_to_3));
     }
 
     std::printf("%s\n", ok ? "OK" : "FAIL");

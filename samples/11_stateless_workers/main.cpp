@@ -90,15 +90,15 @@ int main() {
         if (seen[t] == 0) ++lost;
         else if (seen[t] > 1) ++dup;
     }
-    std::printf("pool of %zu workers processed %llu jobs:\n", pool.size(), (unsigned long long)kJobs);
+    std::printf("pool of %zu workers processed %llu jobs:\n", pool.size(), static_cast<unsigned long long>(kJobs));
     for (std::size_t i = 0; i < pool.size(); ++i) {
         total += pool.actor(i).handled;
-        std::printf("  worker %zu handled %llu jobs\n", i, (unsigned long long)pool.actor(i).handled);
+        std::printf("  worker %zu handled %llu jobs\n", i, static_cast<unsigned long long>(pool.actor(i).handled));
     }
     std::printf("  distinct workers used: %zu / %zu\n", pool.used_count(), pool.size());
     std::printf("  total handled=%llu (expected %llu), lost=%llu, duplicated=%llu\n",
-                (unsigned long long)total, (unsigned long long)kJobs,
-                (unsigned long long)lost, (unsigned long long)dup);
+                static_cast<unsigned long long>(total), static_cast<unsigned long long>(kJobs),
+                static_cast<unsigned long long>(lost), static_cast<unsigned long long>(dup));
 
     const bool ok = total == kJobs && lost == 0 && dup == 0 && pool.used_count() >= 2;
     std::printf("%s\n", ok ? "OK" : "FAIL");

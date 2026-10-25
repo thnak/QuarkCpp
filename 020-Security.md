@@ -99,7 +99,12 @@ Because 010 already multiplexes **one connection per peer**, the handshake cost 
 paid **once per peer**, then amortized across all traffic — the per-message cost is
 one AEAD seal/open, not a handshake. Replay is prevented by per-session sequence
 numbers inside the AEAD associated data (composing with, not replacing, the
-delivery-layer dedup of 017).
+delivery-layer dedup of 017). The sequence space is **per lane** (data vs
+control, by `FrameKind`), not one per session: the transport may reorder
+*across* lanes (ADR-046 S4 sends control ahead of queued data) while keeping
+each lane FIFO, so one shared counter would reject overtaken data frames as
+replays (issue #16). The lane is bound into both the AAD and the nonce, so a
+frame cannot be moved between lanes and the lanes never share a nonce.
 
 ### The honest exception: crypto is not self-implemented
 

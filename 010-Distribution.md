@@ -71,7 +71,7 @@ suspicion. Excluding on suspicion would migrate actors off a node on every
 transient blip, the very thrash the stabilization window (021) exists to damp.
 A `Dead` node is excluded; a refuted node (higher incarnation) stays.
 
-Since [ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md) the view is
+Since [ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md) the view is
 precisely the **non-tombstone** set (`Alive`/`Suspect`). `Dead` is adopted only from a
 node's own suspicion timer, never from gossip; `Left` is a separate, authoritative
 graceful departure. The indirect ping is asynchronous: the correlation travels in the
@@ -142,10 +142,55 @@ transport for one peer's session must be ordered atomically with respect to
 other same-session senders.** Assigning `seq` without serializing it through
 to wire submission permits wire-arrival order to diverge from `seq` order
 under concurrent same-session senders, causing genuine, non-replayed frames
-to be spuriously rejected by the strict-monotonic replay guard. The lock this
+to be spuriously rejected by the strict-monotonic replay guard. The same
+hazard exists *across* lanes: this transport sends control frames ahead of
+queued data (ADR-046 S4), so `seq` is strictly increasing **per lane**
+(data, control), matching the only order the wire actually preserves — FIFO
+within a lane (issue #16; `security_secure_transport_lane_reorder_test`). The lock this
 requires is scoped to one session's own mutex, never shared cluster-wide (see
 020-Security.md's "Rotation and revocation invariants") — one peer's crypto
 work never blocks another peer's session.
+
+### Direct↔relay endpoint fallback (ADR-048)
+
+A peer with no reachable listener (behind NAT / a restrictive firewall) cannot be
+dialed directly, and even a known endpoint that never accepts cycles forever
+through `TcpTransport`'s `Backoff` state with jittered exponential retry — there
+is no terminal "direct is unreachable" signal in the connection state machine
+itself. `TcpTransport` (`include/quark/net/tcp_transport.hpp`) resolves this with
+a **`TcpTransport`-level, non-`Transport`-subclassing fallback mechanism**, not a
+new peer transport: `NoRelayFallback` (default, zero-cost) and
+`DirectThenRelay<TimeoutMs>` are compile-time policy tags — matching the
+`DrainBudget<N>`-style "tag resolved once at construction to a runtime field,
+zero cost when unused" idiom (`policies.hpp`) — that resolve to one runtime
+`int64_t` deadline field per `TcpTransport` instance.
+
+Relay routing changes **only which `Endpoint` a peer's `Conn` dials** — a
+designated relay node's listener instead of the peer's own — via a single
+`resolve_dial_endpoint()` call site shared by `dial()`/`ensure_conn()` **and**
+`do_reconnect()` (both must agree, or relay routing silently reverts to a broken
+direct dial on the relay leg's own ordinary reconnect). It never touches
+`MessageFrame::to`, `outq_`'s per-logical-peer keying, or the SWIM dead-letter
+contract on `close_peer()` — a peer's addressing and per-peer FIFO ordering are
+untouched by the routing decision. On the relay node itself, forwarding is a
+thin `on_receive()` hook — "if `frame.to != self`, `send(frame.to, frame)`
+instead of delivering locally" — decorator-shaped like `SecureTransport`, not a
+parallel transport hierarchy; the relay only ever touches routing metadata,
+never payload, so it composes unchanged under `SecureTransport`'s AEAD sealing.
+
+A fenced, never-mid-frame cutover is required when a relay-routed peer recovers
+back to direct (an out-of-band probe connection proves direct reachability
+before the live `Conn`'s fd is swapped) — see
+[017-Delivery-Guarantees.md](017-Delivery-Guarantees.md)'s "Relay-routed peer
+ordering" for why a naive "flip on next reconnect" cutover is unsound (it was
+proven, not merely suspected, to reorder frames). Relay-node discovery/
+advertisement, relay-hop backpressure semantics, multi-relay/failover, and the
+relay node's own trust boundary are explicit non-goals of this mechanism —
+tracked as open follow-on work in
+[021-Cluster-Formation-and-Lifecycle.md](021-Cluster-Formation-and-Lifecycle.md).
+See [ADR-048](decisions/ADR-048-relay-transport-fallback-policy.md) for the full
+design debate and proof (a competing count-based fallback threshold was
+disqualified after being proven to reorder frames 50–57% of the time).
 
 ### Alternatives considered
 
@@ -279,7 +324,7 @@ single-node build.
 (HRW/VirtualBins by ADR-006; FIFO-under-relay by ADR-011). **Cross-node backpressure is now
 resolved** ([ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md), below).
 SWIM membership now survives partition heals and runs its indirect ping over a real
-transport ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).
+transport ([ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md)).
 
 ## Open questions
 

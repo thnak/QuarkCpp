@@ -50,10 +50,10 @@ estimate. **We get it for free:** SWIM membership (010) already pings peers and
 tracks a smoothed round-trip time, so `transit ≈ rtt/2`. No separate PTP/NTP
 handshake is introduced. Only Acks to a node's **own** direct probes may feed that
 estimate; relayed (PingReq) and tombstone probe-back round trips cover extra hops and
-must not ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)). The
+must not ([ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md)). The
 RTT smoothing itself is not implemented in `SwimMembership` yet (021 seam).
 
-**SWIM timers (ADR-048).** Every SWIM timer — suspicion, the indirect window, the relay
+**SWIM timers (ADR-049).** Every SWIM timer — suspicion, the indirect window, the relay
 token's time bucket, tombstone TTL, probe-back spacing and verify-ping pacing — reads the
 injectable monotonic clock, never wall time. Detection and heal bounds are stated
 **tick-quantized**: each stage is rounded up to the protocol tick, because a timer is

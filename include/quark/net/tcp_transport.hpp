@@ -66,8 +66,16 @@ public:
     // `self` is this node's identity; `bind_addr`/`bind_port` are where this node LISTENS (port 0 ⇒ the
     // OS picks an ephemeral port, readable via listen_port() after start()). Construct → register peer
     // endpoints (add_peer) and on_receive → start().
-    TcpTransport(NodeId self, std::uint64_t bind_addr, std::uint16_t bind_port) noexcept
-        : self_(self), bind_addr_(bind_addr), bind_port_(bind_port) {}
+    //
+    // `fallback_timeout_ns` is ADR-048's relay-fallback threshold: 0 (default) = `NoRelayFallback`, this
+    // transport behaves byte-identically to before that ADR. A positive value = `DirectThenRelay<TimeoutMs>`
+    // (resolve the runtime value via `fallback_timeout_ns_of<...>()`, fallback_policy.hpp) — a peer whose
+    // direct connection has not reached `St::Open` within this many nanoseconds of its first `St::Connecting`
+    // is redialed through its `set_relay()`-configured relay Endpoint instead.
+    TcpTransport(NodeId self, std::uint64_t bind_addr, std::uint16_t bind_port,
+                 std::int64_t fallback_timeout_ns = 0) noexcept
+        : self_(self), bind_addr_(bind_addr), bind_port_(bind_port),
+          fallback_timeout_ns_(fallback_timeout_ns) {}
 
     ~TcpTransport() override { stop(); }
 
@@ -82,6 +90,23 @@ public:
             io_.post([this, ep] { peers_[ep.node.value] = ep; });
         else
             peers_[ep.node.value] = ep;
+    }
+
+    // ADR-048: designate `relay_ep` as `peer`'s fallback dial target — the Endpoint TcpTransport switches
+    // to once `peer`'s direct connection has failed to reach `St::Open` within the constructor's
+    // `fallback_timeout_ns` (0 = fallback disabled; this call is then inert — `relays_` is still recorded
+    // but never consulted). `relay_ep` must be byte-transparent for `peer` specifically (e.g. a TURN-style
+    // per-peer relay allocation): whoever answers on it must send `peer`'s own HELLO, since dial-dedup,
+    // frame decode, and delivery all continue completely unchanged over it (the "settled architecture" this
+    // ADR did not re-litigate). Producing that transparent relay allocation is separate, deferred work (see
+    // ADR-048's non-goals + 021's "Relay transport endpoint fallback" section) — this call only teaches
+    // TcpTransport which Endpoint to dial once one exists. Thread-safe, same started_-gated io_.post()
+    // idiom as add_peer().
+    void set_relay(NodeId peer, Endpoint relay_ep) {
+        if (started_.load(std::memory_order_acquire))
+            io_.post([this, peer, relay_ep] { relays_[peer.value] = relay_ep; });
+        else
+            relays_[peer.value] = relay_ep;
     }
 
     // Bind + listen + spawn the I/O thread. Returns false if the listener could not be opened.
@@ -104,6 +129,8 @@ public:
         // Loop is stopped; tear down sockets on this thread (no handler can run concurrently now).
         for (auto& [id, c] : conns_) retire_fd(c->fd);
         for (auto& [fd, c] : pending_in_) retire_fd(c->fd);
+        for (auto& [fd, p] : probes_) retire_fd(fd);                    // ADR-048
+        for (auto& [peer, fd] : pending_cutover_) retire_fd(fd);        // ADR-048
         retire_fd(listener_);
         listener_ = pal::invalid_fd;
         conns_.clear();
@@ -112,6 +139,9 @@ public:
         open_marked_.clear();
         reconnect_suppressed_.clear();
         outq_.clear();
+        relay_routed_.clear();
+        pending_cutover_.clear();
+        probes_.clear();
     }
 
     [[nodiscard]] std::uint16_t listen_port() const noexcept { return bind_port_; }
@@ -148,6 +178,7 @@ public:
             reconnect_suppressed_.insert(peer.value);
             if (auto it = conns_.find(peer.value); it != conns_.end()) drop_conn(it->second.get());
             outq_.erase(peer.value);  // dead-letter frames queued for the now-dead peer (010)
+            discard_relay_fallback_state(peer);  // ADR-048: a dead peer has nothing left to fall back on
         });
     }
 
@@ -225,6 +256,30 @@ private:
         FrameStream in;               // inbound byte-stream reassembler (partial reads / coalescing)
         std::uint32_t backoff_attempt = 0;
         std::uint32_t interest = 0;   // current epoll interest mask (avoid redundant mod_fd)
+
+        // ADR-048 relay fallback. `first_connecting_ns` is when the CURRENT give-up window started (0 =
+        // none armed — either fallback is off, no relay is configured for this peer, or the peer is
+        // already relay-routed); it is a wall-clock stamp (`now_ns()`), read only by the opportunistic
+        // check in schedule_reconnect(). `fallback_epoch` increments on every direct⇄relay transition and
+        // guards a stale check_relay_timeout()/direct-recovery-probe callback from acting on a Conn that
+        // has since moved on (recycled, torn down, or already flipped again).
+        std::int64_t first_connecting_ns = 0;
+        std::uint32_t fallback_epoch = 0;
+    };
+
+    // ADR-048: an out-of-band connection that only ever proves "peer is reachable at its own direct
+    // Endpoint right now" (connect + HELLO round-trip, never joins the peer's `outq_`/dedup machinery).
+    // On success it hands its already-established, already-identified fd to cutover_to_direct(); on any
+    // failure it is simply retried after another `fallback_timeout_ns_` (the disclosed single-constant,
+    // no-backoff-of-its-own probe cadence, ADR-048 residual risks).
+    struct Probe {
+        NodeId peer{};
+        pal::fd_t fd = pal::invalid_fd;
+        std::uint32_t epoch = 0;         // must still match the live Conn's fallback_epoch to be honored
+        bool connecting = true;          // awaiting EPOLLOUT connect-completion vs. mid hello exchange
+        std::array<std::byte, hello_size> hello{};
+        std::size_t hello_sent = 0;
+        std::vector<std::byte> hello_in;
     };
 
     // ADR-046 S4 fix: per-peer queues of WHOLE, still-unstarted frames, split by FrameKind, so a
@@ -285,7 +340,9 @@ private:
     // connection retries it first — a torn, partially-sent frame (out_sent>0) cannot resume and is
     // dead-lettered (010 at-most-once). Every OTHER not-yet-started frame was never removed from
     // `outq_[peer]` in the first place (`load_next_frame` only pops one at a time), so nothing else
-    // needs salvaging here.
+    // needs salvaging here. Re-queuing a salvaged DATA frame on the control queue is safe for
+    // SecureTransport's per-lane replay guard (issue #16): the receiver picks the lane from the frame's
+    // own `kind`, and the salvaged frame is the OLDEST unsent data frame, so data-lane FIFO still holds.
     void salvage_out(Conn* c) {
         if (!c->out.empty() && c->out_sent == 0) outq_[c->peer.value].control.push_front(std::move(c->out));
         c->out.clear();
@@ -296,9 +353,21 @@ private:
     // already in the map (Connecting/Open/Backoff) is returned as-is — frames queue on it.
     Conn* ensure_conn(NodeId to) {
         if (auto it = conns_.find(to.value); it != conns_.end()) return it->second.get();
-        const auto pit = peers_.find(to.value);
-        if (pit == peers_.end()) return nullptr;  // unknown endpoint — caller drops
-        return dial(to, pit->second);
+        const auto ep = resolve_dial_endpoint(to);
+        if (!ep) return nullptr;  // no direct AND no relay endpoint known — caller drops
+        return dial(to, *ep);
+    }
+
+    // ADR-048: the SOLE dial-target lookup — `to`'s direct Endpoint (peers_) normally, or its relay
+    // Endpoint (relays_) once `relay_routed_` has flipped for it. Shared by ensure_conn()/dial() (fresh
+    // dials) and do_reconnect() (the fix for the confirmed relay-leg-churn wedge: without this, a relay
+    // connection's own reconnect would silently redial the (unreachable) direct endpoint instead).
+    [[nodiscard]] std::optional<Endpoint> resolve_dial_endpoint(NodeId to) const {
+        if (relay_routed_.count(to.value)) {
+            if (const auto rit = relays_.find(to.value); rit != relays_.end()) return rit->second;
+        }
+        if (const auto pit = peers_.find(to.value); pit != peers_.end()) return pit->second;
+        return std::nullopt;
     }
 
     Conn* dial(NodeId to, const Endpoint& ep) {
@@ -316,6 +385,7 @@ private:
         by_fd_[raw->fd] = raw;
         raw->interest = EPOLLIN | EPOLLOUT;  // EPOLLOUT = connect completion
         io_.add_fd(raw->fd, raw->interest, [this, fd = raw->fd](std::uint32_t ev) { on_conn(fd, ev); });
+        arm_fallback_if_needed(raw);  // ADR-048
         return raw;
     }
 
@@ -385,6 +455,16 @@ private:
         if (c->confirmed) {
             for (;;) {
                 if (c->out_sent >= c->out.size()) {
+                    // ADR-048 fenced cutover: only ever swap `c->fd` here, at a whole-frame boundary
+                    // (out_sent==out.size(), the same guard load_next_frame uses) — never mid-frame. A
+                    // `continue` re-enters the loop against the NEW fd so any already-queued outq_ frame
+                    // sends over the recovered direct connection without further special-casing.
+                    if (auto pit = pending_cutover_.find(c->peer.value); pit != pending_cutover_.end()) {
+                        const pal::fd_t new_fd = pit->second;
+                        pending_cutover_.erase(pit);
+                        cutover_to_direct(c, new_fd);
+                        continue;
+                    }
                     load_next_frame(c);
                     if (c->out.empty()) break;  // nothing else queued right now
                 }
@@ -475,6 +555,7 @@ private:
             c->confirmed = true;  // sole connection to this peer — frames may flow
             mark_open(c);
             pump(c);
+            on_confirmed(c);
             return true;
         }
         Conn* existing = it->second.get();
@@ -482,6 +563,7 @@ private:
             c->confirmed = true;
             mark_open(c);
             pump(c);
+            on_confirmed(c);
             return true;
         }
         // Two connections between the same pair — keep the one the dedup rule elects, close the other.
@@ -502,6 +584,7 @@ private:
             c->confirmed = true;
             mark_open(c);
             pump(c);  // the surviving connection drains the peer queue (incl. salvaged frames)
+            on_confirmed(c);
             return true;
         }
         // existing wins: close `c`. owned_c (if set) drops here with its fd closed.
@@ -511,7 +594,21 @@ private:
         existing->confirmed = true;
         mark_open(existing);
         pump(existing);  // the surviving connection drains the peer queue
+        on_confirmed(existing);
         return false;
+    }
+
+    // ADR-048: a connection that the PEER dialed (accepted, or won dedup as the accept side) is direct
+    // reachability made manifest — clear any stale `relay_routed_` flag for it (e.g. the peer's NAT/
+    // firewall state changed and it reached us before our own recovery probe did) and drop a pending
+    // cutover fd that would otherwise leak, now that this Conn is already, genuinely, directly Open.
+    void on_confirmed(Conn* c) {
+        if (c->initiated_by_self) return;  // our own dial (direct OR relay-routed) proves nothing new
+        relay_routed_.erase(c->peer.value);
+        if (auto pit = pending_cutover_.find(c->peer.value); pit != pending_cutover_.end()) {
+            pal::close_fd(pit->second);
+            pending_cutover_.erase(pit);
+        }
     }
 
     // ---- teardown / reconnect -------------------------------------------------------------------
@@ -543,6 +640,7 @@ private:
         } else {
             conns_.erase(it);        // give up: forget the connection …
             outq_.erase(peer.value);  // … and dead-letter its queued frames (010)
+            discard_relay_fallback_state(peer);  // ADR-048
         }
     }
 
@@ -550,6 +648,15 @@ private:
         auto it = conns_.find(peer.value);
         if (it == conns_.end()) return;
         Conn* c = it->second.get();
+        // ADR-048 opportunistic early check: re-entering Backoff is a good moment to notice the give-up
+        // deadline has ALREADY passed without waiting for the one-shot timer armed in arm_fallback_if_
+        // needed() to fire. Only meaningful for a still-direct peer (relay-routed Backoff cycles reconnect
+        // through the relay Endpoint as normal, via do_reconnect()'s resolve_dial_endpoint() call).
+        if (fallback_timeout_ns_ > 0 && !relay_routed_.count(peer.value) && c->first_connecting_ns != 0 &&
+            now_ns() - c->first_connecting_ns >= fallback_timeout_ns_) {
+            check_relay_timeout(peer, c->fallback_epoch);  // may replace/erase conns_[peer] — stop here
+            return;
+        }
         c->st = St::Backoff;
         c->fd = pal::invalid_fd;
         c->hello_sent = 0;
@@ -572,15 +679,20 @@ private:
         if (reconnect_suppressed_.count(peer.value)) {
             conns_.erase(it);
             outq_.erase(peer.value);
+            discard_relay_fallback_state(peer);  // ADR-048
             return;
         }
-        const auto pit = peers_.find(peer.value);
-        if (pit == peers_.end()) {
+        // ADR-048: resolve_dial_endpoint(), not a raw peers_ lookup — a relay-routed peer's reconnect
+        // must keep redialing the RELAY Endpoint (the fix for the confirmed relay-leg-churn wedge; see
+        // ADR-048's cross-examination summary).
+        const auto ep = resolve_dial_endpoint(peer);
+        if (!ep) {
             conns_.erase(it);
             outq_.erase(peer.value);
+            discard_relay_fallback_state(peer);  // ADR-048
             return;
         }
-        auto fd = pal::tcp_connect(pit->second.addr, pit->second.port);
+        auto fd = pal::tcp_connect(ep->addr, ep->port);
         if (!fd) {  // dial failed outright — back off and try again
             schedule_reconnect(peer);
             return;
@@ -595,6 +707,7 @@ private:
         c->interest = EPOLLIN | EPOLLOUT;
         io_.add_fd(c->fd, c->interest, [this, f = c->fd](std::uint32_t ev) { on_conn(f, ev); });
         reconnects_.fetch_add(1, std::memory_order_relaxed);
+        arm_fallback_if_needed(c);  // ADR-048: no-op while already relay-routed
     }
 
     // Deterministic jittered exponential backoff (021): no random_device / wall clock. base*2^attempt
@@ -661,10 +774,229 @@ private:
             conns_open_.fetch_add(1, std::memory_order_relaxed);
         }
         if (c->st == St::Connecting) c->st = St::Open;
+        c->first_connecting_ns = 0;  // ADR-048: succeeded — no direct give-up window pending
     }
     [[nodiscard]] bool was_open(Conn* c) const { return open_marked_.count(c) != 0; }
     void unmark_open(Conn* c) {
         if (open_marked_.erase(c)) conns_open_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    // ---- ADR-048: relay fallback ------------------------------------------------------------------
+    // Arm the one-shot give-up timer for `c`'s CURRENT fallback epoch, IF: relay fallback is configured
+    // (fallback_timeout_ns_ > 0), `c`'s peer has a relay Endpoint on record (set_relay), the peer is not
+    // already relay-routed, and no timer is already outstanding for this epoch (`first_connecting_ns == 0`
+    // — the one-shot guard: repeated Backoff→do_reconnect cycles within the SAME epoch must not each
+    // re-arm a fresh TimeoutMs window, or the give-up deadline would never actually arrive under a fast
+    // backoff cadence). Called from both dial() (fresh dials) and do_reconnect() (retries).
+    void arm_fallback_if_needed(Conn* c) {
+        if (fallback_timeout_ns_ <= 0) return;                     // NoRelayFallback — feature off
+        if (relay_routed_.count(c->peer.value)) return;            // already on the relay leg
+        if (!relays_.count(c->peer.value)) return;                 // nothing configured to fall back to
+        if (c->first_connecting_ns != 0) return;                   // already armed this epoch
+        c->first_connecting_ns = now_ns();
+        const NodeId peer = c->peer;
+        const std::uint32_t epoch = c->fallback_epoch;
+        io_.post_after(fallback_timeout_ns_, [this, peer, epoch] { check_relay_timeout(peer, epoch); });
+    }
+
+    // The one-shot give-up backstop: fires `fallback_timeout_ns_` after the epoch's first St::Connecting,
+    // regardless of how many Backoff/reconnect cycles happened in between — this is what catches a
+    // black-holed connect() that never even errors out of Connecting (ADR-048's C3).
+    void check_relay_timeout(NodeId peer, std::uint32_t epoch) {
+        const auto it = conns_.find(peer.value);
+        if (it == conns_.end()) return;                            // peer torn down — nothing to give up on
+        Conn* c = it->second.get();
+        if (c->fallback_epoch != epoch) return;                    // stale: this Conn moved on already
+        if (c->st == St::Open) return;                             // direct succeeded before the timer fired
+        if (relay_routed_.count(peer.value)) return;                // already flipped (opportunistic-check race)
+        const auto rit = relays_.find(peer.value);
+        if (rit == relays_.end()) return;                           // relay unconfigured meanwhile — nothing to do
+
+        // Give up on the direct attempt: drop the socket/husk (any unsent frame it held was already
+        // salvaged into outq_ back when it entered Backoff, or never existed for an unconfirmed Connecting
+        // Conn — outq_[peer] itself is untouched) and immediately redial through the relay Endpoint.
+        relay_routed_.insert(peer.value);
+        const std::uint32_t next_epoch = c->fallback_epoch + 1;  // read before drop_conn destroys `c`
+        drop_conn(c);
+        Conn* nc = ensure_conn(peer);  // resolve_dial_endpoint() now returns the relay Endpoint for `peer`
+        if (nc) {
+            nc->fallback_epoch = next_epoch;
+            nc->first_connecting_ns = 0;   // no direct give-up window while relay-routed
+            arm_direct_probe(peer, next_epoch);
+        }
+    }
+
+    // Out-of-band direct-reachability probing (recovery). Re-arms itself at `fallback_timeout_ns_`
+    // cadence — ADR-048's disclosed residual: one constant does double duty as both the give-up threshold
+    // and the probe interval, with no backoff/jitter of its own.
+    void arm_direct_probe(NodeId peer, std::uint32_t epoch) {
+        io_.post_after(fallback_timeout_ns_, [this, peer, epoch] { try_direct_probe(peer, epoch); });
+    }
+
+    void try_direct_probe(NodeId peer, std::uint32_t epoch) {
+        if (!relay_routed_.count(peer.value)) return;  // already recovered (or torn down) — stop probing
+        const auto it = conns_.find(peer.value);
+        if (it == conns_.end() || it->second->fallback_epoch != epoch) return;  // stale generation
+        const auto pit = peers_.find(peer.value);
+        if (pit == peers_.end()) {  // no direct endpoint on record — nothing to probe yet
+            arm_direct_probe(peer, epoch);
+            return;
+        }
+        auto fd = pal::tcp_connect(pit->second.addr, pit->second.port);
+        if (!fd) {  // still unreachable — try again next interval
+            arm_direct_probe(peer, epoch);
+            return;
+        }
+        auto p = std::make_unique<Probe>();
+        p->peer = peer;
+        p->fd = *fd;
+        p->epoch = epoch;
+        build_hello(p->hello);
+        const pal::fd_t raw = p->fd;
+        probes_[raw] = std::move(p);
+        io_.add_fd(raw, EPOLLIN | EPOLLOUT, [this, raw](std::uint32_t ev) { on_probe(raw, ev); });
+    }
+
+    void on_probe(pal::fd_t fd, std::uint32_t ev) {
+        const auto it = probes_.find(fd);
+        if (it == probes_.end()) return;
+        Probe* p = it->second.get();
+        if (ev & (EPOLLERR | EPOLLHUP)) {
+            fail_probe(fd);
+            return;
+        }
+        if (p->connecting) {
+            if (!(ev & EPOLLOUT)) return;
+            if (!pal::connect_result(fd)) {
+                fail_probe(fd);
+                return;
+            }
+            p->connecting = false;
+        }
+        if (ev & EPOLLOUT) {
+            while (p->hello_sent < hello_size) {
+                auto r = pal::send_some(fd, p->hello.data() + p->hello_sent, hello_size - p->hello_sent);
+                if (!r) {
+                    if (r.error() == pal::would_block()) {
+                        io_.mod_fd(fd, EPOLLIN | EPOLLOUT);
+                        return;
+                    }
+                    fail_probe(fd);
+                    return;
+                }
+                if (*r == 0) {
+                    io_.mod_fd(fd, EPOLLIN | EPOLLOUT);
+                    return;
+                }
+                p->hello_sent += *r;
+            }
+            io_.mod_fd(fd, EPOLLIN);  // our hello is fully out — only reading theirs from here
+        }
+        if (ev & EPOLLIN) {
+            std::array<std::byte, hello_size> buf{};
+            for (;;) {
+                const std::size_t need = hello_size - p->hello_in.size();
+                if (need == 0) break;
+                auto r = pal::recv_some(fd, buf.data(), need);
+                if (!r) {
+                    if (r.error() == pal::would_block()) return;
+                    fail_probe(fd);
+                    return;
+                }
+                if (*r == 0) {  // peer closed before completing its hello
+                    fail_probe(fd);
+                    return;
+                }
+                p->hello_in.insert(p->hello_in.end(), buf.data(), buf.data() + *r);
+            }
+            NodeId learned{};
+            if (!parse_hello(p->hello_in.data(), learned) || learned != p->peer) {
+                fail_probe(fd);  // wrong/garbled answer — not the peer we're trying to recover
+                return;
+            }
+            succeed_probe(fd);
+        }
+    }
+
+    void fail_probe(pal::fd_t fd) {
+        const auto it = probes_.find(fd);
+        if (it == probes_.end()) return;
+        const NodeId peer = it->second->peer;
+        const std::uint32_t epoch = it->second->epoch;
+        retire_fd(fd);
+        probes_.erase(it);
+        if (relay_routed_.count(peer.value)) arm_direct_probe(peer, epoch);  // keep trying at the same cadence
+    }
+
+    void succeed_probe(pal::fd_t fd) {
+        const auto it = probes_.find(fd);
+        if (it == probes_.end()) return;
+        std::unique_ptr<Probe> p = std::move(it->second);
+        probes_.erase(it);
+        io_.del_fd(fd);  // stop the probe's own handler — cutover_to_direct() re-adds it under Conn's
+        const auto cit = conns_.find(p->peer.value);
+        if (cit == conns_.end() || cit->second->fallback_epoch != p->epoch ||
+            !relay_routed_.count(p->peer.value)) {
+            pal::close_fd(fd);  // stale: the Conn moved on (or already recovered) while this probe ran
+            return;
+        }
+        cutover_direct_or_defer(cit->second.get(), fd);
+    }
+
+    // If a frame is mid-send over the (still relay-routed) live connection, defer the swap until it fully
+    // leaves the wire (017's no-mid-frame-splice requirement) — flush()'s loop applies it at the next
+    // frame boundary. Otherwise there is nothing to wait for; cut over immediately.
+    void cutover_direct_or_defer(Conn* c, pal::fd_t new_fd) {
+        if (c->out_sent > 0 && c->out_sent < c->out.size()) {
+            pending_cutover_[c->peer.value] = new_fd;
+            return;
+        }
+        cutover_to_direct(c, new_fd);
+        flush(c);  // resume draining outq_ (if anything queued) on the freshly swapped fd
+    }
+
+    // The fenced swap itself: retire the relay fd, adopt the probe's already-connected, already-HELLO-
+    // confirmed fd in its place. Never calls flush()/pump() itself (both call sites above do, exactly
+    // once, in the right place) — avoids re-entering flush()'s own send loop when invoked from within it.
+    void cutover_to_direct(Conn* c, pal::fd_t new_fd) {
+        by_fd_.erase(c->fd);
+        io_.del_fd(c->fd);  // 019 fix: del_fd BEFORE add_fd — epoll EEXISTs (silently) on a live re-add
+        pal::close_fd(c->fd);
+        c->fd = new_fd;
+        c->in.clear();             // fresh byte stream; the new fd's hello was already consumed by the probe
+        c->hello_sent = hello_size;  // our hello was already sent during probing
+        c->peer_hello_read = true;   // the peer's hello was already validated during probing
+        c->interest = 0;             // force update_interest() to (re)establish the fd's interest mask
+        by_fd_[new_fd] = c;
+        io_.add_fd(new_fd, EPOLLIN, [this, fd = new_fd](std::uint32_t ev) { on_conn(fd, ev); });
+        relay_routed_.erase(c->peer.value);
+        c->fallback_epoch++;       // a fresh generation: any outstanding probe/timer for the old one is stale
+        c->first_connecting_ns = 0;
+        update_interest(c);
+    }
+
+    void cancel_probes_for(NodeId peer) {
+        for (auto it = probes_.begin(); it != probes_.end();) {
+            if (it->second->peer.value == peer.value) {
+                retire_fd(it->first);
+                it = probes_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Drop every piece of ADR-048 bookkeeping for a peer that is being torn down entirely (SWIM death via
+    // close_peer(), or handle_dead()'s own give-up path) — there is nothing left to fall back on or
+    // recover to. Leaves `relays_[peer]` itself untouched (a future add_peer()/close_peer() cycle for the
+    // same NodeId may reuse it — mirrors peers_'s own lifetime, never cleared by close_peer() either).
+    void discard_relay_fallback_state(NodeId peer) {
+        relay_routed_.erase(peer.value);
+        if (auto pit = pending_cutover_.find(peer.value); pit != pending_cutover_.end()) {
+            pal::close_fd(pit->second);
+            pending_cutover_.erase(pit);
+        }
+        cancel_probes_for(peer);
     }
 
     void build_hello(std::array<std::byte, hello_size>& h) const noexcept {
@@ -720,6 +1052,14 @@ private:
     std::unordered_set<std::uint64_t> reconnect_suppressed_;  // peers SWIM declared dead (close_peer)
     std::unordered_set<Conn*> open_marked_;  // conns counted in conns_open_ (idempotent open/close)
     PeerCongestionTable congestion_;  // ADR-046 — checked on the CALLER's thread, before send() posts
+
+    // ADR-048 relay fallback state — all loop-thread-owned, like everything else above.
+    std::int64_t fallback_timeout_ns_ = 0;  // 0 = NoRelayFallback (feature off, byte-identical to before)
+    std::unordered_map<std::uint64_t, Endpoint> relays_;  // peer → its designated relay Endpoint (set_relay)
+    std::unordered_set<std::uint64_t> relay_routed_;      // peers currently dialed via their relay Endpoint
+    std::unordered_map<std::uint64_t, pal::fd_t> pending_cutover_;  // peer → probed direct fd awaiting a
+                                                                     // frame boundary (fenced cutover)
+    std::unordered_map<pal::fd_t, std::unique_ptr<Probe>> probes_;  // out-of-band direct-reachability probes
 
     std::atomic<std::uint64_t> frames_received_{0};
     std::atomic<std::uint64_t> frames_sent_{0};

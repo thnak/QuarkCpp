@@ -1,4 +1,4 @@
-# ADR-048: SWIM Partition-Heal Rejoin + Asynchronous Indirect-Ping Relay
+# ADR-049: SWIM Partition-Heal Rejoin + Asynchronous Indirect-Ping Relay
 
 ## Status
 
@@ -198,7 +198,7 @@ already covers the target-first digest.
     Suspect hint, checked by a verify ping. A tombstone is lifted only by an Alive or Suspect at a
     strictly higher incarnation, or by a Join where `subject == from`, which re-admits at
     `max(presented, tomb.inc+1)`. The seed returns the assigned incarnation in JoinAck.
-  - §3: add a subsection "SWIM failure-detector rules (ADR-048)" listing R1/R1b/R2/R3/R4'/R5'/R6'/R7,
+  - §3: add a subsection "SWIM failure-detector rules (ADR-049)" listing R1/R1b/R2/R3/R4'/R5'/R6'/R7,
     the stateless token relay, and the new `Config` fields: `indirect_timeout_ns` (0 = ack),
     `tombstone_ttl_ns`=60 s, `max_tombstones`, `tombstone_probe_interval_ns`,
     `verify_ping_budget`, and the probe-back budget B.
@@ -211,7 +211,7 @@ already covers the target-first digest.
   (`Alive`/`Suspect`). `Dead` is adopted only from a node's own suspicion timer; `Left` is a
   separate authoritative departure. Indirect ping is asynchronous, with correlation carried in the
   frame and no relay state. Add a note that the relay round trip is 4 hops and must fit within
-  `indirect_timeout_ns`. Cite ADR-048 under Status.
+  `indirect_timeout_ns`. Cite ADR-049 under Status.
 - **014-Testing-Model.md**, "Fault injection": require a **deferred-delivery transport** for any
   protocol test whose correctness depends on reply timing. It never delivers in the sender's call
   stack, and supports delivery in waves, seeded reorder, per-directed-link drop, a **hold** mode
@@ -225,7 +225,7 @@ already covers the target-first digest.
   **tick-quantized**, with each stage rounded up to the tick (proven: 840 ms against a
   700 ms un-quantized bound, identical on HEAD). Rule 2a: only Acks to the node's own probes feed
   the smoothed RTT. Relayed and probe-back round trips must not.
-- **OpenQuestions.md**, item 021: mark it resolved in mechanism by ADR-048, pending merge under
+- **OpenQuestions.md**, item 021: mark it resolved in mechanism by ADR-049, pending merge under
   the conditions above. Add the TcpTransport `close_fd`/`del_fd` race as a separate 010/021 entry.
 
 ## Merge record (2026-10-22)

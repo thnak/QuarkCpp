@@ -108,7 +108,7 @@ int main() {
                 actor.completed);
     std::printf("state reset happened after reset:     %s, with %d siblings already unwound (expected 4)\n",
                 actor.did_reset ? "yes" : "no", actor.cancelled_when_reset);
-    std::printf("lane quiescent at end: in_flight=%d, %s\n", act.in_flight(),
+    std::printf("lane quiescent at end: in_flight=%zu, %s\n", act.in_flight(),
                 act.state() == ExecState::Idle ? "Idle" : "NOT Idle");
 
     const bool ok = actor.cancelled == 4 && actor.completed == 0 && actor.did_reset &&

@@ -104,9 +104,9 @@ public:
     }
 
 private:
-    // Our nonce is an 8-byte, session-scoped, strictly-monotonic counter (secure_transport.hpp's
-    // nonce_for) — zero-extend to the standard 12-byte GCM IV. Uniqueness-per-key is inherited from
-    // the caller's strict seq monotonicity, which is what GCM actually requires (the IV need not be
+    // Our nonce is an 8-byte, session-scoped (lane, strictly-monotonic seq) pair, lane in the top bit
+    // (secure_transport.hpp's nonce_for) — zero-extend to the standard 12-byte GCM IV. Uniqueness-per-
+    // key is inherited from the caller's strict per-lane seq monotonicity, which is what GCM actually requires (the IV need not be
     // random, only ever-repeating under the same key).
     static void nonce_to_iv(std::uint64_t nonce, unsigned char (&iv)[kIvBytes]) noexcept {
         std::memset(iv, 0, kIvBytes);

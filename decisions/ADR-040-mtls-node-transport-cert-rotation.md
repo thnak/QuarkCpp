@@ -319,6 +319,25 @@ concrete CMake wiring. Import C8's test verbatim as a follow-up before merge.
 - §"Membership": cross-reference 021's new rotation/revocation subsection rather than duplicating
   it.
 
+## Amendment — per-lane sequence spaces (issue #16)
+
+The "seq order == wire-arrival order" invariant above holds only within a FIFO the transport
+actually preserves. ADR-046 S4 later gave `TcpTransport` separate control/data queues with control
+preferred, so a SWIM control frame sealed *after* a still-queued data frame reached the wire first,
+advanced the single per-session high-water mark, and the data frame was rejected as a replay
+(reproduced: 1 MiB frames with SWIM running, 6/20 delivered, `replays_rejected` = the missing 14).
+
+Resolution: `PeerSession` keeps one send seq and one receive high-water mark **per lane**
+(`FrameKind::Control` vs everything else; `Authenticate` never enters the seq path). The lane is
+bound into the AAD (moving a sealed frame to the other lane fails the tag) and into the nonce's top
+bit (the lanes' nonce sets are disjoint under one key, as GCM requires; seq never reaches 2^63).
+The C14 lock scope is unchanged. A renegotiation resets both lanes. Proof:
+`tests/security_secure_transport_lane_reorder_test.cpp` (deterministic lane-reordering transport +
+real `TcpTransport` backlog; pre-fix 0/200 data delivered with 200 false replays, post-fix 200/200
+with 0; adversarial controls: a same-lane replay is still rejected, a cross-lane move fails the tag).
+A sliding replay window was rejected: the number of control frames that can overtake one data frame
+is unbounded, so no fixed window size is safe.
+
 ## Artifacts
 
 Executed-evidence artifacts for both designs (build logs, prove binaries, benchmark outputs):

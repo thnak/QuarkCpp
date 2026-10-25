@@ -1,4 +1,4 @@
-// Shared harness for the ADR-048 SWIM tests (NOT a *_test.cpp — just an include). 014 fault injection:
+// Shared harness for the ADR-049 SWIM tests (NOT a *_test.cpp — just an include). 014 fault injection:
 // a deterministic test transport that NEVER delivers in the sender's call stack. send() only queues;
 // Sim::round() ticks every node, then flushes the queue wave by wave (frames produced while a wave is
 // delivered go to the next wave). Optional seeded shuffle per wave, a per-directed-link policy
@@ -6,7 +6,7 @@
 // and a per-wave virtual-clock advance `d` as a latency model.
 //
 // Why this exists: LoopbackTransport delivers inline, so a reply lands inside the sender's own call.
-// That hid ADR-048's relay defect (the PingReq handler checked for the Ack before returning) and the
+// That hid ADR-049's relay defect (the PingReq handler checked for the Ack before returning) and the
 // partition-heal collapse (stale gossip racing the subject's refutation). Every timing-dependent SWIM
 // test should run on this, not on the loopback.
 #pragma once
