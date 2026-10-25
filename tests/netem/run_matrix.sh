@@ -1,6 +1,6 @@
 #!/bin/bash
-# Network-impairment matrix for the real-socket transport tests (010 Distribution / 020 Security /
-# 028 Voice over TcpTransport). Linux only; needs sudo for `ip netns` + `tc`.
+# Network-impairment matrix for the real-socket transport tests (010 Distribution / 020 Security).
+# Linux only; needs sudo for `ip netns` + `tc`.
 #
 # Every test runs in its OWN fresh network namespace with `tc netem` on that namespace's private
 # loopback. The tests talk over 127.0.0.1, so they run unchanged. The host's real interfaces and its
@@ -15,7 +15,7 @@ REPS=${2:-3}
 OUT=${3:-netem-results}
 NS=quark-netem-$$
 RUN_AS=$(id -un)
-TESTS_RE='tcp_|security_rotation_sweep|security_secure_transport_handshake_timeout|security_secure_transport_peer_disconnect|voice_channel_loopback'
+TESTS_RE='tcp_|security_rotation_sweep|security_secure_transport_handshake_timeout|security_secure_transport_peer_disconnect'
 
 PROFILES=(
   "00_baseline|"

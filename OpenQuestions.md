@@ -632,13 +632,14 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   Both change SWIM safety rules, so the fix goes through `design-debate-prove` → ADR, with
   `run_swim_chaos.sh` as the acceptance test (every scenario must end with all nodes alive).
   This is also the first concrete step on 014's multi-process distribution test tier.
-- **010/021** — **TcpTransport fd race (found 2026-10-22 during ADR-048, not fixed).**
-  `close_fd()` runs before `io_.del_fd()` (`tcp_transport.hpp:517-519` and `:625-626`), so
-  between the two calls the kernel can hand the same fd number to a concurrent `accept4`,
-  and `del_fd` then removes the wrong descriptor from epoll. ADR-048's Lifeguard prover saw
-  TSan reports in 3/11 Debug runs over real TcpTransport; the unmodified code reproduces
-  it (1/10). Fix: deregister from epoll first, then close. Needs a TSan regression test
-  that churns connections while accepting.
+- **010/021** — **TcpTransport fd race (found 2026-10-22, fixed 2026-10-25).**
+  `close_fd()` ran before `io_.del_fd()`, so between the two calls the kernel could hand the
+  same fd number to a concurrent `open`/`accept`/`connect`, and `del_fd` then removed (or
+  acted on) the *new* descriptor's handler in `IoContext::handlers_`. Every teardown site now
+  goes through `TcpTransport::retire_fd()`, which deregisters from the reactor *before*
+  closing — one helper so the order cannot regress. Exercised by the existing real-socket
+  churn tests (`tcp_transport_dial_dedup_test`, `tcp_transport_reconnect_test`); a dedicated
+  TSan test that churns connections while accepting is still worth adding.
 - **ADR-019 test teeth** — **`topic_no_quiesce_control` is too weak on a large host (found
   2026-10-22).** This ASan-only negative control removes the subscribe/quiesce barrier and
   must be caught by ASan (`WILL_FAIL`). On a 28-core bare-metal Ubuntu box (g++ 15.2,

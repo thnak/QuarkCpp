@@ -63,7 +63,7 @@ judging rubric).
 | | F2 sockaddr build cost ≤20% slower | fast | yes (claim itself) | **WRONG** | 1.86-1.90 ns/call → 3.20-3.23 ns/call, **+71%**, over budget |
 | | F3 PeerSession cache-line packing | fast | yes, revised (repack) | **CORRECT** | static_assert + offset check; Linux perf_event sub-check unavailable, INCONCLUSIVE for that part |
 | | S1 dual-stack concurrent v4+v6, no race | safe | yes, methodology substituted (no TSan on MSVC) | **CORRECT**(non-TSan) | 100/100 runs clean |
-| | S2→S2b full call-site compat incl. voice_channel.hpp | correct | **no — original S2 falsified, revised** | **CORRECT** (revised) | diff -rq samples/tests/ empty; 202/202 → 203/203 ASan pass |
+| | S2→S2b full call-site compat | correct | **no — original S2 falsified, revised** | **CORRECT** (revised) | diff -rq samples/tests/ empty; 202/202 → 203/203 ASan pass |
 | | S3 checked IPV6_V6ONLY, fail-fast | safe | yes, revised (new fix) | **CORRECT** (logic only) | unit-level gate logic verified; real syscall-failure injection not run (no LD_PRELOAD-equivalent on Windows) |
 | | S4 local_port sockaddr_storage on both backends | safe | yes, revised | **CORRECT** | positive-only proof; pre-fix WSAEFAULT not re-reproduced |
 | | C1-C5 (mapping/round-trip/connect/v4-only fail-fast/scope_id) | correct | yes, C5 (scope_id) added post-attack | **CORRECT** (5/5) | incl. real link-local dial on host interface |

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Quark is a header-first C++23 actor engine (mailbox, work-stealing scheduler, hybrid sync/async
-handlers, cluster distribution, persistence, supervision). The project is spec-driven: 28 RFC
+handlers, cluster distribution, persistence, supervision). The project is spec-driven: 27 RFC
 documents (`NNN-*.md`) are the authoritative design, `decisions/ADR-*.md` are executed proofs
 (real C++23 built under GCC+Clang, run under ASan/UBSan/TSan, benchmarked) that settle contested
 hot-path/safety choices. **When code and a spec disagree, the spec wins**; if the spec is wrong,
@@ -77,7 +77,7 @@ tests/                  correctness gate, one *_test.cpp per load-bearing invari
 bench/                  hot-path microbenchmarks, percentiles vs the 023 budget table
 samples/                runnable programs over the public developer surface (01..22, numbered by topic)
 decisions/              ADRs — design → red-team → prove → judge verdicts, most on the mailbox hot path
-NNN-*.md                the 28 RFC specs (authoritative design; see README's reading-order table)
+NNN-*.md                the 27 RFC specs (authoritative design; see README's reading-order table)
 ```
 
 Core concepts (see the glossary in README.md for the full list): an **Actor** is state + sequential

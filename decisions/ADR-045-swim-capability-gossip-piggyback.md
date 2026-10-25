@@ -11,9 +11,9 @@ is fed by real, network-backed cluster state. In the codebase as found, `SwimMem
 (`include/quark/core/cluster.hpp:345`) gossips only the live `NodeId` roster — zero mentions of
 "capabilit" anywhere in the file — and `membership.hpp:16`'s comment promising "025: static
 capabilities gossiped in the SWIM join payload" was never implemented; only
-`InProcessCapabilityView`, a std-only test double, exists. `VoiceChannel` (ADR-030) and
-`Require<...>`/`Prefer<...>`/`Weighted` placement (ADR-013) already depend on a live
-`CapabilityView` but require a caller to construct and push one in manually.
+`InProcessCapabilityView`, a std-only test double, exists. `Require<...>`/`Prefer<...>`/
+`Weighted` placement (ADR-013) already depends on a live `CapabilityView` but requires a
+caller to construct and push one in manually.
 
 The question: how should `SwimMembership` actually disseminate a node's advertised
 `NodeCapabilities` to the rest of the cluster over the real `Transport`, reusing the existing

@@ -268,7 +268,7 @@ When placement moves actor `X` from old node O to new node N:
    N, per the actor's policy. No store, so no fencing needed — worst case is lost
    volatile state, which an in-memory actor already tolerates on node loss (010).
 
-### Capability gossip beyond placement (025, 028, ADR-045)
+### Capability gossip (025, ADR-045)
 
 Node capabilities (025 Part A: `Flag`/`Label`/`Scalar`) ride the SAME bounded
 piggyback-digest gossip channel `ControlMsg.updates`/ADR-040 `ControlMsg.revocations`
@@ -279,11 +279,8 @@ in `CapabilityRegistry` (capability_registry.hpp), the real, network-backed
 `CapabilityView` producer; SwimMembership itself stays capability-ignorant, moving only
 opaque bytes. A freshly joined node becomes capability-visible within the same
 O(log_fanout N) convergence window as membership itself (empirically 1-2 gossip rounds
-up to N=128), not necessarily atomically at Join/JoinAck. Every consumer to date has
-been a **placement** input (025's `Require`/`Prefer`/`Weighted`). `Flag{"voice-relay"}`
-(028) is the first consumer that is **not** placement in the mailbox-routed sense — a
-node's own `VoiceChannel` reads it locally (via `registry.view(swim.view())`) to build
-its voice-relay-eligible `VirtualBins` subset, entirely off the actor path.
+up to N=128), not necessarily atomically at Join/JoinAck. Every consumer is a
+**placement** input (025's `Require`/`Prefer`/`Weighted`).
 
 **Freshness and conflict resolution.** A capability entry is superseded by a strictly
 higher SWIM incarnation — the same freshness axis membership itself uses, no second
@@ -295,13 +292,10 @@ pattern (the less-exercised path is a live republish), but it is no longer a har
 requirement: `CapabilityRegistry::publish_local()` makes a live mutation safe and
 deterministic if a caller does need one.
 
-**Mid-session handoff across a capability change.** There is deliberately **no**
-hand-off procedure like the actor hand-off above: each node's `VoiceChannel` picks up
-the new eligible set on its own next `on_capability_view_changed` rebuild (bounded by
-ordinary gossip convergence, same as any other membership change), and in-flight
-datagrams addressed to the now-stale relay are simply lost under voice's ordinary
-best-effort contract. No fencing token, no `PathPin` (026) — those exist to protect an
-ordering/consistency guarantee that 028 explicitly does not make.
+**Mid-session handoff across a capability change.** A capability republish and any
+placement re-resolution it triggers are ordinary membership changes: consumers pick up
+the new eligible set on their next view refresh, bounded by ordinary gossip convergence.
+Stateful actor movement across such a change is covered by the fenced hand-off above.
 
 **Dead-node eviction.** `CapabilityRegistry::evict_dead(node)` is wired onto
 `SwimMembership::set_sweep_hook` (the same idiom ADR-040 uses for revocation/rotation

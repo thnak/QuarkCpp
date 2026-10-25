@@ -142,18 +142,9 @@ seam — extending support means filling in a PAL backend, not redesigning the e
 > ([ADR-042](decisions/ADR-042-ipv6-endpoint-locator-widening.md), **Accepted (x86-64)**);
 > `scope_id` for link-local addresses and a v6-carrying gossip wire format remain open.
 >
-> **New in this round: 028 (Voice/UDP media channel)**, a best-effort, unordered UDP sibling
-> seam to `Transport` for real-time voice — sharing the existing PAL `IoContext` event loop,
-> AEAD-sealed on the 020 session key, relay-node placement via a capability-gossiped
-> `VirtualBins` generalization
-> ([ADR-030](decisions/ADR-030-voice-udp-datagram-channel.md)). **028 is Draft**: the design
-> is pinned and proven CORRECT end-to-end, but only against a mock cipher (no production AEAD
-> wired yet) and only over loopback (no real-network loss/reorder/jitter run yet).
->
-> **Still Draft (3):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
+> **Still Draft (2):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
 > whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
-> Zen4/SPR reference re-baseline and the ARM64 ratio; **028 (Voice channel)** is Draft pending
-> a production AEAD and a real-network proof (above). *Accepted (x86-64)* means the design is
+> Zen4/SPR reference re-baseline and the ARM64 ratio. *Accepted (x86-64)* means the design is
 > settled and backed on the current support target; ARM64 promotion of the mailbox's `seq_cst`
 > Dekker close-out waits on a formal weak-memory re-gate
 > ([OpenQuestions.md](OpenQuestions.md)) even though ARM64 already runs the full correctness
@@ -189,8 +180,6 @@ seam — extending support means filling in a PAL backend, not redesigning the e
   already-open-session revocation, wire-arrived principal propagation into handler
   `MessageContext` ([ADR-040](decisions/ADR-040-mtls-node-transport-cert-rotation.md)/[044](decisions/ADR-044-principal-propagation-envelope-pool.md)).
 - **Deterministic simulation testing** (014) for fault injection without real time or threads.
-- **Real-time voice/media channel** (028, Draft) — best-effort UDP sharing the existing PAL
-  event loop, capability-placed relay nodes, AEAD-sealed on the 020 session key.
 - **Cross-platform by design** via a thin Platform Abstraction Layer (PAL); the full
   correctness matrix (gcc/clang, Release/ASan+UBSan/TSan) runs on both Linux/x86-64 and
   Linux/ARM64 in CI today, on real ARM64 hardware — Windows/x86-64 has its own PAL backend;
@@ -372,7 +361,7 @@ tests/                  194-test correctness gate (CTest)
 bench/                  benchmark harness — the 023 budget verdicts
 samples/                22 runnable programs over the public developer surface
 decisions/              ADRs — the design → red-team → prove → judge records
-NNN-*.md                the 28 RFC specification documents
+NNN-*.md                the 27 RFC specification documents
 ```
 
 The core is **std-only C++23** and **header-first** — the hot path (mailbox, scheduler,
@@ -401,7 +390,7 @@ today**, Windows/x86-64 with its own PAL backend, and macOS designed-for but not
 There is no .NET / managed-runtime vocabulary anywhere in the design — see the glossary below.
 
 <details>
-<summary><strong>Reading order — the 28 RFC specification documents</strong></summary>
+<summary><strong>Reading order — the 27 RFC specification documents</strong></summary>
 
 | # | Document | Covers | Maturity |
 |---|---|---|---|
@@ -433,7 +422,6 @@ There is no .NET / managed-runtime vocabulary anywhere in the design — see the
 | 025 | [025-Placement-Policies-and-Stateless-Workers.md](025-Placement-Policies-and-Stateless-Workers.md) | Node capabilities, capability/affinity/weighted placement modifiers, stateless worker pools (cross-cutting) | **Accepted** (x86-64) |
 | 026 | [026-Large-Scale-Cluster-Topology.md](026-Large-Scale-Cluster-Topology.md) | Scaling to 10³–10⁴ nodes: VirtualBins O(1) placement, bounded partial-view, DHT-relay; configurable topology/connection/cache axes (cross-cutting) | **Accepted** (x86-64) |
 | 027 | [027-Reminders.md](027-Reminders.md) | Durable, wall-clock, at-least-once scheduled wake-ups on the 012 `Store` seam; SEGSTREAM token-bucket drain flattens mass-due (10⁶-at-9PM) to `peak == fire_rate` (cross-cutting) | **Accepted** (x86-64) |
-| 028 | [028-Voice-Datagram-Channel.md](028-Voice-Datagram-Channel.md) | Best-effort, unordered UDP voice/media channel sharing `TcpTransport`'s I/O reactor; capability-gossiped relay placement via a `VirtualBins` generalization, AEAD-sealed on the existing 020 session key | Draft |
 
 </details>
 
@@ -476,7 +464,6 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-027](decisions/ADR-027-mailbox-mpsc-hot-path-r6.md) | Mailbox MPSC hot path (round 6) | Winner **unchanged** (6th round) — Intrusive Vyukov MPSC. Both challengers (Segmented Bounded-Ring; BSR bounded-segment Treiber-push) disqualified on safety/correctness (a TSan-caught close-out race; 8,632/1M FIFO violations + a deterministic hang). Zero WRONG verdicts across the incumbent's ten claims. One hardening adopted: `Descriptor::complete()` moves from a plain store to a CAS-gated `Running→Completed` transition, closing a sanitizer-invisible TOCTOU. |
 | [ADR-028](decisions/ADR-028-lazy-activation-idle-timeout-eviction.md) | Lazy activation-on-first-message + idle-timeout deactivate eviction | **Broker-Actor Serialization** — a per-shard `ActivationBroker` actor reuses the single-executor guarantee itself to arbitrate first-touch/reactivation, instead of inventing new CAS/RCU machinery; a new `Dormant` ExecState reuses the existing seq_cst mailbox-close-out Dekker fence verbatim. Zero disproven safety/correctness claims, hot path within noise of baseline. A competing pre-sized CAS slot-table design is disqualified (steady-state regression +47–167%); a generation-tagged identity-word design is disqualified (message loss 3 separate ways). |
 | [ADR-029](decisions/ADR-029-mailbox-mpsc-hot-path-r7-judgment.md) | Mailbox MPSC hot path (round 7) | Winner **unchanged** (7th round) — Intrusive Vyukov MPSC, r7-hardened (debug-only double-enqueue guard, zero-cost dequeue prefetch). SBR-Mailbox disqualified — its generation-tagged claim word produced deterministic cross-actor message injection (3/3 repeats). REX-CAS/B disqualified — mechanism-identical to ADR-020's already-rejected REX-BIR, conceded fatal in the debate itself. 27 CORRECT / 4 WRONG / 1 INCONCLUSIVE across all three designs combined. |
-| [ADR-030](decisions/ADR-030-voice-udp-datagram-channel.md) | UDP datagram channel for real-time voice/media + relay-node placement (new spec 028) | **VoiceChannel, shared-loop / capability-placed (reuse-maximalist)** — a NEW sibling seam to `Transport`, sharing `TcpTransport`'s existing `pal::IoContext` via one additive `event_loop()` accessor; room→relay placement is a generalized `VirtualBins` over gossiped `Flag{"voice-relay"}` capability; AEAD-sealed, HKDF sub-key off the existing 020 session key. 13/13 proven CORRECT, zero WRONG — the only one of three designs with a clean record. Mailbox/`GovernanceCore` proven byte-identical/untouched when voice is unused. → **028 Draft** (mock-cipher + loopback-only proof so far). |
 | [ADR-031](decisions/ADR-031-mailbox-mpsc-hot-path-r8-judgment.md) | Mailbox MPSC hot path (round 8) | Winner **unchanged** (8th round) — Intrusive Vyukov MPSC. SBR-v4 disqualified — never reached Prove (conceded rewrite, zero executed evidence). REX-CAS/C disqualified — its own FIFO claim came back INCONCLUSIVE via a harness later shown methodologically unsound, despite winning on raw throughput at low P. Multi-producer scaling regression (P1→P4) mechanistically isolated for the first time to shared-`tail_`-cache-line contention via an independent-cache-line control (2.5–2.6× vs 0.73–0.88×). |
 | [ADR-032](decisions/ADR-032-mailbox-mpsc-hot-path-r9-judgment.md) | Mailbox MPSC hot path (round 9) | Winner **unchanged** (9th round) — Intrusive Vyukov MPSC. Both challengers purpose-built to bound oldest-message-discovery cost, both disqualified: SBR-v5 proven WRONG on its own central global-ordering claim (up to 858,983 inversions once its overflow valve engages); SEG-REX disqualified on safety — reproducible unsigned-underflow/deadlock, sanitizer-invisible. Incumbent 10/10 CORRECT; newly closed a standing open question (`ExecStateCell`'s acquire/release proven independently load-bearing). |
 | [ADR-033](decisions/ADR-033-mailbox-mpsc-hot-path-r10-judgment.md) | Mailbox MPSC hot path (round 10) | Winner **unchanged** (10th round) — Intrusive Vyukov MPSC. SEG-HP (hazard-pointer-paired segmented descendant) disqualified — a new bug class: `try_dequeue()` returns spurious `Empty` at an ordinary segment-rotation boundary (97.5% isolated repro), plus a 370–400× p999 regression under contention. `DeliveryMode<OrderFirst\|ThroughputFirst<K>\|LatencyFirst>` passes the safety gate but its throughput claim (≥3× at P=K=8) falls to 1.2–2.7×, structurally capped by the single-executor invariant — banked as a finding, not adopted as default. |
@@ -537,7 +524,7 @@ Remaining cross-cutting design questions are tracked in [OpenQuestions.md](OpenQ
 
 ## Contributing
 
-Every change must follow the RFC specs (`001`–`028`) and the proven decisions
+Every change must follow the RFC specs (`001`–`027`) and the proven decisions
 (`decisions/ADR-*`) — when code and a spec disagree, the spec wins; if the spec is genuinely
 wrong, fix the spec first (RFC-style, backed by an ADR), then the code. Read
 **[CONVENTIONS.md](CONVENTIONS.md)** before opening a PR — it covers target/scope, language and

@@ -33,14 +33,14 @@ const GH_TREE = `${GH}/tree/master/`
 const CATEGORIES_EN: Record<DocCategory, { label: string; blurb: string; order: number }> = {
   guide: { label: 'Guides', blurb: 'Start here — write an actor, tour the samples, read the status.', order: 0 },
   reference: { label: 'Reference', blurb: 'The architecture overview, conventions and the verification record.', order: 1 },
-  spec: { label: 'Specifications', blurb: 'The 28 RFC documents. Authoritative design — when code and a spec disagree, the spec wins.', order: 2 },
+  spec: { label: 'Specifications', blurb: 'The 27 RFC documents. Authoritative design — when code and a spec disagree, the spec wins.', order: 2 },
   adr: { label: 'Decision records', blurb: 'Executed proofs. Real C++23 under GCC + Clang, ASan/UBSan/TSan, benchmarked.', order: 3 },
 }
 
 const CATEGORIES_VI: Record<DocCategory, { label: string; blurb: string; order: number }> = {
   guide: { label: 'Hướng dẫn', blurb: 'Bắt đầu từ đây — viết actor, tham quan mẫu mã nguồn, xem trạng thái dự án.', order: 0 },
   reference: { label: 'Tham chiếu', blurb: 'Tổng quan kiến trúc, quy ước lập trình và bản ghi kiểm thử.', order: 1 },
-  spec: { label: 'Đặc tả RFC', blurb: '28 tài liệu RFC đặc tả thiết kế chuẩn mực — khi mã nguồn và đặc tả mâu thuẫn, đặc tả thắng.', order: 2 },
+  spec: { label: 'Đặc tả RFC', blurb: '27 tài liệu RFC đặc tả thiết kế chuẩn mực — khi mã nguồn và đặc tả mâu thuẫn, đặc tả thắng.', order: 2 },
   adr: { label: 'Quyết định ADR', blurb: 'Các bằng chứng thiết kế đã thực thi trên C++23 thực tế với GCC + Clang và benchmark.', order: 3 },
 }
 

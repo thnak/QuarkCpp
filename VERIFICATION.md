@@ -107,10 +107,10 @@ The TCP-transport and cluster-relay tests (`tcp_frame_codec_test`, `tcp_transpor
 default TCP transport (010/019/021) is race-free, leak-free, and UB-free over real loopback sockets.
 
 **Impaired-network runs (2026-10-21, bare-metal Ubuntu 26.04, 28 cores, g++ 15.2; Clang 21.1 also
-208/208).** `tests/netem/run_matrix.sh` runs the 10 real-socket tests (`tcp_*`, the three
-SecureTransport socket tests, `security_rotation_sweep_test`, `voice_channel_loopback_test`) in a
+208/208).** `tests/netem/run_matrix.sh` runs the 9 real-socket tests (`tcp_*`, the three
+SecureTransport socket tests, `security_rotation_sweep_test`) in a
 fresh network namespace per test. It applies `tc netem` to that namespace's private loopback, so the
-tests run unchanged and the host's network is untouched. All 9 profiles passed 10/10 in each of 3
+tests run unchanged and the host's network is untouched. All 9 profiles passed 9/9 in each of 3
 runs: baseline, 5 ms±2 ms, 50 ms±10 ms, 1% loss, 5% loss, 25% reordering, 1% duplicate + 0.1%
 corrupt, 1 Mbit, and a WAN mix (80 ms±20 ms, 0.5% loss, 2% reorder). Two harness fixes came out of the
 first pass. `tcp_transport_control_priority_test` now fails only on a 10 s stall in delivery, not
