@@ -147,6 +147,13 @@ public:
     // Phase 6 rotation policy (ADR-040 C5/C15). Defaults are conservative; override per-deployment.
     static constexpr std::uint64_t kDefaultMaxFramesPerKey = 1'000'000;                  // C5
     static constexpr std::int64_t kDefaultRenegotiateIntervalNs = 3600LL * 1'000'000'000;  // 1h idle poll (C15)
+
+    // Pre-auth hardening. A peer may open an Authenticate frame before it has authenticated, and
+    // `handle_authenticate_frame` used to park one engine per spoofed `frame.from` forever (entries
+    // are only reaped when a later frame arrives from the SAME NodeId). Cap both the number of
+    // parked handshakes and the bytes any single Authenticate frame may feed an engine.
+    static constexpr std::size_t kMaxPendingHandshakes = 256;
+    static constexpr std::size_t kMaxAuthenticateFrameBytes = 64 * 1024;
     void set_rotation_policy(std::uint64_t max_frames_per_key, std::int64_t renegotiate_interval_ns) noexcept {
         max_frames_per_key_ = max_frames_per_key;
         renegotiate_interval_ns_ = renegotiate_interval_ns;
@@ -404,6 +411,10 @@ private:
                 pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             }
+            if (pending_.size() >= kMaxPendingHandshakes) {
+                handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             engine = handshake_factory_->create(/*is_client=*/true, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
                                                 revoked_snapshot_);
@@ -467,6 +478,10 @@ private:
                 pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             }
+            if (pending_.size() >= kMaxPendingHandshakes) {
+                handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             engine = handshake_factory_->create(/*is_client=*/true, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
                                                 revoked_snapshot_);
@@ -496,6 +511,13 @@ private:
             }
         }
         if (!engine) {  // no engine in flight ⇒ we're the server side seeing the opening message
+            std::lock_guard<std::mutex> g(pending_mu_);
+            if (pending_.size() >= kMaxPendingHandshakes) {
+                handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, peer.value,
+                                   "secure transport: pending handshake cap reached", 0});
+                return;
+            }
             engine = handshake_factory_->create(/*is_client=*/false, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
                                                 revoked_snapshot_);
@@ -506,6 +528,12 @@ private:
 
     void deliver(MessageFrame frame) {
         if (frame.kind == FrameKind::Authenticate) {
+            if (frame.payload.size() > kMaxAuthenticateFrameBytes) {
+                tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, frame.from.value,
+                                   "secure transport: oversized Authenticate frame", 0});
+                return;
+            }
             handle_authenticate_frame(std::move(frame));
             return;
         }
@@ -576,8 +604,11 @@ private:
                (seq | (static_cast<std::uint64_t>(lane) << 63));
     }
 
-    // AAD = the routing header the receiver must be able to trust: from, to, target actor, msg type, the
-    // seq lane, and the replay seq. Authenticated, not encrypted (routing needs it in the clear).
+    // AAD = every frame-header field the receiver will ACT ON, not just the routing keys. Binding
+    // `mode`, `kind`, `deadline_ns`, `trace_id` and the Principal is load-bearing: those fields ride
+    // in the CLEAR (only `payload` is sealed), so omitting them let an on-path attacker rewrite, e.g.,
+    // principal.rights to an ACL-satisfying value or flip mode to Tagless while the AEAD tag still
+    // verified. Authenticated, not encrypted (routing needs it in the clear).
     [[nodiscard]] static std::vector<std::byte> build_aad(NodeId from, NodeId to, const MessageFrame& f,
                                                           std::size_t lane, std::uint64_t seq) {
         std::vector<std::byte> aad;
@@ -586,6 +617,12 @@ private:
         detail::put_u64_le(aad, f.target.type.value);
         detail::put_u64_le(aad, f.target.key);
         detail::put_u64_le(aad, f.msg_type.value);
+        detail::put_u64_le(aad, static_cast<std::uint64_t>(f.mode));
+        detail::put_u64_le(aad, static_cast<std::uint64_t>(f.kind));
+        detail::put_u64_le(aad, static_cast<std::uint64_t>(f.deadline_ns));
+        detail::put_u64_le(aad, f.trace_id);
+        detail::put_u64_le(aad, f.principal.subject);
+        detail::put_u64_le(aad, f.principal.rights);
         detail::put_u64_le(aad, static_cast<std::uint64_t>(lane));
         detail::put_u64_le(aad, seq);
         return aad;

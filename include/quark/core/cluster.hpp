@@ -812,6 +812,7 @@ private:
 
     // --- inbound ------------------------------------------------------------------------------
     void on_frame(MessageFrame f) {
+        if (f.to != self_) return;  // a transport may hand us frames addressed elsewhere; never act on them
         if (f.kind != FrameKind::Control) {
             if (data_sink_) data_sink_(std::move(f));  // 010 data plane, untouched
             return;
@@ -819,7 +820,7 @@ private:
         if (!online_) return;  // crashed node ignores control (stops acking)
         ControlMsg m;
         if (!detail::decode_control(f.payload.data(), f.payload.size(), m)) return;  // malformed → drop
-        handle_control(m);
+        handle_control(m, f.from);
     }
 
     // Stateless relay correlation (ADR-048): a relay remembers nothing about a PingReq. It stamps the
@@ -836,7 +837,12 @@ private:
     }
     [[nodiscard]] std::int64_t bucket(std::int64_t now) const noexcept { return now / indirect_ns(); }
 
-    void handle_control(const ControlMsg& m) {
+    void handle_control(const ControlMsg& m, NodeId authenticated_from) {
+        // A peer may only speak for ITSELF. The authenticated transport identity (a mTLS session's
+        // peer, or the HELLO identity on a plaintext link) is `authenticated_from`; the payload's
+        // `m.from` is attacker-controlled. Without this check one admitted node could impersonate
+        // any other node in SWIM gossip (forge Left/Dead/Suspect, mint members, trigger relays).
+        if (m.from != authenticated_from) return;
         // Join is the ONE control that legitimately crosses a cluster-id boundary (it is how a mismatch
         // is detected). Every other control from a foreign cluster is dropped (accidental-merge guard).
         if (m.kind != ControlKind::Join && m.cluster != cfg_.cluster_id) return;
@@ -853,9 +859,16 @@ private:
                     apply_update(m.from, m.from_incarnation, MemberStatus::Alive, Src::Direct, now);
                 }
             }
-            for (const MemberUpdate& u : m.updates)  // may trigger self-refutation
-                apply_update(NodeId{u.node}, u.incarnation, static_cast<MemberStatus>(u.status), Src::Gossip,
-                             now);
+            for (const MemberUpdate& u : m.updates) {  // may trigger self-refutation
+                // A node may announce its OWN graceful Left (the sender is authenticated above), but
+                // it may not tombstone a THIRD PARTY: a gossip Left is otherwise authoritative and
+                // cannot be refuted, which would let one peer permanently evict any other node.
+                if (static_cast<MemberStatus>(u.status) == MemberStatus::Left &&
+                    u.node != m.from.value)
+                    continue;
+                apply_update(NodeId{u.node}, u.incarnation, static_cast<MemberStatus>(u.status),
+                             Src::Gossip, now);
+            }
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
             if (capability_merge_ && !m.capabilities.empty()) capability_merge_(m.capabilities);
             for (const MailboxPressureEntry& e : m.pressure) last_pressure_[e.node.value] = e.resident_total;

@@ -151,6 +151,13 @@ public:
             failure_ = setup_failure_.empty() ? "mbedTLS handshake setup failed" : setup_failure_;
             return Step::Failed;
         }
+        // A single handshake may not buffer unbounded attacker-supplied bytes. 64 KiB is far above
+        // any real ClientHello/certificate flight; the wrapping SecureTransport also rejects
+        // Authenticate frames larger than this before they reach an engine.
+        if (in_buf_.size() + in.size() > kMaxBufferedHandshakeBytes) {
+            failure_ = "handshake input exceeds the buffered-bytes cap";
+            return Step::Failed;
+        }
         in_buf_.insert(in_buf_.end(), reinterpret_cast<const unsigned char*>(in.data()),
                        reinterpret_cast<const unsigned char*>(in.data()) + in.size());
         out_buf_.clear();
@@ -339,6 +346,7 @@ private:
     Fingerprint peer_fingerprint_{};
     Result result_{};
 
+    static constexpr std::size_t kMaxBufferedHandshakeBytes = 64 * 1024;
     std::vector<unsigned char> in_buf_;
     std::vector<unsigned char> out_buf_;
 };

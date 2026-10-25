@@ -439,6 +439,89 @@ const std::byte* tagless_read_object(const std::byte* p, T& obj) {
     return r.p;
 }
 
+// --- Bounds-checked tagless decode (UNTRUSTED wire bytes) ---------------------------------------
+// The tagless fast path is deliberately UNCHECKED between fingerprint+ABI-matched peers, but the
+// receiver must still validate that the bytes it was handed actually decode inside the payload: a
+// peer controls its own sealed plaintext, so `mode=Tagless` plus a short body could otherwise make
+// std::string::assign / vector::resize read past the buffer. This mirrors the writer exactly and
+// fails closed on any truncation or oversized declared length.
+template <class M>
+bool tagless_read_value_checked(const std::byte*& p, const std::byte* end, M& m);
+
+template <class T>
+bool tagless_read_object_checked(const std::byte*& p, const std::byte* end, T& obj);
+
+template <class T>
+struct TaglessCheckedReader {
+    const std::byte* p;
+    const std::byte* end;
+    bool ok = true;
+    template <class M>
+    void field(std::uint32_t, M& m) {
+        if (!ok) return;
+        if (!tagless_read_value_checked(p, end, m)) ok = false;
+    }
+};
+
+template <class T>
+bool tagless_read_object_checked(const std::byte*& p, const std::byte* end, T& obj) {
+    TaglessCheckedReader<T> r{p, end};
+    quark_describe(r, obj);
+    p = r.p;
+    return r.ok;
+}
+
+template <class M>
+bool tagless_read_value_checked(const std::byte*& p, const std::byte* end, M& m) {
+    using U = std::remove_cvref_t<M>;
+    if constexpr (std::is_trivially_copyable_v<U> && !is_std_vector_v<U> && !is_std_string_v<U> &&
+                  !Described<U>) {
+        if (static_cast<std::size_t>(end - p) < sizeof(U)) return false;
+        std::memcpy(&m, p, sizeof(U));
+        p += sizeof(U);
+        return true;
+    } else if constexpr (is_std_string_v<U>) {
+        if (static_cast<std::size_t>(end - p) < sizeof(std::uint32_t)) return false;
+        std::uint32_t n;
+        std::memcpy(&n, p, sizeof(n));
+        p += sizeof(n);
+        if (static_cast<std::size_t>(end - p) < n) return false;
+        m.assign(reinterpret_cast<const char*>(p), n);
+        p += n;
+        return true;
+    } else if constexpr (is_std_vector_v<U>) {
+        using E = std::remove_cvref_t<typename U::value_type>;
+        if (static_cast<std::size_t>(end - p) < sizeof(std::uint32_t)) return false;
+        std::uint32_t n;
+        std::memcpy(&n, p, sizeof(n));
+        p += sizeof(n);
+        if constexpr (std::is_trivially_copyable_v<E> && !Described<E>) {
+            const std::size_t bytes = static_cast<std::size_t>(n) * sizeof(E);
+            if (sizeof(E) != 0 && bytes / sizeof(E) != n) return false;  // overflow
+            if (static_cast<std::size_t>(end - p) < bytes) return false;
+            m.resize(n);
+            if (bytes != 0) std::memcpy(m.data(), p, bytes);
+            p += bytes;
+            return true;
+        } else {
+            // Non-trivial elements have no per-element byte length on the wire, so bound the count
+            // by the bytes actually remaining (>=1 byte each) and a hard cap before allocating.
+            constexpr std::uint32_t kMaxTaglessElements = 1u << 20;
+            if (n > kMaxTaglessElements || static_cast<std::size_t>(end - p) < n) return false;
+            m.clear();
+            m.reserve(n);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                E elem{};
+                if (!tagless_read_value_checked(p, end, elem)) return false;
+                m.push_back(std::move(elem));
+            }
+            return true;
+        }
+    } else {  // nested described type
+        return tagless_read_object_checked(p, end, m);
+    }
+}
+
 template <class T>
 std::size_t tagless_object_size(const T& obj);  // fwd
 
@@ -491,11 +574,21 @@ std::size_t encode_tagless(const T& obj, std::byte* buf) noexcept {
     return static_cast<std::size_t>(end - buf);
 }
 
-// Tagless decode from a matched-schema, matched-ABI peer's bytes. UNCHECKED by design.
+// Tagless decode from a matched-schema, matched-ABI peer's bytes. UNCHECKED by design — only for
+// locally-constructed bytes whose schema/size the caller already owns.
 template <Described T>
 std::size_t decode_tagless(const std::byte* buf, T& out) noexcept {
     const std::byte* end = detail::tagless_read_object(buf, out);
     return static_cast<std::size_t>(end - buf);
+}
+
+// Bounds-checked tagless decode for a payload that arrived over an untrusted boundary. Returns
+// false (and the caller must drop the frame) on any truncation or oversized declared length.
+template <Described T>
+[[nodiscard]] bool decode_tagless_checked(const std::byte* buf, std::size_t len, T& out) noexcept {
+    const std::byte* p = buf;
+    const std::byte* end = buf + len;
+    return detail::tagless_read_object_checked(p, end, out);
 }
 
 // The exact tagless size of an object (for buffer provisioning). For an all-trivial POD this is

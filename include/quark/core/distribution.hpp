@@ -144,6 +144,9 @@ public:
 
     // --- Inbound (Transport receiver): decode a frame and re-post it as a local delivery. ---------
     void deliver(const MessageFrame& f) {
+        // The transport contract says only frames addressed to THIS node reach us; enforce it here
+        // too (a peer could otherwise aim a frame at another NodeId and have it applied locally).
+        if (f.to != self_) return;
         // Boundary authorization (020 §3) runs FIRST — before the (target,msg) lookup and well before
         // decode — so a denied frame is never deserialized and never touches actor state.
         if (authz_ != nullptr &&
@@ -195,7 +198,9 @@ private:
     static void inbound_thunk(LocalRouter& local, const MessageFrame& f) {
         M msg{};
         if (f.mode == WireMode::Tagless) {
-            (void)decode_tagless(f.payload.data(), msg);  // UNCHECKED — matched-peer gate (016)
+            // A peer controls its own plaintext and can force Tagless; never run the unchecked
+            // decoder on wire bytes. A truncated/oversized declared length is dropped here.
+            if (!decode_tagless_checked(f.payload.data(), f.payload.size(), msg)) return;
         } else {
             if (!decode_tagged(f.payload.data(), f.payload.size(), msg)) return;  // malformed → drop
         }
