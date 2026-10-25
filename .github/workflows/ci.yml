@@ -182,6 +182,21 @@ jobs:
       - name: Test
         run: ${{ matrix.config.ctest_env }} ctest --test-dir build -j ${{ matrix.config.ctest_jobs }} --output-on-failure --timeout 1800
 
+      # P5: the same shared targets under libFuzzer + ASan/UBSan against the generated corpus. The
+      # deterministic fuzz_decoders_test above already ran in ctest on every leg/platform; this is
+      # the continuous mutation campaign on the Clang x86-64 leg.
+      - name: Fuzz decoders (libFuzzer, 60s)
+        if: matrix.arch == 'x86_64' && matrix.config.name == 'clang-release'
+        run: |
+          cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++-20 -DQUARK_BUILD_TESTS=ON \
+            -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_FUZZ=ON -DQUARK_SANITIZE=address
+          cmake --build build-fuzz --target fuzz_decoders fuzz_seed_corpus -j 2
+          mkdir -p build-fuzz/corpus
+          build-fuzz/tests/fuzz_seed_corpus build-fuzz/corpus
+          build-fuzz/tests/fuzz_decoders -max_total_time=60 -timeout=10 \
+            -artifact_prefix=build-fuzz/corpus/ build-fuzz/corpus
+
       - name: Upload ctest logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

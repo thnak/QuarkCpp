@@ -49,6 +49,23 @@ foreach(src ${QUARK_TEST_SOURCES})
   add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
+# --- P5 libFuzzer targets (opt-in; Clang only). The shared targets are ALSO exercised by the
+# auto-discovered, deterministic fuzz_decoders_test on every platform/compiler. -----------------
+if(QUARK_BUILD_FUZZ)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "QUARK_BUILD_FUZZ requires Clang (libFuzzer + ASan/UBSan)")
+  endif()
+  add_executable(fuzz_decoders fuzz/fuzz_decoders.cpp)
+  target_include_directories(fuzz_decoders PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(fuzz_decoders PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_options(fuzz_decoders PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+  target_link_options(fuzz_decoders PRIVATE -fsanitize=fuzzer,address,undefined)
+
+  add_executable(fuzz_seed_corpus fuzz/fuzz_seed_corpus.cpp)
+  target_include_directories(fuzz_seed_corpus PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(fuzz_seed_corpus PRIVATE quark::quark quark_warnings Threads::Threads)
+endif()
+
 # --- Special targets (positive controls / -D variants) that can't be auto-discovered ----------
 # The no-lost-wakeup CONTROL: -DQUARK_SCHED_BROKEN_WAKEUP drops the park Dekker barrier+rescan, so
 # the harness MUST strand — proving it detects a lost wakeup. The control binary returns 0 iff it

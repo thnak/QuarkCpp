@@ -57,6 +57,9 @@ add_library(quark::quark ALIAS quark)
 # ---- Tests, benchmarks & samples -------------------------------------------
 option(QUARK_BUILD_TESTS "Build Quark tests" ON)
 option(QUARK_BUILD_BENCH "Build Quark benchmarks" ON)
+# P5: Clang/libFuzzer targets (fuzz_decoders + fuzz_seed_corpus). Off by default; the shared
+# targets are also exercised deterministically by fuzz_decoders_test in the normal suite.
+option(QUARK_BUILD_FUZZ "Build libFuzzer decoder targets (requires Clang)" OFF)
 # Samples default OFF so the test/sanitizer builds stay lean; enable with -DQUARK_BUILD_SAMPLES=ON.
 option(QUARK_BUILD_SAMPLES "Build Quark sample projects" OFF)
 

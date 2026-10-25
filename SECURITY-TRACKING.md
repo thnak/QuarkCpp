@@ -194,13 +194,22 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 
 ### P5 — coverage
 
-- [~] **Expand fuzzing beyond the 2M-input decoder campaign.**
-  - **Done:** 2,000,000 random inputs across `decode_tagged`, `decode_control`,
-    `decode_tagless_checked` under ASan+UBSan — clean.
-  - **Next:** snapshot/persistence decoders, stream credit/frame reassembly, and mixed-schema
-    inputs; add a CI fuzz target with a corpus.
-  - **Acceptance:** continuous fuzz coverage for every untrusted decode path; crashes triage to an
-    issue, not a flaky test.
+- [x] **Expand fuzzing beyond the 2M-input decoder campaign.**
+  - **Done (pass 5):** one shared target set (`tests/fuzz/fuzz_targets.hpp`) now covers canonical
+    tagged + bounds-checked tagless, the F17 mixed-schema pair + negotiation gate, SWIM control,
+    the schema advert, durable snapshot/event records + the migration chain, TCP frame bodies +
+    `FrameStream` reassembly, and random `.qwal` WAL replay. Two drivers: `fuzz_decoders_test`
+    (deterministic, every CTest matrix leg/platform, 50k default) and `fuzz_decoders` (Clang
+    libFuzzer + ASan/UBSan), with a generated 28-seed corpus; the CI Clang x86-64 leg runs a
+    **60-second** campaign on every push/PR. `FUZZING.md` records the commands and triage.
+  - **Acceptance:** every untrusted decode path has continuous fuzz coverage and a deterministic
+    regression gate; a crash is an artifact + a deterministic seed, never a flaky test. **Met.**
+  - **Verify:** `fuzz_decoders_test --iters 200000` (28 seeds + 100 WAL replays) clean; a 60s
+    libFuzzer + ASan/UBSan run completed **2,577,246** executions with **no crash/timeout** and no
+    artifact; the 2M ASan+UBSan campaign below remains the long-campaign reference.
+  - **Residual:** libFuzzer only runs on the Clang/Linux leg (the deterministic driver covers
+    Windows/arm64/gcc); CI uses 60s per push rather than a 24/7 fleet, and the TLS/AEAD internals
+    are the vetted mbedTLS library, not re-fuzzed here.
 
 ---
 
@@ -225,6 +234,7 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 | F17 | Layout-aware fingerprint + authenticated PeerSchema advert | `06c69c9`+ | `schema_probe` gate; mixed-schema tagged/reject; live mTLS tagless |
 | P4 at-rest | `EncryptedStore<S>` + KMS Keyring decision/checklist | pass 4 | store test: ciphertext/reopen/tamper/splice/wrong key |
 | P4 supply chain | Pin manifest + audit self-test + CycloneDX SBOM + attestation | pass 4 | mutable action/bad hash rejected; SBOM valid (18 components) |
+| P5 fuzzing | Shared targets + deterministic CTest + libFuzzer corpus/CI | pass 5 | 200k deterministic + 2,577,246 libFuzzer runs, no crash |
 | Supply chain | Action SHAs, LLVM hash, mbedTLS version | `81c8d0d` | CI no longer pipes to sudo |
 
 ---
@@ -250,6 +260,8 @@ The production build refuses the plaintext variant before `start()`.
 | P4 pin audit | self-test rejects mutable action + bad LLVM hash; real audit passes |
 | P4 SBOM | valid CycloneDX 1.5, 18 components, file SHA-256s |
 | P4 at-rest | InMemory+FileStore ciphertext; reopen, tamper, cross-actor, wrong key controlled |
+| P5 deterministic fuzz | 200k iterations + 100 random WAL replays, clean |
+| P5 libFuzzer 60s | **2,577,246** runs, no crash/timeout artifact |
 | 21/21 affected CTest suites + 17 targeted core | pass |
 
 Implemented in this pass:
@@ -276,6 +288,9 @@ Implemented in this pass:
   ownership, rotation/rewrap and deployment checklist in `PersistenceAdapters.md`.
 - **P4 supply chain:** `ci/pins.env`, `ci/install-deps.sh`, fail-closed `ci/check_pins.sh`
   (+ self-test), CycloneDX `ci/gen_sbom.sh`, and the attested `supply-chain` CI gate.
+- **P5 fuzzing:** `tests/fuzz/fuzz_targets.hpp` (wire/control/schema/durable/mixed/frame/WAL),
+  deterministic `fuzz_decoders_test`, Clang `fuzz_decoders` + corpus generator, and the CI 60s
+  libFuzzer campaign.
 - **Test seam:** `DistributedRouter::tell_on()` pins the lab ledger; production routing still uses
   placement.
 
@@ -360,4 +375,6 @@ bash run_f17_live.sh       # schema probe + 7-node mTLS tagless / plaintext tagg
 ./security_at_rest_store_test   # P4 at-rest: ciphertext/reopen/tamper/splice/wrong key
 bash ci/check_pins.sh --self-test   # P4 supply chain: negative controls + real audit
 bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (attested in CI)
+./fuzz_decoders_test --iters 2000000   # P5 long deterministic campaign
+# P5 libFuzzer: -DQUARK_BUILD_FUZZ=ON (Clang); seed corpus then 60s campaign — see FUZZING.md
 ```
