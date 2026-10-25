@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -52,7 +53,12 @@ namespace quark {
 // `Authenticate` (ADR-040): carries mTLS handshake bytes between two peers' `SecureTransport`
 // instances (handshake.hpp) — `TcpTransport` moves them exactly like any other frame, entirely
 // ignorant of their meaning. No new public surface on the 010 transport is needed for the handshake.
-enum class FrameKind : std::uint8_t { Data = 0, Control = 1, Authenticate = 2 };
+enum class FrameKind : std::uint8_t {
+    Data = 0,
+    Control = 1,
+    Authenticate = 2,
+    Schema = 3,  // F17: authenticated post-handshake schema advertisement (SecureTransport only)
+};
 
 // The wire unit handed to a Transport. Owns its serialized bytes; movable. The header is everything
 // the receiving node needs to (a) find the target actor, (b) decode the payload into the right type,
@@ -101,6 +107,14 @@ public:
     // overrides it to `false`. Startup validation uses this to refuse Strict + multi-node + plaintext.
     [[nodiscard]] virtual bool is_plaintext() const noexcept { return true; }
 
+    // F17 schema negotiation. A secure transport advertises this node's decodable message TypeKeys +
+    // ABI to an AUTHENTICATED peer after the handshake, and exposes the peer's advertisement here.
+    // Default: unsupported/unknown ⇒ the DistributedRouter stays on canonical tagged (safe).
+    virtual void set_local_schema(const SchemaAdvertisement& /*adv*/) {}
+    [[nodiscard]] virtual std::optional<SchemaAdvertisement> peer_schema(NodeId /*peer*/) const {
+        return std::nullopt;
+    }
+
     // ADR-046 cross-node backpressure — the 010 open question this resolves. Called by
     // `DistributedRouter::send_remote` BEFORE `send()`, on the CALLER's thread, so a congested peer
     // is stalled/shed before a frame is even constructed for the wire. Default: never throttle — a
@@ -133,6 +147,18 @@ public:
         receivers_.erase(n);
     }
 
+    // F17 test-double schema exchange: what node `n` advertises to its peers.
+    void set_schema(NodeId n, SchemaAdvertisement adv) {
+        std::lock_guard<std::mutex> g(mu_);
+        schemas_[n] = std::move(adv);
+    }
+    [[nodiscard]] std::optional<SchemaAdvertisement> get_schema(NodeId n) const {
+        std::lock_guard<std::mutex> g(mu_);
+        const auto it = schemas_.find(n);
+        if (it == schemas_.end()) return std::nullopt;
+        return it->second;
+    }
+
     // Deliver inline. A frame to an unattached node is dropped (peer down / not yet joined) — the
     // 010 table's "tell dead-lettered locally" degrades here to a silent drop at the fabric edge,
     // which the sender already treated as fire-and-forget. Count observed for tests.
@@ -163,6 +189,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<NodeId, std::function<void(MessageFrame)>> receivers_;
+    std::unordered_map<NodeId, SchemaAdvertisement> schemas_;
     std::uint64_t sends_ = 0;
     std::uint64_t drops_ = 0;
 };
@@ -186,6 +213,13 @@ public:
     }
     void mark_congested(NodeId peer, std::int64_t remaining_ns) noexcept override {
         congestion_.mark_congested(peer, now_ns() + remaining_ns);
+    }
+
+    void set_local_schema(const SchemaAdvertisement& adv) override {
+        fabric_->set_schema(self_, adv);
+    }
+    [[nodiscard]] std::optional<SchemaAdvertisement> peer_schema(NodeId peer) const override {
+        return fabric_->get_schema(peer);
     }
 
     // Clock injection (014 idiom, mirrors SwimMembership::set_clock) — a test drives the gate's TTL

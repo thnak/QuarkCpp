@@ -138,6 +138,10 @@ public:
             std::lock_guard<std::mutex> g(pending_mu_);
             pending_.erase(peer.value);
         }
+        {
+            std::lock_guard<std::mutex> g(schema_mu_);
+            peer_schemas_.erase(peer.value);
+        }
         sessions_dropped_on_disconnect_.fetch_add(1, std::memory_order_relaxed);
     }
     [[nodiscard]] std::uint64_t sessions_dropped_on_disconnect() const noexcept {
@@ -154,6 +158,8 @@ public:
     // parked handshakes and the bytes any single Authenticate frame may feed an engine.
     static constexpr std::size_t kMaxPendingHandshakes = 256;
     static constexpr std::size_t kMaxAuthenticateFrameBytes = 64 * 1024;
+    static constexpr std::size_t kMaxSchemaFrameBytes = 64 * 1024;
+    static constexpr std::size_t kMaxSchemaTypes = 4096;
     void set_rotation_policy(std::uint64_t max_frames_per_key, std::int64_t renegotiate_interval_ns) noexcept {
         max_frames_per_key_ = max_frames_per_key;
         renegotiate_interval_ns_ = renegotiate_interval_ns;
@@ -261,6 +267,32 @@ public:
 
     // Register the real receiver; interpose the open + replay check.
     [[nodiscard]] bool is_plaintext() const noexcept override { return false; }
+
+    // F17: advertise this node's decodable message TypeKeys + ABI. The advertisement travels in an
+    // AUTHENTICATED, sealed FrameKind::Schema frame after a session is established (and is re-sent
+    // to already-open sessions if the app registers types later). No local schema ⇒ nothing is sent.
+    void set_local_schema(const SchemaAdvertisement& adv) override {
+        {  // copy under the schema lock; send outside it
+            std::lock_guard<std::mutex> g(schema_mu_);
+            local_schema_ = adv;
+            has_local_schema_ = true;
+        }
+        if (!handshake_factory_) return;
+        std::vector<NodeId> peers;
+        {
+            std::shared_lock<std::shared_mutex> g(map_mu_);
+            peers.reserve(sessions_.size());
+            for (const auto& entry : sessions_) peers.push_back(NodeId{entry.first});
+        }
+        for (NodeId p : peers) send_schema_frame(p);
+    }
+
+    [[nodiscard]] std::optional<SchemaAdvertisement> peer_schema(NodeId peer) const override {
+        std::lock_guard<std::mutex> g(schema_mu_);
+        const auto it = peer_schemas_.find(peer.value);
+        if (it == peer_schemas_.end()) return std::nullopt;
+        return it->second;
+    }
 
     void on_receive(std::function<void(MessageFrame)> cb) override {
         receiver_ = std::move(cb);
@@ -383,6 +415,43 @@ private:
         inner_->send(peer, std::move(f));
     }
 
+    // F17: send the local schema over the just-established (or existing) session. Skipped until the
+    // session exists; a lost/delayed advert only costs the tagless fast path (the default is tagged).
+    void send_schema_frame(NodeId peer) {
+        if (!handshake_factory_ || !try_get_session(peer)) return;
+        SchemaAdvertisement adv;
+        {
+            std::lock_guard<std::mutex> g(schema_mu_);
+            if (!has_local_schema_) return;
+            adv = local_schema_;
+        }
+        if (adv.types.size() > kMaxSchemaTypes) return;  // bounded like the decoder
+        MessageFrame f{};
+        f.from = self_;
+        f.to = peer;
+        f.kind = FrameKind::Schema;
+        f.payload = encode_schema_advert(adv);
+        send(peer, std::move(f));
+    }
+
+    void handle_schema_frame(MessageFrame frame) {
+        if (frame.to != self_ || frame.payload.size() > kMaxSchemaFrameBytes) {
+            tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
+            audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, frame.from.value,
+                               "secure transport: malformed schema advertisement", 0});
+            return;
+        }
+        SchemaAdvertisement adv;
+        if (!decode_schema_advert(frame.payload.data(), frame.payload.size(), adv)) {
+            tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
+            audit_(AuditRecord{AuditKind::AuthnFailure, errc::serialization, frame.from.value,
+                               "secure transport: malformed schema advertisement", 0});
+            return;
+        }
+        std::lock_guard<std::mutex> g(schema_mu_);
+        peer_schemas_[frame.from.value] = std::move(adv);
+    }
+
     // Returns true iff this was an in-place RENEGOTIATION (an existing session was swapped), false iff
     // it installed a fresh session (including the identity-mismatch reject, which installs nothing).
     // The caller (drive_handshake) uses this to route the ADR-040 Phase 8 metric correctly.
@@ -461,6 +530,9 @@ private:
                                            : metrics_->security_handshakes_succeeded)
                               .inc();
             if (!out.empty()) send_authenticate_frame(peer, std::move(out));  // send recurses
+            // F17: AFTER any handshake reply (so the peer has installed its session), advertise the
+            // schema. Both sides do this; a peer that misses it simply stays on canonical tagged.
+            send_schema_frame(peer);
             return;
         }
         if (step == HandshakeEngine::Step::Failed) {
@@ -646,6 +718,10 @@ private:
         }
         opened_.fetch_add(1, std::memory_order_relaxed);
         frame.payload = std::move(plaintext);
+        if (frame.kind == FrameKind::Schema) {  // authenticated schema advert: consume, don't dispatch
+            handle_schema_frame(std::move(frame));
+            return;
+        }
         if (receiver_) receiver_(std::move(frame));
     }
 
@@ -736,6 +812,11 @@ private:
             }
         }
     }
+
+    mutable std::mutex schema_mu_;
+    SchemaAdvertisement local_schema_;
+    bool has_local_schema_ = false;
+    std::unordered_map<std::uint64_t, SchemaAdvertisement> peer_schemas_;
 
     mutable std::mutex pending_mu_;
     struct PendingHandshake {

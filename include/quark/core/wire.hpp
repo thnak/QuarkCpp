@@ -617,6 +617,55 @@ struct PeerSchema {
     std::uint32_t abi_tag = 0;
 };
 
+// F17: the authenticated, post-handshake schema advertisement. `types` lists every MESSAGE TypeKey
+// (016 fingerprint) this node can decode; `abi_tag` is the platform ABI/endian tag. The sender only
+// takes the unchecked tagless path when the peer advertises the exact local key AND ABI. A different
+// key means a different schema: the sender falls back to canonical tagged, and the receiver's
+// inbound registry (keyed by its OWN type key) rejects the frame — never a silent reinterpretation.
+struct SchemaAdvertisement {
+    std::uint32_t abi_tag = 0;
+    std::vector<std::uint64_t> types;
+
+    [[nodiscard]] bool contains(std::uint64_t key) const noexcept {
+        for (const std::uint64_t t : types)
+            if (t == key) return true;
+        return false;
+    }
+};
+
+inline std::vector<std::byte> encode_schema_advert(const SchemaAdvertisement& adv) {
+    std::vector<std::byte> out;
+    out.reserve(16 + adv.types.size() * 8);
+    const auto put = [&out](std::uint64_t v) {
+        for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::byte>((v >> (b * 8)) & 0xFF));
+    };
+    put(adv.abi_tag);
+    put(adv.types.size());
+    for (const std::uint64_t t : adv.types) put(t);
+    return out;
+}
+
+// Bounds-checked decode (untrusted peer input): count capped at 4096 and against the remaining bytes.
+[[nodiscard]] inline bool decode_schema_advert(const std::byte* buf, std::size_t len,
+                                               SchemaAdvertisement& out) noexcept {
+    if (len < 16) return false;
+    const auto get = [](const std::byte* p) noexcept {
+        std::uint64_t v = 0;
+        for (int b = 0; b < 8; ++b)
+            v |= static_cast<std::uint64_t>(static_cast<unsigned char>(p[b])) << (b * 8);
+        return v;
+    };
+    const std::uint64_t abi = get(buf);
+    const std::uint64_t count = get(buf + 8);
+    if (count > 4096 || count > (len - 16) / 8) return false;
+    out.abi_tag = static_cast<std::uint32_t>(abi);
+    out.types.clear();
+    out.types.reserve(static_cast<std::size_t>(count));
+    const std::byte* p = buf + 16;
+    for (std::uint64_t i = 0; i < count; ++i, p += 8) out.types.push_back(get(p));
+    return true;
+}
+
 // Choose the wire encoding for `T` against a peer's advertised schema. Tagless IFF the per-type
 // fingerprint matches AND the platform/ABI/endian tag matches; otherwise canonical tagged +
 // a warning. Bypassing this (forcing tagless past a mismatch) demonstrably corrupts — ADR-016

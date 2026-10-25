@@ -125,14 +125,30 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
     prefix; `TcpTransport::set_max_frame_body` applies it to new/existing connections;
     `run_big.sh` rejects 32 MiB at the 4 MiB default. (Implemented pass 2.)
 
-- [ ] **F17: `PeerSchema`/ABI negotiation for real schema changes.**
-  - **Why:** tagged is now the default (safe against tagless positional confusion), but tagged
-    reuses tag IDs; a genuine layout change with reused tags still needs schema/ABI verification.
-  - **Next:** wire the handshake-advertised `PeerSchema` into `set_peer_schema_provider`; require a
-    match before tagless; define a version/migration policy for reused tags.
+- [x] **F17: `PeerSchema`/ABI negotiation for real schema changes.**
+  - **Why:** tagged is the default (safe against tagless positional confusion), but the 016
+    fingerprint folded only `(tag, wire_type)`: a reused tag changing `int32`→`int64` collided, so
+    the gate still chose tagless and silently reinterpreted fields (`schema_probe`). Tagged also
+    reuses tag IDs, so a genuine layout change needs schema/ABI verification.
+  - **Next:** fixed in pass 3 — see verify.
   - **Acceptance:** a schema mismatch falls back to tagged/rejects; matched peers can opt into
-    tagless; `schema_probe` documents the behavior.
-  - **Verify:** `schema_probe`, `serialize_evolution_test`, a mixed-schema integration test.
+    tagless; `schema_probe` documents the behavior. **Met.**
+  - **Verify:** **pass 3 implemented.** (a) `FingerprintFolder` now folds each member's category,
+    size, signedness and nested schema fingerprint, so reused-tag layout changes get distinct
+    TypeKeys (`schema_probe`: matched=1, mismatch_key=0, mismatch_abi=0). (b) `register_remote`
+    publishes the node's decodable message TypeKeys + ABI; `SecureTransport` sends an authenticated
+    `FrameKind::Schema` advert after the mTLS handshake and exposes `Transport::peer_schema`
+    (`TcpTransport`/`Loopback` too). (c) `DistributedRouter`'s default provider consults the
+    transport: tagless only on an exact TypeKey+ABI match, otherwise tagged; an unknown TypeKey is
+    dropped before decode. Tests: `security_handshake_test` (advert), `distribution_routing_test`
+    (advertised tagless, advertised mismatch→tagged, unknown-key reject), `serialize_evolution_test`;
+    **21/21**. Live 7-node mTLS: **33,564** transfers, ledger `fallbacks=0`; plaintext senders stay
+    tagged (fallbacks counted).
+  - **Migration (TypeKey bump):** the layout-aware fingerprint changes EVERY TypeKey. Old
+    snapshots/durable records and old-binary peers carry the old key. Re-encode/migrate durable data
+    with the old reader, roll the whole cluster to one schema generation, or use an explicit
+    compatibility adapter. A mixed generation is never silently tagless; the receiver rejects the
+    unknown key.
 
 ### P4 — supply chain and at-rest
 
@@ -184,7 +200,7 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 | F14 | Random per-instance relay secret | `81c8d0d` | forged token stays Suspect |
 | F15 | Per-peer token bucket | `81c8d0d` | 10k flood → 1,277 admitted |
 | F16 | 4 MiB single-frame cap | `81c8d0d` | 32 MiB rejected, HWM 6.7 MB |
-| F17 | Tagged default; tagless explicit opt-in | `81c8d0d` | routing/integration tests pass |
+| F17 | Layout-aware fingerprint + authenticated PeerSchema advert | `06c69c9`+ | `schema_probe` gate; mixed-schema tagged/reject; live mTLS tagless |
 | Supply chain | Action SHAs, LLVM hash, mbedTLS version | `81c8d0d` | CI no longer pipes to sudo |
 
 ---
@@ -204,6 +220,9 @@ The production build refuses the plaintext variant before `start()`.
 | per-IP handshake flood | 3000 same-IP senders → **64** pending; allowlisted peer authenticates mid-flood; unknown peer succeeds after the 5s reaper |
 | hard mailbox bound (64) | 10,000 sent → 1,258 rate-admitted → **1,126 refused at admission**; RSS 6.6→6.9 MB |
 | 7-node busy mTLS + F15 | **33,568** transfers, **drops=0**, thief=0, 6 sessions |
+| F17 schema gate | `schema_probe`: matched=1, mismatch_key=0, mismatch_abi=0 |
+| F17 mixed-schema routing | advertised tagless; mismatch→tagged; unknown TypeKey rejected |
+| F17 live 7-node mTLS | **33,564** transfers, ledger `fallbacks=0`; plaintext senders stay tagged |
 | 21/21 affected CTest suites + 17 targeted core | pass |
 
 Implemented in this pass:
@@ -223,6 +242,9 @@ Implemented in this pass:
   checked post admission (`PostCourier::post_checked` → `Engine::post_checked` →
   `Activation::post_governed`) with drop-and-reclaim at `LocalRouter`, admission-exempt internal
   posts, and `enable_governance` opt-in on the wire-facing ledger.
+- **P3/F17:** layout-aware 016 fingerprint (member category/size/signedness/nested schema);
+  authenticated post-handshake `FrameKind::Schema` advert; `Transport::peer_schema`; the
+  `DistributedRouter` default provider requires an exact TypeKey+ABI match before tagless.
 - **Test seam:** `DistributedRouter::tell_on()` pins the lab ledger; production routing still uses
   placement.
 
@@ -257,6 +279,12 @@ transport.set_max_pending_inbound(1024);
 
 // 6. Placement: use the verified placement view, not the convergence roster.
 owner = place(id, membership.placement_view());
+
+// 7. Schema rollout: register_remote publishes each message TypeKey; the mTLS handshake advertises
+//    them. Tagless is chosen only on an exact peer TypeKey+ABI match; a mismatch uses tagged, and
+//    an unknown TypeKey is dropped. A layout change changes the TypeKey: migrate durable data and
+//    roll the whole cluster to one schema generation (never mix fingerprints silently).
+dist.register_remote<Ledger, Transfer>();
 ```
 
 ---
@@ -271,6 +299,8 @@ owner = place(id, membership.placement_view());
 - [ ] Set a per-peer budget, a single-frame cap, and a mailbox bound appropriate to the deployment;
   opt wire-facing actors into `enable_governance` and alert on `mailbox_dropped()`.
 - [ ] Treat `Membership::view()` as the convergence roster; use `placement_view()` for placement.
+- [ ] Roll schema changes as one generation; the fingerprint is layout-aware, so mixing binaries
+  mixes TypeKeys and disables tagless/rejects unknown keys.
 - [ ] Pin/verify build inputs; never pipe a remote script into `sudo`.
 
 ---
@@ -291,5 +321,6 @@ bash run_bank.sh           # plaintext + mTLS bank attacks
 bash run_bank_heavy.sh     # 7-node busy mTLS/plaintext + strict-refusal case
 ./relay_probe              # forged token rejected (exit 1)
 ./fuzz_wire 2000000        # decoder fuzz clean
-./schema_probe             # tagless schema reinterpretation evidence
+./schema_probe             # F17 gate: matched=1, mismatch_key=0, mismatch_abi=0
+bash run_f17_live.sh       # schema probe + 7-node mTLS tagless / plaintext tagged
 ```

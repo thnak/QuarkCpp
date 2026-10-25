@@ -79,10 +79,8 @@ struct ClusterNode {
         dist = std::make_unique<DistributedRouter>(membership, local, transport);
         static const AllowAllAuthorizer authz;  // test opt-in: deny-by-default wire policy
         dist->set_authorizer(authz);
-        // This test asserts the tagless fast path; F17 makes TAGGED the default, so opt in explicitly.
-        dist->set_peer_schema_provider([](NodeId, TypeKey tk) {
-            return DistributedRouter::matched_peer_schema(tk);
-        });
+        // F17: register_remote publishes (Logger, Seq)'s TypeKey to the transport; the peer's
+        // advertised schema is the ONLY source for the tagless fast path. No explicit provider.
         dist->template register_remote<Logger, Seq>();  // inbound decode+post for (Logger, Seq)
     }
 };
@@ -179,8 +177,10 @@ int main() {
 
     // ---- (3) REMOTE + canonical tagged fallback: force a schema mismatch (rolling-upgrade peer). --
     {
-        n1.dist->set_peer_schema_provider(
-            [](NodeId, TypeKey) { return PeerSchema{/*bogus fingerprint*/ 0xDEADBEEF, /*abi*/ 0}; });
+        // The mismatch is in the PEER's authenticated advertisement: n2 advertises a type set that
+        // does not contain n1's Seq TypeKey, so n1 must fall back to tagged. (A genuinely different
+        // receiver schema also changes the inbound registry key, which drops the frame.)
+        fabric.set_schema(NodeId{2}, SchemaAdvertisement{/*abi*/ 0, {/*bogus key*/ 0xDEADBEEF}});
         DistRef<Logger> ref = n1.dist->get<Logger>(remote_key);
         const std::uint64_t sends_before = fabric.sends();
         for (int i = 0; i < N; ++i) ref.tell(Seq{N + i});  // now encoded as canonical TAGGED
@@ -191,6 +191,19 @@ int main() {
             if (n2.actor.got[static_cast<std::size_t>(i)] != i) ordered = false;
         check(ordered, "tagged fallback roundtrips correctly + FIFO across both batches", ok);
         check(g_warns.load() > 0, "schema mismatch triggered the tagged-fallback warning (016)", ok);
+
+        // F17 fail-closed: a frame carrying a schema TypeKey this node never registered (the
+        // rolling-upgrade receiver's own key differs) is rejected before any decode — no silent
+        // tagless/tagged field reinterpretation.
+        const int before_unknown = n2.actor.count.load(std::memory_order_acquire);
+        MessageFrame unknown;
+        unknown.from = NodeId{1};
+        unknown.to = NodeId{2};
+        unknown.target = actor_id_of<Logger>(remote_key);
+        unknown.msg_type = TypeKey{0xDEADBEEF};
+        n2.dist->deliver(unknown);
+        check(n2.actor.count.load(std::memory_order_acquire) == before_unknown,
+              "F17: unknown schema TypeKey is rejected (no reinterpretation)", ok);
     }
 
     n1.eng.stop();

@@ -230,10 +230,15 @@ struct DescribeProbe {
 template <class T>
 concept Described = requires(detail::DescribeProbe& p, T& v) { quark_describe(p, v); };
 
+template <Described T>
+constexpr std::uint64_t compute_fingerprint() noexcept;
+
 // --- Constexpr fingerprint folder (016 §"Schema version and fingerprint") --------------------
-// FNV-1a over the ordered {(tag, wire_type)} set. Order-sensitive on purpose: the fingerprint
-// gates the tagless fast path, which bulk-copies fields in declared order, so two peers whose
-// fields differ in order MUST get distinct fingerprints and fall back to tagged (ADR-016).
+// FNV-1a over the ordered {(tag, wire_type, member layout)} set. Order-sensitive on purpose: the
+// fingerprint gates the tagless fast path, which bulk-copies fields in declared order. F17: the
+// member's exact category/size/signedness (and, for a nested described value, its fingerprint) is
+// folded too. Folding only (tag, wire_type) let a reused tag change int32 -> int64 and still
+// collide, so the gate chose tagless and silently reinterpreted fields (see schema_probe).
 class FingerprintFolder {
 public:
     static constexpr std::uint64_t fnv_offset = 1469598103934665603ULL;
@@ -241,16 +246,42 @@ public:
 
     template <class M>
     constexpr void field(std::uint32_t tag, M&) noexcept {
-        // Fold the tag (4 bytes, LE) then the wire type — never the member value.
+        // Fold the tag (4 bytes, LE), the wire type, and the member's layout — never its value.
         for (int i = 0; i < 4; ++i) {
             fold(static_cast<std::uint8_t>(tag >> (8 * i)));
         }
         fold(static_cast<std::uint8_t>(wire_type_of<M>()));
+        fold_type<std::remove_cvref_t<M>>();
     }
 
     [[nodiscard]] constexpr std::uint64_t value() const noexcept { return hash_; }
 
 private:
+    template <class U>
+    constexpr void fold_type() noexcept {
+        if constexpr (std::is_same_v<U, bool>) {
+            fold(1);
+        } else if constexpr (detail::is_std_string_v<U>) {
+            fold(2);  // tagless = u32 length + bytes, independent of std::string's ABI
+        } else if constexpr (detail::is_std_vector_v<U>) {
+            fold(3);
+            fold_type<typename U::value_type>();
+        } else if constexpr (std::is_enum_v<U>) {
+            fold(4);
+            fold_type<std::underlying_type_t<U>>();
+        } else if constexpr (Described<U>) {
+            fold(5);
+            fold_bytes(compute_fingerprint<U>());  // nested schema participates in the identity
+        } else {
+            fold(6);  // trivially-copyable scalar/POD: raw native layout is the wire layout
+            fold_bytes(sizeof(U));
+            fold(static_cast<std::uint8_t>(std::is_signed_v<U> ? 1 : 0));
+        }
+    }
+
+    constexpr void fold_bytes(std::uint64_t v) noexcept {
+        for (int i = 0; i < 8; ++i) fold(static_cast<std::uint8_t>(v >> (8 * i)));
+    }
     constexpr void fold(std::uint8_t byte) noexcept {
         hash_ ^= byte;
         hash_ *= fnv_prime;

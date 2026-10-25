@@ -315,6 +315,40 @@ int main() {
         check(fabric.pending() == 0, "a Failed engine sends nothing back", ok);
     }
 
+    // --- F17: authenticated schema advertisement after the mTLS handshake. ------------------------
+    {
+        QueuedFabric fabric;
+        const NodeId n1{1}, n2{2};
+        QueuedTransport n1_inner(fabric, n1), n2_inner(fabric, n2);
+        MockCipher unused_cipher(0);
+        SecureTransport n1_secure(n1_inner, unused_cipher, n1);
+        SecureTransport n2_secure(n2_inner, unused_cipher, n2);
+        IdentityMaterial identity1(identity_blob), identity2(identity_blob);
+        TrustStore trust1(trust_blob), trust2(trust_blob);
+        MockHandshakeFactory factory1, factory2;
+        n1_secure.enable_handshake(factory1, cluster, identity1, trust1);
+        n2_secure.enable_handshake(factory2, cluster, identity2, trust2);
+        n1_secure.on_receive([](MessageFrame) {});
+        n2_secure.on_receive([](MessageFrame) {});
+
+        n1_secure.set_local_schema(SchemaAdvertisement{pal::platform_abi_tag, {0x11, 0x22}});
+        n2_secure.set_local_schema(SchemaAdvertisement{pal::platform_abi_tag, {0x33}});
+
+        n1_secure.send(n2, make_data_frame(n1, n2));  // first send starts the handshake
+        while (fabric.pending() > 0) fabric.pump_one();
+
+        const auto p1 = n1_secure.peer_schema(n2);
+        const auto p2 = n2_secure.peer_schema(n1);
+        check(p1.has_value() && p1->abi_tag == pal::platform_abi_tag && p1->types.size() == 1 &&
+                  p1->types[0] == 0x33,
+              "F17: n1 stored n2's authenticated schema advertisement", ok);
+        check(p2.has_value() && p2->abi_tag == pal::platform_abi_tag && p2->types.size() == 2 &&
+                  p2->types[0] == 0x11 && p2->types[1] == 0x22,
+              "F17: n2 stored n1's authenticated schema advertisement", ok);
+        check(p1.has_value() && p1->contains(0x33) && !p1->contains(0x44),
+              "F17: the tagless gate matches exact advertised type keys", ok);
+    }
+
     std::printf("security_handshake_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

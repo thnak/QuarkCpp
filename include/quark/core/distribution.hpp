@@ -71,10 +71,16 @@ public:
           self_(membership.self()),
           local_(&local),
           transport_(&transport),
-          // Safe default: a mismatched PeerSchema makes negotiate() choose TAGGED. Tagless is the
-          // opt-in fast path (set_peer_schema_provider returning matched_peer_schema(tk)); the
-          // receiver must never trust a sender's claimed layout by default (F17).
-          peer_schema_([](NodeId, TypeKey) noexcept { return PeerSchema{~0ull, ~0u}; }) {
+          // F17 safe default: consult the transport's AUTHENTICATED post-handshake schema advert.
+          // No advert (plaintext/unknown) ⇒ tagged. A peer advertises the exact local TypeKey and
+          // ABI only when it can decode this schema; otherwise no tagless. `set_peer_schema_provider`
+          // remains an explicit override for tests/embedded transports.
+          peer_schema_([this](NodeId owner, TypeKey tk) -> PeerSchema {
+              const std::optional<SchemaAdvertisement> adv = transport_->peer_schema(owner);
+              if (!adv || adv->abi_tag != pal::platform_abi_tag || !adv->contains(tk.value))
+                  return PeerSchema{~0ull, ~0u};
+              return PeerSchema{tk.value, adv->abi_tag};
+          }) {
         transport_->on_receive([this](MessageFrame f) { deliver(f); });
     }
 
@@ -154,6 +160,13 @@ public:
         static_assert(Described<M>,
                       "register_remote<A,M>: a remotely-received message needs QUARK_SERIALIZE (016)");
         inbound_[wire_key(type_key_of<A>(), type_key_of<M>())] = &inbound_thunk<A, M>;
+        // F17: publish the message TypeKey this node can decode. A secure transport advertises it
+        // (with the platform ABI) to authenticated peers; the sender takes tagless only on an exact
+        // key+ABI match. The type key IS the 016 schema fingerprint, so a layout change changes it.
+        if (!local_schema_.contains(type_key_of<M>().value))
+            local_schema_.types.push_back(type_key_of<M>().value);
+        local_schema_.abi_tag = pal::platform_abi_tag;
+        transport_->set_local_schema(local_schema_);
     }
 
     // --- tell (010): place, then LOCAL fast path or REMOTE serialize+transport. -----------------
@@ -305,10 +318,6 @@ private:
         transport_->send(owner, std::move(f));
     }
 
-    // A peer we know nothing specific about is assumed to run the same binary: matched fingerprint
-    // (for a Described type, type_key == 016 fingerprint) + matched ABI ⇒ negotiate() picks tagless.
-    static PeerSchema default_peer_schema(TypeKey tk) noexcept { return matched_peer_schema(tk); }
-
     [[nodiscard]] std::int64_t now_ns() const noexcept { return clock_fn_ ? clock_fn_(clock_ctx_) : 0; }
 
     [[nodiscard]] std::int64_t rate_now_ns() const noexcept {
@@ -360,6 +369,7 @@ private:
     std::uint64_t peer_rate_per_sec_ = 4096;
     std::uint64_t peer_burst_ = 1024;
     std::function<PeerSchema(NodeId, TypeKey)> peer_schema_;
+    SchemaAdvertisement local_schema_;  // F17: what this node advertises to authenticated peers
     PrincipalPolicy principal_policy_;
     std::unordered_map<WireKey, InboundFn, WireKeyHash> inbound_;
     const Authorizer* authz_ = nullptr;
