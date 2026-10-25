@@ -171,6 +171,8 @@ int main(int argc, char** argv) {
     cfg.cluster_id = kClusterId;
     SwimMembership swim{NodeId{self_id}, transport, cfg};
     DistributedRouter dist{swim, local, transport};  // briefly clobbers on_receive — harmless pre-start()
+    static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
+    dist.set_authorizer(authz);
     swim.set_data_sink([&dist](MessageFrame f) { dist.deliver(f); });  // final, correct demux
     eng.register_activation(actor_id_of<Logger>(keys[static_cast<std::size_t>(self_id - 1)]), *act);
     dist.register_remote<Logger, Seq>();

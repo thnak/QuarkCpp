@@ -153,6 +153,31 @@ void swim_source_binding() {
     // (d) the same frame with a correct sender and destination is accepted.
     send_control(NodeId{2}, NodeId{1}, valid);
     check(swim.is_known(NodeId{4242}), "valid gossip from the authenticated sender is accepted");
+
+    // (e) gossip-only membership is in the convergence view but NOT in the placement view.
+    bool in_view = false;
+    for (NodeId n : swim.view().nodes())
+        if (n.value == 4242) in_view = true;
+    bool in_placement = false;
+    for (NodeId n : swim.placement_view().nodes())
+        if (n.value == 4242) in_placement = true;
+    check(in_view, "unverified gossip member is in the convergence view");
+    check(!in_placement, "unverified gossip member is excluded from placement");
+
+    // (f) a DIRECT Ack from that node verifies it and admits it to placement.
+    ControlMsg ack;
+    ack.kind = ControlKind::Ack;
+    ack.cluster = cfg.cluster_id;
+    ack.from = NodeId{4242};
+    ack.from_incarnation = 1;
+    ack.subject = NodeId{1};
+    ack.subject_incarnation = 0;
+    ack.seq = 0;
+    send_control(NodeId{4242}, NodeId{1}, ack);
+    bool in_placement_after = false;
+    for (NodeId n : swim.placement_view().nodes())
+        if (n.value == 4242) in_placement_after = true;
+    check(in_placement_after, "first-hand Ack verifies the member for placement");
 }
 
 // ---- 3. Checked tagless decode -----------------------------------------------------------------

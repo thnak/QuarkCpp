@@ -144,6 +144,8 @@ int main(int argc, char** argv) {
                                  static_cast<std::uint16_t>(base_port + static_cast<int>(self_id))};
     eng.register_activation(actor_id_of<Logger>(keys[static_cast<std::size_t>(self_id - 1)]), *act);
     auto dist = std::make_unique<DistributedRouter>(membership, local, transport);
+    static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
+    dist->set_authorizer(authz);
     dist->register_remote<Logger, Seq>();  // decode+post inbound (Logger,Seq)
 
     if (!transport.start()) {

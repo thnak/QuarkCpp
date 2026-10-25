@@ -198,6 +198,12 @@ struct EscalationSink {
 struct ReclaimSink {
     void (*fn)(Descriptor*, void*) noexcept = nullptr;
     void* ctx = nullptr;
+    // ADR-044 fail-closed marker: true only for a sink that dispatches between MessagePool and
+    // EnvelopePool (LocalRouter::reclaim_sink()). A plain MessagePool::sink() leaves this false;
+    // delivering an EnvelopePool-backed descriptor to such an activation would read the envelope's
+    // Principal as a MessagePool destroy function pointer (remote code execution). The wire path
+    // drops non-anonymous-principal messages for non-dual activations instead.
+    bool dual = false;
     QUARK_ALWAYS_INLINE void operator()(Descriptor* d) const noexcept {
         if (fn)
             fn(d, ctx);
@@ -287,6 +293,10 @@ public:
         if (max_concurrency != 1)
             rc_ = std::make_unique<ReCore>(max_concurrency);
     }
+
+    // ADR-044 fail-closed probe: only a dual reclaim sink can safely receive an EnvelopePool-backed
+    // descriptor (non-anonymous wire Principal). The wire path consults this before building one.
+    [[nodiscard]] bool accepts_envelopes() const noexcept { return reclaim_.dual; }
 
     // ---- Supervision wiring (007/ADR-009; cold, set at registration by the engine/harness) -----
     void set_supervision(SupervisionPolicy sup) noexcept { sup_ = sup; }

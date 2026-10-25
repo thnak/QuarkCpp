@@ -63,6 +63,8 @@ struct ClusterNode {
         // DistributedRouter attaches its inbound sink here (transport not started yet — stored, used
         // once the I/O thread runs). register the (Logger,Seq) inbound decode+post thunk.
         dist = std::make_unique<DistributedRouter>(membership, local, transport);
+        static const AllowAllAuthorizer authz;  // test opt-in: deny-by-default wire policy
+        dist->set_authorizer(authz);
         dist->template register_remote<Logger, Seq>();
     }
 };

@@ -365,3 +365,52 @@ version/hash-checked mbedTLS, and add an SBOM/provenance gate.
 8. **F14** — random per-process relay secret; bind the token to the authenticated peer.
 9. **F17** — enforce `PeerSchema` on connect; tagged fallback by default.
 10. **Supply chain** — pin actions to SHAs; verify the LLVM/apt inputs; vcpkg-only mbedTLS.
+
+---
+
+## Remediation pass (2026-10-25) — statuses below supersede the matrix above
+
+Implemented and re-tested on `thnak-server` (real mTLS 3.6.5, ASan+UBSan where applicable).
+**21/21 affected CTest suites pass**, including the new placement/principal/verification regressions.
+
+| ID | Fix | Post-fix evidence |
+|---|---|---|
+| F8/F18 | `ReclaimSink::dual` + `Activation::accepts_envelopes()`; wire/local delivery **drops** a non-anonymous descriptor for a non-dual activation instead of reclaiming it | RCE victim (`pool.sink()`, no-PIE) now exits **0**; no `RCE_HIJACK`, no attacker transfer. `local.reclaim_sink()` remains the supported path |
+| F2 | `DistributedRouter::set_principal_policy`; **default denies** non-anonymous wire principals. A policy maps `(authenticated peer, claimed)` → effective principal or nullopt | mTLS insider theft produces no `authz`/`bank_transfer`; `security_boundary_wire_test` opts in with an identity binder and still passes |
+| F10 | `DistributedRouter::deliver` **denies when no Authorizer is installed** (fail-closed). `AllowAllAuthorizer` is the explicit opt-in | No-auth bank victim: the anonymous 100 transfer disappears; only local traffic. Samples 08/15–19/22 install `AllowAllAuthorizer` explicitly |
+| F12 | `Member::verified`; **placement_view()** excludes gossip-only members; `Join` may only admit the sender itself; `max_live_members=4096`; local Suspect/Dead never verifies; `view()` keeps convergence/probing | 512 ghost `Alive` members in the convergence roster, but `owner=1`, `pview=1`, remote pings continue; `cluster_swim_partition_heal` + join/rejoin pass; gossip member is in view, not placement, until a Direct Ack |
+| F13 | Global `reap_stale_pending` (any Authenticate frame frees entries older than 5s); optional `set_handshake_admission(NodeId)` hook for known-peer reservation | First legitimate mTLS handshake during the flood fails; after 6s the retry **succeeds**, `pending=0`. The 5s window remains (per-IP reservation is a deployment hook, not plumbed address-level) |
+| F11 | `LocalRouter::set_authorizer` — optional ACL on `tell`/`ask`/`ask_stream` before descriptor construction | Forward probe: Gate boundary allowed (rights=1), local Bank/Transfer **denied** (required 4); no transfer. Opt-in; default internal trust unchanged |
+| F15 | Per-peer token bucket (`set_peer_budget`, default 4096/s, burst 1024, fixed 256-bucket table) before authz/decode | 10,000-frame flood in 0.03s → **1,277** admitted; RSS 6.5→7.1MB (was 6.5→9.7MB and growing); actor no longer buried |
+| F16 | `max_frame_body` 64MiB → **4MiB** per frame | 32MiB frame → connection reset; `VmHWM 6,584→6,712KB` (was 71,656KB). Large payloads must use 024 streaming/chunking |
+| F14 | Per-instance random relay secret (`Config::relay_secret`, 0 ⇒ random); token no longer derivable from seed+NodeId | Forged relay Ack no longer flips node 3: `Suspect(1)` stays `Suspect`; `relay_probe` exits 1. mTLS sender binding already blocked impersonation |
+| F17 | **Tagged is the default** (`peer_schema_` placeholder mismatch); tagless requires `set_peer_schema_provider(matched_peer_schema)` | `distribution_routing_test` explicitly opts into tagless; `tcp_distribution_integration_test` passes on tagged; checked tagless remains |
+| Supply chain | `actions/checkout@11d5960…` and `upload-artifact@ea165f8…` pinned to commit SHAs; `/tmp/llvm.sh` downloaded + SHA-256 verified (`03878e08…`) before `sudo bash`; `find_package(MbedTLS 3.6.2)` + compile-time `MBEDTLS_VERSION_NUMBER >= 0x03060200` | CI no longer pipes a remote script into sudo; no `FetchContent`/remote build downloads; vcpkg baseline remains pinned |
+
+Prior fixes remain in force: AAD binds mode/kind/deadline/trace/principal (F3); SWIM sender binding + no third-party
+gossip `Left` (F4); checked tagless decode (F5); pending cap + Authenticate size cap (F6); `f.to == self_` (F7).
+
+### Residuals / deliberate behavior changes
+
+- **F1/F9 plaintext**: the plaintext transport still has no authenticated sender; the bank's plaintext Control-plane
+  `Left` eviction still removes the ledger (`status1=3`). Only mTLS/`SecureTransport` closes that; `SecurityMode::Strict`
+  is still **not wired** into startup. Do not run a ledger on `TcpTransport`.
+- **Breaking defaults**: with no `Authorizer`, no `PrincipalPolicy` for non-anonymous frames, and a non-dual activation,
+  inbound messages are now **dropped**. Apps must install `AllowAllAuthorizer`/a real ACL, a principal binder, and use
+  `LocalRouter::reclaim_sink()` for actors that receive wire principals.
+- **F11** is opt-in: internal sends remain trusted unless `LocalRouter::set_authorizer` is installed.
+- **F12** bounds ghosts at 4096 and keeps them out of placement, but the convergence view still carries them; an
+  application that consumes `Membership::view()` directly must use `placement_view()` for placement.
+- **F13** per-IP/connection caps are not plumbed (the transport does not surface the peer address); the admission
+  predicate can reserve known ids, but a 5-second 256-slot fill window remains.
+- **F15** is a rate limit, not a hard mailbox bound; tune the budget for a legitimate high-throughput peer.
+- **F16** 4MiB is a single-frame limit; larger logical payloads need 024 chunking/streaming.
+- **F17** tagged still uses reused tag numbers, so a real schema change with reused tags needs `PeerSchema`/ABI
+  negotiation; the default only removes the tagless positional-confusion path.
+- **Supply chain** still has unpinned `apt-get`/`windows-latest`/MSVC; the LLVM hash and action SHAs must be bumped
+  deliberately (a changed upstream script will fail the checksum step, as intended).
+
+### Live verification commands
+
+`run_batch1.sh` (RCE/fail-open), `run_forward.sh`, `run_place.sh`, `run_slot_exhaust.sh`, `run_flood.sh`,
+`run_big.sh`, `run_bank.sh`, `relay_probe`, `fuzz_wire 2000000`, `schema_probe`, plus `run_tests.sh` (21 suites).

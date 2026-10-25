@@ -17,7 +17,12 @@
 #include <stdexcept>
 #include <vector>
 
+#include <mbedtls/build_info.h>
 #include <mbedtls/gcm.h>
+
+#if !defined(MBEDTLS_VERSION_NUMBER) || MBEDTLS_VERSION_NUMBER < 0x03060200
+#error "Quark's mbedTLS adapter requires mbedTLS >= 3.6.2 (see vcpkg.json)"
+#endif
 
 #include "quark/core/aead.hpp"
 

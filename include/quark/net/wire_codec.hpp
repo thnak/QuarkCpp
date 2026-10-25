@@ -25,10 +25,11 @@
 namespace quark::net {
 
 // The largest body a single frame may declare. A peer (or a corrupt/adversarial stream) that prefixes a
-// larger length is a protocol error — the reassembler rejects the stream rather than attempting a
-// multi-GB allocation. 64 MiB is far above any real actor message; oversized payloads are a chunking
-// concern (024 streaming), not a single-frame concern.
-inline constexpr std::uint32_t max_frame_body = 64u * 1024u * 1024u;
+// larger length is a protocol error — the reassembler rejects the stream rather than buffering it.
+// 4 MiB is far above any actor control message; oversized payloads are a chunking/streaming concern
+// (024), not a single-frame concern. The old 64 MiB limit let one connection force a ~128 MiB peak
+// (reassembler buffer + MessageFrame payload) per frame.
+inline constexpr std::uint32_t max_frame_body = 4u * 1024u * 1024u;
 
 namespace detail {
 

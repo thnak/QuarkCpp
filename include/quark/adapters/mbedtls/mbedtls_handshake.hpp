@@ -42,6 +42,10 @@
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
 
+#if !defined(MBEDTLS_VERSION_NUMBER) || MBEDTLS_VERSION_NUMBER < 0x03060200
+#error "Quark's mbedTLS adapter requires mbedTLS >= 3.6.2 (see vcpkg.json)"
+#endif
+
 #include "quark/adapters/mbedtls/mbedtls_aead.hpp"
 #include "quark/core/handshake.hpp"
 

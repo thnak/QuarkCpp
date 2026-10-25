@@ -93,6 +93,8 @@ struct ClusterNode {
         act = std::make_unique<Activation>(&actor, Logger::dispatch_table(), pool.sink());
         eng.register_activation(actor_id_of<Logger>(logger_key), *act);
         dist = std::make_unique<DistributedRouter>(membership, local, transport);
+        static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
+        dist->set_authorizer(authz);
         dist->template register_remote<Logger, Seq>();  // decode+post inbound (Logger,Seq)
     }
 };

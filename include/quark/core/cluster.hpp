@@ -60,6 +60,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <random>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -471,6 +472,10 @@ public:
         std::uint32_t max_gossip_updates = 32;               // bounded piggyback digest
         std::uint64_t max_capability_gossip_bytes = 4096;    // ADR-045: bounded capability piggyback
         std::uint64_t seed = 0;                              // deterministic peer/fanout selection
+        // ADR-048 relay correlation secret. 0 ⇒ a fresh random secret per SwimMembership instance.
+        // The token must NOT be derivable from the public seed + NodeId (the old derivation
+        // splitmix64(seed ^ self ^ constant) let any peer forge relay Acks).
+        std::uint64_t relay_secret = 0;
         // ADR-046: cross-node backpressure watermarks (resident-message-count hysteresis) and the
         // Congested signal's TTL. Unvalidated-at-real-workload-scale operational config (ADR's own
         // disclosed residual risk) — tune per deployment, not derived from anything else here.
@@ -485,6 +490,10 @@ public:
         std::int64_t indirect_timeout_ns = 0;                    // 0 ⇒ ack_timeout_ns
         std::int64_t tombstone_ttl_ns = 60'000'000'000;          // must exceed the longest tolerated partition
         std::uint32_t max_tombstones = 256;                      // hard cap; Dead evicted before Left
+        // Hard cap on member-table entries. Gossip-created (unverified) entries are dropped once
+        // reached; first-hand/seed-admitted joins are still allowed so a legitimate joiner is not
+        // locked out by a ghost flood.
+        std::uint32_t max_live_members = 4096;
         std::int64_t tombstone_probe_interval_ns = 500'000'000;  // min spacing per tombstone
         std::uint32_t tombstone_probe_budget = 2;                // probe-backs per tick
         std::uint32_t verify_ping_budget = 16;                   // verify pings per tick
@@ -496,10 +505,18 @@ public:
 
     SwimMembership(NodeId self, Transport& transport, Config cfg)
         : self_(self), transport_(&transport), cfg_(sanitize(cfg)) {
-        relay_key_ = detail::splitmix64(cfg_.seed ^ self_.value ^ 0x5E1A7ULL);
+        std::uint64_t secret = cfg_.relay_secret;
+        if (secret == 0) {
+            std::random_device rd;
+            secret = (static_cast<std::uint64_t>(rd()) << 32) ^
+                     static_cast<std::uint64_t>(rd());
+            if (secret == 0) secret = 0x5E1A7C0FFEEULL;  // pathological RNG; still non-public
+        }
+        relay_key_ = detail::splitmix64(cfg_.seed ^ self_.value ^ secret ^ 0x5E1A7ULL);
         Member me{};
         me.cluster = cfg_.cluster_id;
         me.incarnation = self_incarnation_;
+        me.verified = true;
         members_[self_.value] = me;
         republish();
         transport_->on_receive([this](MessageFrame f) { on_frame(std::move(f)); });
@@ -513,6 +530,12 @@ public:
     [[nodiscard]] MembershipView view() const noexcept override {
         std::lock_guard<std::mutex> g(mu_);
         return MembershipView{snapshot_, epoch_};
+    }
+    // Placement sees only members with first-hand evidence (or self). Gossip-created ghosts stay in
+    // `view()` for convergence/probing but can never win an HRW placement.
+    [[nodiscard]] MembershipView placement_view() const noexcept override {
+        std::lock_guard<std::mutex> g(mu_);
+        return MembershipView{verified_snapshot_, epoch_};
     }
     [[nodiscard]] std::uint64_t epoch() const noexcept {
         std::lock_guard<std::mutex> g(mu_);
@@ -687,6 +710,11 @@ private:
         MemberStatus status = MemberStatus::Alive;
         std::uint8_t tx_left = 0;              // frames left to piggyback this entry on (R4')
         bool verify_pending = false;           // a second-hand Suspect awaiting a verify ping (R1b)
+        // First-hand evidence (a Direct frame/Ack from the node itself, or a seed-admitted Join).
+        // Gossip/JoinSnapshot members start unverified: they may be probed, but they are NOT in the
+        // placement view and are NOT re-gossiped until they answer directly. This prevents a peer
+        // from minting ghost nodes that receive placed actors (F12).
+        bool verified = false;
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -702,6 +730,7 @@ private:
     static Config sanitize(Config c) noexcept {
         if (c.ack_timeout_ns <= 0) c.ack_timeout_ns = 1;  // bucket() divides by indirect_ns()
         if (c.indirect_timeout_ns < 0) c.indirect_timeout_ns = 0;
+        if (c.max_live_members == 0) c.max_live_members = 4096;
         return c;
     }
     static constexpr bool is_tomb(MemberStatus s) noexcept {
@@ -772,6 +801,7 @@ private:
             for (auto& [id, m] : members_) {
                 if (out.size() >= piggy_cap) break;
                 if (id == to.value || id == self_.value || m.tx_left == 0) continue;
+                if (!m.verified) continue;  // never amplify an unverified ghost
                 if ((m.status == MemberStatus::Suspect) != (pass == 0)) continue;
                 push(id, m);
             }
@@ -788,6 +818,7 @@ private:
             for (std::size_t i = fixed; i < out.size() && !already; ++i) already = out[i].node == id;
             if (already) continue;
             const Member& m = members_.find(id)->second;
+            if (!m.verified) continue;  // rotating digest covers verified members only
             out.push_back(MemberUpdate{id, m.incarnation, static_cast<std::uint8_t>(m.status)});
             digest_cursor_ = id;
         }
@@ -805,7 +836,8 @@ private:
     void refresh_sorted_ids() {
         if (!ids_dirty_) return;
         sorted_ids_.clear();
-        for (const auto& [id, m] : members_) sorted_ids_.push_back(id);
+        for (const auto& [id, m] : members_)
+            if (!is_tomb(m.status) && (m.verified || id == self_.value)) sorted_ids_.push_back(id);
         std::sort(sorted_ids_.begin(), sorted_ids_.end());
         ids_dirty_ = false;
     }
@@ -843,6 +875,10 @@ private:
         // `m.from` is attacker-controlled. Without this check one admitted node could impersonate
         // any other node in SWIM gossip (forge Left/Dead/Suspect, mint members, trigger relays).
         if (m.from != authenticated_from) return;
+        // A node may join only ITSELF. Without this, a peer could present a Join for a third-party
+        // id and have it admitted as a verified (first-hand) member, bypassing the live-member cap
+        // and the unverified-gossip placement guard.
+        if (m.kind == ControlKind::Join && m.subject != m.from) return;
         // Join is the ONE control that legitimately crosses a cluster-id boundary (it is how a mismatch
         // is detected). Every other control from a foreign cluster is dropped (accidental-merge guard).
         if (m.kind != ControlKind::Join && m.cluster != cfg_.cluster_id) return;
@@ -1146,11 +1182,17 @@ private:
         if (it == members_.end()) {
             if (is_tomb(st) && src != Src::Local) return;  // never create a tombstone second-hand
             if (st == MemberStatus::Suspect) return;       // never create an unknown node as Suspect
+            // Verification needs positive evidence of the node: a Direct/Join Alive. A LOCAL
+            // Suspect/Dead is only our own failed probe — it must never make a ghost placeable.
+            const bool first_hand = (src == Src::Direct || src == Src::Join) ||
+                                    (src == Src::Local && st == MemberStatus::Alive);
+            if (!first_hand && members_.size() >= cfg_.max_live_members) return;  // ghost-flood cap
             Member m{};
             m.cluster = cfg_.cluster_id;
             m.incarnation = inc;
             m.status = st;
-            set_tx(m, piggyback_count());
+            m.verified = first_hand;
+            set_tx(m, m.verified ? piggyback_count() : 0);  // do not re-gossip unverified ghosts
             if (is_tomb(st)) {
                 m.death_ns = now;
                 m.last_probe_ns = now;
@@ -1158,13 +1200,19 @@ private:
             }
             members_.emplace(node.value, m);
             ids_dirty_ = true;
-            if (!is_tomb(st)) republish();  // first we hear of this node ⇒ roster grows, epoch++
+            // The convergence view includes every live member (verified or not); the separate
+            // placement_view() filters unverified ones. Republish for either kind.
+            if (!is_tomb(st)) republish();
             enforce_tomb_cap();
             return;
         }
 
         Member& cur = it->second;
         const bool was_live = !is_tomb(cur.status);
+        const bool was_verified = cur.verified;
+        if (src == Src::Direct || src == Src::Join ||
+            (src == Src::Local && st == MemberStatus::Alive))
+            cur.verified = true;
         MemberStatus next = st;
         bool take = false;
         switch (st) {
@@ -1195,7 +1243,15 @@ private:
                 take = cur.status == MemberStatus::Left ? inc > cur.incarnation : inc >= cur.incarnation;
                 break;
         }
-        if (!take) return;
+        if (!take) {
+            // A first-hand frame can verify a member without changing its incarnation/status (e.g.
+            // an Ack at the same incarnation as the gossip). Publish that verification.
+            if (!was_verified && cur.verified) {
+                set_tx(cur, piggyback_count());
+                republish();
+            }
+            return;
+        }
         if (cur.incarnation != inc || cur.status != next) set_tx(cur, piggyback_count());
         cur.incarnation = inc;
         cur.status = next;
@@ -1213,6 +1269,10 @@ private:
         if (!was_live && now_live) --tomb_count_;
         // Roster (non-tombstone set) membership changed? join (new live) or dead (live→dead) ⇒ epoch++.
         if (was_live != now_live) republish();
+        if (!was_verified && cur.verified) {  // now eligible for placement + gossip
+            set_tx(cur, piggyback_count());
+            republish();
+        }
         enforce_tomb_cap();  // may erase entries: `cur` is NOT touched after this line
     }
 
@@ -1327,11 +1387,18 @@ private:
     // Publish an immutable snapshot of the current live (non-tombstone) node set and bump the epoch.
     void republish() {
         std::vector<NodeId> live;
-        for (const auto& [id, m] : members_)
-            if (!is_tomb(m.status)) live.push_back(NodeId{id});
-        std::sort(live.begin(), live.end(), [](NodeId a, NodeId b) { return a.value < b.value; });
+        std::vector<NodeId> verified;
+        for (const auto& [id, m] : members_) {
+            if (is_tomb(m.status)) continue;
+            live.push_back(NodeId{id});
+            if (m.verified || id == self_.value) verified.push_back(NodeId{id});
+        }
+        const auto by_id = [](NodeId a, NodeId b) { return a.value < b.value; };
+        std::sort(live.begin(), live.end(), by_id);
+        std::sort(verified.begin(), verified.end(), by_id);
         std::lock_guard<std::mutex> g(mu_);
         snapshot_ = std::make_shared<const std::vector<NodeId>>(std::move(live));
+        verified_snapshot_ = std::make_shared<const std::vector<NodeId>>(std::move(verified));
         ++epoch_;
     }
 
@@ -1377,6 +1444,7 @@ private:
 
     mutable std::mutex mu_;
     std::shared_ptr<const std::vector<NodeId>> snapshot_;
+    std::shared_ptr<const std::vector<NodeId>> verified_snapshot_;
     std::uint64_t epoch_ = 0;
 };
 

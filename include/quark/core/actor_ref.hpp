@@ -30,6 +30,7 @@
 #include <utility>
 
 #include "quark/core/descriptor.hpp"
+#include "quark/core/authorizer.hpp"  // F11 local-send ACL hook
 #include "quark/core/dispatch.hpp"
 #include "quark/core/engine.hpp"
 #include "quark/core/error.hpp"
@@ -142,7 +143,7 @@ struct DualReclaimSink {
             s->plain->reclaim(d);
     }
     void reclaim(Descriptor* d) const noexcept { thunk(d, const_cast<DualReclaimSink*>(this)); }
-    [[nodiscard]] ReclaimSink sink() noexcept { return ReclaimSink{&thunk, this}; }
+    [[nodiscard]] ReclaimSink sink() noexcept { return ReclaimSink{&thunk, this, true}; }
 };
 
 class LocalRouter {
@@ -159,6 +160,12 @@ public:
 
     LocalRouter(const LocalRouter&) = delete;
     LocalRouter& operator=(const LocalRouter&) = delete;
+
+    // F11: optional authorization for LOCAL sends (tell/ask/ask_stream). The boundary authorizer
+    // only covers wire frames; without this hook a forwarding actor can hand a low-privilege
+    // principal to a privileged actor with no check. Unset = trusted internal sends (the default
+    // actor model); a bank/authorization-sensitive app should install its ACL here too.
+    void set_authorizer(const Authorizer& authz) noexcept { local_authz_ = &authz; }
 
     // Resolve identity + placement only — never blocks, never creates state (006 §Actor references).
     template <class A>
@@ -193,6 +200,15 @@ public:
         static_assert(Handles<A, std::remove_cvref_t<Msg>>,
                       "deliver_from_wire: message type is not in the actor's protocol (unhandled)");
         Schedulable* s = courier_.resolve(id);
+        // Fail closed (ADR-044): a non-anonymous principal needs an EnvelopePool descriptor, and
+        // that descriptor may only be reclaimed by an activation whose sink is the DUAL sink. A
+        // plain MessagePool::sink() would read the envelope's Principal as a destroy pointer (the
+        // remote-code-execution bug). If the target is unknown we still build the envelope and
+        // dead-letter it through our own dual sink below; if it is known but not dual, drop it.
+        if (!principal.anonymous() && s != nullptr &&
+            (s->activation == nullptr || !s->activation->accepts_envelopes())) {
+            return;
+        }
         Descriptor* d = principal.anonymous()
             ? make_descriptor<A, std::remove_cvref_t<Msg>>(std::forward<T>(msg), trace_id, deadline_ns)
             : make_descriptor_enveloped<A, std::remove_cvref_t<Msg>>(std::forward<T>(msg), trace_id,
@@ -320,6 +336,18 @@ private:
             deadline_ns = amb->deadline_ns;
             principal = amb->principal;
         }
+        // F11: enforce the optional local ACL BEFORE the descriptor is built. This is the internal
+        // forward path (an actor relaying a message it received); the boundary check does not apply.
+        if (local_authz_ != nullptr && !local_authz_->allow(principal, id, type_key_of<Msg>())) {
+            return;
+        }
+        // Fail closed (ADR-044) on the local-forward path too: an ambient non-anonymous principal
+        // must never become an EnvelopePool descriptor for a non-dual activation (including a lazy
+        // target we would activate below — we cannot prove its sink is dual).
+        if (!principal.anonymous() &&
+            (s == nullptr || s->activation == nullptr || !s->activation->accepts_envelopes())) {
+            return;
+        }
         Descriptor* d = principal.anonymous()
             ? make_descriptor<A, Msg>(std::forward<T>(msg), trace_id, deadline_ns)
             : make_descriptor_enveloped<A, Msg>(std::forward<T>(msg), trace_id, deadline_ns, principal);
@@ -353,6 +381,7 @@ private:
 
     PostCourier courier_;
     detail::MessagePool* pool_;
+    const Authorizer* local_authz_ = nullptr;  // F11: optional internal-send ACL
     detail::EnvelopePool envelope_pool_;  // ADR-044: wire-scale, non-anonymous-principal pool
     DualReclaimSink dual_;                // ADR-044 (S1r): flag-dispatched reclaim — never a bare
                                            // pool_->reclaim/pool_->sink() call site remains

@@ -77,6 +77,12 @@ struct ClusterNode {
         act = std::make_unique<Activation>(&actor, Logger::dispatch_table(), pool.sink());
         eng.register_activation(actor_id_of<Logger>(logger_key), *act);
         dist = std::make_unique<DistributedRouter>(membership, local, transport);
+        static const AllowAllAuthorizer authz;  // test opt-in: deny-by-default wire policy
+        dist->set_authorizer(authz);
+        // This test asserts the tagless fast path; F17 makes TAGGED the default, so opt in explicitly.
+        dist->set_peer_schema_provider([](NodeId, TypeKey tk) {
+            return DistributedRouter::matched_peer_schema(tk);
+        });
         dist->template register_remote<Logger, Seq>();  // inbound decode+post for (Logger, Seq)
     }
 };

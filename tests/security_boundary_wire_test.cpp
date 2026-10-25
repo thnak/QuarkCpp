@@ -112,6 +112,10 @@ int main() {
     authz.require(type_key_of<Logger>(), type_key_of<Seq>(), kSendRight);
     SecurityDeadLetter sec_dl;
     n2.dist->set_authorizer(authz, &sec_dl);
+    // This test deliberately round-trips a non-anonymous Principal to exercise the ACL. The
+    // production default now drops unbound wire principals (F2); opt in with an identity binder.
+    n2.dist->set_principal_policy(
+        [](NodeId, const Principal& claimed) { return std::optional<Principal>{claimed}; });
 
     n1.eng.start();
     n2.eng.start();

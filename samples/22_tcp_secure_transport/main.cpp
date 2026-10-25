@@ -104,7 +104,9 @@ int main() {
     net::TcpTransport tcp2{NodeId{2}, pal::ipv4_loopback, 0};
     SecureTransport secure2{tcp2, shared_cipher, NodeId{2}};
     eng2.register_activation(actor_id_of<Logger>(1), *act2);
+    static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
     auto dist2 = std::make_unique<DistributedRouter>(mem2, local2, secure2);
+    dist2->set_authorizer(authz);
     dist2->register_remote<Logger, Seq>();
 
     // ---- Node 1: the legitimate sender. A RecordingTransport sits between SecureTransport and the
@@ -117,6 +119,7 @@ int main() {
     RecordingTransport rec1{tcp1};
     SecureTransport secure1{rec1, shared_cipher, NodeId{1}};
     auto dist1 = std::make_unique<DistributedRouter>(mem1, local1, secure1);
+    dist1->set_authorizer(authz);
 
     ok &= tcp1.start() && tcp2.start();
     if (!ok) { std::printf("FAIL (transport startup)\n"); return 1; }

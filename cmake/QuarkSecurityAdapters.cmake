@@ -21,7 +21,7 @@ endif()
 if(QUARK_WITH_MBEDTLS)
   # Prefer the packaged CMake config (vcpkg ships one); fall back to a plain library/header search
   # for a system-installed mbedTLS. Mirrors cmake/QuarkPersistenceAdapters.cmake's RocksDB branch.
-  find_package(MbedTLS CONFIG QUIET)
+  find_package(MbedTLS 3.6.2 CONFIG QUIET)
   add_library(quark_security_mbedtls INTERFACE)
   if(TARGET MbedTLS::mbedtls)
     target_link_libraries(quark_security_mbedtls INTERFACE

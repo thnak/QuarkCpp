@@ -74,6 +74,11 @@ public:
 
     // The current live-node snapshot. Cheap (a published pointer + epoch); safe to call per-send.
     [[nodiscard]] virtual MembershipView view() const noexcept = 0;
+
+    // The subset placement may choose from. Default = view(); SWIM overrides it to exclude members
+    // learned only from gossip until they answer directly (F12). SWIM's own convergence/probe logic
+    // and `view()` still see them, so the roster converges; they simply cannot receive an actor.
+    [[nodiscard]] virtual MembershipView placement_view() const noexcept { return view(); }
 };
 
 // ============================================================================================

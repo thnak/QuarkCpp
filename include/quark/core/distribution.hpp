@@ -29,10 +29,14 @@
 //   * 019 — the real socket/event-loop transport adapter (the loopback here is a test double).
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -67,7 +71,10 @@ public:
           self_(membership.self()),
           local_(&local),
           transport_(&transport),
-          peer_schema_([](NodeId, TypeKey tk) noexcept { return default_peer_schema(tk); }) {
+          // Safe default: a mismatched PeerSchema makes negotiate() choose TAGGED. Tagless is the
+          // opt-in fast path (set_peer_schema_provider returning matched_peer_schema(tk)); the
+          // receiver must never trust a sender's claimed layout by default (F17).
+          peer_schema_([](NodeId, TypeKey) noexcept { return PeerSchema{~0ull, ~0u}; }) {
         transport_->on_receive([this](MessageFrame f) { deliver(f); });
     }
 
@@ -82,13 +89,26 @@ public:
         return remote_sheds_.load(std::memory_order_relaxed);
     }
 
+    // Per-peer inbound admission (F15): token bucket to stop one peer from filling the actor's
+    // mailbox faster than it drains. Default 4096 frames/s with a 1024-frame burst; 0 disables.
+    // Buckets are hashed into a fixed table, so spoofed plaintext ids share limits rather than
+    // growing memory. Raise this for a legitimate high-throughput data-plane peer.
+    void set_peer_budget(std::uint64_t frames_per_sec, std::uint64_t burst) noexcept {
+        std::lock_guard<std::mutex> g(budget_mu_);
+        peer_rate_per_sec_ = frames_per_sec;
+        peer_burst_ = burst == 0 ? 1 : burst;
+    }
+    [[nodiscard]] std::uint64_t peer_sheds() const noexcept {
+        return peer_sheds_.load(std::memory_order_relaxed);
+    }
+
     using ClockFn = std::int64_t (*)(void* ctx) noexcept;  // mirrors Activation::set_clock (014)
 
     // --- Boundary authorization (020 §3): gate an inbound frame BEFORE it is deserialized/dispatched.
-    // Unset (default) = no check — a deployment that never configures security pays nothing extra on
-    // the receive path (020 core principle). `sec_dl`/`audit` are optional; a denial with both null is
-    // still refused, just unrecorded. `clock`/`clock_ctx` timestamp a denial for the sinks above; a
-    // null clock timestamps denials as 0 rather than pulling in a clock dependency.
+    // DENY BY DEFAULT: an unset authorizer drops every inbound data frame. A deployment that wants
+    // allow-all must install AllowAllAuthorizer explicitly. `sec_dl`/`audit` are optional; a denial
+    // with both null is still refused, just unrecorded. `clock`/`clock_ctx` timestamp a denial for
+    // the sinks above; a null clock timestamps denials as 0.
     void set_authorizer(const Authorizer& authz, SecurityDeadLetter* sec_dl = nullptr,
                         const AuditSink* audit = nullptr, ClockFn clock = nullptr,
                         void* clock_ctx = nullptr) noexcept {
@@ -98,6 +118,16 @@ public:
         clock_fn_ = clock;
         clock_ctx_ = clock_ctx;
     }
+
+    // --- Principal binding (020 §3 / F2): the Principal in a frame is chosen by the SENDER. The
+    // transport authenticates the NODE (mTLS), not the principal. With no policy installed, a
+    // non-anonymous wire principal is DROPPED (fail closed); anonymous frames still reach the
+    // Authorizer. A policy maps the authenticated peer NodeId + claimed principal to the effective
+    // principal (or nullopt to reject). Install one only when the peer is authorized to speak for
+    // that principal (e.g., an ingress gateway with a signed user assertion).
+    using PrincipalPolicy =
+        std::function<std::optional<Principal>(NodeId authenticated_peer, const Principal& claimed)>;
+    void set_principal_policy(PrincipalPolicy policy) { principal_policy_ = std::move(policy); }
 
     // Resolve identity → a distributed ref (identity + placement context). Never blocks, never
     // touches the network — placement happens at send time against the then-current view.
@@ -126,7 +156,7 @@ public:
         static_assert(Described<Msg>,
                       "tell (distributed): a routable message needs QUARK_SERIALIZE (016) — 008 "
                       "Validation requires a Serializer for any remotely-sent type");
-        const MembershipView v = membership_->view();
+        const MembershipView v = membership_->placement_view();
         const std::optional<NodeId> owner = place(id, v);
         if (!owner || *owner == self_) {
             // LOCAL FAST PATH — identical to a single-node send: no serialization, 0 hot-path alloc.
@@ -147,27 +177,49 @@ public:
         // The transport contract says only frames addressed to THIS node reach us; enforce it here
         // too (a peer could otherwise aim a frame at another NodeId and have it applied locally).
         if (f.to != self_) return;
+        // F15: per-peer admission before authz/decode/posting. A slow actor can no longer be
+        // buried by one peer's burst; the bucket is bounded and fixed-size.
+        if (!admit_peer(f.from, rate_now_ns())) {
+            peer_sheds_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         // Boundary authorization (020 §3) runs FIRST — before the (target,msg) lookup and well before
         // decode — so a denied frame is never deserialized and never touches actor state.
-        if (authz_ != nullptr &&
-            !authorize_at_boundary(*authz_, f.principal, f.target, f.msg_type, sec_dl_, audit_,
+        // Deny by default: a DistributedRouter with no configured Authorizer is a fail-open hole
+        // (the old `authz_ != nullptr && ...` accepted every frame). Apps that really want
+        // allow-all must install AllowAllAuthorizer explicitly.
+        if (authz_ == nullptr) return;
+        // F2: bind the claimed principal to the authenticated peer before the ACL sees it.
+        Principal effective = f.principal;
+        if (!effective.anonymous() || principal_policy_) {
+            if (!principal_policy_) return;  // no binder configured: never trust a wire principal
+            std::optional<Principal> bound = principal_policy_(f.from, effective);
+            if (!bound) return;
+            effective = *bound;
+        }
+        if (!authorize_at_boundary(*authz_, effective, f.target, f.msg_type, sec_dl_, audit_,
                                    now_ns())) {
             return;
         }
         const auto it = inbound_.find(wire_key(f.target.type, f.msg_type));
         if (it == inbound_.end()) return;  // no such (actor,msg) type registered here → drop (007 seam)
-        it->second(*local_, f);
+        it->second(*local_, f, effective);
     }
 
-    // --- Test / 021 seam: override the per-peer schema (default assumes a matched same-binary peer,
-    // i.e. the 016 tagless fast path). A real connect handshake advertises the peer's PeerSchema;
-    // a rolling-upgrade mismatch then makes negotiate() fall back to tagged automatically.
+    // --- Test / 021 seam: opt into the 016 tagless fast path by returning the peer's REAL schema.
+    // The default is TAGGED (mismatched placeholder) — tagless is never assumed. A real connect
+    // handshake must advertise the peer's PeerSchema; a rolling-upgrade mismatch then falls back to
+    // tagged automatically. `matched_peer_schema(tk)` is the explicit "same binary" opt-in.
     void set_peer_schema_provider(std::function<PeerSchema(NodeId, TypeKey)> fn) {
         peer_schema_ = std::move(fn);
     }
 
+    [[nodiscard]] static PeerSchema matched_peer_schema(TypeKey tk) noexcept {
+        return PeerSchema{tk.value, pal::platform_abi_tag};
+    }
+
     [[nodiscard]] NodeId owner_of(ActorId id) const noexcept {
-        const std::optional<NodeId> o = place(id, membership_->view());
+        const std::optional<NodeId> o = place(id, membership_->placement_view());
         return o ? *o : self_;
     }
     [[nodiscard]] bool is_local(ActorId id) const noexcept { return owner_of(id) == self_; }
@@ -189,13 +241,13 @@ private:
         return WireKey{actor.value, msg.value};
     }
 
-    using InboundFn = void (*)(LocalRouter& local, const MessageFrame& f);
+    using InboundFn = void (*)(LocalRouter& local, const MessageFrame& f, const Principal& effective);
 
     // The per-(A,M) inbound thunk: decode the 016 bytes per the frame's negotiated mode, then hand
-    // the typed message to the local router with the wire-propagated deadline/trace. A malformed
-    // tagged stream is dropped (defense-in-depth; tagless trusts the connect gate, 016).
+    // the typed message to the local router with the wire-propagated deadline/trace and the
+    // principal bound by the policy. A malformed tagged stream is dropped.
     template <class A, class M>
-    static void inbound_thunk(LocalRouter& local, const MessageFrame& f) {
+    static void inbound_thunk(LocalRouter& local, const MessageFrame& f, const Principal& effective) {
         M msg{};
         if (f.mode == WireMode::Tagless) {
             // A peer controls its own plaintext and can force Tagless; never run the unchecked
@@ -205,7 +257,7 @@ private:
             if (!decode_tagged(f.payload.data(), f.payload.size(), msg)) return;  // malformed → drop
         }
         local.template deliver_from_wire<A, M>(f.target, std::move(msg), f.deadline_ns, f.trace_id,
-                                               f.principal);  // ADR-044: was silently dropped before
+                                               effective);
     }
 
     // Serialize `m` (016) and hand the frame to the transport. NOT the zero-alloc local hot path —
@@ -247,18 +299,60 @@ private:
 
     // A peer we know nothing specific about is assumed to run the same binary: matched fingerprint
     // (for a Described type, type_key == 016 fingerprint) + matched ABI ⇒ negotiate() picks tagless.
-    static PeerSchema default_peer_schema(TypeKey tk) noexcept {
-        return PeerSchema{tk.value, pal::platform_abi_tag};
-    }
+    static PeerSchema default_peer_schema(TypeKey tk) noexcept { return matched_peer_schema(tk); }
 
     [[nodiscard]] std::int64_t now_ns() const noexcept { return clock_fn_ ? clock_fn_(clock_ctx_) : 0; }
+
+    [[nodiscard]] std::int64_t rate_now_ns() const noexcept {
+        if (clock_fn_) return clock_fn_(clock_ctx_);
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   pal::now().time_since_epoch())
+            .count();
+    }
+
+    struct PeerBudget {
+        std::int64_t last_ns = 0;
+        std::uint64_t tokens = 0;
+    };
+    static constexpr std::size_t kBudgetSlots = 256;
+
+    [[nodiscard]] bool admit_peer(NodeId peer, std::int64_t now) noexcept {
+        // Fixed-size hashed buckets: no per-NodeId allocation from a spoofed-id flood.
+        const std::size_t idx = static_cast<std::size_t>(
+            (peer.value * 0x9E3779B97F4A7C15ULL) >> 56) & (kBudgetSlots - 1);
+        std::lock_guard<std::mutex> g(budget_mu_);
+        if (peer_rate_per_sec_ == 0) return true;
+        const std::uint64_t rate = peer_rate_per_sec_;
+        const std::uint64_t burst = peer_burst_;
+        PeerBudget& b = peer_budgets_[idx];
+        if (b.last_ns == 0) {
+            b.last_ns = now;
+            b.tokens = burst;
+        } else if (now > b.last_ns) {
+            const std::int64_t elapsed = now - b.last_ns;
+            const std::uint64_t dt = static_cast<std::uint64_t>(
+                std::min<std::int64_t>(elapsed, 1'000'000'000LL));
+            const std::uint64_t add = dt * rate / 1'000'000'000ULL;
+            b.tokens = std::min(burst, b.tokens + add);
+            b.last_ns = now;
+        }
+        if (b.tokens == 0) return false;
+        --b.tokens;
+        return true;
+    }
 
     Membership* membership_;
     NodeId self_;
     LocalRouter* local_;
     Transport* transport_;
     std::atomic<std::uint64_t> remote_sheds_{0};  // ADR-046: frames locally shed by admit_send()
+    std::atomic<std::uint64_t> peer_sheds_{0};    // F15: frames shed by the per-peer token bucket
+    mutable std::mutex budget_mu_;
+    std::array<PeerBudget, kBudgetSlots> peer_budgets_{};
+    std::uint64_t peer_rate_per_sec_ = 4096;
+    std::uint64_t peer_burst_ = 1024;
     std::function<PeerSchema(NodeId, TypeKey)> peer_schema_;
+    PrincipalPolicy principal_policy_;
     std::unordered_map<WireKey, InboundFn, WireKeyHash> inbound_;
     const Authorizer* authz_ = nullptr;
     SecurityDeadLetter* sec_dl_ = nullptr;

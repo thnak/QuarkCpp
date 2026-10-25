@@ -91,14 +91,19 @@ jobs:
             ctest_jobs: 2
             ctest_env: "TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y g++-14 cmake ninja-build gdb
           if [[ "${{ matrix.config.cxx }}" == clang++* ]]; then
-            wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+            # Never pipe a remote script into sudo. Pin the exact script bytes; bump this hash
+            # deliberately when moving the LLVM major, in the same commit as the version change.
+            curl -fsSL -o /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+            echo "03878e08f47b66cc95bc4b544b0db3c6d9ce8d60e6cf2492ae357984330a9eae  /tmp/llvm.sh" \
+              | sha256sum -c -
+            sudo bash /tmp/llvm.sh 20
             sudo apt-get install -y clang-20 libc++-20-dev libc++abi-20-dev || true
           fi
 
@@ -147,7 +152,7 @@ jobs:
 
       - name: Upload ctest logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ctest-${{ matrix.config.name }}-${{ matrix.arch }}
           path: build/Testing/**/*.log
@@ -171,7 +176,7 @@ jobs:
             # msvc-release only) — collects real signal without blocking merges until established.
             informational: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # The default CMake generator on windows-latest is the installed Visual Studio toolset
       # (MSBuild-driven) — no vcvarsall/Developer-Prompt setup needed, unlike a manual Ninja build.
@@ -204,7 +209,7 @@ jobs:
 
       - name: Upload ctest logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ctest-${{ matrix.config.name }}-windows
           path: build/Testing/**/*.log
@@ -214,7 +219,7 @@ jobs:
     name: perf-gate (023 budgets, x86-64)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain
         run: |
@@ -237,7 +242,7 @@ jobs:
     # re-baseline without letting shared-runner arm64 noise veto merges.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain
         run: |

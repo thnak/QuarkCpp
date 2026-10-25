@@ -302,6 +302,12 @@ public:
         std::shared_lock<std::shared_mutex> g(map_mu_);
         return sessions_.size();
     }
+    // Pre-auth admission policy (optional). Called ONLY when a new Authenticate sender would create
+    // an engine; return false to reject it before the cap is consulted. A deployment can allowlist
+    // known NodeIds (reserving slots for them) and reject random spoofed ids; the default allows all.
+    using HandshakeAdmission = std::function<bool(NodeId)>;
+    void set_handshake_admission(HandshakeAdmission fn) { handshake_admission_ = std::move(fn); }
+
     [[nodiscard]] std::uint64_t handshake_pending_dropped() const noexcept {
         return handshake_pending_dropped_.load(std::memory_order_relaxed);
     }
@@ -511,6 +517,12 @@ private:
             }
         }
         if (!engine) {  // no engine in flight ⇒ we're the server side seeing the opening message
+            if (handshake_admission_ && !handshake_admission_(peer)) {
+                handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, peer.value,
+                                   "secure transport: handshake admission rejected", 0});
+                return;
+            }
             std::lock_guard<std::mutex> g(pending_mu_);
             if (pending_.size() >= kMaxPendingHandshakes) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -534,6 +546,10 @@ private:
                                    "secure transport: oversized Authenticate frame", 0});
                 return;
             }
+            // Global stale sweep: entries are otherwise only reaped when the SAME peer returns, so
+            // a flood of one-shot spoofed senders could pin all 256 slots forever. Any new auth
+            // frame (including a legitimate retry) now frees handshakes older than the timeout.
+            reap_stale_pending(now_ns());
             handle_authenticate_frame(std::move(frame));
             return;
         }
@@ -663,6 +679,19 @@ private:
 
     // Handshakes in flight, keyed by peer. Touched only in short, independent critical sections (see
     // drive_handshake's banner) — never held across advance()/inner_->send().
+    // Erase EVERY parked handshake with no progress for the timeout (not just the current peer).
+    void reap_stale_pending(std::int64_t now) noexcept {
+        std::lock_guard<std::mutex> g(pending_mu_);
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            if (now - it->second.last_progress_ns >= handshake_timeout_ns_) {
+                it = pending_.erase(it);
+                handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     mutable std::mutex pending_mu_;
     struct PendingHandshake {
         std::unique_ptr<HandshakeEngine> engine;
@@ -672,6 +701,7 @@ private:
     // A parked handshake with no progress for this long is abandoned and retried (set_handshake_timeout
     // banner above) — closes the "a lost opening frame wedges this peer permanently" gap.
     std::int64_t handshake_timeout_ns_ = 5'000'000'000;  // 5s
+    HandshakeAdmission handshake_admission_;
 
     std::atomic<std::uint64_t> sealed_{0};
     std::atomic<std::uint64_t> opened_{0};

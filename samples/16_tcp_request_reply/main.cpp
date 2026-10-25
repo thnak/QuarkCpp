@@ -109,7 +109,9 @@ int main() {
     InProcessMembership mem1{NodeId{1}, cluster};
     net::TcpTransport tx1{NodeId{1}, pal::ipv4_loopback, 0};
     eng1.register_activation(actor_id_of<Collector>(collector_key), *act1);
+    static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
     auto dist1 = std::make_unique<DistributedRouter>(mem1, local1, tx1);
+    dist1->set_authorizer(authz);
     dist1->register_remote<Collector, Pong>();  // node 1 decodes inbound Pong
 
     // ---- Node 2: engine + Ponger + transport + router. -----------------------------------------
@@ -122,6 +124,7 @@ int main() {
     net::TcpTransport tx2{NodeId{2}, pal::ipv4_loopback, 0};
     eng2.register_activation(actor_id_of<Ponger>(ponger_key), *act2);
     auto dist2 = std::make_unique<DistributedRouter>(mem2, local2, tx2);
+    dist2->set_authorizer(authz);
     dist2->register_remote<Ponger, Ping>();  // node 2 decodes inbound Ping
     ponger.home = dist2.get();               // Ponger replies through node 2's router...
     ponger.collector_key = collector_key;    // ...to the Collector on node 1
