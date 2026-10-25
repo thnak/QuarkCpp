@@ -13,17 +13,18 @@ which can hang or power off if a build/run saturates all cores. Never use `-j$(n
 
 | Field | Value |
 |---|---|
-| Commit | `7dc7e81` (`feat/broadcast-topic`) |
-| Date | 2026-07-19 |
-| Host | Linux x86-64 (the sole verified target; other arches/OSes are deferred behind the PAL) |
-| Compilers | g++ 14.2.0 (Release + all sanitizers), clang 20.1.2 (second supported compiler) |
+| Commit | `a602f29` (merge of `netem-swim-chaos` into `master`) |
+| Date | 2026-10-25 |
+| Host | Linux x86-64, 28-core Xeon E5-2680 v4, 61 GB (`devserver`); Linux x86-64 remains the primary target — ARM64 is CI-verified and Windows is a correctness-only leg (CONVENTIONS.md) |
+| Compilers | g++ 15.2.0 (Release + all sanitizers), clang 21.1.0 (second supported compiler) |
 | Standard | C++23 |
 
 | Config | Command (build dir) | Result |
 |---|---|---|
-| **Release** (gcc) | `build` | **153 / 153 passed**, 0 failed |
-| **ASan + UBSan** (gcc) | `build-asan` | **152 / 152 passed**, 0 failed — no leaks, no UB |
-| **ThreadSanitizer** (gcc) | `build-tsan` | **137 / 137 passed**, 0 failed — no data races |
+| **Release** (gcc) | `build` | **211 / 211 passed**, 0 failed |
+| **ThreadSanitizer** (gcc) | `build-tsan` | **194 / 194 passed**, 0 failed — no data races (the TSan config's documented exclusions; `tcp_transport_control_priority_test` passed this run) |
+| **ASan + UBSan** (gcc) | `build-asan` | **13 / 13 passed** on the changed transport/SWIM/security slice this cycle — full-suite ASan was last run at 209/210, the one miss being the pre-existing `topic_no_quiesce_control` weakness below |
+| **SWIM chaos** (not CTest) | `tests/netem/run_swim_chaos.sh build` | **5 / 5** scenarios end all-alive (form, isolate, asym, split, flaky) |
 
 Release is the full gate — it is the only config where every allocation-counting probe and every
 store-buffer litmus control is meaningful, so it runs the complete set. The sanitizer configs run a
@@ -35,7 +36,7 @@ deltas below are the *whole* difference — no test silently dropped out.
 ## Reproduce
 
 ```bash
-# Release (gcc) — the full 153-test gate
+# Release (gcc) — the full 211-test gate
 cmake -S . -B build
 taskset -c 0-3 cmake --build build -j4
 taskset -c 0-3 ctest --test-dir build -j4 --output-on-failure
@@ -95,9 +96,10 @@ Three principled groups, all excluded from TSan only:
   instrumented binary) — excluded from **both** ASan and TSan, verified in Release.
 
 The net rule: **the delta is exactly these tests and nothing else.** If a sanitizer run ever reports a
-count other than 152 (ASan) or 137 (TSan) against a 153-test Release baseline, the difference is a real
+count other than the Release baseline minus its documented exclusions, the difference is a real
 regression, not an exclusion — investigate it. (These counts move as tests are added; verify the delta
-against a fresh `ctest -N` on each config rather than assuming a fixed number.)
+against a fresh `ctest -N` on each config rather than assuming a fixed number. At `a602f29` that is
+211 Release, 194 TSan, and the ASan count follows the exclusion list in `tests/CMakeLists.txt`.)
 
 ## Coverage note
 
@@ -131,8 +133,9 @@ asymmetric link cut **failed**: two SWIM defects (021 in `OpenQuestions.md`). Af
 8 seeds: worst heal 600 ms; leave → restart → rejoin 120 ms; a crashed node is still dropped in
 1.08 s and never resurrected) and `cluster_swim_async_relay_test` (1↔2 cut, 0/10/25 ms per hop:
 0 incarnation bumps). Both were run against the old `cluster.hpp` first: the heal test failed
-all 32 heal runs and the relay test showed 363 bumps. Full suites after the merge (same host):
-g++ 15.2 210/210, clang++ 21.1 210/210, ASan+UBSan 209/210, TSan 192/193. The two failures are
+all 32 heal runs and the relay test showed 363 bumps. Full suites after the branch merge (same host):
+g++ 15.2 210/210, clang++ 21.1 210/210, ASan+UBSan 209/210, TSan 192/193. After merging
+`origin/master` (2026-10-25) the suite is 211-test Release 211/211, TSan 194/194. The two failures are
 pre-existing test weaknesses unrelated to SWIM: the `topic_no_quiesce_control` negative control
 caught its race in only 1/20 runs, and `tcp_transport_control_priority_test` misses its ordering
 threshold under TSan (4/10 on the unmodified code). Both are recorded in `OpenQuestions.md`.

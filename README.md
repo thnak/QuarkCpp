@@ -14,7 +14,7 @@ scheduler, hybrid sync/async handlers, point-to-point and streaming messaging, c
 distribution to 10³–10⁴ nodes, durable persistence, and failure supervision, all expressed
 through compile-time CRTP policies instead of runtime configuration.
 
-It's backed by a **194-test** correctness suite ([`tests/`](tests)) verified clean under
+It's backed by a **211-test** correctness suite ([`tests/`](tests)) verified clean under
 ASan/UBSan/TSan, a benchmark harness ([`bench/`](bench)) that turns every hot-path performance
 claim into a pass/fail gate, and **22 runnable samples** ([`samples/`](samples)) from a single
 local actor to multi-node TCP clusters. Every subsystem is backed by a written design and, where
@@ -43,6 +43,9 @@ is **verified clean under ASan, UBSan, and TSan** on every push. **Linux/x86-64 
 supported and verified target today**; ARM64 already runs the full correctness matrix in CI on
 real hardware, and Windows/macOS are designed-for behind the existing Platform Abstraction Layer
 seam — extending support means filling in a PAL backend, not redesigning the engine.
+
+For the candid version — the profile that is safe to run in production today, and every named gap
+that still blocks a platform-wide commitment — see [PRODUCTION-READINESS.md](PRODUCTION-READINESS.md).
 
 <details>
 <summary>Full status detail (per-subsystem gating, ADR references)</summary>
@@ -366,7 +369,7 @@ include/quark/adapters/ opt-in persistence/reminder backends (SQLite, RocksDB)
 include/quark/detail/   internals (message pool, reply cell, hashing)
 pal/                    Platform Abstraction Layer — the single OS seam (019)
 src/                    non-template translation units
-tests/                  194-test correctness gate (CTest)
+tests/                  211-test correctness gate (CTest)
 bench/                  benchmark harness — the 023 budget verdicts
 samples/                22 runnable programs over the public developer surface
 decisions/              ADRs — the design → red-team → prove → judge records

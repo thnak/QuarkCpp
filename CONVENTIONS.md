@@ -11,7 +11,7 @@ with the ADR that proved it), then the code — never silently diverge.
   pinned to it, and it's where x86-TSO-specific fast paths (producer-fence elision, the Dekker
   litmus controls) are proven.
 - **Linux / arm64 is CI-verified, not yet spec-Accepted.** GitHub-hosted arm64 runners run the
-  full correctness matrix (gcc/clang Release, ASan+UBSan, TSan — same 153-test suite as x86-64)
+  full correctness matrix (gcc/clang Release, ASan+UBSan, TSan — same 211-test suite as x86-64)
   on real AArch64 hardware on every push/PR (`.github/workflows/ci.yml`). That's real, repeatable
   evidence the engine builds and runs race-free on arm64 — but it is empirical CI coverage, not
   the formal weak-memory-model proof (herd7/GenMC) the `TODO(arm64)` markers still call for on the
