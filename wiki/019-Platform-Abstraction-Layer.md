@@ -72,13 +72,6 @@ Grouped by the spec that consumes it. All fallible calls return
   next due timer — no separate timer primitive.
 - A portable `Socket` handle (hiding `int` fd vs. Windows `SOCKET`), non-blocking,
   bound to an `IoContext`. Framing lives above the PAL.
-- **UDP primitives (additive, 028)**: `udp_socket()`/`udp_bind()`/`udp_send_to()`/
-  `udp_recv_from()` — non-blocking, same `std::expected<T, std::error_code>` /
-  `would_block()` normalization discipline as the `tcp_*` primitives above, on both
-  backends (`pal/linux_x86_64/net.hpp`, `pal/windows_x86_64/net.hpp`). Added for
-  `VoiceChannel` (028) to register a UDP fd on the same `IoContext` a `Transport`
-  already drives, per "the one rule" above — `VoiceChannel` calls these, never a
-  raw `<sys/socket.h>`/`<winsock2.h>` symbol.
 
 ### Advanced I/O tier (ADR-026, proven)
 
@@ -164,13 +157,11 @@ deterministic per seed, C6).
   stubs this (deterministic tests run with a fixed/stubbed source), distinct from
   014's non-cryptographic seeded PRNG.
 
-  The `Aead` seam itself (`aead.hpp`, not PAL — see 020's "honest exception") gained
-  additive, fixed-buffer `seal_into`/`open_into` overloads (028) so `VoiceChannel`
-  can seal/open a datagram with zero heap allocation on the hot path. These exist
-  today only against `MockCipher` — **NOT** real cryptography, same caveat as
-  `seal`/`open`. A production AEAD adapter (mbedTLS/BoringSSL) implementing this
-  interface, including `seal_into`/`open_into`, is required before `VoiceChannel`
-  ships live traffic; it does not exist yet.
+  The `Aead` seam itself (`aead.hpp`, not PAL — see 020's "honest exception") also
+  exposes additive, fixed-buffer `seal_into`/`open_into` overloads: identical
+  authentication semantics to `seal`/`open`, but the caller owns the output buffer, so
+  a sealing caller never grows a `std::vector` on the hot path. The production mbedTLS
+  adapter implements the same interface, including the fixed-buffer forms.
 
 ## Per-OS backends
 

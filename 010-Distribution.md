@@ -71,6 +71,14 @@ suspicion. Excluding on suspicion would migrate actors off a node on every
 transient blip, the very thrash the stabilization window (021) exists to damp.
 A `Dead` node is excluded; a refuted node (higher incarnation) stays.
 
+Since [ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md) the view is
+precisely the **non-tombstone** set (`Alive`/`Suspect`). `Dead` is adopted only from a
+node's own suspicion timer, never from gossip; `Left` is a separate, authoritative
+graceful departure. The indirect ping is asynchronous: the correlation travels in the
+frames and relays keep no state, so a reply may arrive on any later frame. The relay
+round trip is 4 hops and must fit within `indirect_timeout_ns`. The full rule set is
+021 §3 "SWIM failure-detector rules".
+
 ### Alternatives considered
 
 - **External coordinator (etcd / Consul / ZooKeeper)**: strong consistency, but a
@@ -148,25 +156,9 @@ work never blocks another peer's session.
 
 ### Sibling seams
 
-Not every byte a node moves is a `Transport` frame. `VoiceChannel`
-([028-Voice-Datagram-Channel.md](028-Voice-Datagram-Channel.md)) — best-effort,
-unordered, unreliable UDP for real-time voice/media — is a **NEW, PARALLEL seam**,
-not a `MessageFrame`/`FrameKind` variant and not a `Transport` decorator. It shares
-**no** code path with `Transport`/`MessageFrame`, and it is never reachable through
-the actor mailbox/`GovernanceCore` (003) — a deployment that doesn't use voice pays
-nothing for it. Do not assume voice traffic is "just another frame kind" flowing
-through this seam; it deliberately opts out of the ordering guarantee this section
-exists to provide.
-
-What it **does** share: the node's I/O reactor. `TcpTransport::event_loop()` is the
-**one sanctioned extension point** for a sibling seam that needs to share the
-node's already-open `pal::IoContext` instead of standing up a second thread/loop/
-fd-set — `VoiceChannel` is its first (and, by design, only intended) consumer. No
-other public surface should be added to `TcpTransport` for *reactor sharing*; a
-future sibling seam should extend `event_loop()`'s usage, not grow a second
-accessor.
-
-A second, narrower exception exists for a different purpose: `TcpTransport::
+Not every byte a node moves is a `Transport` frame, but every byte that is a
+`MessageFrame` flows through this seam. A narrower exception exists for a
+connection-control purpose, not a parallel data path: `TcpTransport::
 reset_peer_connection(NodeId)` (020, ADR-040) lets `SecureTransport` force-drop
 the live socket to a peer after a failed certificate renegotiation, WITHOUT
 declaring the peer dead — unlike `close_peer()` (021's permanent-death
@@ -286,6 +278,8 @@ single-node build.
 **Accepted (x86-64, core)** — the placement + cross-node **FIFO data path** is proven
 (HRW/VirtualBins by ADR-006; FIFO-under-relay by ADR-011). **Cross-node backpressure is now
 resolved** ([ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md), below).
+SWIM membership now survives partition heals and runs its indirect ping over a real
+transport ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)).
 
 ## Open questions
 

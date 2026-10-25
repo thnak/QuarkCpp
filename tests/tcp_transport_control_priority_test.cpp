@@ -93,8 +93,20 @@ int main() {
         ta.send(B, big_frame(A, B, i, FrameKind::Data, kFrameBytes));
     ta.send(B, big_frame(A, B, kControlSeq, FrameKind::Control, 64));
 
-    check(wait_until([&] { return received.load(std::memory_order_acquire) >= kDataFrames + 1; }, 30000),
-          "B eventually receives every data frame plus the control frame", ok);
+    // Progress-based deadline, not a fixed wall-clock one: the ~8 MiB backlog needs ~67 s on a 1 Mbit
+    // link (netem-impaired runs), so a flat 30 s fails a healthy-but-slow transport. Fail only on a
+    // genuine stall — no new frame delivered for kStallMs — which still catches a wedged connection.
+    constexpr int kStallMs = 10000;
+    for (std::uint64_t last = received.load(std::memory_order_acquire);;) {
+        if (wait_until([&] { return received.load(std::memory_order_acquire) >= kDataFrames + 1; },
+                       kStallMs))
+            break;
+        const std::uint64_t now = received.load(std::memory_order_acquire);
+        if (now == last) break;  // stalled for kStallMs — the check below reports it
+        last = now;
+    }
+    check(received.load(std::memory_order_acquire) >= kDataFrames + 1,
+          "B eventually receives every data frame plus the control frame (no stall > 10 s)", ok);
 
     std::size_t control_index = arrival_order.size();
     {

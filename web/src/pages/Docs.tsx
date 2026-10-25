@@ -5,10 +5,14 @@ import { DocsSidebar } from '../components/docs/DocsSidebar'
 import { DocsSearch } from '../components/docs/DocsSearch'
 import { DocsArticle } from '../components/docs/DocsArticle'
 import { DocsBrowse } from '../components/docs/DocsBrowse'
+import { useLang } from '../hooks/useLang'
+import { TRANSLATIONS } from '../data/translations'
 
 export function Docs() {
   const { slug } = useParams<{ slug?: string }>()
-  const { data: index, error, loading } = useDocsIndex()
+  const { lang } = useLang()
+  const { data: index, error, loading } = useDocsIndex(lang)
+  const t = TRANSLATIONS[lang]
   const [navOpen, setNavOpen] = useState(false)
 
   useEffect(() => setNavOpen(false), [slug])
@@ -16,7 +20,9 @@ export function Docs() {
   if (loading) {
     return (
       <div className="docs-shell">
-        <div className="docs-loading">Loading the design record…</div>
+        <div className="docs-loading">
+          {lang === 'vi' ? 'Đang tải hồ sơ thiết kế…' : 'Loading the design record…'}
+        </div>
       </div>
     )
   }
@@ -25,8 +31,9 @@ export function Docs() {
     return (
       <div className="docs-shell">
         <div className="docs-loading error">
-          Could not load the documentation index ({error ?? 'unknown error'}). If you opened this page straight off the
-          filesystem, serve the folder over HTTP instead — the docs are fetched as JSON.
+          {lang === 'vi'
+            ? `Không thể tải mục mục tài liệu (${error ?? 'lỗi không xác định'}). Nếu bạn mở trực tiếp qua tệp tin, hãy phục vụ qua HTTP.`
+            : `Could not load the documentation index (${error ?? 'unknown error'}). If you opened this page straight off the filesystem, serve the folder over HTTP instead — the docs are fetched as JSON.`}
         </div>
       </div>
     )
@@ -37,7 +44,7 @@ export function Docs() {
       <div className="docs-bar">
         <button className="docs-nav-toggle" onClick={() => setNavOpen((v) => !v)} aria-expanded={navOpen}>
           <MenuIcon />
-          Documents
+          {t.docsUI.documentsToggle}
         </button>
         <DocsSearch pages={index.pages} />
       </div>

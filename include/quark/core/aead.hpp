@@ -47,11 +47,11 @@ public:
 
     [[nodiscard]] virtual std::size_t tag_size() const noexcept = 0;
 
-    // ADDITIVE (voice_channel.hpp / ADR-030, claim F1): fixed-buffer, non-allocating seal/open. `out`
-    // must be caller-owned (stack/thread_local) and at least `plaintext.size() + tag_size()` bytes;
-    // writes {ciphertext||tag} into it and returns the length written. Same authentication semantics as
-    // `seal`/`open` above — this ONLY changes where the bytes land (no std::vector growth on the
-    // datagram hot path), never the framing/security contract.
+    // Fixed-buffer, non-allocating seal/open for callers that own their output buffer. `out` must be
+    // caller-owned (stack/thread_local) and at least `plaintext.size() + tag_size()` bytes; writes
+    // {ciphertext||tag} into it and returns the length written. Same authentication semantics as
+    // `seal`/`open` above — this ONLY changes where the bytes land (no std::vector growth on a hot
+    // path), never the framing/security contract.
     [[nodiscard]] virtual std::size_t seal_into(std::uint64_t nonce, std::span<const std::byte> aad,
                                                 std::span<const std::byte> plaintext,
                                                 std::span<std::byte> out) const = 0;

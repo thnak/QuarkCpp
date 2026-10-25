@@ -158,27 +158,27 @@ int main() {
 
         check(!reg2.view(swim2.view()).capabilities_of(NodeId{1}).has_flag("gpu"),
               "node 2 has not heard of node 1's capabilities yet", ok);
-        reg1.publish_local(NodeCapabilities{Flag{"voice-relay"}, Scalar{"weight", 3.0}});  // origin: node 1 only
+        reg1.publish_local(NodeCapabilities{Flag{"gpu"}, Scalar{"weight", 3.0}});  // origin: node 1 only
 
         bool converged = false;
         for (int round = 0; round < 50 && !converged; ++round) {
             clk.now += 120'000'000;
             swim1.tick();
             swim2.tick();
-            converged = reg2.view(swim2.view()).capabilities_of(NodeId{1}).has_flag("voice-relay");
+            converged = reg2.view(swim2.view()).capabilities_of(NodeId{1}).has_flag("gpu");
         }
         check(converged, "a locally-published capability reaches the peer via the existing gossip channel", ok);
         check(reg2.view(swim2.view()).capabilities_of(NodeId{1}).scalar("weight") == 3.0,
               "the full capability set (not just the flag) converges", ok);
-        check(reg1.view(swim1.view()).capabilities_of(NodeId{1}).has_flag("voice-relay"),
+        check(reg1.view(swim1.view()).capabilities_of(NodeId{1}).has_flag("gpu"),
               "the originating node still has its own published capability", ok);
 
-        // A capability-constrained CapabilityView built the same way ADR-030's VoiceChannel does
-        // (build_voice_route_snapshot) now sees node 1 as eligible from node 2's own local, converged state.
+        // A capability-constrained CapabilityView now sees node 1 as eligible from node 2's own local,
+        // converged state.
         const CapabilityView v2 = reg2.view(swim2.view());
         int eligible = 0;
         for (NodeId n : v2.nodes())
-            if (v2.capabilities_of(n).has_flag("voice-relay")) ++eligible;
+            if (v2.capabilities_of(n).has_flag("gpu")) ++eligible;
         check(eligible == 1, "capability-filtered eligibility over the converged, network-backed view is correct", ok);
     }
 

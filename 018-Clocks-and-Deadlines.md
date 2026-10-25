@@ -48,7 +48,17 @@ Naively, `deadline_B = now_B + remaining` is too lenient by the transit time —
 budget kept shrinking while the message was in flight. We subtract a transit
 estimate. **We get it for free:** SWIM membership (010) already pings peers and
 tracks a smoothed round-trip time, so `transit ≈ rtt/2`. No separate PTP/NTP
-handshake is introduced.
+handshake is introduced. Only Acks to a node's **own** direct probes may feed that
+estimate; relayed (PingReq) and tombstone probe-back round trips cover extra hops and
+must not ([ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md)). The
+RTT smoothing itself is not implemented in `SwimMembership` yet (021 seam).
+
+**SWIM timers (ADR-048).** Every SWIM timer — suspicion, the indirect window, the relay
+token's time bucket, tombstone TTL, probe-back spacing and verify-ping pacing — reads the
+injectable monotonic clock, never wall time. Detection and heal bounds are stated
+**tick-quantized**: each stage is rounded up to the protocol tick, because a timer is
+only checked when `tick()` runs (e.g. ack 100 ms + indirect 100 ms + suspicion 500 ms at
+a 120 ms tick is 840 ms, not 700 ms).
 
 ## Rule 3 — deadline inheritance
 

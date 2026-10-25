@@ -106,6 +106,37 @@ The TCP-transport and cluster-relay tests (`tcp_frame_codec_test`, `tcp_transpor
 `cluster_dial_dedup_test`) are present and green in **every** config above, including under TSan — the
 default TCP transport (010/019/021) is race-free, leak-free, and UB-free over real loopback sockets.
 
+**Impaired-network runs (2026-10-21, bare-metal Ubuntu 26.04, 28 cores, g++ 15.2; Clang 21.1 also
+208/208).** `tests/netem/run_matrix.sh` runs the 9 real-socket tests (`tcp_*`, the three
+SecureTransport socket tests, `security_rotation_sweep_test`) in a
+fresh network namespace per test. It applies `tc netem` to that namespace's private loopback, so the
+tests run unchanged and the host's network is untouched. All 9 profiles passed 9/9 in each of 3
+runs: baseline, 5 ms±2 ms, 50 ms±10 ms, 1% loss, 5% loss, 25% reordering, 1% duplicate + 0.1%
+corrupt, 1 Mbit, and a WAN mix (80 ms±20 ms, 0.5% loss, 2% reorder). Two harness fixes came out of the
+first pass. `tcp_transport_control_priority_test` now fails only on a 10 s stall in delivery, not
+after a flat 30 s, because its ~8 MiB backlog needs ~67 s on a 1 Mbit link; even when it timed out,
+the control frame had arrived **first** (index 0). The fresh namespace per test is needed because
+packets left queued in a rate-limited qdisc by one test delayed the next one's connection setup,
+which once made `tcp_transport_dial_dedup_test` look like it failed. Limit: Linux TCP retransmits and
+reorders below the transport, so these profiles exercise the transport's timing, reconnect and
+priority behavior, not frame parsing on a damaged stream.
+
+**Multi-process SWIM.** `tests/netem/run_swim_chaos.sh` (5 processes, one per namespace, iptables
+partitions). On 2026-10-21, formation and a 20%-loss flaky link passed, but partition heal and an
+asymmetric link cut **failed**: two SWIM defects (021 in `OpenQuestions.md`). After the ADR-048 merge
+(2026-10-22) all 5 scenarios end all-alive: an isolated node and a {1,2}|{3,4,5} split each heal about
+1 s after the cut is lifted, and with only the 1↔2 link cut nodes 1 and 2 are never suspected
+(incarnation stays 1; it was 31). In-process regression tests on a deferred-delivery fabric
+(`tests/swim_deferred_fabric.hpp`): `cluster_swim_partition_heal_test` (isolate + split, drop + hold,
+8 seeds: worst heal 600 ms; leave → restart → rejoin 120 ms; a crashed node is still dropped in
+1.08 s and never resurrected) and `cluster_swim_async_relay_test` (1↔2 cut, 0/10/25 ms per hop:
+0 incarnation bumps). Both were run against the old `cluster.hpp` first: the heal test failed
+all 32 heal runs and the relay test showed 363 bumps. Full suites after the merge (same host):
+g++ 15.2 210/210, clang++ 21.1 210/210, ASan+UBSan 209/210, TSan 192/193. The two failures are
+pre-existing test weaknesses unrelated to SWIM: the `topic_no_quiesce_control` negative control
+caught its race in only 1/20 runs, and `tcp_transport_control_priority_test` misses its ordering
+threshold under TSan (4/10 on the unmodified code). Both are recorded in `OpenQuestions.md`.
+
 The outbound-streaming-reply suite (`reply_stream_backpressure_test`, `reply_stream_concurrency_test`,
 `reply_stream_credit_merge_test`, `reply_stream_exactly_once_test`, `reply_stream_teardown_test`, ADR-018)
 and the broadcast suite (`topic_at_most_once_test`, `topic_payload_reclaim_test`,

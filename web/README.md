@@ -22,7 +22,7 @@ runtime. It runs automatically before `dev` and `build`.
 
 Sources, in precedence order:
 
-1. **repo-root markdown** — `NNN-*.md` (the 28 RFC specs), `decisions/ADR-*.md`, and the
+1. **repo-root markdown** — `NNN-*.md` (the 27 RFC specs), `decisions/ADR-*.md`, and the
    reference docs (`ActorEngineSpecification`, `CONVENTIONS`, `VERIFICATION`, `PERFORMANCE`,
    `OpenQuestions`, `PersistenceAdapters`, `TAIL-CONTENTION`). These are authoritative and
    always current.
@@ -76,6 +76,6 @@ that way: if a number changes in the repo, change it here in the same commit.
 ### Known staleness in `wiki/`
 
 The five wiki-only pages predate the current repo state and still say **153 tests / 16 samples /
-27 specs / 19 ADRs** where the repository is at **194 / 22 / 28 / 46**. They render verbatim, so
+27 specs / 19 ADRs** where the repository is at **194 / 22 / 27 / 46**. They render verbatim, so
 those figures appear in the site's guide pages and contradict the landing page. Fixing that means
 editing `../wiki/*.md`; the site needs no change.

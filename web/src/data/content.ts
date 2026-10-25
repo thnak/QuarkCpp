@@ -319,8 +319,8 @@ svc.tick(at(21 * 3600));`,
 
 export const QUICKSTART = `# Build + run the full correctness gate (Release)
 cmake -S . -B build
-cmake --build build -j4                          # -j4, never -j$(nproc)
-ctest --test-dir build -j4 --output-on-failure   # 194 / 194
+cmake --build build                          # default parallelism
+ctest --test-dir build --output-on-failure   # run all tests
 
 # Sanitizers (the same suite, minus by-design exclusions)
 cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined"
@@ -328,6 +328,6 @@ cmake -S . -B build-tsan -DQUARK_SANITIZE="thread"   # build -j1
 
 # Benchmarks (default ON) and the runnable samples (default OFF)
 cmake -S . -B build -DQUARK_BUILD_SAMPLES=ON
-taskset -c 0-3 build/samples/01_hello_counter    # prints OK / exit 0`
+./build/samples/01_hello_counter    # prints OK / exit 0`
 
 export const MAILBOX_ROUNDS = 11

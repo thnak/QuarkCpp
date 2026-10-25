@@ -102,9 +102,9 @@ public:
         io_.stop();
         if (io_thread_.joinable()) io_thread_.join();
         // Loop is stopped; tear down sockets on this thread (no handler can run concurrently now).
-        for (auto& [id, c] : conns_) pal::close_fd(c->fd);
-        for (auto& [fd, c] : pending_in_) pal::close_fd(c->fd);
-        pal::close_fd(listener_);
+        for (auto& [id, c] : conns_) retire_fd(c->fd);
+        for (auto& [fd, c] : pending_in_) retire_fd(c->fd);
+        retire_fd(listener_);
         listener_ = pal::invalid_fd;
         conns_.clear();
         pending_in_.clear();
@@ -116,14 +116,6 @@ public:
 
     [[nodiscard]] std::uint16_t listen_port() const noexcept { return bind_port_; }
     [[nodiscard]] NodeId self() const noexcept { return self_; }
-
-    // ADDITIVE (voice_channel.hpp claim C4, ADR-030): the ONLY touch this file needs to let VoiceChannel
-    // share this node's already-open, already-scheduled epoll reactor instead of standing up a second
-    // thread/loop/fd-set. Returns a reference to the private `io_` member that already exists; changes
-    // no existing method, field, or behavior. This is the ONE sanctioned extension point for a sibling
-    // seam (010's "Sibling seams" note) that needs to share the node's I/O reactor — do not add any
-    // other public surface to TcpTransport for that purpose.
-    [[nodiscard]] pal::IoContext& event_loop() noexcept { return io_; }
 
     // --- Transport seam -------------------------------------------------------------------------
     void send(NodeId to, MessageFrame frame) override {
@@ -168,9 +160,9 @@ public:
     // `peer` (e.g. already mid-Backoff, or the peer is unknown). Thread-safe (marshals onto the I/O loop
     // like every other public method here).
     //
-    // THIS IS A DELIBERATE, NARROW ADDITION to this file's public surface, alongside event_loop() —
-    // see 010-Distribution's "Sibling seams" note (Phase 9 spec update) for why this is sanctioned and
-    // what it does NOT do (it never suppresses reconnect, unlike close_peer()).
+    // THIS IS A DELIBERATE, NARROW ADDITION to this file's public surface — see 010-Distribution's
+    // "Sibling seams" note (Phase 9 spec update) for why this is sanctioned and what it does NOT do
+    // (it never suppresses reconnect, unlike close_peer()).
     void reset_peer_connection(NodeId peer) {
         io_.post([this, peer] {
             const auto it = conns_.find(peer.value);
@@ -514,9 +506,8 @@ private:
         }
         // existing wins: close `c`. owned_c (if set) drops here with its fd closed.
         salvage_out(c);  // recover any unsent frames `c` queued before losing (race window)
-        pal::close_fd(c->fd);
+        retire_fd(c->fd);
         by_fd_.erase(c->fd);
-        io_.del_fd(c->fd);
         existing->confirmed = true;
         mark_open(existing);
         pump(existing);  // the surviving connection drains the peer queue
@@ -529,8 +520,7 @@ private:
         const bool was_identified = c->identified;
         const bool was_established = was_open(c);  // captured before unmark_open() clears it below
         salvage_out(c);  // return unsent whole frames to the peer queue BEFORE the fd/state go away
-        pal::close_fd(c->fd);
-        io_.del_fd(c->fd);
+        retire_fd(c->fd);
         by_fd_.erase(c->fd);
         if (was_open(c)) unmark_open(c);
 
@@ -620,10 +610,20 @@ private:
     }
 
     // ---- small helpers --------------------------------------------------------------------------
+    // Deregister from the reactor BEFORE closing. The kernel may hand this fd number to a concurrent
+    // open/accept/connect between the two calls; IoContext keys its handler table by fd and
+    // epoll_ctl(DEL) targets the registration, so closing first would let del_fd() erase (or act on)
+    // the NEW descriptor's handler instead of ours. 010/021 fd-lifetime invariant — never open-code
+    // this pair again.
+    void retire_fd(pal::fd_t fd) noexcept {
+        if (fd == pal::invalid_fd) return;
+        io_.del_fd(fd);
+        pal::close_fd(fd);
+    }
+
     // Detach `existing` from conns_ WITHOUT erasing (the caller re-inserts the survivor), closing its fd.
     void drop_conn_detach(Conn* existing) {
-        pal::close_fd(existing->fd);
-        io_.del_fd(existing->fd);
+        retire_fd(existing->fd);
         by_fd_.erase(existing->fd);
         if (was_open(existing)) unmark_open(existing);
         // erase the owning entry (it is keyed by peer)
@@ -632,8 +632,7 @@ private:
 
     // Fully drop a connection: close fd, deregister, remove from whichever map owns it.
     void drop_conn(Conn* c) {
-        pal::close_fd(c->fd);
-        io_.del_fd(c->fd);
+        retire_fd(c->fd);
         by_fd_.erase(c->fd);
         if (was_open(c)) unmark_open(c);
         if (auto pit = pending_in_.find(c->fd); pit != pending_in_.end()) {

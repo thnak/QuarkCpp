@@ -1,17 +1,21 @@
 import { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import type { DocCategory, DocIndex } from '../../types'
+import { useLang } from '../../hooks/useLang'
+import { TRANSLATIONS } from '../../data/translations'
 
 const ORDER: DocCategory[] = ['guide', 'reference', 'spec', 'adr']
 
 export function DocsSidebar({ index, open, onNavigate }: { index: DocIndex; open: boolean; onNavigate: () => void }) {
   const [collapsed, setCollapsed] = useState<Partial<Record<DocCategory, boolean>>>({ adr: false })
+  const { lang } = useLang()
+  const t = TRANSLATIONS[lang]
 
   return (
     <aside className={`docs-sidebar ${open ? 'open' : ''}`.trim()}>
       <nav>
         <NavLink to="/docs" end className={({ isActive }) => `side-home ${isActive ? 'active' : ''}`} onClick={onNavigate}>
-          All documents
+          {t.docsUI.allDocs}
           <span className="side-count">{index.pages.length}</span>
         </NavLink>
 
@@ -28,7 +32,7 @@ export function DocsSidebar({ index, open, onNavigate }: { index: DocIndex; open
                 aria-expanded={!isCollapsed}
               >
                 <ChevronIcon />
-                {index.categories[cat].label}
+                {index.categories[cat]?.label ?? cat}
                 <span className="side-count">{pages.length}</span>
               </button>
 

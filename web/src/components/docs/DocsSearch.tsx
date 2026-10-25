@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { DocIndexEntry } from '../../types'
+import { useLang } from '../../hooks/useLang'
+import { TRANSLATIONS } from '../../data/translations'
 
 interface Hit extends DocIndexEntry {
   score: number
@@ -31,6 +33,8 @@ export function DocsSearch({ pages }: { pages: DocIndexEntry[] }) {
   const [cursor, setCursor] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const navigate = useNavigate()
+  const { lang } = useLang()
+  const t = TRANSLATIONS[lang]
 
   const hits = useMemo(() => rank(pages, q), [pages, q])
 
@@ -73,6 +77,8 @@ export function DocsSearch({ pages }: { pages: DocIndexEntry[] }) {
     }
   }
 
+  const placeholder = lang === 'vi' ? `Tìm kiếm ${pages.length} tài liệu…` : `Search ${pages.length} documents…`
+
   return (
     <div className="docs-search">
       <SearchIcon />
@@ -80,7 +86,7 @@ export function DocsSearch({ pages }: { pages: DocIndexEntry[] }) {
         ref={inputRef}
         type="search"
         value={q}
-        placeholder="Search 86 documents…"
+        placeholder={placeholder}
         aria-label="Search documentation"
         onChange={(e) => {
           setQ(e.target.value)
@@ -109,7 +115,9 @@ export function DocsSearch({ pages }: { pages: DocIndexEntry[] }) {
       ) : null}
 
       {open && q.trim().length >= 2 && hits.length === 0 ? (
-        <div className="search-results empty">No document matches “{q}”.</div>
+        <div className="search-results empty">
+          {t.docsUI.searchEmpty} “{q}”.
+        </div>
       ) : null}
     </div>
   )

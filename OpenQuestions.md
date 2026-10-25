@@ -602,6 +602,58 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   baseline plus a named Tier-2 extension point (`advanced_io()`/`AdvancedIo`), byte-identical
   caller source across backends, ADR-026. Minimum OS versions and the fallback matrix:
   resolved, ADR-026.)*
+- **021** — *(Both defects below: resolved, [ADR-048](decisions/ADR-048-swim-partition-heal-rejoin-async-relay.md),
+  merged 2026-10-22 — first-hand-only Dead, expiring tombstones, Join re-admission over a
+  tombstone, an accusation-first digest, and a stateless token relay. `run_swim_chaos.sh`
+  now ends all-alive in all 5 scenarios, healing in about 1 s; `cluster_swim_partition_heal_test`
+  and `cluster_swim_async_relay_test` fail on the old code and pass on the new.)*
+  **Still open:** tombstone TTL vs. the longest tolerated partition (021 open questions),
+  and a SWIM wire-version gate for rolling across ADR-048 (021 §3 "Rolling upgrade").
+  Original finding, kept for the record: **two SWIM defects found 2026-10-21 by the first
+  multi-process, real-packet-drop harness** (`tests/netem/run_swim_chaos.sh`: 5 `swim_chaos_node` processes, one per Linux network
+  namespace, faults made with iptables/netem in the kernel). Neither shows up in the `cluster_swim_*`
+  unit tests. Those use a transport whose replies arrive in the same call stack, plus the
+  `set_link_reachable`/`set_online` switches, so they never see a delayed reply or a stale view
+  arriving after a heal.
+  1. **Healing a partition breaks the whole cluster (contradicts §1's "rejoining after a partition").**
+     `apply_update` lets `Dead` win over `Alive` at an *equal* incarnation, and `Dead` is terminal.
+     When a cut-off node heals, it gossips its stale "everyone is Dead" entries. Healthy nodes
+     accept those about *each other* before the subject can refute them. Measured: isolating
+     node 5 for 10 s, then healing, left node 1 at `*DDDD` within 3 s. A {1,2}|{3,4,5} split ended
+     with only the 4–5 pair still seeing each other. Separately, the `Join` handler's
+     `apply_update(subject, 0, Alive)` is a no-op for a node already marked `Dead`, so the healed
+     node can never get back in, even when it re-sends Join every 2 s.
+  2. **Indirect ping (`PingReq` relay) never works over a real transport.** The relay sends a Ping
+     and then checks `relay_got_ack_` straight away ("subject's Ack lands in this same call stack
+     (loopback)"). Over TcpTransport the Ack arrives later, after `relay_active_` has already been
+     reset, so it is dropped. Measured: with only the 1↔2 link cut and relays 3/4/5 healthy, nodes
+     1 and 2 kept suspecting and refuting each other about once a second (incarnation 1 → 31 in
+     22 s). The 1 s suspicion window is all that stops them being declared Dead.
+  Both change SWIM safety rules, so the fix goes through `design-debate-prove` → ADR, with
+  `run_swim_chaos.sh` as the acceptance test (every scenario must end with all nodes alive).
+  This is also the first concrete step on 014's multi-process distribution test tier.
+- **010/021** — **TcpTransport fd race (found 2026-10-22, fixed 2026-10-25).**
+  `close_fd()` ran before `io_.del_fd()`, so between the two calls the kernel could hand the
+  same fd number to a concurrent `open`/`accept`/`connect`, and `del_fd` then removed (or
+  acted on) the *new* descriptor's handler in `IoContext::handlers_`. Every teardown site now
+  goes through `TcpTransport::retire_fd()`, which deregisters from the reactor *before*
+  closing — one helper so the order cannot regress. Exercised by the existing real-socket
+  churn tests (`tcp_transport_dial_dedup_test`, `tcp_transport_reconnect_test`); a dedicated
+  TSan test that churns connections while accepting is still worth adding.
+- **ADR-019 test teeth** — **`topic_no_quiesce_control` is too weak on a large host (found
+  2026-10-22).** This ASan-only negative control removes the subscribe/quiesce barrier and
+  must be caught by ASan (`WILL_FAIL`). On a 28-core bare-metal Ubuntu box (g++ 15.2,
+  ASan+UBSan Debug) the race fired in only **1 of 20** runs, so the suite reports it as a
+  failure about 95% of the time, and when it does pass it proves little. The positive
+  `topic_subscribe_race_test` is unaffected. The control needs a deterministic way to force
+  the race (e.g. a test-only yield/hook inside the unprotected window), not more iterations.
+- **ADR-046 test** — **`tcp_transport_control_priority_test` is flaky under TSan (found
+  2026-10-22).** Not a data race: the check that the control frame arrives before index 375
+  of 500 fails because TSan changes how much backlog builds up on the sender, so the frame
+  lands around index 350–490. Measured on the 28-core box: 4/10 failures on the unmodified
+  code, 6–7/10 after ADR-048 (the test does not use SwimMembership). Release, Clang and ASan
+  pass. Either measure the backlog actually queued in `Conn::out` when the control frame is
+  sent and assert relative to that, or skip the ordering check under TSan.
 
 ## Not yet specced at all
 

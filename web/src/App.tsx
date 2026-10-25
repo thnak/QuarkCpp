@@ -6,6 +6,7 @@ import { Backdrop } from './components/Backdrop'
 import { Landing } from './pages/Landing'
 import { Docs } from './pages/Docs'
 import { useTheme } from './hooks/useTheme'
+import { LangProvider } from './context/LangContext'
 
 /** Route changes start at the top — except in-page anchor jumps, owned by the article. */
 function ScrollReset() {
@@ -20,7 +21,7 @@ export default function App() {
   const [theme, toggleTheme] = useTheme()
 
   return (
-    <>
+    <LangProvider>
       <Backdrop />
       <ScrollReset />
       <NavBar theme={theme} onToggleTheme={toggleTheme} />
@@ -33,6 +34,6 @@ export default function App() {
         </Routes>
       </main>
       <Footer />
-    </>
+    </LangProvider>
   )
 }
