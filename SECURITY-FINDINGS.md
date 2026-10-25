@@ -45,7 +45,7 @@ tagless frames are dropped; pending handshakes cap at 256.
 | F5 | Critical | Receiver runs unchecked `decode_tagless` on peer-controlled bytes; truncated length → heap OOB read/leak/crash | **Patched** |
 | F6 | High | Pre-auth `pending_` handshakes never capped/reaped; spoofed `from` ids grow memory without bound | **Patched** |
 | F7 | High | No `f.to == self_` validation; a frame addressed to another node is applied locally | **Patched** |
-| F8 | High | ADR-044 envelope reclaim with the sample-default `pool.sink()` calls `principal.subject` as a function pointer on the second principal-bearing frame | Harness fixed; contract documented (recommend safe default) |
+| F8 | **Critical (RCE)** | ADR-044 envelope reclaim with the sample-default `pool.sink()` calls `principal.subject` as a function pointer; attacker chose `hijack()` and executed it | **RCE proven** (no-PIE victim); framework default still unsafe |
 | F9 | Medium | `SecurityMode::Strict` is not enforced anywhere outside tests | Open (config wiring) |
 
 ---
@@ -199,7 +199,7 @@ enforced at both entry points. Regression: `security_wire_hardening_test` and
 
 ---
 
-## F8 — ADR-044 reclaim-sink contract is a remote crash when the samples are followed
+## F8 — ADR-044 reclaim-sink contract: remote crash → attacker-controlled call (RCE)
 
 ADR-044 deliberately introduced `EnvelopePool` for non-anonymous principals and documented that an
 activation receiving wire principals **must** be constructed with `LocalRouter::reclaim_sink()`,
@@ -207,18 +207,34 @@ not `MessagePool::sink()` — the latter reinterprets `DescriptorEnvelope::princ
 `MessagePool::Cell::destroy` function pointer. Every public sample (01–22, README, wiki) uses
 `pool.sink()`, which is safe only because those actors never receive a non-anonymous principal.
 
-Proof: the first bank harness used `pool.sink()` and crashed on the **second** non-anonymous
-frame, with `pc=0x29a` — exactly the `principal.subject` value `666`:
+First proof was a crash on the second non-anonymous frame, with `pc=0x29a` — exactly the
+`principal.subject` value `666`:
 
 ```
 ERROR: AddressSanitizer: SEGV on unknown address 0x00000000029a (pc 0x00000000029a ...)
 ```
 
-Switching the activation to `local.reclaim_sink()` removes the crash. Recommendation: make the
-safe dual sink the default for any activation whose actor can be registered with
+**Second pass — full control-flow hijack:** the victim was rebuilt from the same sample pattern
+(`pool.sink()`) with `-no-pie` and a never-referenced `extern "C" void hijack(void*)` that writes
+`EVENT RCE_HIJACK` and calls `_exit(42)`. The attacker learned its address (`0x4062d6`) from the
+startup line and sent one Transfer with `principal.subject = 0x4062d6, rights=4`:
+
+```
+EVENT authz ... subject=4219606 rights=4 required=4 allowed=1
+EVENT bank_transfer from=1 to=666 amount=1 ... principal_subject=4219606 rights=4
+EVENT RCE_HIJACK
+victim exit code: 42
+```
+
+`4219606 == 0x4062d6`. This is arbitrary code execution in the victim process driven by a wire
+field (plaintext, or mTLS because the principal is authenticated but unbound — F2). Caveat: the PoC
+uses a no-PIE victim, so the code address is known; on a PIE/ASLR build an info leak or partial
+overwrite is needed to complete the chain. The primitive itself is proven.
+
+Fix: make the safe dual sink the default for any activation whose actor can be registered with
 `DistributedRouter::register_remote`, or fail closed (drop the frame) when a non-anonymous
-principal targets an activation not wired with the dual sink. At minimum, the sample/README
-pattern should use `reclaim_sink()` whenever distribution is enabled.
+principal targets an activation not wired with the dual sink. At minimum, the sample/README pattern
+should use `reclaim_sink()` whenever distribution is enabled.
 
 ---
 
@@ -285,3 +301,67 @@ the scripts.
    sender's claimed mode. Verify the peer's advertised `PeerSchema` before accepting Tagless.
 5. **DoS is still a non-goal** (020): the caps above close the specific unbounded-state bug, not
    volumetric exhaustion; that stays a load-balancer/kernel concern per 022.
+
+---
+
+## Second pass — every candidate vector executed (2026-10-25)
+
+Lab artifacts: `~/quark-sec/sec` on `thnak-server` — `run_batch1.sh`, `run_forward.sh`,
+`run_place.sh`, `run_slot_exhaust.sh`, `run_flood.sh`, `run_big.sh`, plus `relay_probe`,
+`fuzz_wire`, `schema_probe`; logs in `logs_batch1/2/3`. The runtime is HEAD `bbcf60e` (patched);
+the only deliberate reversion is F8's sample-default `pool.sink()` victim.
+
+### Newly proven
+
+| ID | Vector | Evidence | Impact | Status |
+|---|---|---|---|---|
+| F10 | Fail-open authorization | No `set_authorizer` (the sample pattern); an anonymous `Transfer` executed: `subject=0 rights=0` moved 100; a rights=4 frame moved 500; `thief=600` | Any peer can invoke every registered remote type | Open |
+| F11 | Internal-forward ACL bypass | Gate/`Forward` needs rights=1; its handler `local.tell<Bank>(Transfer)` reached the rights=4 Bank: `gate_forward rights=1` → `bank_transfer from=1 to=666 amount=1000 alice=0 thief=1000 rights=1` | Low-privilege wire caller drains a privileged actor through a forwarder | Open (app/framework API gap) |
+| F12 | SWIM `Alive` gossip → placement hijack | Spoofed control sender injected 512 ghost Alive members; `roster=1 → 1,10000..10511`, `owner=1 → 10199`, remote `bank_ping` stopped while local ledger traffic continued | Ghost-node placement, dead-lettered traffic, service loss | Open (SWIM gossip semantics) |
+| F13 | Handshake-slot exhaustion | 3000 partial ClientHellos filled 256 slots; legitimate node-0 mTLS handshake failed immediately and after 6s; `pending=256` persisted | Fixed-capacity pre-auth DoS on new joins | Open |
+| F14 | Relay-token forgery / liveness poisoning | Default `seed=0` ⇒ public `relay_key`; forged PingReq as node 1 + forged Ack as node 3 with the computed token flipped node 1's view of node 3 from `Suspect(1)` to `Alive(0)` | Suppress/defeat failure detection (keep a dead node Alive) | Plaintext proven; mTLS sender binding blocks the spoof |
+| F15 | Queue/backlog amplification | 10,000 authorized frames in 0.12s; 1,000 processed at first sample; RSS 6.5→9.7MB and still draining; all 10k passed authz | One peer can make an actor unresponsive and grow the backlog without bound | Open (022/backpressure) |
+| F16 | Large-frame memory amplification | One 32MiB Data frame (no decode; target type 0) raised `VmHWM` 6,520→71,656KB (~2×); `max_frame_body=64MiB` per frame/connection | Per-peer/aggregate memory exhaustion | Open (volumetric; 020 non-goal) |
+| F17 | Tagless schema mismatch | V1 bytes decoded as V2 and vice versa: `amount=8589934593 from=1000 to=0`, both accepted | Silent field reinterpretation in mixed-version clusters without `PeerSchema` enforcement | Open (checked decoder prevents OOB) |
+| F18 | RCE via F8 | `principal.subject=0x4062d6` → `EVENT RCE_HIJACK`, victim exit 42 | Arbitrary code execution (no-PIE PoC) | Open; see F8 |
+
+### Tested and blocked / not a finding
+
+- **Tagless OOB at HEAD**: dropped by `decode_tagless_checked`; no ASan report.
+- **mTLS forged `Left`**: rejected by `m.from == authenticated_from`; `status1=0`.
+- **mTLS AAD tamper**: rejected; no delivery.
+- **mTLS identity spoofing**: cannot set `frame.from` to another node without its private key; the session + AAD bind it.
+- **Decoder fuzz**: 2,000,000 random inputs across `decode_tagged`, `decode_control`,
+  `decode_tagless_checked` under ASan+UBSan — no finding (coverage, not proof of absence).
+- **Type-key collision**: not attempted/found; 64-bit hash, low practical risk.
+- **Log injection**: the demo prints `memo` as hex; app-level only.
+- **Metrics/health endpoints**: none in this codebase; N/A.
+- **At-rest encryption**: no encryption mention in `PersistenceAdapters.md`; adapter-dependent,
+  separate storage threat, not a network finding.
+
+### Supply chain / package injection (inspection, not exploited)
+
+- CI pipes `wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20` with no checksum or
+  signature — runner RCE if that endpoint/network is compromised.
+- `actions/checkout@v4` and `actions/upload-artifact@v4` are mutable tags, not commit SHAs.
+- `apt-get install` is unpinned; `windows-latest`/MSVC is unpinned.
+- `vcpkg.json` pins a `builtin-baseline` (good) and requires `mbedtls>=3.6.2`; the CMake
+  `find_package(MbedTLS CONFIG QUIET)` / `find_library` fallback accepts a system mbedTLS with no
+  version or hash check — a malicious sysroot/`LD_LIBRARY_PATH` can inject.
+- No `FetchContent`/`ExternalProject` remote downloads were found (good).
+
+Fix: SHA-pin actions, verify the LLVM script and apt packages, require the vcpkg manifest or a
+version/hash-checked mbedTLS, and add an SBOM/provenance gate.
+
+### Priority order after the second pass
+
+1. **F8 / F18** — RCE: default the dual reclaim sink or fail closed.
+2. **F2** — bind the Principal to the authenticated peer.
+3. **F10** — deny by default when any remote type is registered.
+4. **F12** — membership admission/verification and a live-member cap; don't place on unverified peers.
+5. **F13** — global handshake reaper + per-IP/per-connection cap + reserved slots.
+6. **F11** — local authorizer hook / require privileged handlers to check `ctx.principal`.
+7. **F15 / F16** — per-peer admission control, bounded mailboxes, aggregate frame budgets.
+8. **F14** — random per-process relay secret; bind the token to the authenticated peer.
+9. **F17** — enforce `PeerSchema` on connect; tagged fallback by default.
+10. **Supply chain** — pin actions to SHAs; verify the LLVM/apt inputs; vcpkg-only mbedTLS.
