@@ -1,7 +1,7 @@
 # Security Remediation Tracking
 
 **Source:** `SECURITY-FINDINGS.md` (live plaintext + real-mTLS bank cluster attack pass)  
-**Updated:** 2026-10-25 (pass 7: exact apt/MSVC lock + keyless release signing; F1/P4/P5)  
+**Updated:** 2026-10-25 (pass 8: digest-pinned Linux CI image; F1/P4/P5)  
 **Status key:** `[x]` fixed & verified · `[~]` mitigation in place, follow-up open · `[ ]` open
 
 Verified baseline: **21/21 affected CTest suites pass** on `thnak-server` (real mbedTLS 3.6.5,
@@ -11,7 +11,7 @@ P5 deterministic fuzz suite. Commits: `bbcf60e` (wire hardening), `f1286ee` (att
 ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/plaintext lab
 (34,548 mTLS busy transfers, zero theft) plus the strict-refusal check (exit 3). Pass 7 closes the
 supply-chain residual with the exact apt/MSVC lock, installed-version audit, and keyless release
-signing.
+signing; pass 8 pins the Linux base and CI image by digest.
 
 ---
 
@@ -186,17 +186,25 @@ signing.
     tag-triggered `release.yml` builds the archive, emits the SBOM, **keylessly signs** both with
     cosign (pinned action + `COSIGN_VERSION`), verifies the signatures before publishing, and
     attaches provenance.
+  - **Implemented pass 8 (container pin):** `ci/Dockerfile` builds from
+    `ubuntu:24.04@sha256:<UBUNTU_BASE_DIGEST>` with the exact apt lock (including git/curl/python3/
+    gh/wget/gnupg/lsb-release); the Linux test/perf/supply jobs and the release run in `CI_IMAGE`
+    (digest-only); `ci-image.yml` builds/pushes a multi-arch image and prints the digest to bump;
+    `check_pins.sh` rejects a mutable image tag or a non-digest base. The all-zero `CI_IMAGE`
+    placeholder fails closed until the first deliberate bump.
   - **Acceptance:** a changed declared upstream input fails closed until deliberately bumped (audit
     + self-test); the build's exact toolchain/apt/MSVC versions are recorded in the attested SBOM;
-    release artifacts have a verifiable Sigstore signature bound to this workflow. **Met.**
-  - **Residual:** the *base* runner image's non-apt OS libraries/kernel still follow the release
-    label (a container-image digest or fully snapshotted mirror is needed for a byte-identical base);
-    release binaries are Linux x86-64 only (Windows/arm64 release matrix is distribution work).
-  - **Verify:** `bash ci/check_pins.sh --self-test` rejects a mutable action tag, a bad LLVM hash,
-    an unpinned apt entry, an invalid/moving MSVC pin, and an invalid cosign pin, then the real
-    audit passes; `QUARK_VERIFY_INSTALLED=1` is the CI installed-version gate; `gen_sbom.sh` emits
-    valid CycloneDX 1.5 (24 components incl. MSVC + COSIGN); the `release.yml` signs and
-    verify-before-publishes the archive + SBOM; the CI `supply-chain` job is the gate.
+    release artifacts have a verifiable Sigstore signature bound to this workflow; Linux jobs run
+    in a digest-pinned image. **Met.**
+  - **Residual:** the `windows-2022` base image itself still follows its release label (the exact
+    MSVC toolset is pinned); release binaries are Linux x86-64 only (Windows/arm64 release matrix is
+    distribution work); the first CI image build must be pinned deliberately.
+  - **Verify:** `bash ci/check_pins.sh --self-test` rejects seven negatives (mutable action, bad
+    LLVM hash, unpinned apt, invalid MSVC, invalid cosign, mutable CI image, non-digest base), then
+    the real audit passes; `QUARK_VERIFY_INSTALLED=1` is the CI installed-version gate; `gen_sbom.sh`
+    emits valid CycloneDX 1.5 (38 components incl. MSVC/COSIGN/container pins); the `release.yml`
+    signs and verify-before-publishes the archive + SBOM; the `ci-image.yml` workflow builds the
+    digest-addressed image; the CI `supply-chain` job is the gate.
 
 - [x] **At-rest data: document/encrypt persistence snapshots.**
   - **Why:** a storage reader could read actor state; the adapter had no encryption-at-rest story.
@@ -260,7 +268,7 @@ signing.
 | F1 | Plaintext transport production default deny (dev opt-in only) | pass 6 | no-macro control refuses; SecureTransport inner allowed |
 | F17 | Layout-aware fingerprint + authenticated PeerSchema advert | `06c69c9`+ | `schema_probe` gate; mixed-schema tagged/reject; live mTLS tagless |
 | P4 at-rest | `EncryptedStore<S>` + KMS Keyring decision/checklist | pass 4 | store test: ciphertext/reopen/tamper/splice/wrong key |
-| P4 supply chain | Exact apt/MSVC lock + audit self-test + CycloneDX SBOM + attestation + keyless release signing | pass 7 | 5 negatives; installed versions == lock; SBOM 24; release signatures verified before publish |
+| P4 supply chain | Exact apt/MSVC lock + digest-pinned CI image + audit + CycloneDX SBOM + attestation + keyless release signing | pass 8 | 7 negatives; image/base digests; installed == lock; SBOM 38; release signatures verified before publish |
 | P5 fuzzing | Shared targets + deterministic CTest + libFuzzer corpus/CI | pass 5 | 200k deterministic + 2,577,246 libFuzzer runs, no crash |
 | Supply chain | Action SHAs, LLVM hash, mbedTLS version | `81c8d0d` | CI no longer pipes to sudo |
 
@@ -284,8 +292,9 @@ The production build refuses the plaintext variant before `start()`.
 | F17 schema gate | `schema_probe`: matched=1, mismatch_key=0, mismatch_abi=0 |
 | F17 mixed-schema routing | advertised tagless; mismatch→tagged; unknown TypeKey rejected |
 | F17 live 7-node mTLS | **33,564** transfers, ledger `fallbacks=0`; plaintext senders stay tagged |
-| P4 pin audit | self-test rejects mutable action, bad LLVM hash, unpinned apt, invalid MSVC/cosign; real audit passes; CI verifies installed dpkg == exact lock |
-| P4 SBOM | valid CycloneDX 1.5, 24 components, MSVC/COSIGN pins + file SHA-256s |
+| P4 pin audit | self-test rejects mutable action, bad LLVM hash, unpinned apt, invalid MSVC/cosign, mutable CI image, non-digest base; real audit passes; CI verifies installed dpkg == exact lock |
+| P4 SBOM | valid CycloneDX 1.5, 38 components, MSVC/COSIGN/container pins + file SHA-256s |
+| P4 CI image | Linux jobs/release use `CI_IMAGE` (digest-only); Dockerfile `FROM ubuntu@sha256:<base>`; `ci-image.yml` builds multi-arch and prints the digest |
 | P4 release signing | tag workflow signs archive + SBOM keyless (cosign); verify-before-publish pins identity/issuer; provenance attached |
 | P4 at-rest | InMemory+FileStore ciphertext; reopen, tamper, cross-actor, wrong key controlled |
 | F1 transport guard | no-macro control: refused default / explicit dev / secure-marked inner; 21/21 |
@@ -298,6 +307,9 @@ Implemented in this pass:
 - **P4 (pass 7):** exact apt lock (`ci/apt-packages.txt`) installed by `ci/install-deps.sh`;
   LLVM helper repo-only; MSVC pin + `-T version=%MSVC_VERSION%`; installed-version audit; SBOM
   MSVC/COSIGN records; `release.yml` keyless signing + `ci/verify_release.sh` verify-before-publish.
+- **P4 (pass 8):** `ci/Dockerfile` on a digest-pinned Ubuntu base; exact apt toolchain incl. the
+  image prerequisites; `CI_IMAGE` digest-only in the Linux jobs/release; `ci-image.yml` multi-arch
+  build + digest output; seven-way audit rejects a mutable image/base.
 - **P0:** `Transport::is_plaintext()` + `validate_startup_security()`; the ledger sets
   `SecurityMode::Strict` and refuses multi-node plaintext. Lab plaintext must build with
   `QUARK_ALLOW_INSECURE` and prints a warning.
@@ -393,6 +405,8 @@ dist.register_remote<Ledger, Transfer>();
   versions and a green installed-version audit.
 - [ ] Verify release signatures with `ci/verify_release.sh` (or `cosign verify-blob`) and the
   expected `release.yml` identity before deploying an artifact.
+- [ ] Pin the `ci-image.yml` output digest in `CI_IMAGE` and every `container.image` line; never
+  deploy the all-zero placeholder, and rerun the pin audit after the bump.
 
 ---
 
@@ -416,10 +430,11 @@ bash run_bank_heavy.sh     # 7-node busy mTLS/plaintext + strict-refusal case
 bash run_f17_live.sh       # schema probe + 7-node mTLS tagless / plaintext tagged
 ./security_plaintext_transport_refusal_control   # F1: no-macro default deny + secure inner
 ./security_at_rest_store_test   # P4 at-rest: ciphertext/reopen/tamper/splice/wrong key
-bash ci/check_pins.sh --self-test   # P4 supply chain: 5 negative controls + real audit
+bash ci/check_pins.sh --self-test   # P4 supply chain: 7 negative controls + real audit
 QUARK_VERIFY_INSTALLED=1 bash ci/check_pins.sh  # on the pinned runner: installed == exact lock
-bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (24 components; MSVC/COSIGN pins)
+bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (38 components; MSVC/COSIGN/container)
 bash ci/verify_release.sh <artifact> <artifact>.sigstore.json  # verify a release signature
+# .github/workflows/ci-image.yml builds CI_IMAGE from ci/Dockerfile; pin its printed digest.
 # Pushing a v* tag runs .github/workflows/release.yml: build + SBOM + cosign sign + verify + publish
 ./fuzz_decoders_test --iters 2000000   # P5 long deterministic campaign
 # P5 libFuzzer: -DQUARK_BUILD_FUZZ=ON (Clang); seed corpus then 60s campaign — see FUZZING.md

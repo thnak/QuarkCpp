@@ -23,6 +23,8 @@ jobs:
   release:
     name: signed release (${{ github.ref_name }})
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4

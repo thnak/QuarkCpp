@@ -152,7 +152,10 @@ for path in (
     "ci/check_pins.sh",
     "ci/gen_sbom.sh",
     "ci/verify_release.sh",
+    "ci/Dockerfile",
     "CMakeLists.txt",
+    ".github/workflows/ci.yml",
+    ".github/workflows/ci-image.yml",
     ".github/workflows/release.yml",
 ):
     digest = sha256(path)
@@ -197,6 +200,8 @@ sbom = {
             {"name": "quark:pins:windowsRunner", "value": pins["WINDOWS_RUNNER"]},
             {"name": "quark:pins:msvcVersion", "value": pins["MSVC_VERSION"]},
             {"name": "quark:pins:cosignVersion", "value": pins["COSIGN_VERSION"]},
+            {"name": "quark:container:image", "value": pins["CI_IMAGE"]},
+            {"name": "quark:container:ubuntuBaseDigest", "value": pins["UBUNTU_BASE_DIGEST"]},
         ],
         "externalReferences": [{"type": "vcs", "url": f"{server}/{repo}/commit/{commit}"}],
     },

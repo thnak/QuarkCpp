@@ -22,7 +22,11 @@ detected, how to bump it, and what is deliberately left to the runner platform.
    build-provenance attestation.
 8. **Release artifacts are keylessly signed** (Sigstore/cosign over GitHub OIDC) and the signatures
    are verified before publishing, with the signing Action + cosign release pinned.
-9. **No remote script may be piped into `sudo`.** Download, verify, then execute.
+9. **Linux jobs run in a digest-addressed image**: the Ubuntu base is pinned by manifest-list
+   digest and the toolchain image by its image digest (`CI_IMAGE`). `ci/Dockerfile` builds from the
+   pinned base with the exact apt lock; `.github/workflows/ci-image.yml` publishes multi-arch and
+   prints the digest to bump. The all-zero placeholder fails closed until that deliberate bump.
+10. **No remote script may be piped into `sudo`.** Download, verify, then execute.
 
 ## Pinned inputs
 
@@ -30,6 +34,8 @@ detected, how to bump it, and what is deliberately left to the runner platform.
 |---|---|---|
 | GitHub Actions commits | `.github/workflows/*.yml` | `check_pins.sh`: `uses:@<40-hex>` only |
 | Ubuntu x86-64 / arm64 image | `ci/pins.env`, `runs-on` | release label only; no `-latest` |
+| Linux CI image | `CI_IMAGE` | digest-only; all Linux jobs use it |
+| Ubuntu base | `UBUNTU_BASE_DIGEST` | `ci/Dockerfile` FROM digest; image build |
 | Windows image | `ci/pins.env`, `runs-on` | release label only |
 | Windows MSVC toolset | `MSVC_VERSION` | exact `cmake -T version=…`; pin in SBOM |
 | LLVM installer | `LLVM_SH_SHA256` | SHA-256 verified pre-execution; repo-only patch |
@@ -55,13 +61,16 @@ The single toolchain installer is `ci/install-deps.sh`. The single workflow pin 
   the lock; on a CI runner (`QUARK_VERIFY_INSTALLED=1`) the installed `dpkg` version must equal it;
 - the LLVM helper's own package install is not neutralized, so it could bypass the exact lock;
 - the Windows workflow does not export/use `MSVC_VERSION` through `-T version=%MSVC_VERSION%`;
+- `CI_IMAGE` is not a digest-only ghcr image, is not used by every Linux job, or the Dockerfile
+  base differs from `UBUNTU_BASE_DIGEST`;
 - `vcpkg.json`'s baseline differs from `VCPKG_BASELINE`, or mbedTLS is below `MBEDTLS_MIN`;
 - `release.yml` uses a cosign release other than `COSIGN_VERSION`, or does not verify signatures
   before publishing.
 
-`bash ci/check_pins.sh --self-test` first proves the audit's teeth with five negative controls: a
+`bash ci/check_pins.sh --self-test` first proves the audit's teeth with seven negative controls: a
 mutable `actions/checkout@v4` reference, a malformed LLVM hash, an apt entry without an exact
-version, an invalid/moving `MSVC_VERSION`, and an invalid `COSIGN_VERSION` must all be rejected.
+version, an invalid/moving `MSVC_VERSION`, an invalid `COSIGN_VERSION`, a mutable CI image, and a
+non-digest base image must all be rejected.
 The CI `supply-chain` job runs the self-test and the real audit with `QUARK_VERIFY_INSTALLED=1`;
 every test/perf job has `needs: supply-chain`, so a red pin audit blocks all builds.
 
@@ -71,11 +80,12 @@ every test/perf job has `needs: supply-chain`, so a red pin audit blocks all bui
 
 - the project component (commit), mbedTLS, vcpkg, GCC/Clang/CMake/Ninja/GDB versions;
 - the exact **MSVC** toolset pin and the `windows-2022` selection;
+- the digest-pinned Linux CI image (`CI_IMAGE`) and Ubuntu base manifest-list digest;
 - every pinned Action and commit;
 - every installed locked apt package and its exact resolved version;
 - SHA-256 hashes of `vcpkg.json`, `ci/pins.env`, `ci/apt-packages.txt`, `ci/install-deps.sh`,
-  `ci/check_pins.sh`, `ci/gen_sbom.sh`, `ci/verify_release.sh`, `CMakeLists.txt`, and
-  `.github/workflows/release.yml`;
+  `ci/check_pins.sh`, `ci/gen_sbom.sh`, `ci/verify_release.sh`, `ci/Dockerfile`, `CMakeLists.txt`,
+  and the `ci.yml`/`ci-image.yml`/`release.yml` workflows;
 - runner image/OS/arch and the pin values (including `COSIGN_VERSION`).
 
 The `supply-chain` CI job uploads `sbom.json` + `sbom.sha256` as an immutable artifact and attests
@@ -118,17 +128,20 @@ different signer version fails the pin gate.
    runner with the exact packages installed.
 3. Run the full CI matrix; the SBOM diff is the review artifact (commit/toolchain/apt versions).
    For a signed release, push a `v*` tag and verify the workflow's verify-before-publish step.
-4. Merge the pin-only change separately from code changes; never "fix" a red audit by removing the
+4. For the CI image: run `ci-image.yml` (or wait for its push build), copy the printed
+   `ghcr.io/<owner>/quark-ci@sha256:<digest>` into `CI_IMAGE` and every `container.image` line,
+   then rerun the pin audit. The placeholder digest must never be deployed.
+5. Merge the pin-only change separately from code changes; never "fix" a red audit by removing the
    pin. The LLVM script hash comes from `sha256sum` of the exact downloaded bytes; an Action SHA
    comes from `git ls-remote <repo> refs/tags/<tag>^{}` (the peeled commit, not the tag object).
 
 ## Residuals (explicit)
 
-- **The base runner image beyond the apt lock is runner-managed.** Direct apt packages are now
-  version-locked and CI fails if the installed version differs; the MSVC toolset is selected
-  exactly. The OS libraries/kernel that are NOT in `ci/apt-packages.txt` still follow the pinned
-  release label and can refresh. A byte-identical base therefore still needs a container-image
-  digest (or a fully snapshotted apt mirror); that is the remaining reproducibility step.
+- **The Linux base is now digest-pinned; the Windows base is still runner-managed.** Linux jobs run
+  in `CI_IMAGE`, built by `ci-image.yml` from `ubuntu:24.04@sha256:<UBUNTU_BASE_DIGEST>` with the
+  exact apt lock. The first image build must be pinned deliberately (the placeholder fails closed).
+  The `windows-2022` base image itself still follows its release label; the exact MSVC toolset is
+  selected from the pin, but a byte-identical Windows base is not possible on hosted runners.
 - **The SBOM describes inputs, not a hermetic build.** Compiler output can vary with the host
   image; the source + pin manifest + SBOM identify the inputs, and the provenance attestation ties
   the SBOM to the CI run.

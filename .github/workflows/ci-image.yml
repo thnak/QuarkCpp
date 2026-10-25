@@ -1,0 +1,59 @@
+# Build the digest-addressed Linux CI image from ci/Dockerfile (base pinned by digest, exact apt
+# toolchain from ci/apt-packages.txt). After the first run, copy the printed image digest into
+# CI_IMAGE in ci/pins.env and the container.image lines in ci.yml/release.yml, then rerun the pin
+# audit. Until that deliberate bump the all-zero placeholder fails closed.
+name: CI image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'ci/**'
+      - '.github/workflows/ci-image.yml'
+      - 'vcpkg.json'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: build + push (amd64/arm64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Audit pins (base digest, exact apt lock)
+        run: bash ci/check_pins.sh --self-test
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        with:
+          context: .
+          file: ci/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/quark-ci:latest
+          provenance: true
+          sbom: true
+
+      - name: Print the CI_IMAGE pin
+        run: |
+          echo "CI_IMAGE=ghcr.io/${{ github.repository_owner }}/quark-ci@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pin this exact @sha256 digest in ci/pins.env and the container.image lines." >> "$GITHUB_STEP_SUMMARY"

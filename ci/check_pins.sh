@@ -30,6 +30,10 @@ audit_root() {
         fail "ci/pins.env: MSVC_VERSION must be an exact 3-part toolset version (got '$MSVC_VERSION')"
     [[ "$COSIGN_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
         fail "ci/pins.env: COSIGN_VERSION must be vMAJOR.MINOR.PATCH (got '$COSIGN_VERSION')"
+    [[ "$UBUNTU_BASE_DIGEST" =~ ^[0-9a-f]{64}$ ]] ||
+        fail "ci/pins.env: UBUNTU_BASE_DIGEST must be a 64-hex sha256 digest"
+    [[ "$CI_IMAGE" =~ ^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$ ]] ||
+        fail "ci/pins.env: CI_IMAGE must be ghcr.io/<name>@sha256:<64-hex digest> (got '$CI_IMAGE')"
 
     # 1. Every `uses:` is a 40-hex commit, never a tag/branch. Local composite actions (./...) are ok.
     local ref
@@ -107,19 +111,21 @@ PY
         [[ "$ver" == *"*"* ]] && fail "ci/apt-packages.txt: wildcard version for '$pkg'"
         case "$pkg" in
             "g++-${GCC_MAJOR}"|cmake|ninja-build|gdb|"clang-${CLANG_MAJOR}"|\
-            "libc++-${CLANG_MAJOR}-dev"|"libc++abi-${CLANG_MAJOR}-dev") ;;
+            "libc++-${CLANG_MAJOR}-dev"|"libc++abi-${CLANG_MAJOR}-dev"|\
+            git|curl|ca-certificates|python3|gh|wget|gnupg|lsb-release) ;;
             *) fail "ci/apt-packages.txt: unlisted package '$pkg'" ;;
         esac
     done < "$root/ci/apt-packages.txt"
     for pkg in "g++-${GCC_MAJOR}" cmake ninja-build gdb "clang-${CLANG_MAJOR}" \
-               "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev"; do
+               "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev" \
+               git curl ca-certificates python3 gh wget gnupg lsb-release; do
         grep -Fq "${pkg}=" "$root/ci/apt-packages.txt" ||
             fail "ci/apt-packages.txt is missing the locked package '$pkg'"
     done
     while IFS= read -r line; do
         [[ "$line" == *'"${pkgs[@]}"'* ]] ||
             fail "ci/install-deps.sh apt-get install bypasses the exact lock: $line"
-    done < <(grep -E '^[[:space:]]*sudo apt-get install' "$root/ci/install-deps.sh")
+    done < <(grep -E '^[[:space:]]*(\$SUDO|sudo)[[:space:]]+apt-get install' "$root/ci/install-deps.sh")
 
     # In CI after installation, prove the running toolchain IS the lock (dpkg is Linux-only).
     if [[ "${QUARK_VERIFY_INSTALLED:-0}" == 1 ]] && command -v dpkg-query >/dev/null; then
@@ -147,7 +153,15 @@ PY
     grep -Fq 'bash ci/verify_release.sh' "$root/.github/workflows/release.yml" ||
         fail "release.yml does not verify the signatures before publishing"
 
-    echo "pin audit: OK (actions SHA-pinned; release runners; LLVM SHA-256 + repo-only; vcpkg/mbedTLS; exact apt lock; MSVC pin; keyless release signing)"
+    # 8. Linux jobs run in the digest-addressed CI image built from the digest-pinned base.
+    grep -Fq "image: $CI_IMAGE" "$root/.github/workflows/ci.yml" ||
+        fail "ci.yml does not use the pinned CI_IMAGE"
+    grep -Fq "image: $CI_IMAGE" "$root/.github/workflows/release.yml" ||
+        fail "release.yml does not use the pinned CI_IMAGE"
+    grep -Fq "FROM ubuntu:24.04@sha256:$UBUNTU_BASE_DIGEST" "$root/ci/Dockerfile" ||
+        fail "ci/Dockerfile base does not match UBUNTU_BASE_DIGEST"
+
+    echo "pin audit: OK (actions SHA-pinned; release runners; LLVM SHA-256 + repo-only; vcpkg/mbedTLS; exact apt lock; MSVC pin; digest-pinned CI image; keyless release signing)"
 }
 
 self_test() {
@@ -156,7 +170,7 @@ self_test() {
     trap 'rm -rf "$tmp"' RETURN
     mkdir -p "$tmp/ci" "$tmp/.github/workflows"
     cp "$script_root/ci/pins.env" "$script_root/ci/apt-packages.txt" \
-       "$script_root/ci/install-deps.sh" "$tmp/ci/"
+       "$script_root/ci/install-deps.sh" "$script_root/ci/Dockerfile" "$tmp/ci/"
     cp "$script_root/vcpkg.json" "$tmp/"
     cp "$script_root/.github/workflows/ci.yml" "$script_root/.github/workflows/release.yml" \
        "$tmp/.github/workflows/"
@@ -195,8 +209,22 @@ self_test() {
     if (audit_root "$tmp") >/dev/null 2>&1; then
         fail "self-test: an invalid COSIGN_VERSION was accepted"
     fi
+    cp "$script_root/ci/pins.env" "$tmp/ci/"
 
-    echo "pin audit self-test: OK (mutable action, bad LLVM hash, unpinned apt, invalid MSVC/cosign rejected)"
+    # Negative control 6: a mutable CI image tag must be rejected.
+    sed -i -E 's#^CI_IMAGE=.*#CI_IMAGE=ghcr.io/example/ci:latest#' "$tmp/ci/pins.env"
+    if (audit_root "$tmp") >/dev/null 2>&1; then
+        fail "self-test: a mutable CI image was accepted"
+    fi
+    cp "$script_root/ci/pins.env" "$tmp/ci/"
+
+    # Negative control 7: a non-digest base image must be rejected.
+    sed -i -E 's/^UBUNTU_BASE_DIGEST=.*/UBUNTU_BASE_DIGEST=latest/' "$tmp/ci/pins.env"
+    if (audit_root "$tmp") >/dev/null 2>&1; then
+        fail "self-test: an invalid base digest was accepted"
+    fi
+
+    echo "pin audit self-test: OK (mutable action, bad LLVM hash, unpinned apt, invalid MSVC/cosign, mutable CI image, bad base digest rejected)"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then

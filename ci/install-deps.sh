@@ -17,6 +17,12 @@ if [[ "${1:-}" == "--with-clang" ]]; then
     with_clang=1
 fi
 
+# The CI image builds as root; the GitHub-hosted runner needs sudo. Keep one code path.
+SUDO=""
+if [[ "$EUID" -ne 0 ]]; then
+    SUDO="sudo"
+fi
+
 # The single exact-version source. Every package installed by this script must be listed here.
 locked() {
     local pkg="$1" line
@@ -32,11 +38,13 @@ install_locked() {
     local pkgs=() p
     for p in "$@"; do pkgs+=("$(locked "$p")"); done
     # --allow-downgrades: the runner image may preinstall a newer version; the lock wins.
-    sudo apt-get install -y --no-install-recommends --allow-downgrades "${pkgs[@]}"
+    $SUDO apt-get install -y --no-install-recommends --allow-downgrades "${pkgs[@]}"
 }
 
-sudo apt-get update
-install_locked "g++-${GCC_MAJOR}" cmake ninja-build gdb
+$SUDO apt-get update
+# Toolchain + the container/job prerequisites (checkout/HTTP, Python audit/SBOM, release CLI).
+install_locked "g++-${GCC_MAJOR}" cmake ninja-build gdb \
+    git curl ca-certificates python3 gh wget gnupg lsb-release
 
 if ((with_clang)); then
     curl -fsSL -o /tmp/llvm.sh https://apt.llvm.org/llvm.sh
@@ -44,6 +52,6 @@ if ((with_clang)); then
     # Add the LLVM apt repo/key only. The script's final `apt-get install -y $PKG` would install
     # the repository's latest set (and packages outside our lock); neutralize just that line.
     sed -i 's#^apt-get install -y \$PKG$#:#' /tmp/llvm.sh
-    sudo bash /tmp/llvm.sh "${LLVM_MAJOR}"
+    $SUDO bash /tmp/llvm.sh "${LLVM_MAJOR}"
     install_locked "clang-${CLANG_MAJOR}" "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev"
 fi

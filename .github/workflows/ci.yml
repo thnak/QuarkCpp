@@ -56,6 +56,8 @@ jobs:
   supply-chain:
     name: supply-chain (pins, SBOM, provenance)
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
     permissions:
       contents: read
       id-token: write
@@ -95,6 +97,8 @@ jobs:
     name: test (${{ matrix.config.name }}, ${{ matrix.arch }})
     needs: supply-chain
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
     # Safety net: the arm64 gcc/clang-release legs were observed to hang indefinitely (a real
     # non-termination, not just "slow") and got silently killed only by GitHub's 6h job cap. A
     # per-test ctest --timeout (below) is the primary fix; this is the backstop.
@@ -279,6 +283,8 @@ jobs:
     name: perf-gate (023 budgets, x86-64)
     needs: supply-chain
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
@@ -297,6 +303,8 @@ jobs:
     name: perf-gate (023 budgets, arm64, informational)
     needs: supply-chain
     runs-on: ubuntu-24.04-arm
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
     # 023's Hard budgets are pinned to the x86-64 reference machine and the ARM64 ratio is explicitly
     # provisional (023 §"The reference machine"). Collect real arm64 numbers for that future
     # re-baseline without letting shared-runner arm64 noise veto merges.
