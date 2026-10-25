@@ -9,9 +9,12 @@ on:
   push:
     branches: [main, master]
     paths:
-      - 'ci/**'
+      # Deliberately excludes ci/pins.env: bumping CI_IMAGE must not change the image it points to.
+      # A compiler/toolchain bump still needs a workflow_dispatch build + new pin.
+      - 'ci/Dockerfile'
+      - 'ci/apt-packages.txt'
+      - 'ci/install-deps.sh'
       - '.github/workflows/ci-image.yml'
-      - 'vcpkg.json'
 
 permissions:
   contents: read

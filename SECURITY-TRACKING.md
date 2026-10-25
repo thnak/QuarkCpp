@@ -190,15 +190,15 @@ signing; pass 8 pins the Linux base and CI image by digest.
     `ubuntu:24.04@sha256:<UBUNTU_BASE_DIGEST>` with the exact apt lock (including git/curl/python3/
     gh/wget/gnupg/lsb-release); the Linux test/perf/supply jobs and the release run in `CI_IMAGE`
     (digest-only); `ci-image.yml` builds/pushes a multi-arch image and prints the digest to bump;
-    `check_pins.sh` rejects a mutable image tag or a non-digest base. The all-zero `CI_IMAGE`
-    placeholder fails closed until the first deliberate bump.
+    `check_pins.sh` rejects a mutable image tag or a non-digest base. The image is pinned as
+    `sha256:869f9699…`; a toolchain change requires a new build and digest pin.
   - **Acceptance:** a changed declared upstream input fails closed until deliberately bumped (audit
     + self-test); the build's exact toolchain/apt/MSVC versions are recorded in the attested SBOM;
     release artifacts have a verifiable Sigstore signature bound to this workflow; Linux jobs run
     in a digest-pinned image. **Met.**
   - **Residual:** the `windows-2022` base image itself still follows its release label (the exact
     MSVC toolset is pinned); release binaries are Linux x86-64 only (Windows/arm64 release matrix is
-    distribution work); the first CI image build must be pinned deliberately.
+    distribution work); the image itself is pinned, but a toolchain change needs a new build + pin.
   - **Verify:** `bash ci/check_pins.sh --self-test` rejects seven negatives (mutable action, bad
     LLVM hash, unpinned apt, invalid MSVC, invalid cosign, mutable CI image, non-digest base), then
     the real audit passes; `QUARK_VERIFY_INSTALLED=1` is the CI installed-version gate; `gen_sbom.sh`

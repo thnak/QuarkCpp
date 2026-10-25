@@ -25,7 +25,8 @@ detected, how to bump it, and what is deliberately left to the runner platform.
 9. **Linux jobs run in a digest-addressed image**: the Ubuntu base is pinned by manifest-list
    digest and the toolchain image by its image digest (`CI_IMAGE`). `ci/Dockerfile` builds from the
    pinned base with the exact apt lock; `.github/workflows/ci-image.yml` publishes multi-arch and
-   prints the digest to bump. The all-zero placeholder fails closed until that deliberate bump.
+   prints the digest to bump. The image is pinned in `CI_IMAGE`; a toolchain change requires a new
+   image build and pin.
 10. **No remote script may be piped into `sudo`.** Download, verify, then execute.
 
 ## Pinned inputs
@@ -139,7 +140,7 @@ different signer version fails the pin gate.
 
 - **The Linux base is now digest-pinned; the Windows base is still runner-managed.** Linux jobs run
   in `CI_IMAGE`, built by `ci-image.yml` from `ubuntu:24.04@sha256:<UBUNTU_BASE_DIGEST>` with the
-  exact apt lock. The first image build must be pinned deliberately (the placeholder fails closed).
+  exact apt lock. A compiler/toolchain change requires a new image build and a new digest pin.
   The `windows-2022` base image itself still follows its release label; the exact MSVC toolset is
   selected from the pin, but a byte-identical Windows base is not possible on hosted runners.
 - **The SBOM describes inputs, not a hermetic build.** Compiler output can vary with the host

@@ -16,6 +16,7 @@ concurrency:
 
 permissions:
   contents: write
+  packages: read
   id-token: write
   attestations: write
 
@@ -24,7 +25,10 @@ jobs:
     name: signed release (${{ github.ref_name }})
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/thnak/quark-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: ghcr.io/thnak/quark-ci@sha256:869f9699c725ffdbfb07109896681ef3ca34b9caa0ace0e23d79eca56c6a0727
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
