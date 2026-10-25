@@ -94,7 +94,7 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 
 ### P3 — resource governance and framing
 
-- [~] **F15: hard mailbox bound / backpressure; tune the per-peer budget.**
+- [x] **F15: hard mailbox bound / backpressure; tune the per-peer budget.**
   - **Why:** the token bucket caps ingress (10k → 1,277 admitted, RSS 6.5→7.1 MB), but it is a
     rate limit, not a hard queue bound; the default 4096/s may be too low for a legitimate
     high-throughput peer.
@@ -102,9 +102,17 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
     document the tuning knobs (022).
   - **Acceptance:** a slow actor's backlog is bounded by config; a legitimate bulk peer can be
     configured without dropping; no regression in the distribution tests.
-  - **Verify:** `run_flood.sh` at multiple budgets; the 7-node busy run sustained ~1.1–1.2k
-    transfers/s with a bounded queue. `set_peer_budget` is the tuning API; a hard
-    engine-mailbox bound is still open.
+  - **Verify:** **pass 3 implemented.** `PostCourier::post_checked` and
+    `Engine::post_checked` enforce the LIVE `HotCell` mailbox bound before enqueue;
+    `LocalRouter` reclaims and counts every Block/Shed (`mailbox_dropped()`), and
+    engine-internal posts use the admission-exempt governed enqueue so Dormant/lazy
+    reactivation and depth accounting stay correct. Wire-facing actors opt in with
+    `eng.enable_governance(sched)`; `BANK_MAILBOX_BOUND` tunes the local default.
+    Live: 10,000-frame flood at bound 64 → **1,258 rate-admitted, 1,126 refused at
+    admission**, RSS flat 6.6→6.9 MB; 7-node busy mTLS **33,568** transfers,
+    **drops=0**, thief=0; 17 targeted engine/governance suites pass. Unit:
+    `distribution_routing_test::wire_mailbox_bound` (8 enqueued, 92 reclaimed).
+    `set_peer_budget` remains the rate knob.
 
 - [x] **F16: configurable frame size + 024 chunking guidance.**
   - **Why:** the 64 MiB single-frame cap is now 4 MiB; 32 MiB is rejected (HWM stays 6.7 MB). A
@@ -194,7 +202,9 @@ The production build refuses the plaintext variant before `start()`.
 | 7-node plaintext lab | **26,666** busy transfers; theft=0; forged `Left` still evicts (`status1=3`) — the remaining **F1** residual |
 | strict refusal | `bank_strict` (no lab macro) with 3-node plaintext exits **3**: `Strict + multi-node ... plaintext` |
 | per-IP handshake flood | 3000 same-IP senders → **64** pending; allowlisted peer authenticates mid-flood; unknown peer succeeds after the 5s reaper |
-| 21/21 affected CTest suites | pass |
+| hard mailbox bound (64) | 10,000 sent → 1,258 rate-admitted → **1,126 refused at admission**; RSS 6.6→6.9 MB |
+| 7-node busy mTLS + F15 | **33,568** transfers, **drops=0**, thief=0, 6 sessions |
+| 21/21 affected CTest suites + 17 targeted core | pass |
 
 Implemented in this pass:
 
@@ -209,7 +219,10 @@ Implemented in this pass:
   `TcpTransport` attaches it transiently, `SecureTransport` enforces a per-IP pending cap
   (default 64) plus 16 reserved slots for allowlisted peering identities.
 - **P3:** `FrameStream::set_max_body()/max_body()`, `TcpTransport::set_max_frame_body()`, and
-  `TcpTransport::set_max_pending_inbound()`; 4 MiB default retained.
+  `TcpTransport::set_max_pending_inbound()`; 4 MiB default retained; **hard mailbox bound**:
+  checked post admission (`PostCourier::post_checked` → `Engine::post_checked` →
+  `Activation::post_governed`) with drop-and-reclaim at `LocalRouter`, admission-exempt internal
+  posts, and `enable_governance` opt-in on the wire-facing ledger.
 - **Test seam:** `DistributedRouter::tell_on()` pins the lab ledger; production routing still uses
   placement.
 
@@ -233,11 +246,16 @@ act = std::make_unique<Activation>(&actor, Actor::dispatch_table(), local.reclai
 local.set_authorizer(authz);                // internal forwards become a checked boundary.
 // Stamp system-originated local work with a privileged Principal via AmbientContextScope.
 
-// 4. Framing / connections (TcpTransport).
+// 4. Wire-facing actors opt in to the hard mailbox bound (live HotCell, 022).
+auto* sched = eng.register_activation(actor_id_of<Ledger>(1), *act);
+eng.enable_governance(sched);               // Overflow::Block sheds at admission
+// Monitor local.mailbox_dropped(); a slow actor's backlog cannot exceed the bound.
+
+// 5. Framing / connections (TcpTransport).
 transport.set_max_frame_body(4u * 1024u * 1024u);
 transport.set_max_pending_inbound(1024);
 
-// 5. Placement: use the verified placement view, not the convergence roster.
+// 6. Placement: use the verified placement view, not the convergence roster.
 owner = place(id, membership.placement_view());
 ```
 
@@ -250,7 +268,8 @@ owner = place(id, membership.placement_view());
 - [ ] Non-anonymous wire principals require a `PrincipalPolicy`; never trust the raw frame principal.
 - [ ] Wire-facing activations use `LocalRouter::reclaim_sink()`.
 - [ ] Authorization-sensitive internal forwarding installs a `LocalRouter` authorizer.
-- [ ] Set a per-peer budget and a single-frame cap appropriate to the deployment.
+- [ ] Set a per-peer budget, a single-frame cap, and a mailbox bound appropriate to the deployment;
+  opt wire-facing actors into `enable_governance` and alert on `mailbox_dropped()`.
 - [ ] Treat `Membership::view()` as the convergence roster; use `placement_view()` for placement.
 - [ ] Pin/verify build inputs; never pipe a remote script into `sudo`.
 
@@ -266,7 +285,7 @@ bash run_batch1.sh         # RCE + fail-open (both blocked)
 bash run_forward.sh        # local ACL (blocked)
 bash run_place.sh          # placement view (ghosts in view, not placement)
 bash run_slot_exhaust.sh   # reaper: retry succeeds after 5s
-bash run_flood.sh          # per-peer budget (10k -> ~1.3k admitted)
+bash run_flood.sh          # per-peer budget + 64-entry mailbox (10k -> ~1.3k admitted, ~1.1k shed)
 bash run_big.sh            # 32 MiB rejected at 4 MiB cap
 bash run_bank.sh           # plaintext + mTLS bank attacks
 bash run_bank_heavy.sh     # 7-node busy mTLS/plaintext + strict-refusal case

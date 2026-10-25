@@ -81,12 +81,22 @@ struct PostCourier {
     // ⇒ unsupported — a hand-rolled `PostCourier` (tests, TestKit, SimEngine) keeps `.passivate()`
     // returning false, matching how `activate_fn == nullptr` already degrades `activate()` today.
     bool (*passivate_fn)(void* engine, ActorId id) noexcept = nullptr;
+    // 022 hard mailbox bound: a checked post that returns Blocked/Shed WITHOUT enqueueing (the
+    // caller owns and reclaims the descriptor) instead of the legacy unconditional `post`. Null on
+    // hand-rolled couriers; `post_checked` then falls back to `post` and reports Enqueued.
+    enum class PostResult : std::uint8_t { Enqueued = 0, Blocked = 1, Shed = 2 };
+    PostResult (*post_checked_fn)(void* engine, Schedulable* s, Descriptor* d) noexcept = nullptr;
 
     [[nodiscard]] Schedulable* resolve(ActorId id) const noexcept {
         return resolve_fn(engine, id);
     }
     [[nodiscard]] bool post(Schedulable* s, Descriptor* d) const noexcept {
         return post_fn(engine, s, d);
+    }
+    [[nodiscard]] PostResult post_checked(Schedulable* s, Descriptor* d) const noexcept {
+        if (post_checked_fn != nullptr) return post_checked_fn(engine, s, d);
+        (void)post(s, d);
+        return PostResult::Enqueued;
     }
     [[nodiscard]] bool activate(ActorId id, Descriptor* d, ReclaimSink origin_reclaim) const noexcept {
         return activate_fn != nullptr && activate_fn(engine, id, d, origin_reclaim);
@@ -369,7 +379,7 @@ public:
     // Hand out the Policy-erased courier `ActorRef`/`LocalRouter` (006) use to resolve + post.
     [[nodiscard]] PostCourier post_courier() noexcept {
         return PostCourier{this, &resolve_courier, &post_courier_fn, &activate_courier_fn,
-                           &passivate_courier_fn};
+                           &passivate_courier_fn, &post_checked_courier_fn};
     }
 
     // --- Supervision (007 §Escalation; ADR-009 `Supervision<Node|PerType|Tree<…>>`) ---------
@@ -426,9 +436,30 @@ public:
     // Enqueue a message on the actor's mailbox; if THIS caller drove Idle→Scheduled, carry the
     // activation onto its shard run-queue and wake EXACTLY ONE sleeping worker (never broadcast).
     QUARK_ALWAYS_INLINE bool post(Schedulable* s, Descriptor* d) noexcept {
-        const bool wake = s->activation->post(d);  // mailbox enqueue + producer fence + exec CAS
+        // A governed activation must keep the depth accounting consistent even for engine-originated
+        // internal traffic (broker wake/control, timer, escalation): use the admission-EXEMPT
+        // governed enqueue. Ordinary application producers go through post_checked/governed_post.
+        const bool wake = s->activation->is_governed()
+                              ? s->activation->post_governed_unconditional(d)
+                              : s->activation->post(d);
         if (wake) schedule_and_wake(s);
         return wake;
+    }
+
+    // Checked producer path for bound-aware callers (LocalRouter's wire/local delivery): on a
+    // governed activation the mailbox bound/overflow is enforced BEFORE enqueue. Blocked/Shed means
+    // the descriptor was NOT enqueued and remains the caller's to reclaim — never silently leaked.
+    [[nodiscard]] PostCourier::PostResult post_checked(Schedulable* s, Descriptor* d) noexcept {
+        if (s == nullptr || s->activation == nullptr) return PostCourier::PostResult::Shed;
+        if (s->activation->is_governed()) {
+            const Activation::PostAdmission pa = governed_post(s, d);
+            if (pa.result == Activation::AdmitResult::Blocked)
+                return PostCourier::PostResult::Blocked;
+            if (pa.result == Activation::AdmitResult::Shed) return PostCourier::PostResult::Shed;
+            return PostCourier::PostResult::Enqueued;
+        }
+        (void)post(s, d);
+        return PostCourier::PostResult::Enqueued;
     }
 
     // If the caller enqueued through the mailbox directly, it must drive the wake edge with this.
@@ -688,6 +719,10 @@ private:
     }
     static bool post_courier_fn(void* eng, Schedulable* s, Descriptor* d) noexcept {
         return static_cast<Engine*>(eng)->post(s, d);
+    }
+    static PostCourier::PostResult post_checked_courier_fn(void* eng, Schedulable* s,
+                                                           Descriptor* d) noexcept {
+        return static_cast<Engine*>(eng)->post_checked(s, d);
     }
     // ADR-028 Phase 4: the lazy-activation cold-path hand-off wrapper.
     static bool activate_courier_fn(void* eng, ActorId id, Descriptor* d,

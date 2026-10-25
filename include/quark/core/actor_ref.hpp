@@ -21,6 +21,7 @@
 // `R handle(const Q&)` is a dispatch-layer extension deferred to 005/ADR-007.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <memory_resource>
@@ -167,6 +168,12 @@ public:
     // actor model); a bank/authorization-sensitive app should install its ACL here too.
     void set_authorizer(const Authorizer& authz) noexcept { local_authz_ = &authz; }
 
+    // Hard mailbox bound accounting: frames refused at admission (Block/Shed) are reclaimed here and
+    // counted. A slow actor's backlog therefore cannot grow past the engine's live mailbox bound.
+    [[nodiscard]] std::uint64_t mailbox_dropped() const noexcept {
+        return mailbox_dropped_.load(std::memory_order_relaxed);
+    }
+
     // Resolve identity + placement only — never blocks, never creates state (006 §Actor references).
     template <class A>
     [[nodiscard]] ActorRef<A> get(std::uint64_t key) noexcept {
@@ -217,7 +224,11 @@ public:
             dual_.reclaim(d);  // not_found on this node: dead-letter locally (006) — ADR-044 dual-dispatch
             return;
         }
-        (void)courier_.post(s, d);
+        const PostCourier::PostResult pr = courier_.post_checked(s, d);
+        if (pr != PostCourier::PostResult::Enqueued) {
+            mailbox_dropped_.fetch_add(1, std::memory_order_relaxed);
+            dual_.reclaim(d);  // blocked/shed at admission: caller still owns the descriptor
+        }
     }
 
     // --- ask (006 §ask): request/reply through a pooled ReplyCell. Returns an AskFuture<R>. -----
@@ -359,7 +370,11 @@ private:
             if (!courier_.activate(id, d, dual_.sink())) dual_.reclaim(d);
             return;
         }
-        (void)courier_.post(s, d);  // the wake-edge bool is the scheduler's; the sender ignores it
+        const PostCourier::PostResult pr = courier_.post_checked(s, d);
+        if (pr != PostCourier::PostResult::Enqueued) {
+            mailbox_dropped_.fetch_add(1, std::memory_order_relaxed);
+            dual_.reclaim(d);  // 022 hard mailbox bound: not enqueued, reclaim via the dual sink
+        }
     }
 
     // One ReplyCell pool per R, created lazily and stored keyed by a per-type sentinel address
@@ -382,6 +397,7 @@ private:
     PostCourier courier_;
     detail::MessagePool* pool_;
     const Authorizer* local_authz_ = nullptr;  // F11: optional internal-send ACL
+    std::atomic<std::uint64_t> mailbox_dropped_{0};  // 022 Block/Shed at admission
     detail::EnvelopePool envelope_pool_;  // ADR-044: wire-scale, non-anonymous-principal pool
     DualReclaimSink dual_;                // ADR-044 (S1r): flag-dispatched reclaim — never a bare
                                            // pool_->reclaim/pool_->sink() call site remains

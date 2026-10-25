@@ -87,11 +87,38 @@ struct ClusterNode {
     }
 };
 
+// 022 hard mailbox bound on the wire path: the engine config's bound is enforced at admission, and
+// frames refused there are reclaimed (never leaked) and counted. No worker is started, so exactly
+// the bound is enqueued and everything beyond it is shed.
+bool wire_mailbox_bound() {
+    detail::MessagePool pool{128};
+    Logger actor;
+    auto act = std::make_unique<Activation>(&actor, Logger::dispatch_table(), pool.sink());
+    EngineConfig cfg{/*workers*/ 1, /*shards*/ 1, /*budget*/ 64, /*busy_spin*/ 64};
+    cfg.default_mailbox_bound = 8;
+    Engine<> eng{cfg};
+    const ActorId id = actor_id_of<Logger>(1);
+    Schedulable* sched = eng.register_activation(id, *act);
+    eng.enable_governance(sched);  // F15: opt in to the hard mailbox bound
+    LocalRouter local{eng.post_courier(), pool};
+    for (int i = 0; i < 100; ++i)
+        local.deliver_from_wire<Logger, Seq>(id, Seq{i}, /*deadline_ns*/ 0, /*trace_id*/ 0);
+    const std::uint64_t dropped = local.mailbox_dropped();
+    if (dropped != 92) {
+        std::fprintf(stderr, "  CHECK FAILED: wire mailbox dropped=%llu (expected 92)\n",
+                     static_cast<unsigned long long>(dropped));
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
     bool ok = true;
     g_wire_fallback_warn = &count_warn;
+
+    check(wire_mailbox_bound(), "wire mailbox bound sheds and reclaims beyond the bound", ok);
 
     // Find one Logger key owned by node 1 (local to the sender) and one owned by node 2 (remote).
     InProcessMembership probe(NodeId{1}, {NodeId{1}, NodeId{2}});
