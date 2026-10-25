@@ -53,5 +53,6 @@ if ((with_clang)); then
     # the repository's latest set (and packages outside our lock); neutralize just that line.
     sed -i 's#^apt-get install -y \$PKG$#:#' /tmp/llvm.sh
     $SUDO bash /tmp/llvm.sh "${LLVM_MAJOR}"
-    install_locked "clang-${CLANG_MAJOR}" "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev"
+    install_locked "clang-${CLANG_MAJOR}" "libc++-${CLANG_MAJOR}-dev" \
+        "libc++abi-${CLANG_MAJOR}-dev" "libclang-rt-${CLANG_MAJOR}-dev"
 fi

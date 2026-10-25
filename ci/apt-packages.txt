@@ -13,6 +13,7 @@ gdb=15.1-1ubuntu1~24.04.1
 clang-20=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
 libc++-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
 libc++abi-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
+libclang-rt-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
 # Container/runner prerequisites used by the CI image and the jobs: checkout/HTTP, audit/SBOM
 # Python, and the release CLI. Exact for the same noble snapshot as the toolchain.
 git=1:2.43.0-1ubuntu7.4
