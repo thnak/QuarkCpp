@@ -154,7 +154,7 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} \
             ${SAN:+-DQUARK_SANITIZE="$SAN"}
@@ -201,7 +201,7 @@ jobs:
       - name: Fuzz decoders (libFuzzer, 60s)
         if: matrix.arch == 'x86_64' && matrix.config.name == 'clang-release'
         run: |
-          cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-20 -DQUARK_BUILD_TESTS=ON \
             -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_FUZZ=ON -DQUARK_SANITIZE=address
           cmake --build build-fuzz --target fuzz_decoders fuzz_seed_corpus -j 2
@@ -302,7 +302,7 @@ jobs:
         run: bash ci/install-deps.sh
 
       - name: Configure (gcc Release + bench gate)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
 
       - name: Build benches + run 023 gate
         # The custom target builds every *_bench then runs ci_bench_gate.sh: exit non-zero ONLY on a
@@ -329,7 +329,7 @@ jobs:
         run: bash ci/install-deps.sh
 
       - name: Configure (gcc Release + bench gate)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
 
       - name: Build benches + run 023 gate (informational)
         run: cmake --build build --target bench-gate -j 2

@@ -7,9 +7,9 @@
 //
 // Tiered because `type_key_of<T>()` (metadata.hpp) derives three different ways, and only one is
 // toolchain-portable by construction:
-//   Tier 1 — Described types: `type_key_of<T>() == fingerprint_v<T>` (016), folds only
-//            `{(tag, wire_type)}` — no name enters it, so it is portable BY CONSTRUCTION. Golden
-//            on every toolchain.
+//   Tier 1 — Described types: `type_key_of<T>() == fingerprint_v<T>` (016). F17 folds the member
+//            category/size/signedness plus the nested schema fingerprint; a builtin member's nested
+//            key is name-derived, so real MSVC and GCC/Clang diverge. Golden per compiler family.
 //   Tier 2 — non-Described, name-derived keys (`fnv1a(canonical_type_name<T>())`): the GCC/Clang
 //            `__PRETTY_FUNCTION__` slice agrees, but MSVC's `__FUNCSIG__` slice keeps the
 //            `struct`/`class` elaborator (`struct ns::Point` vs `ns::Point`) — a different string
@@ -74,15 +74,17 @@ void check(bool c, const char* what, bool& ok) {
 }  // namespace
 
 // --- Golden constants ---------------------------------------------------------------------
-// Tier 1 is portable BY CONSTRUCTION (no name folded in), so one golden covers every toolchain.
-// Measured directly on this box: Clang 22.1.5 (Windows, MSVC-ABI-compatible frontend) AND real
-// MSVC 19.51.36252 (cl.exe) independently compute the SAME value — a genuine cross-toolchain
-// measurement, not carried forward from the (unverified) numbers OpenQuestions.md previously
-// quoted. GCC is not independently confirmed on this box (no g++ installed here); Tier 1's
-// portability is asserted unconditionally because it holds by construction (FingerprintFolder
-// never reads a name — see describe.hpp), not merely by two toolchains agreeing.
+// Tier 1 was originally one golden because FingerprintFolder was name-free. F17's layout-aware
+// fold includes the nested schema fingerprint of each member, and a builtin member's nested key
+// is name-derived — so GCC/Clang and real MSVC produce different Tier-1 values. Pin each family;
+// the CI Windows toolset is MSVC 14.44 (see MSVC_VERSION).
+#if defined(_MSC_VER) && !defined(__clang__)
+inline constexpr std::uint64_t kTier1Golden = 0x27756b6f126e43f2ULL;
+inline constexpr std::uint64_t kTier1SwappedGolden = 0xec12c83ceaf59f3cULL;
+#else
 inline constexpr std::uint64_t kTier1Golden = 0x60eb68b9763e6f4cULL;
 inline constexpr std::uint64_t kTier1SwappedGolden = 0x54f52ae0703db766ULL;
+#endif
 
 // Tier 2 golden, measured on Clang (Windows box) — the branch metadata.hpp's canonical_type_name()
 // takes whenever __clang__ is defined, INCLUDING Windows Clang, which also defines _MSC_VER for
@@ -111,7 +113,7 @@ int main() {
     const std::uint64_t tier2_key = type_key_of<ConformanceTag>().value;
     const std::uint64_t tier3_key = type_key_of<ConformanceWrap<std::size_t>>().value;
 
-    // --- Tier 1: portable by construction — golden on every toolchain. ----------------------
+    // --- Tier 1: golden per compiler family (F17 nested member key is name-derived). ---------
     check(type_key_of<ConformancePoint>().value == fingerprint_v<ConformancePoint>,
           "Tier 1: type_key_of == fingerprint_v for a Described type", ok);
     check(tier1_key == kTier1Golden,
