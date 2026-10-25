@@ -1,0 +1,10 @@
+# Packages `ci/install-deps.sh` is allowed to install. Adding one is a deliberate supply-chain
+# change. Exact resolved versions are recorded in the CI SBOM (runner images are release-pinned by
+# `ci/pins.env`; a runner refresh is visible as an SBOM diff).
+g++-14
+cmake
+ninja-build
+gdb
+clang-20
+libc++-20-dev
+libc++abi-20-dev

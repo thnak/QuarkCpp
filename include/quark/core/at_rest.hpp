@@ -21,7 +21,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "quark/core/aead.hpp"
@@ -41,14 +43,14 @@ class Keyring {
 public:
     virtual ~Keyring() = default;
     // The data-key cipher for `id`. Non-owning; valid for the store's lifetime.
-    [[nodiscard]] virtual const Aead& data_key(ActorId id) noexcept = 0;
+    [[nodiscard]] virtual const Aead& data_key(ActorId id) const noexcept = 0;
 };
 
 // The default single-key ring (dev / single-tenant): one process cipher for every actor. NOT a KMS.
 class StaticKeyring final : public Keyring {
 public:
     explicit StaticKeyring(const Aead& cipher) noexcept : cipher_(&cipher) {}
-    [[nodiscard]] const Aead& data_key(ActorId) noexcept override { return *cipher_; }
+    [[nodiscard]] const Aead& data_key(ActorId) const noexcept override { return *cipher_; }
 
 private:
     const Aead* cipher_;
@@ -94,5 +96,143 @@ private:
                     "at-rest AEAD open failed (tamper / stale fencing-token splice / wrong key)");
     return out;
 }
+
+// ============================================================================================
+// Store-level context (P4): a durable record also needs the ACTOR and the RECORD KIND in
+// the AAD, or a record could be spliced between actors that share a key (StaticKeyring) or between
+// a snapshot and an event with the same seq. `fence` is bound for snapshots (the record carries it);
+// events bind actor+seq (the store's event record has no fence). Nonce = an injective hash of the
+// same context, so a record can only be opened at the position it was sealed for.
+// ============================================================================================
+enum class AtRestKind : std::uint8_t { Snapshot = 1, Event = 2 };
+
+struct AtRestContext {
+    ActorId actor{};
+    AtRestKind kind = AtRestKind::Event;
+    SeqNo seq = 0;
+    FenceToken fence{};  // snapshot only; events are position-bound by actor+seq
+};
+
+[[nodiscard]] inline std::vector<std::byte> at_rest_aad(const AtRestContext& ctx) {
+    std::vector<std::byte> aad;
+    const auto put = [&aad](std::uint64_t v) {
+        for (int b = 0; b < 8; ++b) aad.push_back(static_cast<std::byte>((v >> (b * 8)) & 0xFF));
+    };
+    put(ctx.actor.type.value);
+    put(ctx.actor.key);
+    put(static_cast<std::uint64_t>(ctx.kind));
+    put(ctx.seq);
+    put(ctx.fence.value);
+    return aad;
+}
+
+[[nodiscard]] inline std::uint64_t at_rest_nonce(const AtRestContext& ctx) noexcept {
+    std::uint64_t h = detail::hash_combine(ctx.actor.type.value, ctx.actor.key);
+    h = detail::hash_combine(h, static_cast<std::uint64_t>(ctx.kind));
+    h = detail::hash_combine(h, ctx.seq);
+    h = detail::hash_combine(h, ctx.fence.value);
+    return detail::splitmix64(h);
+}
+
+[[nodiscard]] inline std::vector<std::byte> seal_at_rest(const Aead& cipher, const AtRestContext& ctx,
+                                                         std::span<const std::byte> canonical) {
+    const std::vector<std::byte> aad = at_rest_aad(ctx);
+    std::vector<std::byte> out;
+    cipher.seal(at_rest_nonce(ctx), std::span<const std::byte>(aad), canonical, out);
+    return out;
+}
+
+[[nodiscard]] inline result<std::vector<std::byte>> open_at_rest(const Aead& cipher,
+                                                                 const AtRestContext& ctx,
+                                                                 std::span<const std::byte> sealed) {
+    const std::vector<std::byte> aad = at_rest_aad(ctx);
+    std::vector<std::byte> out;
+    if (!cipher.open(at_rest_nonce(ctx), std::span<const std::byte>(aad), sealed, out))
+        return fail(errc::serialization,
+                    "at-rest AEAD open failed (tamper / wrong actor/seq/fence / wrong key)");
+    return out;
+}
+
+// ============================================================================================
+// EncryptedStore<S> — a Store decorator that seals every durable payload at the record layer.
+// Fencing, strict seq, atomic batch and snapshot<=tail are delegated UNCHANGED; only the opaque
+// `record` bytes are transformed. Canonical 016 bytes are produced by the layer above first, so
+// schema evolution/migration is untouched. Wrap FileStore/SqliteStore/RocksStore the same way.
+// The default (unwrapped) adapters remain plaintext; see PersistenceAdapters.md for the decision.
+// ============================================================================================
+template <class S>
+class EncryptedStore {
+public:
+    EncryptedStore(S& inner, const Keyring& keys) noexcept : inner_(&inner), keys_(&keys) {}
+    EncryptedStore(const EncryptedStore&) = delete;
+    EncryptedStore& operator=(const EncryptedStore&) = delete;
+
+    [[nodiscard]] S& inner() noexcept { return *inner_; }
+    [[nodiscard]] const S& inner() const noexcept { return *inner_; }
+
+    [[nodiscard]] FenceToken acquire_fence(ActorId id) { return inner_->acquire_fence(id); }
+    [[nodiscard]] SeqNo last_seq(ActorId id) const noexcept { return inner_->last_seq(id); }
+
+    [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const {
+        auto raw = inner_->load_snapshot(id);
+        if (!raw) return std::unexpected(raw.error());
+        if (!raw->has_value()) return std::optional<SnapshotRecord>{};
+        const SnapshotRecord& rec = **raw;
+        const AtRestContext ctx{id, AtRestKind::Snapshot, rec.through_seq, rec.fence};
+        auto opened = open_at_rest(keys_->data_key(id), ctx, rec.record);
+        if (!opened) return std::unexpected(opened.error());
+        SnapshotRecord out = rec;
+        out.record = std::move(*opened);
+        return std::optional<SnapshotRecord>{std::move(out)};
+    }
+
+    [[nodiscard]] result<void> save_snapshot(ActorId id, FenceToken tok,
+                                             const SnapshotRecord& snap) {
+        const AtRestContext ctx{id, AtRestKind::Snapshot, snap.through_seq, tok};
+        SnapshotRecord sealed = snap;
+        sealed.fence = tok;
+        sealed.record = seal_at_rest(keys_->data_key(id), ctx, snap.record);
+        return inner_->save_snapshot(id, tok, sealed);
+    }
+
+    [[nodiscard]] result<void> append(ActorId id, FenceToken tok, SeqNo seq,
+                                      std::span<const std::byte> bytes) {
+        const AtRestContext ctx{id, AtRestKind::Event, seq, FenceToken{}};
+        const std::vector<std::byte> sealed = seal_at_rest(keys_->data_key(id), ctx, bytes);
+        return inner_->append(id, tok, seq, std::span<const std::byte>(sealed));
+    }
+
+    [[nodiscard]] result<void> append_batch(ActorId id, FenceToken tok,
+                                            std::span<const EventRecord> batch) {
+        std::vector<EventRecord> sealed;
+        sealed.reserve(batch.size());
+        for (const EventRecord& r : batch) {
+            const AtRestContext ctx{id, AtRestKind::Event, r.seq, FenceToken{}};
+            sealed.push_back(EventRecord{r.seq, seal_at_rest(keys_->data_key(id), ctx, r.record)});
+        }
+        return inner_->append_batch(id, tok, std::span<const EventRecord>(sealed));
+    }
+
+    [[nodiscard]] result<EventCursor> read_log(ActorId id, SeqNo from) const {
+        auto raw = inner_->read_log(id, from);
+        if (!raw) return std::unexpected(raw.error());
+        EventCursor out;
+        out.entries.reserve(raw->entries.size());
+        for (const EventRecord& r : raw->entries) {
+            const AtRestContext ctx{id, AtRestKind::Event, r.seq, FenceToken{}};
+            auto opened = open_at_rest(keys_->data_key(id), ctx, r.record);
+            if (!opened) return std::unexpected(opened.error());
+            out.entries.push_back(EventRecord{r.seq, std::move(*opened)});
+        }
+        return out;
+    }
+
+private:
+    S* inner_;
+    const Keyring* keys_;
+};
+
+static_assert(Store<EncryptedStore<InMemoryStore>>,
+              "EncryptedStore must satisfy the 012 Store concept");
 
 }  // namespace quark

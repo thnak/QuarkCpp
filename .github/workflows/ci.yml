@@ -10,9 +10,11 @@
 #               `store_load_barrier()` Dekker close-outs those specs flag as x86-TSO-proven only.
 #               GitHub's Linux arm64 hosted runners (`ubuntu-24.04-arm`) are free for public repos
 #               (GA since 2025-08) — no self-hosted runner or QEMU emulation needed.
-#  * test-windows: the Windows/x86-64 PAL backend (pal/windows_x86_64/) correctness leg, on
-#               `windows-latest` (MSVC). `msvc-release` blocks the merge, same as the Linux/arm64
-#               legs. `msvc-asan` is continue-on-error: MSVC's `/fsanitize=address` is real but has
+#  * test-windows: the Windows/x86-64 PAL backend (pal/windows_x86_64/) correctness leg, on the
+#               pinned `windows-2022` image (MSVC). The image label is release-pinned; the exact
+#               MSVC/toolset version is recorded in the supply-chain SBOM. `msvc-release` blocks the
+#               merge, same as the Linux/arm64 legs. `msvc-asan` is continue-on-error: MSVC's
+#               `/fsanitize=address` is real but has
 #               not yet been proven clean against this codebase the way the Linux ASan+UBSan leg has
 #               — it collects real signal without gating merges until that's established. TSan/UBSan
 #               have no MSVC equivalent, so Windows carries no analogue of those legs; that gap stays
@@ -33,10 +35,10 @@
 # Toolchain: Quark is C++23 and is verified on g++-14.2 + clang-20.1 (CONVENTIONS.md). The setup step
 # installs g++-14 and LLVM 20; bump these together with the locally-verified compilers. Both are
 # available from the same apt sources on arm64 Ubuntu 24.04 — no per-arch toolchain substitution.
-# Windows uses whatever MSVC ships on `windows-latest` (no pinned version); QuarkWarnings.cmake asks
-# for `/std:c++latest` rather than a fixed `/std:c++NN`, so it tracks whatever C++23 support that
-# toolset has, the same way the bring-up box (a newer/preview MSVC lacking a literal `/std:c++23`
-# flag) was verified.
+# Windows uses the pinned `windows-2022` image's MSVC (the toolset version is captured in the SBOM);
+# QuarkWarnings.cmake asks for `/std:c++latest` rather than a fixed `/std:c++NN`, so it tracks
+# whatever C++23 support that toolset has, the same way the bring-up box (a newer/preview MSVC
+# lacking a literal `/std:c++23` flag) was verified.
 name: CI
 
 on:
@@ -49,8 +51,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Supply-chain gate: fail-closed pin audit (with negative self-test), CycloneDX SBOM, and a
+  # GitHub-signed provenance attestation for the SBOM. Every test/perf job waits on this.
+  supply-chain:
+    name: supply-chain (pins, SBOM, provenance)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install toolchain (versions recorded in the SBOM)
+        run: bash ci/install-deps.sh --with-clang
+
+      - name: Audit pinned inputs + negative self-test
+        run: bash ci/check_pins.sh --self-test
+
+      - name: Generate CycloneDX SBOM + checksums
+        run: |
+          bash ci/gen_sbom.sh > sbom.json
+          python3 -m json.tool sbom.json > /dev/null
+          sha256sum sbom.json ci/pins.env ci/apt-packages.txt ci/install-deps.sh vcpkg.json > sbom.sha256
+          cat sbom.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: sbom
+          path: |
+            sbom.json
+            sbom.sha256
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        # Fork PRs have no OIDC attestation permission; the SBOM is still built/uploaded there.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          subject-path: sbom.json
+
   test:
     name: test (${{ matrix.config.name }}, ${{ matrix.arch }})
+    needs: supply-chain
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     # Safety net: the arm64 gcc/clang-release legs were observed to hang indefinitely (a real
     # non-termination, not just "slow") and got silently killed only by GitHub's 6h job cap. A
@@ -94,18 +135,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-14 cmake ninja-build gdb
-          if [[ "${{ matrix.config.cxx }}" == clang++* ]]; then
-            # Never pipe a remote script into sudo. Pin the exact script bytes; bump this hash
-            # deliberately when moving the LLVM major, in the same commit as the version change.
-            curl -fsSL -o /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-            echo "03878e08f47b66cc95bc4b544b0db3c6d9ce8d60e6cf2492ae357984330a9eae  /tmp/llvm.sh" \
-              | sha256sum -c -
-            sudo bash /tmp/llvm.sh 20
-            sudo apt-get install -y clang-20 libc++-20-dev libc++abi-20-dev || true
-          fi
+        # One pinned/hash-verified installer; never pipe a remote script into sudo. The LLVM hash,
+        # majors and the apt allowlist live in ci/pins.env + ci/apt-packages.txt (audited above).
+        run: bash ci/install-deps.sh ${{ startsWith(matrix.config.cxx, 'clang') && '--with-clang' || '' }}
 
       - name: Configure
         run: |
@@ -160,7 +192,8 @@ jobs:
 
   test-windows:
     name: test-windows (${{ matrix.config.name }})
-    runs-on: windows-latest
+    needs: supply-chain
+    runs-on: windows-2022
     timeout-minutes: 90
     continue-on-error: ${{ matrix.config.informational }}
     strategy:
@@ -217,14 +250,13 @@ jobs:
 
   perf-gate:
     name: perf-gate (023 budgets, x86-64)
+    needs: supply-chain
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-14 cmake
+        run: bash ci/install-deps.sh
 
       - name: Configure (gcc Release + bench gate)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
@@ -236,6 +268,7 @@ jobs:
 
   perf-gate-arm64:
     name: perf-gate (023 budgets, arm64, informational)
+    needs: supply-chain
     runs-on: ubuntu-24.04-arm
     # 023's Hard budgets are pinned to the x86-64 reference machine and the ARM64 ratio is explicitly
     # provisional (023 §"The reference machine"). Collect real arm64 numbers for that future
@@ -245,9 +278,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-14 cmake
+        run: bash ci/install-deps.sh
 
       - name: Configure (gcc Release + bench gate)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON

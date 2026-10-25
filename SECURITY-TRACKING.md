@@ -155,20 +155,42 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 - [~] **Supply chain: pin the remaining mutable inputs; add provenance.**
   - **Fixed:** actions pinned to SHAs; `llvm.sh` SHA-256 verified before `sudo`; mbedTLS ≥ 3.6.2
     at configure + compile time; vcpkg baseline pinned.
-  - **Open:** `apt-get install` versions, `windows-latest`/MSVC, and the LLVM hash/action-SHA
-    update process; no SBOM/signature verification.
-  - **Next:** a container image digest or pinned package versions; a documented bump procedure;
-    SBOM/provenance generation in CI.
-  - **Acceptance:** a changed upstream input fails closed until deliberately bumped; the build is
-    reproducible from pinned inputs.
-  - **Verify:** CI dry-run + a hash-mismatch negative test.
+  - **Open:** exact `apt-get`/MSVC patch versions (runner-managed); no released-binary signing.
+  - **Implemented pass 4:** one pin source `ci/pins.env`; `ci/install-deps.sh` (hash-verified LLVM
+    installer, no pipe-to-sudo, apt allowlist); `ci/check_pins.sh` fails closed on an unpinned
+    Action, a `*-latest` runner, a malformed LLVM hash, a vcpkg/mbedTLS mismatch, or an unlisted
+    apt package — with `--self-test` negative controls; `ci/gen_sbom.sh` emits CycloneDX 1.5 + file
+    hashes; the `supply-chain` CI job audits, uploads the SBOM + `sbom.sha256`, and **attests**
+    it via GitHub OIDC (pinned Action); every test/perf job is `needs: supply-chain`; Windows is
+    pinned to `windows-2022`. See [`SUPPLY-CHAIN.md`](SUPPLY-CHAIN.md).
+  - **Acceptance:** a changed declared upstream input fails closed until deliberately bumped (audit
+    + self-test); the build's exact toolchain/apt versions are recorded in the attested SBOM.
+  - **Residual:** apt/MSVC patch versions follow the release-pinned runner image and are visible in
+    the SBOM, not byte-locked; a container digest / exact package lock and release-binary signing
+    remain future distribution work.
+  - **Verify:** `bash ci/check_pins.sh --self-test` rejects a mutable action tag and a bad LLVM
+    hash, then the real audit passes; `gen_sbom.sh` emits valid CycloneDX 1.5 (18 components) on
+    the lab Linux box; the CI `supply-chain` job is the gate.
 
-- [ ] **At-rest data: document/encrypt persistence snapshots.**
-  - **Why:** `PersistenceAdapters.md` has no encryption-at-rest story; a storage reader can read
-    actor state. This is outside the network threat model but relevant to a bank.
-  - **Next:** document the storage threat, key management, and whether the adapter/volume
-    encrypts; add a deployment checklist.
-  - **Acceptance:** an explicit at-rest encryption decision and ownership are recorded.
+- [x] **At-rest data: document/encrypt persistence snapshots.**
+  - **Why:** a storage reader could read actor state; the adapter had no encryption-at-rest story.
+  - **Decision (P4):** durable records are sealed with `EncryptedStore<S>` backed by a KMS/HSM
+    `Keyring`; a bank deployment **MUST** wrap every store (`FileStore`/SQLite/RocksDB) and also
+    encrypt volumes/snapshots/backups. Plain adapters stay plaintext by default; at-rest crypto
+    links only when configured; `MockCipher` is test-only.
+  - **Implementation:** `AtRestContext` binds `(actor, kind, seq, fence)` as AEAD associated data;
+    `EncryptedStore<S>` seals snapshots/events/batches on write and opens on read, delegating
+    fencing/strict-seq/atomic-batch/snapshot≤tail unchanged. `PersistenceAdapters.md` records the
+    threat model, ownership, key management/rewrap, metadata that remains visible, and a deployment
+    checklist.
+  - **Ownership:** the platform operator owns the KMS/keys/access policy/backups/rotation; the
+    application owns the decision to wrap and the `Keyring` implementation.
+  - **Verify:** `security_at_rest_store_test` (InMemory + FileStore): raw ciphertext on disk, batch
+    sealing, real reopen/replay, tamper rejection, cross-actor splice rejection, wrong-key
+    rejection; `security_at_rest_seal_test` retains the primitive fence/seq controls.
+  - **Residual:** the envelope has no key-id and online rotation is not implemented (rewrap or a
+    dual-key `Keyring`); actor ids/sequence/size/timestamp metadata remain visible (volume
+    encryption); a compromised process/KMS is out of scope.
 
 ### P5 — coverage
 
@@ -201,6 +223,8 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 | F15 | Per-peer token bucket | `81c8d0d` | 10k flood → 1,277 admitted |
 | F16 | 4 MiB single-frame cap | `81c8d0d` | 32 MiB rejected, HWM 6.7 MB |
 | F17 | Layout-aware fingerprint + authenticated PeerSchema advert | `06c69c9`+ | `schema_probe` gate; mixed-schema tagged/reject; live mTLS tagless |
+| P4 at-rest | `EncryptedStore<S>` + KMS Keyring decision/checklist | pass 4 | store test: ciphertext/reopen/tamper/splice/wrong key |
+| P4 supply chain | Pin manifest + audit self-test + CycloneDX SBOM + attestation | pass 4 | mutable action/bad hash rejected; SBOM valid (18 components) |
 | Supply chain | Action SHAs, LLVM hash, mbedTLS version | `81c8d0d` | CI no longer pipes to sudo |
 
 ---
@@ -223,6 +247,9 @@ The production build refuses the plaintext variant before `start()`.
 | F17 schema gate | `schema_probe`: matched=1, mismatch_key=0, mismatch_abi=0 |
 | F17 mixed-schema routing | advertised tagless; mismatch→tagged; unknown TypeKey rejected |
 | F17 live 7-node mTLS | **33,564** transfers, ledger `fallbacks=0`; plaintext senders stay tagged |
+| P4 pin audit | self-test rejects mutable action + bad LLVM hash; real audit passes |
+| P4 SBOM | valid CycloneDX 1.5, 18 components, file SHA-256s |
+| P4 at-rest | InMemory+FileStore ciphertext; reopen, tamper, cross-actor, wrong key controlled |
 | 21/21 affected CTest suites + 17 targeted core | pass |
 
 Implemented in this pass:
@@ -245,6 +272,10 @@ Implemented in this pass:
 - **P3/F17:** layout-aware 016 fingerprint (member category/size/signedness/nested schema);
   authenticated post-handshake `FrameKind::Schema` advert; `Transport::peer_schema`; the
   `DistributedRouter` default provider requires an exact TypeKey+ABI match before tagless.
+- **P4 at-rest:** `EncryptedStore<S>` + `AtRestContext` AAD; KMS/HSM `Keyring` decision,
+  ownership, rotation/rewrap and deployment checklist in `PersistenceAdapters.md`.
+- **P4 supply chain:** `ci/pins.env`, `ci/install-deps.sh`, fail-closed `ci/check_pins.sh`
+  (+ self-test), CycloneDX `ci/gen_sbom.sh`, and the attested `supply-chain` CI gate.
 - **Test seam:** `DistributedRouter::tell_on()` pins the lab ledger; production routing still uses
   placement.
 
@@ -301,7 +332,10 @@ dist.register_remote<Ledger, Transfer>();
 - [ ] Treat `Membership::view()` as the convergence roster; use `placement_view()` for placement.
 - [ ] Roll schema changes as one generation; the fingerprint is layout-aware, so mixing binaries
   mixes TypeKeys and disables tagless/rejects unknown keys.
-- [ ] Pin/verify build inputs; never pipe a remote script into `sudo`.
+- [ ] Wrap every durable store in `EncryptedStore` with a KMS/HSM key; encrypt volumes and backups;
+  run `security_at_rest_store_test`; never ship `MockCipher`.
+- [ ] Pin/verify build inputs; never pipe a remote script into `sudo`; review the attested SBOM diff
+  on every pin bump.
 
 ---
 
@@ -323,4 +357,7 @@ bash run_bank_heavy.sh     # 7-node busy mTLS/plaintext + strict-refusal case
 ./fuzz_wire 2000000        # decoder fuzz clean
 ./schema_probe             # F17 gate: matched=1, mismatch_key=0, mismatch_abi=0
 bash run_f17_live.sh       # schema probe + 7-node mTLS tagless / plaintext tagged
+./security_at_rest_store_test   # P4 at-rest: ciphertext/reopen/tamper/splice/wrong key
+bash ci/check_pins.sh --self-test   # P4 supply chain: negative controls + real audit
+bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (attested in CI)
 ```

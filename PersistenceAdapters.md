@@ -47,6 +47,53 @@ checks all of them against a real reopen ("crash"):
 | **Snapshot ≤ tail** | `save_snapshot` rejects `through_seq > last_seq`. | An over-advanced checkpoint would skip un-replayed events (silent loss). |
 | **Durability (for `PersistMode::Sync`)** | An acknowledged write survives process exit / power loss (fsync before returning). | The whole point of a durable backend. |
 
+## At-rest encryption (020 §5) — the decision
+
+**Decision (P4):** the durable record layer is encrypted with `EncryptedStore<S>`
+([`at_rest.hpp`](include/quark/core/at_rest.hpp)) whenever a deployment holds data whose compromise
+matters. A bank deployment **MUST** wrap every durable adapter (`FileStore`, `SqliteStore`,
+`RocksStore`) with `EncryptedStore` backed by a KMS/HSM `Keyring`, **and** run on encrypted volumes
+with encrypted backups. The plain adapters remain plaintext by default: at-rest crypto never links
+unless the deployment opts in, and `MockCipher` is test-only framing, never production crypto.
+
+**Threat model.** Protects against a stolen disk, volume snapshot, backup, or a storage operator who
+can read files but not the live process/KMS: the canonical 016 bytes are AEAD ciphertext on disk.
+It does **not** protect against a compromised process, a compromised KMS/key, or traffic on the
+network (use the mTLS transport), and it does **not** hide metadata: actor TypeKey/key (the
+`<type>-<key>.qwal` filename), sequence numbers, record sizes/counts, fences and timestamps remain
+visible. Volume encryption covers that metadata; it is defense in depth, not a replacement.
+
+**Mechanism.** The layer above produces the canonical 016 `encode_record` bytes FIRST, so schema
+evolution/migration is untouched; `EncryptedStore` then seals only the opaque `record` bytes.
+Snapshots bind `(actor, Snapshot, through_seq, fence)`, events/batches bind `(actor, Event, seq)` in
+the AEAD associated data, and the nonce is derived from the same context. Consequently a ciphertext
+cannot be spliced onto another actor, another sequence, a snapshot vs event, or the wrong fence —
+`open_at_rest` fails and the store read errors. Fencing, strict-seq, atomic-batch and
+snapshot≤tail are delegated unchanged to the wrapped adapter.
+
+**Key management / ownership.** The platform operator owns the KMS/HSM, the per-actor (or
+per-shard) data keys, access policy, backups, and rotation. The application owns the decision to
+wrap each store and the `Keyring` implementation. `StaticKeyring` is a single-tenant dev aid, not a
+KMS. The current envelope has no key-id field: rotate by rewrap (read with the old key, seal with
+the new, atomically replace) or a dual-key `Keyring`; online rotation/key-id versioning is a
+documented seam, not implemented.
+
+**Deployment checklist.**
+
+- [ ] Every durable store is wrapped in `EncryptedStore`; no raw `FileStore`/SQLite/RocksDB handle
+      is reachable by application code.
+- [ ] `Keyring::data_key(actor)` comes from a KMS/HSM or OS keystore, not a source constant.
+- [ ] Volumes, snapshots and backups are encrypted (metadata + defense in depth).
+- [ ] Key access is least-privilege and audited; the key is not in images/logs/argv.
+- [ ] A restore drill proves an old backup opens with its key; a rotation/rewrap runbook exists.
+- [ ] Tamper/wrong-key/cross-actor controls pass (`security_at_rest_store_test`).
+- [ ] `MockCipher` is never linked into a production build.
+
+**Verification.** `security_at_rest_seal_test` proves the primitive's fence/seq AAD binding;
+`security_at_rest_store_test` proves the store decorator over both `InMemoryStore` and `FileStore`:
+raw ciphertext (no canonical bytes on disk), batch sealing, reopen/replay, tamper rejection,
+cross-actor splice rejection, and wrong-key rejection.
+
 ## The adapters
 
 | Adapter | Backing | Durable? | Dependency | Status |
