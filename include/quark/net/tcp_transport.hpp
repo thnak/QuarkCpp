@@ -248,6 +248,9 @@ private:
     struct Conn {
         NodeId peer{};
         pal::fd_t fd = pal::invalid_fd;
+        std::uint64_t peer_addr = 0;    // accepted socket's source (IPv4, host order)
+        std::uint16_t peer_port = 0;
+        bool has_peer_addr = false;
         St st = St::Connecting;
         bool initiated_by_self = false;  // did WE dial? (the dedup discriminant, 021 §2)
         bool identified = false;         // peer NodeId confirmed via hello (accept side learns it here)
@@ -389,6 +392,9 @@ private:
         c->in.set_max_body(max_frame_body_);
         c->peer = to;
         c->fd = *fd;
+        c->peer_addr = ep.addr;
+        c->peer_port = ep.port;
+        c->has_peer_addr = true;
         c->st = St::Connecting;
         c->initiated_by_self = true;
         c->identified = true;  // we know exactly who we dialed
@@ -405,7 +411,9 @@ private:
     // ---- accept path (loop thread) --------------------------------------------------------------
     void on_accept_ready() {
         for (;;) {
-            auto fd = pal::accept_one(listener_);
+            std::uint64_t peer_addr = 0;
+            std::uint16_t peer_port = 0;
+            auto fd = pal::accept_one(listener_, &peer_addr, &peer_port);
             if (!fd) break;  // would_block (drained) or a transient error — stop this batch
             if (max_pending_in_ != 0 && pending_in_.size() >= max_pending_in_) {
                 pal::close_fd(*fd);
@@ -415,6 +423,9 @@ private:
             auto c = std::make_unique<Conn>();
             c->in.set_max_body(max_frame_body_);
             c->fd = *fd;
+            c->peer_addr = peer_addr;
+            c->peer_port = peer_port;
+            c->has_peer_addr = true;
             c->st = St::Open;               // TCP already established for an accepted socket
             c->initiated_by_self = false;    // the PEER dialed us
             c->identified = false;           // learn their NodeId from their hello
@@ -541,9 +552,10 @@ private:
                 // peer; the remaining bytes below belong to its stream.
             }
             // Remaining bytes are length-prefixed frames — the "stream" reassembler emits each whole one.
-            const bool ok = c->in.feed(p, n, [this, peer = c->peer](MessageFrame f) {
+            const PeerAddress src{c->peer_addr, c->peer_port, c->has_peer_addr};
+            const bool ok = c->in.feed(p, n, [this, src](MessageFrame f) {
                 frames_received_.fetch_add(1, std::memory_order_relaxed);
-                (void)peer;
+                f.source_address = src;  // transient: never encoded, used for pre-auth admission
                 if (receiver_) receiver_(std::move(f));
             });
             if (!ok) {  // protocol error on the stream (oversized/malformed) ⇒ untrustworthy, drop

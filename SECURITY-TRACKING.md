@@ -52,7 +52,7 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 
 ### P2 — pre-auth and control-plane DoS
 
-- [~] **F13: per-IP/connection handshake cap + reserved slots.**
+- [x] **F13: per-IP/connection handshake cap + reserved slots.**
   - **Why:** the global reaper frees slots after 5s, but 256 distinct spoofed senders can still
     fill the cap for that window; `set_handshake_admission` is a NodeId predicate, not an address
     cap. The legitimate node-0 retry succeeds after the timeout (verified).
@@ -60,9 +60,14 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
     per-connection token bucket at the transport; reserve a small slot set for known/verified peers.
   - **Acceptance:** a 3000-sender flood cannot deny a known peer's handshake within the window;
     memory stays bounded; the legitimate retry remains successful.
-  - **Verify:** extend `run_slot_exhaust.sh` with a known-peer reservation. **Pass 2:** global
-    reaper + `set_handshake_admission` + `TcpTransport::set_max_pending_inbound` (default 1024)
-    are in; address-level per-IP accounting still needs the PAL accept endpoint.
+  - **Verify:** **pass 2 implemented.** `pal::accept_one` reports the accepted peer address;
+    `TcpTransport` attaches it transiently to the frame (`PeerAddress`, never serialized);
+    `SecureTransport` caps pending handshakes per source IP (default 64), reserves 16 slots for an
+    allowlisted known-peer predicate, and exposes `set_handshake_admission_addr`. Live:
+    3000 same-IP pre-auth senders → **64 pending**; the allowlisted node 0 authenticates
+    **during** the flood; an unknown peer is denied in the window and succeeds after the 5s
+    reaper. Unit: `security_wire_hardening_test::per_ip_pending_cap` (same-IP cap, different-IP
+    unaffected, reserved-slot exhaustion).
 
 - [x] **F1 (control plane): rate-limit SWIM Control frames.**
   - **Why:** the F15 bucket covers `DistributedRouter` **data** frames; a peer can still flood
@@ -188,6 +193,7 @@ The production build refuses the plaintext variant before `start()`.
 | mTLS theft / eviction / MITM | no attacker `authz`/`bank_transfer`; node 2 `status1=0` (forged `Left` rejected); AAD-patched MITM rejected |
 | 7-node plaintext lab | **26,666** busy transfers; theft=0; forged `Left` still evicts (`status1=3`) — the remaining **F1** residual |
 | strict refusal | `bank_strict` (no lab macro) with 3-node plaintext exits **3**: `Strict + multi-node ... plaintext` |
+| per-IP handshake flood | 3000 same-IP senders → **64** pending; allowlisted peer authenticates mid-flood; unknown peer succeeds after the 5s reaper |
 | 21/21 affected CTest suites | pass |
 
 Implemented in this pass:
@@ -199,7 +205,9 @@ Implemented in this pass:
   `{subject=1,rights=4}` so the local ACL admits legitimate internal work.
 - **P2:** SWIM Control token bucket (`control_rate_per_sec=4096`, `burst=1024`, fixed 256 buckets);
   unverified-member TTL reaper (30 s default; 1 ms regression test); transport pending-inbound
-  cap (1024); existing `SecureTransport` admission hook/global reaper.
+  cap (1024); **address-aware handshake admission**: PAL accept reports the peer address,
+  `TcpTransport` attaches it transiently, `SecureTransport` enforces a per-IP pending cap
+  (default 64) plus 16 reserved slots for allowlisted peering identities.
 - **P3:** `FrameStream::set_max_body()/max_body()`, `TcpTransport::set_max_frame_body()`, and
   `TcpTransport::set_max_pending_inbound()`; 4 MiB default retained.
 - **Test seam:** `DistributedRouter::tell_on()` pins the lab ledger; production routing still uses

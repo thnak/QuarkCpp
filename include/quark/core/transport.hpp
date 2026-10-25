@@ -58,6 +58,14 @@ enum class FrameKind : std::uint8_t { Data = 0, Control = 1, Authenticate = 2 };
 // the receiving node needs to (a) find the target actor, (b) decode the payload into the right type,
 // and (c) reconstruct the propagated deadline/trace — WITHOUT a schema exchange per message (that is
 // the connect-time negotiation, 016; the per-frame `mode` records its outcome).
+// Transient source address attached by a transport that knows it (TcpTransport). It is NOT part of
+// the wire format; a handshake admission hook uses it for per-IP accounting before identity exists.
+struct PeerAddress {
+    std::uint64_t addr = 0;  // IPv4, host byte order; 0 = unknown
+    std::uint16_t port = 0;
+    bool valid = false;
+};
+
 struct MessageFrame {
     NodeId from{};                     // origin node (FIFO-per-sender / reply routing seam)
     NodeId to{};                       // destination node (placement winner)
@@ -71,6 +79,7 @@ struct MessageFrame {
     Principal principal{};             // 020 ambient identity carried across the boundary; default =
                                        // anonymous. Stamped ATTENUATED from the sender's inbound context
                                        // at the wire edge; re-established as the ambient on receive.
+    PeerAddress source_address{};      // transport-local, never serialized (pre-auth per-IP accounting)
 };
 
 // The transport seam (010). Fire-and-forget by contract; ordering/at-most-once are the transport's

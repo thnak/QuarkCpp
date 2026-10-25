@@ -221,13 +221,18 @@ inline void close_fd(fd_t s) noexcept {
 
 // Accept one pending connection (non-blocking listener). Returns the accepted socket (non-blocking,
 // nodelay), or would_block() when the backlog is drained (the normal loop-exit condition).
-[[nodiscard]] inline std::expected<fd_t, std::error_code> accept_one(fd_t lfd) noexcept {
-    const fd_t s = ::accept(lfd, nullptr, nullptr);
+[[nodiscard]] inline std::expected<fd_t, std::error_code> accept_one(
+    fd_t lfd, std::uint64_t* out_addr = nullptr, std::uint16_t* out_port = nullptr) noexcept {
+    ::sockaddr_in sa{};
+    int len = sizeof(sa);
+    const fd_t s = ::accept(lfd, reinterpret_cast<::sockaddr*>(&sa), &len);
     if (s == invalid_fd) {
         const int err = ::WSAGetLastError();
         if (err == WSAEWOULDBLOCK) return std::unexpected(would_block());
         return std::unexpected(std::error_code(err, std::system_category()));
     }
+    if (out_addr) *out_addr = static_cast<std::uint64_t>(::ntohl(sa.sin_addr.s_addr));
+    if (out_port) *out_port = static_cast<std::uint16_t>(::ntohs(sa.sin_port));
     if (auto r = set_nonblocking(s); !r) {
         close_fd(s);
         return std::unexpected(r.error());

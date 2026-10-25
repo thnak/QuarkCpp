@@ -186,12 +186,18 @@ inline void close_fd(int fd) noexcept {
 
 // Accept one pending connection (non-blocking listener). Returns the accepted fd (non-blocking,
 // nodelay), or would_block() when the backlog is drained (the normal loop-exit condition).
-[[nodiscard]] inline std::expected<int, std::error_code> accept_one(int lfd) noexcept {
-    const int fd = ::accept4(lfd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+[[nodiscard]] inline std::expected<int, std::error_code> accept_one(
+    int lfd, std::uint64_t* out_addr = nullptr, std::uint16_t* out_port = nullptr) noexcept {
+    ::sockaddr_in sa{};
+    ::socklen_t len = sizeof(sa);
+    const int fd = ::accept4(lfd, reinterpret_cast<::sockaddr*>(&sa), &len,
+                             SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return std::unexpected(would_block());
         return std::unexpected(last_error());
     }
+    if (out_addr) *out_addr = static_cast<std::uint64_t>(::ntohl(sa.sin_addr.s_addr));
+    if (out_port) *out_port = static_cast<std::uint16_t>(::ntohs(sa.sin_port));
     set_nodelay(fd);
     return fd;
 }

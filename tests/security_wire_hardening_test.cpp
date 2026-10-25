@@ -289,6 +289,60 @@ void pending_handshake_cap() {
 
 }  // namespace
 
+void per_ip_pending_cap() {
+    LoopbackFabric fab;
+    LoopbackTransport node_tx{fab, NodeId{1}};
+    MockCipher cipher{1};
+    SecureTransport secure{node_tx, cipher, NodeId{1}};
+
+    auto identity = std::make_shared<const TlsIdentity>();
+    auto roots = std::make_shared<const TrustedRoots>();
+    IdentityMaterial identity_material{identity};
+    TrustStore trust{roots};
+    WantReadFactory factory;
+    secure.enable_handshake(factory, ClusterId{0xC0FFEE}, identity_material, trust);
+    secure.on_receive([](MessageFrame) {});
+    secure.set_max_pending_handshakes(8);
+    secure.set_max_pending_per_ip(3);
+    secure.set_reserved_handshake_slots(2);
+    secure.set_known_peer([](NodeId n) { return n.value == 777 || n.value == 778; });
+
+    LoopbackTransport attacker{fab, NodeId{2}};
+    auto send = [&](std::uint64_t id, std::uint64_t ip) {
+        MessageFrame f;
+        f.from = NodeId{id};
+        f.to = NodeId{1};
+        f.kind = FrameKind::Authenticate;
+        f.payload = {std::byte{0x16}, std::byte{0x03}, std::byte{0x01}};
+        f.source_address = PeerAddress{ip, 4444, true};
+        attacker.send(NodeId{1}, std::move(f));
+    };
+
+    // Same-IP flood: only 3 pending engines.
+    for (std::uint64_t i = 0; i < 3; ++i) send(2000 + i, 0x0A000001);
+    check(secure.pending_handshake_count() == 3, "same-IP pending entries are admitted up to the cap");
+    send(2003, 0x0A000001);
+    check(secure.pending_handshake_count() == 3, "same-IP flood is capped");
+
+    // A different IP is unaffected.
+    send(2004, 0x0A000002);
+    check(secure.pending_handshake_count() == 4, "a different source IP is not charged to the flood");
+
+    // Fill the general pool (8) from distinct IPs.
+    for (std::uint64_t i = 0; i < 4; ++i) send(2100 + i, 0x0A000010 + i);
+    check(secure.pending_handshake_count() == 8, "general pending pool is filled");
+    send(2200, 0x0A000020);
+    check(secure.pending_handshake_count() == 8, "unknown peer is denied when the general pool is full");
+
+    // Reserved slots let known peers through; only the configured reservation.
+    send(777, 0x0A000030);
+    check(secure.pending_handshake_count() == 9, "known peer uses a reserved slot");
+    send(778, 0x0A000031);
+    check(secure.pending_handshake_count() == 10, "second known peer uses the last reserved slot");
+    send(779, 0x0A000032);
+    check(secure.pending_handshake_count() == 10, "unreserved peer cannot exceed the reservation");
+}
+
 void custom_frame_cap() {
     net::FrameStream fs{64};
     std::array<std::byte, 4 + 65> bytes{};
@@ -309,6 +363,7 @@ int main() {
     swim_source_binding();
     checked_tagless();
     pending_handshake_cap();
+    per_ip_pending_cap();
     custom_frame_cap();
     std::printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

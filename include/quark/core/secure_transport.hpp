@@ -305,10 +305,23 @@ public:
         return sessions_.size();
     }
     // Pre-auth admission policy (optional). Called ONLY when a new Authenticate sender would create
-    // an engine; return false to reject it before the cap is consulted. A deployment can allowlist
-    // known NodeIds (reserving slots for them) and reject random spoofed ids; the default allows all.
+    // an engine; return false to reject it before the cap is consulted. The address-aware variant is
+    // preferred when the transport reports a source address; the NodeId-only variant remains for
+    // loopback/embedded transports. The default allows all.
     using HandshakeAdmission = std::function<bool(NodeId)>;
+    using HandshakeAdmissionAddr = std::function<bool(NodeId, const PeerAddress&)>;
     void set_handshake_admission(HandshakeAdmission fn) { handshake_admission_ = std::move(fn); }
+    void set_handshake_admission_addr(HandshakeAdmissionAddr fn) {
+        handshake_admission_addr_ = std::move(fn);
+    }
+    // Known peers get the reserved slots when the general pool is full and bypass the per-IP cap;
+    // they are still authenticated by the certificate during the handshake. The default is none.
+    void set_known_peer(std::function<bool(NodeId)> fn) { known_peer_ = std::move(fn); }
+    void set_max_pending_handshakes(std::size_t n) noexcept {
+        max_pending_handshakes_ = n == 0 ? 1 : n;
+    }
+    void set_max_pending_per_ip(std::size_t n) noexcept { max_pending_per_ip_ = n; }  // 0 disables
+    void set_reserved_handshake_slots(std::size_t n) noexcept { reserved_handshake_slots_ = n; }
 
     [[nodiscard]] std::uint64_t handshake_pending_dropped() const noexcept {
         return handshake_pending_dropped_.load(std::memory_order_relaxed);
@@ -419,7 +432,7 @@ private:
                 pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (pending_.size() >= kMaxPendingHandshakes) {
+            if (pending_.size() >= max_pending_handshakes_) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -438,7 +451,8 @@ private:
     // across advance() or inner_->send() — so a reentrant inbound Authenticate frame for this same peer
     // (arriving synchronously from send_authenticate_frame below) can never deadlock on pending_mu_.
     void drive_handshake(NodeId peer, std::unique_ptr<HandshakeEngine> engine,
-                         std::span<const std::byte> in) {
+                         std::span<const std::byte> in,
+                         const PeerAddress* source = nullptr, bool known = false) {
         std::vector<std::byte> out;
         const HandshakeEngine::Step step = engine->advance(in, out);
         if (step == HandshakeEngine::Step::Done) {
@@ -470,8 +484,14 @@ private:
             return;
         }
         {  // WantWrite / WantRead: store BEFORE sending, so a synchronous reentrant reply finds it.
+            PendingHandshake ph{std::move(engine), now_ns()};
+            if (source && source->valid) {
+                ph.source_ip = source->addr;
+                ph.source_ip_valid = true;
+            }
+            ph.known = known;
             std::lock_guard<std::mutex> g(pending_mu_);
-            pending_[peer.value] = PendingHandshake{std::move(engine), now_ns()};
+            pending_[peer.value] = std::move(ph);
         }
         if (!out.empty()) send_authenticate_frame(peer, std::move(out));
     }
@@ -486,7 +506,7 @@ private:
                 pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (pending_.size() >= kMaxPendingHandshakes) {
+            if (pending_.size() >= max_pending_handshakes_) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -501,6 +521,8 @@ private:
     void handle_authenticate_frame(MessageFrame frame) {
         if (!handshake_factory_) return;  // handshake disabled: ignore a stray Authenticate frame
         const NodeId peer = frame.from;
+        const PeerAddress source = frame.source_address;
+        const bool known = known_peer_ && known_peer_(peer);
         std::unique_ptr<HandshakeEngine> engine;
         {
             std::lock_guard<std::mutex> g(pending_mu_);
@@ -519,17 +541,37 @@ private:
             }
         }
         if (!engine) {  // no engine in flight ⇒ we're the server side seeing the opening message
-            if (handshake_admission_ && !handshake_admission_(peer)) {
+            bool admitted = true;
+            if (handshake_admission_addr_)
+                admitted = handshake_admission_addr_(peer, source);
+            else if (handshake_admission_)
+                admitted = handshake_admission_(peer);
+            if (!admitted) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, peer.value,
                                    "secure transport: handshake admission rejected", 0});
                 return;
             }
             std::lock_guard<std::mutex> g(pending_mu_);
-            if (pending_.size() >= kMaxPendingHandshakes) {
+            std::size_t ip_count = 0;
+            std::size_t known_count = 0;
+            for (const auto& [id, ph] : pending_) {
+                (void)id;
+                if (source.valid && ph.source_ip_valid && ph.source_ip == source.addr) ++ip_count;
+                if (ph.known) ++known_count;
+            }
+            if (pending_.size() >= max_pending_handshakes_ &&
+                (!known || known_count >= reserved_handshake_slots_)) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, peer.value,
                                    "secure transport: pending handshake cap reached", 0});
+                return;
+            }
+            if (!known && max_pending_per_ip_ != 0 && source.valid &&
+                ip_count >= max_pending_per_ip_) {
+                handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, peer.value,
+                                   "secure transport: pending handshake per-IP cap reached", 0});
                 return;
             }
             engine = handshake_factory_->create(/*is_client=*/false, self_, peer, cluster_id_,
@@ -537,7 +579,8 @@ private:
                                                 revoked_snapshot_);
             if (metrics_) metrics_->security_handshakes_attempted.inc();
         }
-        drive_handshake(peer, std::move(engine), std::span<const std::byte>(frame.payload));
+        drive_handshake(peer, std::move(engine), std::span<const std::byte>(frame.payload), &source,
+                        known);
     }
 
     void deliver(MessageFrame frame) {
@@ -698,12 +741,20 @@ private:
     struct PendingHandshake {
         std::unique_ptr<HandshakeEngine> engine;
         std::int64_t last_progress_ns = 0;
+        std::uint64_t source_ip = 0;    // per-IP accounting; valid only when source_ip_valid
+        bool source_ip_valid = false;
+        bool known = false;             // may use the reserved slots / bypass the per-IP cap
     };
     std::unordered_map<std::uint64_t, PendingHandshake> pending_;
     // A parked handshake with no progress for this long is abandoned and retried (set_handshake_timeout
     // banner above) — closes the "a lost opening frame wedges this peer permanently" gap.
     std::int64_t handshake_timeout_ns_ = 5'000'000'000;  // 5s
     HandshakeAdmission handshake_admission_;
+    HandshakeAdmissionAddr handshake_admission_addr_;
+    std::function<bool(NodeId)> known_peer_;
+    std::size_t max_pending_handshakes_ = kMaxPendingHandshakes;
+    std::size_t max_pending_per_ip_ = 64;
+    std::size_t reserved_handshake_slots_ = 16;
 
     std::atomic<std::uint64_t> sealed_{0};
     std::atomic<std::uint64_t> opened_{0};
