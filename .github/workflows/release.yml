@@ -25,7 +25,7 @@ jobs:
     name: signed release (${{ github.ref_name }})
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/thnak/quark-ci@sha256:869f9699c725ffdbfb07109896681ef3ca34b9caa0ace0e23d79eca56c6a0727
+      image: ghcr.io/thnak/quark-ci@sha256:25a8819b9dee2399a54d00e876d1a36af24242f014c56e4a5152a9a54e53ad91
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

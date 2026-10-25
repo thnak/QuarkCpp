@@ -191,7 +191,7 @@ signing; pass 8 pins the Linux base and CI image by digest.
     gh/wget/gnupg/lsb-release); the Linux test/perf/supply jobs and the release run in `CI_IMAGE`
     (digest-only); `ci-image.yml` builds/pushes a multi-arch image and prints the digest to bump;
     `check_pins.sh` rejects a mutable image tag or a non-digest base. The image is pinned as
-    `sha256:869f9699…`; a toolchain change requires a new build and digest pin.
+    `sha256:25a8819b…`; a toolchain change requires a new build and digest pin.
   - **Acceptance:** a changed declared upstream input fails closed until deliberately bumped (audit
     + self-test); the build's exact toolchain/apt/MSVC versions are recorded in the attested SBOM;
     release artifacts have a verifiable Sigstore signature bound to this workflow; Linux jobs run
