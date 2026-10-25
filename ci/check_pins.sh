@@ -112,13 +112,15 @@ PY
         case "$pkg" in
             "g++-${GCC_MAJOR}"|cmake|ninja-build|gdb|"clang-${CLANG_MAJOR}"|\
             "libc++-${CLANG_MAJOR}-dev"|"libc++abi-${CLANG_MAJOR}-dev"|\
-            git|curl|ca-certificates|python3|gh|wget|gnupg|lsb-release) ;;
+            git|curl|ca-certificates|python3|gh|wget|gnupg|lsb-release|\
+            software-properties-common) ;;
             *) fail "ci/apt-packages.txt: unlisted package '$pkg'" ;;
         esac
     done < "$root/ci/apt-packages.txt"
     for pkg in "g++-${GCC_MAJOR}" cmake ninja-build gdb "clang-${CLANG_MAJOR}" \
                "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev" \
-               git curl ca-certificates python3 gh wget gnupg lsb-release; do
+               git curl ca-certificates python3 gh wget gnupg lsb-release \
+               software-properties-common; do
         grep -Fq "${pkg}=" "$root/ci/apt-packages.txt" ||
             fail "ci/apt-packages.txt is missing the locked package '$pkg'"
     done

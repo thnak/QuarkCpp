@@ -44,7 +44,7 @@ install_locked() {
 $SUDO apt-get update
 # Toolchain + the container/job prerequisites (checkout/HTTP, Python audit/SBOM, release CLI).
 install_locked "g++-${GCC_MAJOR}" cmake ninja-build gdb \
-    git curl ca-certificates python3 gh wget gnupg lsb-release
+    git curl ca-certificates python3 gh wget gnupg lsb-release software-properties-common
 
 if ((with_clang)); then
     curl -fsSL -o /tmp/llvm.sh https://apt.llvm.org/llvm.sh
