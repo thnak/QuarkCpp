@@ -142,6 +142,14 @@ inline void encode_frame_body(const MessageFrame& f, std::vector<std::byte>& out
 // ================================================================================================
 class FrameStream {
 public:
+    explicit FrameStream(std::uint32_t max_body = max_frame_body) noexcept
+        : max_body_(max_body == 0 ? 1 : max_body) {}
+
+    // Per-transport override (call before start(); a smaller deployment cap rejects oversized
+    // frames without buffering them). 0 is clamped to 1.
+    void set_max_body(std::uint32_t n) noexcept { max_body_ = n == 0 ? 1 : n; }
+    [[nodiscard]] std::uint32_t max_body() const noexcept { return max_body_; }
+
     // Append `n` bytes just recv()'d, then drain every whole frame now available, calling
     // `on_frame(MessageFrame&&)` for each in arrival order. Returns false on a PROTOCOL ERROR
     // (an oversized length prefix, or a body that fails to decode) — the caller must drop the
@@ -154,7 +162,7 @@ public:
         for (;;) {
             if (buf_.size() - pos < 4) break;  // not even a full length prefix yet
             const std::uint32_t body_len = read_u32(&buf_[pos]);
-            if (body_len > max_frame_body) return false;  // protocol error: implausible frame size
+            if (body_len > max_body_) return false;  // protocol error: implausible frame size
             if (buf_.size() - pos < 4u + body_len) break;  // partial frame — wait for more bytes
             std::optional<MessageFrame> f =
                 decode_frame_body(std::span<const std::byte>(&buf_[pos + 4], body_len));
@@ -177,6 +185,7 @@ private:
                                          << (8 * i);
         return v;
     }
+    std::uint32_t max_body_ = max_frame_body;
     std::vector<std::byte> buf_;
 };
 

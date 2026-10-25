@@ -136,6 +136,14 @@ public:
         return DistRef<A>{actor_id_of<A>(key), this};
     }
 
+    // Test/harness seam: send to a specific owner, bypassing HRW placement. Production routing
+    // uses `get<A>(key).tell(...)`; this pins a ledger node in the live security lab when the
+    // cluster has more nodes than the actor's HRW owner would pick.
+    template <class A, class M>
+    void tell_on(NodeId owner, std::uint64_t key, M&& m) {
+        send_remote<A>(owner, actor_id_of<A>(key), std::forward<M>(m));
+    }
+
     // Register message type `M` (in actor `A`'s protocol) as remotely receivable ON THIS NODE: wires
     // the inbound decode+post thunk so a frame for (A, M) that lands here is decoded and delivered.
     // Every node that may HOST an `A` must register its remotely-sent messages (008 Validation: a

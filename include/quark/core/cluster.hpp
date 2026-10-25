@@ -55,6 +55,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -497,6 +499,13 @@ public:
         std::int64_t tombstone_probe_interval_ns = 500'000'000;  // min spacing per tombstone
         std::uint32_t tombstone_probe_budget = 2;                // probe-backs per tick
         std::uint32_t verify_ping_budget = 16;                   // verify pings per tick
+        // P2: pre-auth/control-plane budget. A peer cannot flood Control/Gossip frames faster than
+        // this (fixed 256-bucket table; spoofed ids collide rather than growing memory). 0 disables.
+        std::uint32_t control_rate_per_sec = 4096;
+        std::uint32_t control_burst = 1024;
+        // P2: gossip-only (unverified) members that never answer directly are erased after this.
+        // 0 disables the reaper. Placement already excludes them; this bounds the convergence view.
+        std::int64_t unverified_ttl_ns = 30'000'000'000;
     };
 
     // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
@@ -671,6 +680,7 @@ public:
         const std::int64_t now = now_ns();
         reap_suspects(now);   // Suspect → Dead once the suspicion timeout lapses with no refutation
         reap_tombstones(now);  // erase tombstones older than tombstone_ttl_ns
+        reap_unverified(now);  // P2: drop gossip-only members that never answered
         drive_probe(now);     // resolve/escalate the in-flight probe by virtual time
         start_probe(now);     // begin a new direct probe of the next peer
         send_verifies();      // directly re-check peers that gossip (not we) reported Dead
@@ -693,6 +703,9 @@ public:
     // Tombstone diagnostics (driving thread only; 009 observability / ADR-048 tests).
     [[nodiscard]] std::uint32_t tombstone_count() const noexcept { return tomb_count_; }
     [[nodiscard]] bool is_known(NodeId n) const { return members_.contains(n.value); }
+    [[nodiscard]] std::uint64_t control_sheds() const noexcept {
+        return control_sheds_.load(std::memory_order_relaxed);
+    }
 
 private:
     // Where an update came from — precedence depends on it (ADR-048): only Local may create a Dead
@@ -715,6 +728,7 @@ private:
         // placement view and are NOT re-gossiped until they answer directly. This prevents a peer
         // from minting ghost nodes that receive placed actors (F12).
         bool verified = false;
+        std::int64_t first_seen_ns = 0;  // P2: start of the unverified TTL
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -731,6 +745,8 @@ private:
         if (c.ack_timeout_ns <= 0) c.ack_timeout_ns = 1;  // bucket() divides by indirect_ns()
         if (c.indirect_timeout_ns < 0) c.indirect_timeout_ns = 0;
         if (c.max_live_members == 0) c.max_live_members = 4096;
+        if (c.control_burst == 0) c.control_burst = 1;
+        if (c.unverified_ttl_ns < 0) c.unverified_ttl_ns = 0;
         return c;
     }
     static constexpr bool is_tomb(MemberStatus s) noexcept {
@@ -850,6 +866,12 @@ private:
             return;
         }
         if (!online_) return;  // crashed node ignores control (stops acking)
+        // P2: a fixed, per-sender Control-frame budget before decode/handle. Gossip and probe traffic
+        // is far below this; a flood is shed here rather than driving republish/probe work.
+        if (!admit_control(f.from, now_ns())) {
+            control_sheds_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         ControlMsg m;
         if (!detail::decode_control(f.payload.data(), f.payload.size(), m)) return;  // malformed → drop
         handle_control(m, f.from);
@@ -1192,6 +1214,7 @@ private:
             m.incarnation = inc;
             m.status = st;
             m.verified = first_hand;
+            m.first_seen_ns = now;
             set_tx(m, m.verified ? piggyback_count() : 0);  // do not re-gossip unverified ghosts
             if (is_tomb(st)) {
                 m.death_ns = now;
@@ -1313,6 +1336,21 @@ private:
         }
     }
 
+    // P2: erase member-table entries learned only from gossip that never produced first-hand
+    // evidence within the TTL. They remain absent from placement anyway; this bounds the convergence
+    // view and the probe/digest work a ghost flood can create.
+    void reap_unverified(std::int64_t now) {
+        if (cfg_.unverified_ttl_ns <= 0) return;
+        const std::size_t erased = std::erase_if(members_, [&](const auto& kv) {
+            const Member& m = kv.second;
+            return kv.first != self_.value && !m.verified && !is_tomb(m.status) &&
+                   now - m.first_seen_ns >= cfg_.unverified_ttl_ns;
+        });
+        if (erased == 0) return;
+        ids_dirty_ = true;
+        republish();
+    }
+
     // Hard cap on tombstones: evict Dead before Left, oldest death first (ties by lower id).
     void enforce_tomb_cap() {
         while (tomb_count_ > cfg_.max_tombstones) {
@@ -1358,6 +1396,32 @@ private:
     // (SWIM's time-bounded-detection property), the per-round order seeded so it is deterministic but
     // not a fixed bias. Rebuilds when the round is exhausted; peers tombstoned or erased since the
     // round was built are skipped (one rebuild at most per call).
+    struct ControlBudget {
+        std::int64_t last_ns = 0;
+        std::uint64_t tokens = 0;
+    };
+
+    [[nodiscard]] bool admit_control(NodeId from, std::int64_t now) noexcept {
+        if (cfg_.control_rate_per_sec == 0) return true;
+        const std::size_t idx = static_cast<std::size_t>(
+            (from.value * 0x9E3779B97F4A7C15ULL) >> 56) & 255;
+        ControlBudget& b = control_budgets_[idx];
+        if (b.last_ns == 0) {
+            b.last_ns = now;
+            b.tokens = cfg_.control_burst;
+        } else if (now > b.last_ns) {
+            const std::uint64_t dt = static_cast<std::uint64_t>(
+                std::min<std::int64_t>(now - b.last_ns, 1'000'000'000LL));
+            b.tokens = std::min<std::uint64_t>(
+                cfg_.control_burst,
+                b.tokens + dt * cfg_.control_rate_per_sec / 1'000'000'000ULL);
+            b.last_ns = now;
+        }
+        if (b.tokens == 0) return false;
+        --b.tokens;
+        return true;
+    }
+
     [[nodiscard]] std::optional<NodeId> next_probe_target() {
         for (int attempt = 0; attempt < 2; ++attempt) {
             if (probe_order_idx_ >= probe_order_.size()) {
@@ -1445,6 +1509,8 @@ private:
     mutable std::mutex mu_;
     std::shared_ptr<const std::vector<NodeId>> snapshot_;
     std::shared_ptr<const std::vector<NodeId>> verified_snapshot_;
+    std::array<ControlBudget, 256> control_budgets_{};
+    std::atomic<std::uint64_t> control_sheds_{0};
     std::uint64_t epoch_ = 0;
 };
 

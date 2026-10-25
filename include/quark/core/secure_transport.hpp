@@ -260,6 +260,8 @@ public:
     }
 
     // Register the real receiver; interpose the open + replay check.
+    [[nodiscard]] bool is_plaintext() const noexcept override { return false; }
+
     void on_receive(std::function<void(MessageFrame)> cb) override {
         receiver_ = std::move(cb);
         inner_->on_receive([this](MessageFrame frame) { this->deliver(std::move(frame)); });

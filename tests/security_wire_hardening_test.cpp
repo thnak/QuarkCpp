@@ -5,7 +5,9 @@
 //      tombstone a third party, and frames addressed elsewhere are not applied.
 //   3. Untrusted tagless payloads are bounds-checked (a truncated declared length is dropped).
 //   4. Pre-auth handshake state is bounded (no unbounded `pending_` growth from spoofed senders).
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -14,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -23,6 +26,7 @@
 #include "quark/core/handshake.hpp"
 #include "quark/core/secure_transport.hpp"
 #include "quark/core/tls_identity.hpp"
+#include "quark/net/wire_codec.hpp"
 #include "quark/core/transport.hpp"
 #include "quark/core/wire.hpp"
 
@@ -108,6 +112,9 @@ void swim_source_binding() {
     LoopbackFabric fab;
     SwimMembership::Config cfg;
     cfg.cluster_id = ClusterId{0xC0FFEE};
+    cfg.control_rate_per_sec = 1;       // deliberate low rate for the flood regression
+    cfg.control_burst = 8;
+    cfg.unverified_ttl_ns = 1'000'000;  // 1 ms, so the ghost reaper is observable
     LoopbackTransport node_tx{fab, NodeId{1}};
     SwimMembership swim{NodeId{1}, node_tx, cfg};
     LoopbackTransport attacker{fab, NodeId{2}};
@@ -178,6 +185,34 @@ void swim_source_binding() {
     for (NodeId n : swim.placement_view().nodes())
         if (n.value == 4242) in_placement_after = true;
     check(in_placement_after, "first-hand Ack verifies the member for placement");
+
+    // (g) P2: a gossip-only member that never answers is reaped after the TTL. Send it before the
+    // flood so the deliberately tiny burst does not shed it.
+    ControlMsg ghost;
+    ghost.kind = ControlKind::Gossip;
+    ghost.cluster = cfg.cluster_id;
+    ghost.from = NodeId{2};
+    ghost.updates.push_back(MemberUpdate{5555, 1,
+                                         static_cast<std::uint8_t>(MemberStatus::Alive)});
+    send_control(NodeId{2}, NodeId{1}, ghost);
+    check(swim.is_known(NodeId{5555}), "unverified ghost is known before the TTL");
+
+    // (h) P2: a control-frame flood is shed by the fixed per-sender budget.
+    for (int i = 0; i < 100; ++i) {
+        ControlMsg g;
+        g.kind = ControlKind::Gossip;
+        g.cluster = cfg.cluster_id;
+        g.from = NodeId{2};
+        g.updates.push_back(MemberUpdate{
+            static_cast<std::uint64_t>(10000 + i), 1,
+            static_cast<std::uint8_t>(MemberStatus::Alive)});
+        send_control(NodeId{2}, NodeId{1}, g);
+    }
+    check(swim.control_sheds() > 0, "control-frame flood is rate-limited");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    swim.tick();
+    check(!swim.is_known(NodeId{5555}), "unverified ghost is reaped after the TTL");
 }
 
 // ---- 3. Checked tagless decode -----------------------------------------------------------------
@@ -254,11 +289,27 @@ void pending_handshake_cap() {
 
 }  // namespace
 
+void custom_frame_cap() {
+    net::FrameStream fs{64};
+    std::array<std::byte, 4 + 65> bytes{};
+    const std::uint32_t len = 65;
+    for (int i = 0; i < 4; ++i)
+        bytes[static_cast<std::size_t>(i)] =
+            static_cast<std::byte>((len >> (8 * i)) & 0xFFu);
+    bool called = false;
+    const bool accepted =
+        fs.feed(bytes.data(), bytes.size(), [&](MessageFrame&&) { called = true; });
+    check(!accepted, "custom max_frame_body rejects an oversized prefix");
+    check(!called, "oversized frame is never emitted");
+    check(fs.max_body() == 64, "max_body reports the configured cap");
+}
+
 int main() {
     aad_coverage();
     swim_source_binding();
     checked_tagless();
     pending_handshake_cap();
+    custom_frame_cap();
     std::printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

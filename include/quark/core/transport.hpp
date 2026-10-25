@@ -88,6 +88,10 @@ public:
     // handed to `cb` (the distributed router's `deliver`).
     virtual void on_receive(std::function<void(MessageFrame)> cb) = 0;
 
+    // Security posture (020/013). The plaintext dev transport is `true`; a secure transport (mTLS)
+    // overrides it to `false`. Startup validation uses this to refuse Strict + multi-node + plaintext.
+    [[nodiscard]] virtual bool is_plaintext() const noexcept { return true; }
+
     // ADR-046 cross-node backpressure — the 010 open question this resolves. Called by
     // `DistributedRouter::send_remote` BEFORE `send()`, on the CALLER's thread, so a congested peer
     // is stalled/shed before a frame is even constructed for the wire. Default: never throttle — a

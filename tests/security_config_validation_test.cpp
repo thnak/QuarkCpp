@@ -6,6 +6,7 @@
 // CONTROL (adversarial, must FIRE): the exact forbidden combination (Strict + distributed + plaintext)
 // returns an error; flipping ANY one of the three conditions makes it pass — isolating the rule.
 #include <cstdio>
+#include <functional>
 
 #include "quark/core/engine_config.hpp"
 #include "quark/core/security.hpp"
@@ -19,6 +20,12 @@ void check(bool c, const char* what, bool& ok) {
         ok = false;
     }
 }
+struct TestTransport final : Transport {
+    bool plain = true;
+    void send(NodeId, MessageFrame) override {}
+    void on_receive(std::function<void(MessageFrame)>) override {}
+    [[nodiscard]] bool is_plaintext() const noexcept override { return plain; }
+};
 }  // namespace
 
 int main() {
@@ -56,6 +63,13 @@ int main() {
         check(cfg.has_value(), "base engine config validates", ok);
         const auto sec = validate_security(cfg->security_mode, /*cluster*/ 4, /*plaintext*/ true);
         check(!sec.has_value(), "startup rejects the distributed plaintext Strict deployment", ok);
+
+        TestTransport tx;
+        check(!validate_startup_security(cfg->security_mode, 4, tx).has_value(),
+              "validate_startup_security rejects a plaintext Transport", ok);
+        tx.plain = false;
+        check(validate_startup_security(cfg->security_mode, 4, tx).has_value(),
+              "validate_startup_security admits a secure Transport", ok);
     }
 
     std::printf("security_config_validation_test: %s\n", ok ? "OK" : "FAIL");

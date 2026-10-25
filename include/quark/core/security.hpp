@@ -20,7 +20,8 @@
 
 #include "quark/core/engine_config.hpp"  // SecurityMode (013)
 #include "quark/core/error.hpp"
-#include "quark/core/principal.hpp"  // Principal + attenuation algebra (020 §3)
+#include "quark/core/principal.hpp"
+#include "quark/core/transport.hpp"  // Principal + attenuation algebra (020 §3)
 
 namespace quark {
 
@@ -38,6 +39,15 @@ namespace quark {
                     "Strict + multi-node cluster forbids the plaintext dev transport (020 §2)");
     }
     return {};
+}
+
+// Startup helper: pair the configured posture with the ACTUAL transport. A node must call this
+// before `Transport::start()`/`Engine::start()`; `Strict + cluster_size > 1 + plaintext` is refused.
+// `Transport::is_plaintext()` is false for SecureTransport and true for the dev TCP transport.
+[[nodiscard]] inline result<void> validate_startup_security(SecurityMode mode,
+                                                            std::size_t cluster_size,
+                                                            const Transport& transport) noexcept {
+    return validate_security(mode, cluster_size, transport.is_plaintext());
 }
 
 }  // namespace quark

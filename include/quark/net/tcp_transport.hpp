@@ -85,6 +85,18 @@ public:
     // Teach the transport where a peer LISTENS, so a lazy dial to it can resolve an address. Fed from
     // 021 Discovery/seeds + SWIM gossip in a full deployment; called directly in a test. Thread-safe
     // before start(); after start() it is marshalled onto the loop.
+    // Per-transport single-frame body cap (default net::max_frame_body). Call before start().
+    void set_max_frame_body(std::uint32_t n) noexcept {
+        max_frame_body_ = n == 0 ? 1 : n;
+        if (started_.load(std::memory_order_acquire))
+            io_.post([this] {
+                for (auto& [id, c] : conns_) c->in.set_max_body(max_frame_body_);
+            });
+    }
+
+    // Bound unidentified inbound sockets (a pre-auth connection flood). 0 disables the cap.
+    void set_max_pending_inbound(std::uint32_t n) noexcept { max_pending_in_ = n; }
+
     void add_peer(Endpoint ep) {
         if (started_.load(std::memory_order_acquire))
             io_.post([this, ep] { peers_[ep.node.value] = ep; });
@@ -374,6 +386,7 @@ private:
         auto fd = pal::tcp_connect(ep.addr, ep.port);
         if (!fd) return nullptr;
         auto c = std::make_unique<Conn>();
+        c->in.set_max_body(max_frame_body_);
         c->peer = to;
         c->fd = *fd;
         c->st = St::Connecting;
@@ -394,7 +407,13 @@ private:
         for (;;) {
             auto fd = pal::accept_one(listener_);
             if (!fd) break;  // would_block (drained) or a transient error — stop this batch
+            if (max_pending_in_ != 0 && pending_in_.size() >= max_pending_in_) {
+                pal::close_fd(*fd);
+                drops_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             auto c = std::make_unique<Conn>();
+            c->in.set_max_body(max_frame_body_);
             c->fd = *fd;
             c->st = St::Open;               // TCP already established for an accepted socket
             c->initiated_by_self = false;    // the PEER dialed us
@@ -1032,6 +1051,8 @@ private:
     NodeId self_;
     std::uint64_t bind_addr_;
     std::uint16_t bind_port_;
+    std::uint32_t max_frame_body_ = max_frame_body;
+    std::uint32_t max_pending_in_ = 1024;
     pal::fd_t listener_ = pal::invalid_fd;
 
     pal::IoContext io_;
