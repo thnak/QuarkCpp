@@ -121,8 +121,26 @@ public:
             relays_[peer.value] = relay_ep;
     }
 
-    // Bind + listen + spawn the I/O thread. Returns false if the listener could not be opened.
+    // F1: a bare plaintext TCP transport is DEV-ONLY. It refuses to start unless either an
+    // authenticating wrapper (SecureTransport) marked it or the application explicitly opted into
+    // insecure dev mode. This is a second, structural gate behind `validate_startup_security`:
+    // forgetting that call cannot silently expose a plaintext multi-node cluster.
+    void set_authenticated_transport(bool authenticated) noexcept override {
+        authenticated_transport_ = authenticated;
+    }
+    void set_allow_insecure_plaintext(bool allow) noexcept { allow_insecure_plaintext_ = allow; }
+    [[nodiscard]] bool plaintext_start_refused() const noexcept { return plaintext_start_refused_; }
+
+    // Bind + listen + spawn the I/O thread. Returns false if the listener could not be opened OR if
+    // this is an unauthenticated plaintext transport that was not explicitly opted into dev mode.
     bool start() {
+        plaintext_start_refused_ = false;
+#ifndef QUARK_ALLOW_INSECURE
+        if (!authenticated_transport_ && !allow_insecure_plaintext_) {
+            plaintext_start_refused_ = true;  // F1: fail closed; see set_allow_insecure_plaintext()
+            return false;
+        }
+#endif
         auto lfd = pal::tcp_listen(bind_addr_, bind_port_);
         if (!lfd) return false;
         listener_ = *lfd;
@@ -239,6 +257,9 @@ public:
     [[nodiscard]] std::uint64_t connections_open() const noexcept { return conns_open_.load(); }
 
 private:
+    bool authenticated_transport_ = false;    // F1: set by SecureTransport before the inner starts
+    bool allow_insecure_plaintext_ = false;   // F1: explicit dev opt-in only
+    bool plaintext_start_refused_ = false;    // F1: diagnostic for a refused start()
     // Connecting: TCP connect in flight (dialer) — EPOLLOUT pending. Open: usable, frames flow.
     // Backoff: the socket died and a jittered reconnect timer is armed; the Conn object PERSISTS (with
     // its queued frames) but has no fd — a send queues, a reconnect revives it. There is no "Dead" map

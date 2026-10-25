@@ -46,6 +46,10 @@ foreach(src ${QUARK_TEST_SOURCES})
   endif()
   add_executable(${name} "${src}")
   target_link_libraries(${name} PRIVATE quark::quark quark_warnings Threads::Threads)
+  # The test suite is a DEV build: direct TcpTransport is an explicitly opted-in plaintext
+  # transport (F1). Production builds must omit this and use SecureTransport; the dedicated
+  # security_plaintext_transport_refusal_control below builds WITHOUT it to prove the refusal.
+  target_compile_definitions(${name} PRIVATE QUARK_ALLOW_INSECURE)
   add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
@@ -336,4 +340,16 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(swim_chaos_node netem/swim_chaos_node.cpp)
   target_link_libraries(swim_chaos_node PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(swim_chaos_node PRIVATE QUARK_ALLOW_INSECURE)  # F1: dev plaintext
+endif()
+
+# F1 negative control: built WITHOUT QUARK_ALLOW_INSECURE. A bare plaintext TcpTransport must
+# refuse start(); the explicit dev setter and a SecureTransport-wrapped inner must be allowed.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/security_plaintext_transport_refusal_control.cpp")
+  add_executable(security_plaintext_transport_refusal_control
+                 security_plaintext_transport_refusal_control.cpp)
+  target_link_libraries(security_plaintext_transport_refusal_control
+                        PRIVATE quark::quark quark_warnings Threads::Threads)
+  add_test(NAME security_plaintext_transport_refusal_control
+           COMMAND security_plaintext_transport_refusal_control)
 endif()

@@ -107,6 +107,12 @@ public:
     // overrides it to `false`. Startup validation uses this to refuse Strict + multi-node + plaintext.
     [[nodiscard]] virtual bool is_plaintext() const noexcept { return true; }
 
+    // F1: an AUTHENTICATING wrapper (SecureTransport/mTLS) marks the transport it wraps. A bare
+    // plaintext TCP transport refuses to start unless the application explicitly opts into dev mode
+    // (`TcpTransport::set_allow_insecure_plaintext`), so a forgotten `validate_startup_security`
+    // call cannot silently expose a multi-node cluster. Default no-op for non-network transports.
+    virtual void set_authenticated_transport(bool /*authenticated*/) noexcept {}
+
     // F17 schema negotiation. A secure transport advertises this node's decodable message TypeKeys +
     // ABI to an AUTHENTICATED peer after the handshake, and exposes the peer's advertisement here.
     // Default: unsupported/unknown ⇒ the DistributedRouter stays on canonical tagged (safe).

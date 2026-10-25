@@ -23,10 +23,12 @@ injection, and a wire-principal reclaim crash.
 **Patched in this change:** AEAD AAD coverage, SWIM control-plane sender binding, third-party
 `Left` rejection, `to` validation, pre-auth handshake caps, bounds-checked tagless decode.
 
-**Remaining (design/config, not safely patchable in one wire change):** the plaintext transport is
-still unauthenticated by design; a `Principal` carried by a peer is still self-asserted (an
-authenticated node can claim `rights`); `SecurityMode::Strict` is not wired into startup; the
-ADR-044 `pool.sink()` sample pattern is unsafe for principal-bearing wire traffic.
+**Remaining (design/config, not safely patchable in one wire change):** the plaintext DEV transport
+is still unauthenticated by design, but it now refuses to start in a production build unless
+explicitly opted into dev mode (F1 mitigated); a `Principal` carried by a peer is still self-asserted
+(an authenticated node can claim `rights`); `SecurityMode::Strict` is wired through
+`validate_startup_security` plus the transport gate; the ADR-044 `pool.sink()` sample pattern is
+unsafe for principal-bearing wire traffic.
 
 **Post-patch verification:** 18 targeted CTest suites + `security_wire_hardening_test` pass; the
 MITM principal patch now fails the AEAD tag; forged `Left` over mTLS is rejected; malformed
@@ -38,7 +40,7 @@ tagless frames are dropped; pending handshakes cap at 256.
 
 | ID | Severity | Finding | Status |
 |---|---|---|---|
-| F1 | Critical | Plaintext cluster accepts unauthenticated HELLO + Data/Control frames; anyone can move money | Open (config: use mTLS + enforce Strict) |
+| F1 | Critical | Plaintext cluster accepts unauthenticated HELLO + Data/Control frames; anyone can move money | **Mitigated** (Strict refusal + transport default deny; dev opt-in only) |
 | F2 | Critical | Authenticated peer can self-assert `Principal.subject/rights`; insider steals with `rights=0x4` | Open (design: bind principal to peer) |
 | F3 | Critical | AEAD AAD omits `principal`, `mode`, `kind`, `deadline_ns`, `trace_id`; on-path attacker rewrites authz input | **Patched** |
 | F4 | High | SWIM trusts payload `m.from`/`m.subject`, not the authenticated frame sender; forged `Left` evicts the ledger | **Patched** (authenticated links) |
@@ -46,7 +48,7 @@ tagless frames are dropped; pending handshakes cap at 256.
 | F6 | High | Pre-auth `pending_` handshakes never capped/reaped; spoofed `from` ids grow memory without bound | **Patched** |
 | F7 | High | No `f.to == self_` validation; a frame addressed to another node is applied locally | **Patched** |
 | F8 | **Critical (RCE)** | ADR-044 envelope reclaim with the sample-default `pool.sink()` calls `principal.subject` as a function pointer; attacker chose `hijack()` and executed it | **RCE proven** (no-PIE victim); framework default still unsafe |
-| F9 | Medium | `SecurityMode::Strict` is not enforced anywhere outside tests | Open (config wiring) |
+| F9 | Medium | `SecurityMode::Strict` is not enforced anywhere outside tests | **Mitigated** (`validate_startup_security` + transport start gate) |
 
 ---
 
@@ -54,8 +56,8 @@ tagless frames are dropped; pending handshakes cap at 256.
 
 The default `TcpTransport` accepts a HELLO naming **any** NodeId and then processes Data/Control
 frames from that connection. There is no challenge, no key, and no check that `frame.from` matches
-the HELLO identity. The protected `SecureTransport` is opt-in only; `SecurityMode::Strict` does not
-reject plaintext at startup (F9), and every sample 15–21 runs plaintext.
+the HELLO identity. The protected `SecureTransport` is opt-in only; `SecurityMode::Strict` did not
+reject plaintext at startup (F9), and samples 15–21 demonstrate the plaintext dev transport.
 
 Reproducer: `bank_attack.py` connects with HELLO `666`, sends a Transfer for actor `Bank` with
 `principal.rights=0x4`.
@@ -74,6 +76,16 @@ this is a valid transfer set, not a corrupted sum.
 **Fix direction:** treat plaintext as dev-only at runtime (wire `validate_security` into
 `validate_engine_config`/bootstrap), and never run a multi-node ledger on an unauthenticated
 transport. F3/F5/F7 reduce the damage but cannot authenticate a plaintext peer.
+
+**Mitigated (pass 6).** `validate_startup_security(Strict, cluster>1, transport)` rejects plaintext
+before start; additionally, `TcpTransport::start()` now **fails closed in a production build**
+unless the transport was marked by an authenticating wrapper (`SecureTransport`) or the caller
+explicitly opted into dev mode (`set_allow_insecure_plaintext(true)` / build-wide
+`QUARK_ALLOW_INSECURE`). The test suite and samples 15–21 define the dev macro; sample 22 is the
+mTLS/Strict reference. `security_plaintext_transport_refusal_control` is built **without** the macro
+and proves: bare start refused, explicit dev start allowed but still Strict-unsafe, and a
+SecureTransport-wrapped inner allowed. A plaintext peer is still unauthenticated by design, so the
+dev opt-in must never be used for a multi-node ledger; production needs mTLS.
 
 ---
 

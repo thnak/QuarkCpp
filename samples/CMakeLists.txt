@@ -16,5 +16,8 @@ foreach(dir ${_quark_sample_dirs})
   if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${dir}" AND EXISTS "${_main}")
     add_executable(${dir} "${_main}")
     target_link_libraries(${dir} PRIVATE quark::quark quark_warnings Threads::Threads)
+    # Samples 15-21 demonstrate the DEV plaintext transport; F1 requires an explicit opt-in.
+    # Production code uses sample 22's SecureTransport + SecurityMode::Strict.
+    target_compile_definitions(${dir} PRIVATE QUARK_ALLOW_INSECURE)
   endif()
 endforeach()

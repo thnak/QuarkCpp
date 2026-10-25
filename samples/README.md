@@ -57,6 +57,12 @@ taskset -c 0-3 build/samples/08_cluster_two_nodes
 Each prints its results and exits `0` on success (`OK`) / `1` on failure (`FAIL`), so they double as
 smoke checks. To build just one: `cmake --build build --target 03_pipeline`.
 
+> **Security (F1):** samples 15–21 demonstrate the **dev-only plaintext** `TcpTransport`; the sample
+> CMake compiles them with `QUARK_ALLOW_INSECURE`. A production build's bare `TcpTransport` refuses
+> `start()` unless a `SecureTransport` marks its inner. For any multi-node deployment use sample 22
+> (`22_tcp_secure_transport`, mTLS) together with `SecurityMode::Strict` and
+> `validate_startup_security`; never ship the dev opt-in.
+
 ## The shape every sample shares
 
 ```cpp

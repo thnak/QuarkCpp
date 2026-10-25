@@ -1,7 +1,7 @@
 # Security Remediation Tracking
 
 **Source:** `SECURITY-FINDINGS.md` (live plaintext + real-mTLS bank cluster attack pass)  
-**Updated:** 2026-10-25 (pass 2: 7-node busy lab)  
+**Updated:** 2026-10-25 (pass 6: F1 transport default deny; P4/P5)  
 **Status key:** `[x]` fixed & verified · `[~]` mitigation in place, follow-up open · `[ ]` open
 
 Verified baseline: **21/21 affected CTest suites pass** on `thnak-server` (real mbedTLS 3.6.5,
@@ -27,6 +27,17 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
   - **Verify:** `security_config_validation_test` covers plaintext/secure transport; the production
     `bank_strict` exits **3** with `Strict + multi-node ... plaintext`; the lab uses
     `QUARK_ALLOW_INSECURE` explicitly. (Implemented pass 2.)
+  - **Pass 6 (structural gate):** a bare `TcpTransport::start()` now **fails closed in a production
+    build** unless `SecureTransport` marked it authenticated or the caller explicitly opted into
+    dev plaintext (`set_allow_insecure_plaintext` / `QUARK_ALLOW_INSECURE`). Test/sample targets
+    define the dev macro; production omits it. So an app that forgets `validate_startup_security`
+    still cannot silently expose a plaintext multi-node cluster. The transport still reports
+    `is_plaintext() == true`, so `Strict` validation rejects the dev opt-in as before.
+  - **Verify (pass 6):** `security_plaintext_transport_refusal_control` is built **without** the
+    macro: bare start refused + reported, explicit dev start allowed but Strict-unsafe,
+    SecureTransport-wrapped inner starts, `validate_startup_security(Strict,3,secure)` allows. The
+    21/21 affected suites, both at-rest tests and the fuzz suite pass with the dev macro on the
+    test/sample builds; the production library remains default-deny.
 
 ### P1 — authorization and internal trust
 
@@ -231,6 +242,7 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 | F14 | Random per-instance relay secret | `81c8d0d` | forged token stays Suspect |
 | F15 | Per-peer token bucket | `81c8d0d` | 10k flood → 1,277 admitted |
 | F16 | 4 MiB single-frame cap | `81c8d0d` | 32 MiB rejected, HWM 6.7 MB |
+| F1 | Plaintext transport production default deny (dev opt-in only) | pass 6 | no-macro control refuses; SecureTransport inner allowed |
 | F17 | Layout-aware fingerprint + authenticated PeerSchema advert | `06c69c9`+ | `schema_probe` gate; mixed-schema tagged/reject; live mTLS tagless |
 | P4 at-rest | `EncryptedStore<S>` + KMS Keyring decision/checklist | pass 4 | store test: ciphertext/reopen/tamper/splice/wrong key |
 | P4 supply chain | Pin manifest + audit self-test + CycloneDX SBOM + attestation | pass 4 | mutable action/bad hash rejected; SBOM valid (18 components) |
@@ -249,7 +261,7 @@ The production build refuses the plaintext variant before `start()`.
 |---|---|
 | 7-node mTLS, 35 s | **34,548** busy `Transfer` frames; alice 1,000,000→~966k, bob→~34k, **thief=0**; 6 sessions |
 | mTLS theft / eviction / MITM | no attacker `authz`/`bank_transfer`; node 2 `status1=0` (forged `Left` rejected); AAD-patched MITM rejected |
-| 7-node plaintext lab | **26,666** busy transfers; theft=0; forged `Left` still evicts (`status1=3`) — the remaining **F1** residual |
+| 7-node plaintext lab (explicit `QUARK_ALLOW_INSECURE`) | **26,666** busy transfers; theft=0; forged `Left` still evicts (`status1=3`) — dev-only; production default denies (F1 pass 6) |
 | strict refusal | `bank_strict` (no lab macro) with 3-node plaintext exits **3**: `Strict + multi-node ... plaintext` |
 | per-IP handshake flood | 3000 same-IP senders → **64** pending; allowlisted peer authenticates mid-flood; unknown peer succeeds after the 5s reaper |
 | hard mailbox bound (64) | 10,000 sent → 1,258 rate-admitted → **1,126 refused at admission**; RSS 6.6→6.9 MB |
@@ -260,6 +272,7 @@ The production build refuses the plaintext variant before `start()`.
 | P4 pin audit | self-test rejects mutable action + bad LLVM hash; real audit passes |
 | P4 SBOM | valid CycloneDX 1.5, 18 components, file SHA-256s |
 | P4 at-rest | InMemory+FileStore ciphertext; reopen, tamper, cross-actor, wrong key controlled |
+| F1 transport guard | no-macro control: refused default / explicit dev / secure-marked inner; 21/21 |
 | P5 deterministic fuzz | 200k iterations + 100 random WAL replays, clean |
 | P5 libFuzzer 60s | **2,577,246** runs, no crash/timeout artifact |
 | 21/21 affected CTest suites + 17 targeted core | pass |
@@ -269,6 +282,10 @@ Implemented in this pass:
 - **P0:** `Transport::is_plaintext()` + `validate_startup_security()`; the ledger sets
   `SecurityMode::Strict` and refuses multi-node plaintext. Lab plaintext must build with
   `QUARK_ALLOW_INSECURE` and prints a warning.
+  **Pass 6:** `TcpTransport::start()` adds a structural second gate: a bare production build
+  refuses to start; `SecureTransport` marks its inner authenticated; explicit dev opt-in
+  (`set_allow_insecure_plaintext`/`QUARK_ALLOW_INSECURE`) is the only bypass. Test/sample targets
+  define the macro; `security_plaintext_transport_refusal_control` builds without it.
 - **P1:** the busy ledger installs `LocalRouter::set_authorizer`; its system thread stamps
   `{subject=1,rights=4}` so the local ACL admits legitimate internal work.
 - **P2:** SWIM Control token bucket (`control_rate_per_sec=4096`, `burst=1024`, fixed 256 buckets);
@@ -347,6 +364,9 @@ dist.register_remote<Ledger, Transfer>();
 - [ ] Treat `Membership::view()` as the convergence roster; use `placement_view()` for placement.
 - [ ] Roll schema changes as one generation; the fingerprint is layout-aware, so mixing binaries
   mixes TypeKeys and disables tagless/rejects unknown keys.
+- [ ] Never build production with `QUARK_ALLOW_INSECURE` and never call
+  `set_allow_insecure_plaintext`; use `SecureTransport` + `SecurityMode::Strict` for any multi-node
+  deployment. A bare `TcpTransport` must refuse to start.
 - [ ] Wrap every durable store in `EncryptedStore` with a KMS/HSM key; encrypt volumes and backups;
   run `security_at_rest_store_test`; never ship `MockCipher`.
 - [ ] Pin/verify build inputs; never pipe a remote script into `sudo`; review the attested SBOM diff
@@ -372,6 +392,7 @@ bash run_bank_heavy.sh     # 7-node busy mTLS/plaintext + strict-refusal case
 ./fuzz_wire 2000000        # decoder fuzz clean
 ./schema_probe             # F17 gate: matched=1, mismatch_key=0, mismatch_abi=0
 bash run_f17_live.sh       # schema probe + 7-node mTLS tagless / plaintext tagged
+./security_plaintext_transport_refusal_control   # F1: no-macro default deny + secure inner
 ./security_at_rest_store_test   # P4 at-rest: ciphertext/reopen/tamper/splice/wrong key
 bash ci/check_pins.sh --self-test   # P4 supply chain: negative controls + real audit
 bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (attested in CI)

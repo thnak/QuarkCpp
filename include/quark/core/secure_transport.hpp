@@ -84,7 +84,15 @@ public:
     SecureTransport(Transport& inner, const Aead& cipher, NodeId self) noexcept
         : inner_(&inner),
           self_(self),
-          shared_cipher_(&cipher, [](const Aead*) noexcept {}) {}
+          shared_cipher_(&cipher, [](const Aead*) noexcept {}) {
+        // F1: this wrapper authenticates peers (mTLS), so the inner plaintext transport is allowed
+        // to start. A bare TcpTransport is refused unless the app explicitly opts into dev mode.
+        inner_->set_authenticated_transport(true);
+    }
+
+    ~SecureTransport() override {
+        if (inner_) inner_->set_authenticated_transport(false);
+    }
 
     // Optional audit sink for tamper/replay drops (cold path).
     void set_audit_sink(AuditSink sink) noexcept { audit_ = sink; }
