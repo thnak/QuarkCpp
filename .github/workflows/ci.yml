@@ -67,6 +67,8 @@ jobs:
         run: bash ci/install-deps.sh --with-clang
 
       - name: Audit pinned inputs + negative self-test
+        env:
+          QUARK_VERIFY_INSTALLED: '1'  # prove the installed toolchain equals the exact apt lock
         run: bash ci/check_pins.sh --self-test
 
       - name: Generate CycloneDX SBOM + checksums
@@ -226,12 +228,22 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
+      # The Windows toolset is selected EXACTLY from ci/pins.env (MSVC_VERSION), not just the
+      # windows-2022 label. A runner-image refresh that no longer ships that toolset fails closed.
+      - name: Read toolchain pins
+        shell: bash
+        run: |
+          set -a
+          source ci/pins.env
+          set +a
+          echo "MSVC_VERSION=$MSVC_VERSION" >> "$GITHUB_ENV"
+
       # The default CMake generator on windows-latest is the installed Visual Studio toolset
       # (MSBuild-driven) — no vcvarsall/Developer-Prompt setup needed, unlike a manual Ninja build.
       - name: Configure
         shell: cmd
         run: |
-          cmake -S . -B build -A x64 -DQUARK_BUILD_BENCH=OFF ^
+          cmake -S . -B build -A x64 -T "version=%MSVC_VERSION%" -DQUARK_BUILD_BENCH=OFF ^
             ${{ matrix.config.sanitize != '' && format('-DQUARK_SANITIZE={0}', matrix.config.sanitize) || '' }} ^
             ${{ matrix.config.sanitize != '' && '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=ProgramDatabase' || '' }}
 

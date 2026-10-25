@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Fail-closed supply-chain audit. A changed upstream input is REJECTED until it is bumped
-# deliberately in ci/pins.env (and the matching workflow/install script), then the full CI reruns.
+# deliberately in ci/pins.env / ci/apt-packages.txt (and the matching workflow/install script),
+# then the full CI reruns.
 #
 #   bash ci/check_pins.sh              # audit this checkout
-#   bash ci/check_pins.sh --self-test  # prove the audit rejects a mutable action and a bad hash
+#   bash ci/check_pins.sh --self-test  # prove the audit rejects mutable/bad/wildcard pins
+#   QUARK_VERIFY_INSTALLED=1 bash ci/check_pins.sh   # also require dpkg versions == the exact lock
 set -euo pipefail
 
 script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,6 +26,10 @@ audit_root() {
         fail "ci/pins.env: VCPKG_BASELINE must be a 40-hex commit"
     [[ "$GCC_MAJOR" =~ ^[0-9]+$ && "$CLANG_MAJOR" =~ ^[0-9]+$ && "$LLVM_MAJOR" =~ ^[0-9]+$ ]] ||
         fail "ci/pins.env: GCC_MAJOR/CLANG_MAJOR/LLVM_MAJOR must be numeric"
+    [[ "$MSVC_VERSION" =~ ^[0-9]+(\.[0-9]+){2}$ ]] ||
+        fail "ci/pins.env: MSVC_VERSION must be an exact 3-part toolset version (got '$MSVC_VERSION')"
+    [[ "$COSIGN_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+        fail "ci/pins.env: COSIGN_VERSION must be vMAJOR.MINOR.PATCH (got '$COSIGN_VERSION')"
 
     # 1. Every `uses:` is a 40-hex commit, never a tag/branch. Local composite actions (./...) are ok.
     local ref
@@ -45,13 +51,16 @@ audit_root() {
     grep -RFq "$UBUNTU_ARM_RUNNER" "$root/.github/workflows" || fail "workflow is missing $UBUNTU_ARM_RUNNER"
     grep -RFq "$WINDOWS_RUNNER" "$root/.github/workflows" || fail "workflow is missing $WINDOWS_RUNNER"
 
-    # 3. The LLVM installer is hash-checked, and the hash lives in exactly one place (pins.env).
+    # 3. The LLVM installer is hash-checked, and its unpinned package set is neutralized so only the
+    #    exact apt lock below is installed.
     grep -Fq 'ci/install-deps.sh' "$root/.github/workflows/ci.yml" ||
         fail "workflow does not use ci/install-deps.sh"
     grep -Fq 'LLVM_SH_SHA256' "$root/ci/install-deps.sh" ||
         fail "ci/install-deps.sh does not verify LLVM_SH_SHA256"
     grep -Fq 'sha256sum -c -' "$root/ci/install-deps.sh" ||
         fail "ci/install-deps.sh has no sha256sum verification"
+    grep -Fq 's#^apt-get install -y \$PKG$#:#' "$root/ci/install-deps.sh" ||
+        fail "ci/install-deps.sh does not neutralize llvm.sh's unpinned apt install"
     grep -Fq "g++-\${GCC_MAJOR}" "$root/ci/install-deps.sh" ||
         fail "ci/install-deps.sh does not install g++-\${GCC_MAJOR}"
     grep -Fq 'cxx: g++-'"$GCC_MAJOR" "$root/.github/workflows/ci.yml" ||
@@ -84,26 +93,61 @@ if ver(floor) < ver(want_mbedtls):
     sys.exit(f"mbedtls {floor} is below the pinned floor {want_mbedtls}")
 PY
 
-    # 5. Only allowlisted apt packages may be installed. Versions are resolved from the pinned
-    #    runner image and captured in the SBOM; adding a package needs a deliberate allowlist edit.
-    local expanded installed pkg
-    expanded="$(sed -e "s/\${GCC_MAJOR}/$GCC_MAJOR/g" -e "s/\${CLANG_MAJOR}/$CLANG_MAJOR/g" \
-        "$root/ci/install-deps.sh")"
-    installed="$(printf '%s\n' "$expanded" |
-        awk '/apt-get install/{grab=1} grab{print} grab && $0 !~ /\\$/{grab=0}' |
-        grep -oE 'g\+\+-[0-9]+|clang-[0-9]+|libc\+\+-[0-9]+-dev|libc\+\+abi-[0-9]+-dev|cmake|ninja-build|gdb' |
-        sort -u)"
-    for pkg in $installed; do
-        grep -qxF "$pkg" "$root/ci/apt-packages.txt" ||
-            fail "unlisted apt package '$pkg' (add it to ci/apt-packages.txt deliberately)"
-    done
-    while IFS= read -r pkg; do
-        [[ -z "$pkg" || "$pkg" == \#* ]] && continue
-        printf '%s\n' "$installed" | grep -qxF "$pkg" ||
-            fail "allowlisted apt package '$pkg' is not installed by ci/install-deps.sh"
+    # 5. Exact apt lock. Every entry is `pkg=exact-version` (no wildcard); the known package set is
+    #    fixed; the installer consumes the lock through its helper, never a literal package name.
+    local line pkg ver
+    grep -Fq 'ci/apt-packages.txt' "$root/ci/install-deps.sh" ||
+        fail "ci/install-deps.sh does not consume ci/apt-packages.txt"
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" =~ ^[a-z0-9][a-z0-9+.-]*=[A-Za-z0-9][A-Za-z0-9.+:~_-]*$ ]] ||
+            fail "ci/apt-packages.txt: not pkg=exact-version: '$line'"
+        pkg="${line%%=*}"
+        ver="${line#*=}"
+        [[ "$ver" == *"*"* ]] && fail "ci/apt-packages.txt: wildcard version for '$pkg'"
+        case "$pkg" in
+            "g++-${GCC_MAJOR}"|cmake|ninja-build|gdb|"clang-${CLANG_MAJOR}"|\
+            "libc++-${CLANG_MAJOR}-dev"|"libc++abi-${CLANG_MAJOR}-dev") ;;
+            *) fail "ci/apt-packages.txt: unlisted package '$pkg'" ;;
+        esac
     done < "$root/ci/apt-packages.txt"
+    for pkg in "g++-${GCC_MAJOR}" cmake ninja-build gdb "clang-${CLANG_MAJOR}" \
+               "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev"; do
+        grep -Fq "${pkg}=" "$root/ci/apt-packages.txt" ||
+            fail "ci/apt-packages.txt is missing the locked package '$pkg'"
+    done
+    while IFS= read -r line; do
+        [[ "$line" == *'"${pkgs[@]}"'* ]] ||
+            fail "ci/install-deps.sh apt-get install bypasses the exact lock: $line"
+    done < <(grep -E '^[[:space:]]*sudo apt-get install' "$root/ci/install-deps.sh")
 
-    echo "pin audit: OK (actions SHA-pinned; release runners; LLVM SHA-256; vcpkg/mbedTLS; apt allowlist)"
+    # In CI after installation, prove the running toolchain IS the lock (dpkg is Linux-only).
+    if [[ "${QUARK_VERIFY_INSTALLED:-0}" == 1 ]] && command -v dpkg-query >/dev/null; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            pkg="${line%%=*}"
+            ver="${line#*=}"
+            local got
+            got="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+            [[ "$got" == "$ver" ]] ||
+                fail "installed $pkg=${got:-missing} != locked $ver"
+        done < "$root/ci/apt-packages.txt"
+    fi
+
+    # 6. The Windows job selects the exact MSVC toolset pinned in ci/pins.env.
+    grep -Fq 'MSVC_VERSION=$MSVC_VERSION' "$root/.github/workflows/ci.yml" ||
+        fail "ci.yml does not export MSVC_VERSION from ci/pins.env"
+    grep -Fq 'version=%MSVC_VERSION%' "$root/.github/workflows/ci.yml" ||
+        fail "ci.yml does not pass -T version=%MSVC_VERSION% to CMake"
+
+    # 7. Release artifacts are signed by the pinned keyless signer and verified before publishing.
+    [[ -f "$root/.github/workflows/release.yml" ]] || fail "missing .github/workflows/release.yml"
+    grep -Fq "cosign-release: $COSIGN_VERSION" "$root/.github/workflows/release.yml" ||
+        fail "release.yml cosign-release does not match COSIGN_VERSION=$COSIGN_VERSION"
+    grep -Fq 'bash ci/verify_release.sh' "$root/.github/workflows/release.yml" ||
+        fail "release.yml does not verify the signatures before publishing"
+
+    echo "pin audit: OK (actions SHA-pinned; release runners; LLVM SHA-256 + repo-only; vcpkg/mbedTLS; exact apt lock; MSVC pin; keyless release signing)"
 }
 
 self_test() {
@@ -114,7 +158,8 @@ self_test() {
     cp "$script_root/ci/pins.env" "$script_root/ci/apt-packages.txt" \
        "$script_root/ci/install-deps.sh" "$tmp/ci/"
     cp "$script_root/vcpkg.json" "$tmp/"
-    cp "$script_root/.github/workflows/ci.yml" "$tmp/.github/workflows/"
+    cp "$script_root/.github/workflows/ci.yml" "$script_root/.github/workflows/release.yml" \
+       "$tmp/.github/workflows/"
 
     # Negative control 1: a mutable action tag must be rejected.
     sed -i -E 's#(uses:[[:space:]]*actions/checkout@)[0-9a-f]{40}#\1v4#' \
@@ -122,15 +167,36 @@ self_test() {
     if (audit_root "$tmp") >/dev/null 2>&1; then
         fail "self-test: a mutable action tag was accepted"
     fi
+    cp "$script_root/.github/workflows/ci.yml" "$tmp/.github/workflows/"
 
     # Negative control 2: a changed LLVM installer hash must be rejected.
-    cp "$script_root/.github/workflows/ci.yml" "$tmp/.github/workflows/"
     sed -i -E 's/^LLVM_SH_SHA256=.*/LLVM_SH_SHA256=deadbeef/' "$tmp/ci/pins.env"
     if (audit_root "$tmp") >/dev/null 2>&1; then
         fail "self-test: a malformed LLVM hash was accepted"
     fi
+    cp "$script_root/ci/pins.env" "$tmp/ci/"
 
-    echo "pin audit self-test: OK (mutable action + bad LLVM hash rejected)"
+    # Negative control 3: an apt entry without an exact version must be rejected.
+    sed -i -E 's/^cmake=.*/cmake/' "$tmp/ci/apt-packages.txt"
+    if (audit_root "$tmp") >/dev/null 2>&1; then
+        fail "self-test: an unpinned apt package was accepted"
+    fi
+    cp "$script_root/ci/apt-packages.txt" "$tmp/ci/"
+
+    # Negative control 4: a moving/invalid MSVC toolset must be rejected.
+    sed -i -E 's/^MSVC_VERSION=.*/MSVC_VERSION=latest/' "$tmp/ci/pins.env"
+    if (audit_root "$tmp") >/dev/null 2>&1; then
+        fail "self-test: an invalid MSVC_VERSION was accepted"
+    fi
+    cp "$script_root/ci/pins.env" "$tmp/ci/"
+
+    # Negative control 5: an invalid cosign release pin must be rejected.
+    sed -i -E 's/^COSIGN_VERSION=.*/COSIGN_VERSION=v0/' "$tmp/ci/pins.env"
+    if (audit_root "$tmp") >/dev/null 2>&1; then
+        fail "self-test: an invalid COSIGN_VERSION was accepted"
+    fi
+
+    echo "pin audit self-test: OK (mutable action, bad LLVM hash, unpinned apt, invalid MSVC/cosign rejected)"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then

@@ -1,14 +1,17 @@
 # Security Remediation Tracking
 
 **Source:** `SECURITY-FINDINGS.md` (live plaintext + real-mTLS bank cluster attack pass)  
-**Updated:** 2026-10-25 (pass 6: F1 transport default deny; P4/P5)  
+**Updated:** 2026-10-25 (pass 7: exact apt/MSVC lock + keyless release signing; F1/P4/P5)  
 **Status key:** `[x]` fixed & verified · `[~]` mitigation in place, follow-up open · `[ ]` open
 
 Verified baseline: **21/21 affected CTest suites pass** on `thnak-server` (real mbedTLS 3.6.5,
-ASan/UBSan where applicable). Commits: `bbcf60e` (wire hardening), `f1286ee` (attack matrix),
+ASan/UBSan where applicable), plus the F1 no-macro refusal control, both at-rest tests, and the
+P5 deterministic fuzz suite. Commits: `bbcf60e` (wire hardening), `f1286ee` (attack matrix),
 `81c8d0d` (fail-closed remediation), plus the pass-2 commit adding startup refusal, control budget,
 ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/plaintext lab
-(34,548 mTLS busy transfers, zero theft) plus the strict-refusal check (exit 3).
+(34,548 mTLS busy transfers, zero theft) plus the strict-refusal check (exit 3). Pass 7 closes the
+supply-chain residual with the exact apt/MSVC lock, installed-version audit, and keyless release
+signing.
 
 ---
 
@@ -163,10 +166,9 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 
 ### P4 — supply chain and at-rest
 
-- [~] **Supply chain: pin the remaining mutable inputs; add provenance.**
-  - **Fixed:** actions pinned to SHAs; `llvm.sh` SHA-256 verified before `sudo`; mbedTLS ≥ 3.6.2
-    at configure + compile time; vcpkg baseline pinned.
-  - **Open:** exact `apt-get`/MSVC patch versions (runner-managed); no released-binary signing.
+- [x] **Supply chain: pin the remaining mutable inputs; add provenance and signing.**
+  - **Fixed (pass 4):** actions pinned to SHAs; `llvm.sh` SHA-256 verified before `sudo`; mbedTLS ≥
+    3.6.2 at configure + compile time; vcpkg baseline pinned.
   - **Implemented pass 4:** one pin source `ci/pins.env`; `ci/install-deps.sh` (hash-verified LLVM
     installer, no pipe-to-sudo, apt allowlist); `ci/check_pins.sh` fails closed on an unpinned
     Action, a `*-latest` runner, a malformed LLVM hash, a vcpkg/mbedTLS mismatch, or an unlisted
@@ -174,14 +176,27 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
     hashes; the `supply-chain` CI job audits, uploads the SBOM + `sbom.sha256`, and **attests**
     it via GitHub OIDC (pinned Action); every test/perf job is `needs: supply-chain`; Windows is
     pinned to `windows-2022`. See [`SUPPLY-CHAIN.md`](SUPPLY-CHAIN.md).
+  - **Implemented pass 7 (former residual):** `ci/apt-packages.txt` is an **exact** `pkg=version`
+    lock (noble GCC/cmake/ninja/gdb + apt.llvm.org clang/libc++); `install-deps` installs those
+    exact versions (the LLVM helper only adds its repo/key — its own unpinned apt install is
+    neutralized); the Windows job selects `MSVC_VERSION=14.44.35211` with
+    `-T version=%MSVC_VERSION%`; `check_pins.sh` rejects a missing/wildcard apt version, an invalid
+    MSVC pin, or a signer mismatch, and with `QUARK_VERIFY_INSTALLED=1` proves the **installed**
+    dpkg versions equal the lock; the SBOM records the MSVC/COSIGN pins and 24 components; a
+    tag-triggered `release.yml` builds the archive, emits the SBOM, **keylessly signs** both with
+    cosign (pinned action + `COSIGN_VERSION`), verifies the signatures before publishing, and
+    attaches provenance.
   - **Acceptance:** a changed declared upstream input fails closed until deliberately bumped (audit
-    + self-test); the build's exact toolchain/apt versions are recorded in the attested SBOM.
-  - **Residual:** apt/MSVC patch versions follow the release-pinned runner image and are visible in
-    the SBOM, not byte-locked; a container digest / exact package lock and release-binary signing
-    remain future distribution work.
-  - **Verify:** `bash ci/check_pins.sh --self-test` rejects a mutable action tag and a bad LLVM
-    hash, then the real audit passes; `gen_sbom.sh` emits valid CycloneDX 1.5 (18 components) on
-    the lab Linux box; the CI `supply-chain` job is the gate.
+    + self-test); the build's exact toolchain/apt/MSVC versions are recorded in the attested SBOM;
+    release artifacts have a verifiable Sigstore signature bound to this workflow. **Met.**
+  - **Residual:** the *base* runner image's non-apt OS libraries/kernel still follow the release
+    label (a container-image digest or fully snapshotted mirror is needed for a byte-identical base);
+    release binaries are Linux x86-64 only (Windows/arm64 release matrix is distribution work).
+  - **Verify:** `bash ci/check_pins.sh --self-test` rejects a mutable action tag, a bad LLVM hash,
+    an unpinned apt entry, an invalid/moving MSVC pin, and an invalid cosign pin, then the real
+    audit passes; `QUARK_VERIFY_INSTALLED=1` is the CI installed-version gate; `gen_sbom.sh` emits
+    valid CycloneDX 1.5 (24 components incl. MSVC + COSIGN); the `release.yml` signs and
+    verify-before-publishes the archive + SBOM; the CI `supply-chain` job is the gate.
 
 - [x] **At-rest data: document/encrypt persistence snapshots.**
   - **Why:** a storage reader could read actor state; the adapter had no encryption-at-rest story.
@@ -245,7 +260,7 @@ ghost reaping, and configurable framing. Pass 2 also ran a **7-node busy** mTLS/
 | F1 | Plaintext transport production default deny (dev opt-in only) | pass 6 | no-macro control refuses; SecureTransport inner allowed |
 | F17 | Layout-aware fingerprint + authenticated PeerSchema advert | `06c69c9`+ | `schema_probe` gate; mixed-schema tagged/reject; live mTLS tagless |
 | P4 at-rest | `EncryptedStore<S>` + KMS Keyring decision/checklist | pass 4 | store test: ciphertext/reopen/tamper/splice/wrong key |
-| P4 supply chain | Pin manifest + audit self-test + CycloneDX SBOM + attestation | pass 4 | mutable action/bad hash rejected; SBOM valid (18 components) |
+| P4 supply chain | Exact apt/MSVC lock + audit self-test + CycloneDX SBOM + attestation + keyless release signing | pass 7 | 5 negatives; installed versions == lock; SBOM 24; release signatures verified before publish |
 | P5 fuzzing | Shared targets + deterministic CTest + libFuzzer corpus/CI | pass 5 | 200k deterministic + 2,577,246 libFuzzer runs, no crash |
 | Supply chain | Action SHAs, LLVM hash, mbedTLS version | `81c8d0d` | CI no longer pipes to sudo |
 
@@ -269,8 +284,9 @@ The production build refuses the plaintext variant before `start()`.
 | F17 schema gate | `schema_probe`: matched=1, mismatch_key=0, mismatch_abi=0 |
 | F17 mixed-schema routing | advertised tagless; mismatch→tagged; unknown TypeKey rejected |
 | F17 live 7-node mTLS | **33,564** transfers, ledger `fallbacks=0`; plaintext senders stay tagged |
-| P4 pin audit | self-test rejects mutable action + bad LLVM hash; real audit passes |
-| P4 SBOM | valid CycloneDX 1.5, 18 components, file SHA-256s |
+| P4 pin audit | self-test rejects mutable action, bad LLVM hash, unpinned apt, invalid MSVC/cosign; real audit passes; CI verifies installed dpkg == exact lock |
+| P4 SBOM | valid CycloneDX 1.5, 24 components, MSVC/COSIGN pins + file SHA-256s |
+| P4 release signing | tag workflow signs archive + SBOM keyless (cosign); verify-before-publish pins identity/issuer; provenance attached |
 | P4 at-rest | InMemory+FileStore ciphertext; reopen, tamper, cross-actor, wrong key controlled |
 | F1 transport guard | no-macro control: refused default / explicit dev / secure-marked inner; 21/21 |
 | P5 deterministic fuzz | 200k iterations + 100 random WAL replays, clean |
@@ -279,6 +295,9 @@ The production build refuses the plaintext variant before `start()`.
 
 Implemented in this pass:
 
+- **P4 (pass 7):** exact apt lock (`ci/apt-packages.txt`) installed by `ci/install-deps.sh`;
+  LLVM helper repo-only; MSVC pin + `-T version=%MSVC_VERSION%`; installed-version audit; SBOM
+  MSVC/COSIGN records; `release.yml` keyless signing + `ci/verify_release.sh` verify-before-publish.
 - **P0:** `Transport::is_plaintext()` + `validate_startup_security()`; the ledger sets
   `SecurityMode::Strict` and refuses multi-node plaintext. Lab plaintext must build with
   `QUARK_ALLOW_INSECURE` and prints a warning.
@@ -370,7 +389,10 @@ dist.register_remote<Ledger, Transfer>();
 - [ ] Wrap every durable store in `EncryptedStore` with a KMS/HSM key; encrypt volumes and backups;
   run `security_at_rest_store_test`; never ship `MockCipher`.
 - [ ] Pin/verify build inputs; never pipe a remote script into `sudo`; review the attested SBOM diff
-  on every pin bump.
+  on every pin bump. Bump `ci/apt-packages.txt`/`MSVC_VERSION`/`COSIGN_VERSION` only with the exact
+  versions and a green installed-version audit.
+- [ ] Verify release signatures with `ci/verify_release.sh` (or `cosign verify-blob`) and the
+  expected `release.yml` identity before deploying an artifact.
 
 ---
 
@@ -394,8 +416,11 @@ bash run_bank_heavy.sh     # 7-node busy mTLS/plaintext + strict-refusal case
 bash run_f17_live.sh       # schema probe + 7-node mTLS tagless / plaintext tagged
 ./security_plaintext_transport_refusal_control   # F1: no-macro default deny + secure inner
 ./security_at_rest_store_test   # P4 at-rest: ciphertext/reopen/tamper/splice/wrong key
-bash ci/check_pins.sh --self-test   # P4 supply chain: negative controls + real audit
-bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (attested in CI)
+bash ci/check_pins.sh --self-test   # P4 supply chain: 5 negative controls + real audit
+QUARK_VERIFY_INSTALLED=1 bash ci/check_pins.sh  # on the pinned runner: installed == exact lock
+bash ci/gen_sbom.sh > sbom.json     # P4 CycloneDX SBOM (24 components; MSVC/COSIGN pins)
+bash ci/verify_release.sh <artifact> <artifact>.sigstore.json  # verify a release signature
+# Pushing a v* tag runs .github/workflows/release.yml: build + SBOM + cosign sign + verify + publish
 ./fuzz_decoders_test --iters 2000000   # P5 long deterministic campaign
 # P5 libFuzzer: -DQUARK_BUILD_FUZZ=ON (Clang); seed corpus then 60s campaign — see FUZZING.md
 ```

@@ -1,10 +1,15 @@
-# Packages `ci/install-deps.sh` is allowed to install. Adding one is a deliberate supply-chain
-# change. Exact resolved versions are recorded in the CI SBOM (runner images are release-pinned by
-# `ci/pins.env`; a runner refresh is visible as an SBOM diff).
-g++-14
-cmake
-ninja-build
-gdb
-clang-20
-libc++-20-dev
-libc++abi-20-dev
+# EXACT apt lock for the pinned Ubuntu 24.04 (noble) runners. `ci/install-deps.sh` installs these
+# exact versions; `ci/check_pins.sh` rejects a missing/malformed/wildcard version and, in CI after
+# installation, verifies the installed version matches. Bump deliberately with the runner image and
+# the full CI green run; the SBOM records the resolved versions.
+#
+# Ubuntu noble / noble-updates:
+g++-14=14.2.0-4ubuntu2~24.04.1
+cmake=3.28.3-1build7
+ninja-build=1.11.1-2
+gdb=15.1-1ubuntu1~24.04.1
+# apt.llvm.org llvm-toolchain-noble-20 (the hash-pinned installer only adds the repo; these are
+# installed exactly after it):
+clang-20=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
+libc++-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
+libc++abi-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139

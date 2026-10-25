@@ -61,7 +61,7 @@ apt_versions = {}
 if shutil.which("dpkg-query"):
     with open(os.path.join(root, "ci/apt-packages.txt"), encoding="utf-8") as f:
         for line in f:
-            pkg = line.strip()
+            pkg = line.strip().split("=", 1)[0]
             if not pkg or pkg.startswith("#"):
                 continue
             v = run("dpkg-query", "-W", "-f=${Version}", pkg)
@@ -120,6 +120,17 @@ components = [
     {"type": "application", "bom-ref": "tool:cmake", "name": "cmake", "version": version_line("cmake")},
     {"type": "application", "bom-ref": "tool:ninja", "name": "ninja", "version": version_line("ninja")},
     {"type": "application", "bom-ref": "tool:gdb", "name": "gdb", "version": version_line("gdb")},
+    {
+        "type": "application",
+        "bom-ref": "tool:msvc",
+        "name": "MSVC",
+        "version": pins["MSVC_VERSION"],
+        "properties": [
+            {"name": "quark:runner", "value": pins["WINDOWS_RUNNER"]},
+            {"name": "quark:selection", "value": "cmake -T version=" + pins["MSVC_VERSION"]},
+            {"name": "quark:pinned", "value": "exact toolset; runner image refresh fails closed"},
+        ],
+    },
 ]
 for action, sha in actions:
     components.append(
@@ -133,7 +144,17 @@ for action, sha in actions:
     )
 for pkg, version in sorted(apt_versions.items()):
     components.append({"type": "library", "bom-ref": f"apt:{pkg}@{version}", "name": pkg, "version": version})
-for path in ("vcpkg.json", "ci/pins.env", "ci/install-deps.sh", "ci/check_pins.sh", "CMakeLists.txt"):
+for path in (
+    "vcpkg.json",
+    "ci/pins.env",
+    "ci/apt-packages.txt",
+    "ci/install-deps.sh",
+    "ci/check_pins.sh",
+    "ci/gen_sbom.sh",
+    "ci/verify_release.sh",
+    "CMakeLists.txt",
+    ".github/workflows/release.yml",
+):
     digest = sha256(path)
     components.append(
         {
@@ -174,6 +195,8 @@ sbom = {
             {"name": "quark:pins:mbedtlsMin", "value": pins["MBEDTLS_MIN"]},
             {"name": "quark:pins:ubuntuRunner", "value": pins["UBUNTU_RUNNER"]},
             {"name": "quark:pins:windowsRunner", "value": pins["WINDOWS_RUNNER"]},
+            {"name": "quark:pins:msvcVersion", "value": pins["MSVC_VERSION"]},
+            {"name": "quark:pins:cosignVersion", "value": pins["COSIGN_VERSION"]},
         ],
         "externalReferences": [{"type": "vcs", "url": f"{server}/{repo}/commit/{commit}"}],
     },

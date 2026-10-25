@@ -1,0 +1,92 @@
+# Tag-triggered release: build a release archive from the exact pinned toolchain, emit an SBOM,
+# sign BOTH the archive and the SBOM keylessly with Sigstore/cosign (GitHub OIDC), verify the
+# signatures before publishing, and attach GitHub build-provenance attestations. The signing
+# Action and the cosign release are pinned in ci/pins.env + this file; ci/check_pins.sh verifies
+# their agreement. Consumers: `cosign verify-blob --bundle <file>.sigstore.json ... <file>` (see
+# ci/verify_release.sh).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: signed release (${{ github.ref_name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install exact pinned toolchain
+        run: bash ci/install-deps.sh --with-clang
+
+      - name: Audit pins (negative self-test + installed exact apt lock)
+        env:
+          QUARK_VERIFY_INSTALLED: '1'
+        run: bash ci/check_pins.sh --self-test
+
+      - name: Build release archive
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release \
+            -DQUARK_BUILD_TESTS=OFF -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_SAMPLES=OFF
+          cmake --build build-rel -j2 --target quark
+          ARTIFACT="quark-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          mkdir -p pkg
+          cp build-rel/libquark.a pkg/
+          cp -r include cmake CMakeLists.txt README.md LICENSE vcpkg.json pkg/
+          tar -czf "$ARTIFACT" -C pkg .
+          echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
+          sha256sum "$ARTIFACT"
+
+      - name: Generate SBOM + checksums
+        run: |
+          bash ci/gen_sbom.sh > sbom.json
+          python3 -m json.tool sbom.json > /dev/null
+          sha256sum sbom.json "$ARTIFACT" > sbom.sha256
+          cat sbom.sha256
+
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62  # v3.10.0
+        with:
+          cosign-release: v2.5.0  # must equal COSIGN_VERSION in ci/pins.env
+
+      - name: Sign release artifact + SBOM (keyless, OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign-blob --yes --bundle "$ARTIFACT.sigstore.json" "$ARTIFACT"
+          cosign sign-blob --yes --bundle sbom.json.sigstore.json sbom.json
+
+      - name: Verify signatures before publishing
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          bash ci/verify_release.sh "$ARTIFACT" "$ARTIFACT.sigstore.json"
+          bash ci/verify_release.sh sbom.json sbom.json.sigstore.json
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        with:
+          subject-path: |
+            ${{ env.ARTIFACT }}
+            sbom.json
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$ARTIFACT" "$ARTIFACT.sigstore.json" \
+            sbom.json sbom.sha256 sbom.json.sigstore.json \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
