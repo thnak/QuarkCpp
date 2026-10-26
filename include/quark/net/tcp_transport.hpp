@@ -43,6 +43,7 @@
 #include "pal/net.hpp"
 #include "pal/pal.hpp"                // pal::now() — ADR-046 gate's own clock
 #include "quark/core/cluster.hpp"    // Endpoint, dial_winner, keep_local_dial (021 §2 — the dedup RULE)
+#include "quark/core/node_authority.hpp"  // NodeAuthority (relay admission)
 #include "quark/core/governance.hpp"  // PeerCongestionTable (ADR-046 backpressure gate)
 #include "quark/core/transport.hpp"  // Transport seam + MessageFrame
 #include "quark/detail/hash.hpp"     // splitmix64 (deterministic reconnect jitter — no random_device)
@@ -155,11 +156,23 @@ public:
         relay_forwarding_enabled_ = true;
     }
 
+    // Admission by cluster trust anchor: relay only when BOTH the origin and the destination are
+    // admitted by `authority` (the same NodeAuthority SecureTransport/021 admission consults — an
+    // AllowlistNodeAuthority populated from membership, or a CA-backed one). `authority` must outlive
+    // this transport; its answers must be safe to read from the I/O thread.
+    void set_relay_forwarding(const NodeAuthority& authority) {
+        set_relay_forwarding([&authority](NodeId origin, NodeId dest) {
+            return authority.admitted(origin) && authority.admitted(dest);
+        });
+    }
+
     // Client side of shape B: an ORDERED relay list for `peer` (failover = first entry whose connection
-    // is Open, else the first entry). Used only while `peer` has no Open direct connection AND either no
-    // direct endpoint is known for it (hub-and-spoke) or its direct connection is in Backoff; frames
-    // keep `to == peer` so the relay forwards them. Direct wins again as soon as it is Open. Each relay
-    // needs its own `add_peer` endpoint. Thread-safe, same started_-gated idiom as add_peer().
+    // is Open, else the first entry). Used only for a peer with NO known direct endpoint (hub-and-spoke:
+    // spokes know only their relays), so a frame stream never switches between a relay path and a
+    // direct path and per-peer FIFO is preserved by construction. A peer that does have a direct
+    // endpoint and needs a fallback uses shape A (`set_relay`, which has a fenced cutover). Frames keep
+    // `to == peer` so the relay forwards them. Each relay needs its own `add_peer` endpoint.
+    // Thread-safe, same started_-gated idiom as add_peer().
     void set_relay_via(NodeId peer, std::vector<NodeId> relays) {
         if (started_.load(std::memory_order_acquire))
             io_.post([this, peer, r = std::move(relays)]() mutable { relay_via_[peer.value] = std::move(r); });
@@ -475,10 +488,7 @@ private:
     NodeId route_for(NodeId to) const {
         const auto rv = relay_via_.find(to.value);
         if (rv == relay_via_.end() || rv->second.empty()) return to;
-        const auto direct = conns_.find(to.value);
-        const bool direct_open = direct != conns_.end() && direct->second->st == St::Open;
-        const bool direct_dead = direct != conns_.end() && direct->second->st == St::Backoff;
-        if (direct_open || (peers_.count(to.value) != 0 && !direct_dead)) return to;
+        if (peers_.count(to.value) != 0 || conns_.count(to.value) != 0) return to;  // direct known ⇒ never relay
         for (NodeId via : rv->second) {
             const auto it = conns_.find(via.value);
             if (it != conns_.end() && it->second->st == St::Open) return via;

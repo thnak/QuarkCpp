@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "quark/core/aead.hpp"
+#include "quark/core/node_authority.hpp"
+#include "quark/core/secure_transport.hpp"
 #include "tcp_test_util.hpp"
 
 using namespace quark;
@@ -17,10 +20,52 @@ void check(bool c, const char* what, bool& ok) {
         ok = false;
     }
 }
+
+// End to end: A -> R -> B with SecureTransport at the two ENDS only. R forwards sealed bytes without
+// holding a session, so the relay can neither read nor tamper; B opens them as if they came direct.
+// Admission comes from a NodeAuthority allowlist (the cluster trust anchor), and revoking a node cuts
+// the relay path.
+void secure_via_relay(bool& ok) {
+    const NodeId A{11}, R{12}, B{13};
+    MockCipher cipher(0x14ULL);
+    AllowlistNodeAuthority authority;
+    authority.admit(A);
+    authority.admit(B);
+    net::TcpTransport tr(R, pal::ipv4_loopback, 0);
+    net::TcpTransport ta(A, pal::ipv4_loopback, 0);
+    net::TcpTransport tb(B, pal::ipv4_loopback, 0);
+    SecureTransport sa(ta, cipher, A);
+    SecureTransport sb(tb, cipher, B);
+    Recorder rb;
+    sb.on_receive([&](MessageFrame f) { rb(std::move(f)); });
+    sa.on_receive([](MessageFrame) {});
+    tr.on_receive([](MessageFrame) {});
+    tr.set_allow_insecure_plaintext(true);  // the relay carries only already-sealed end-to-end frames
+    tr.set_relay_forwarding(authority);
+    check(tr.start() && ta.start() && tb.start(), "secure: listeners start", ok);
+    ta.add_peer(loopback_endpoint(R, tr.listen_port()));
+    tb.add_peer(loopback_endpoint(R, tr.listen_port()));
+    tr.add_peer(loopback_endpoint(B, tb.listen_port()));
+    ta.set_relay_via(B, {R});
+    for (std::uint64_t i = 0; i < 30; ++i) sa.send(B, seq_frame(A, B, i));
+    check(wait_until([&] { return rb.count() >= 30; }, 5000), "secure: 30 sealed frames opened at B", ok);
+    check(sb.replays_rejected() == 0 && sb.tamper_rejected() == 0, "secure: no replay/tamper rejections", ok);
+    {
+        std::lock_guard<std::mutex> g(rb.m);
+        for (std::size_t i = 0; i < rb.seqs.size(); ++i) check(rb.seqs[i] == i, "secure: FIFO across relay", ok);
+    }
+    authority.revoke(A);  // cold mutation; no frames in flight
+    const auto refused = tr.relay_refused();
+    sa.send(B, seq_frame(A, B, 99));
+    check(wait_until([&] { return tr.relay_refused() > refused; }, 3000), "secure: revoked origin refused", ok);
+    check(rb.count() == 30, "secure: revoked origin's frame not delivered", ok);
+    ta.stop(); tb.stop(); tr.stop();
+}
 }  // namespace
 
 int main() {
     bool ok = true;
+    secure_via_relay(ok);
     const NodeId A{1}, R{2}, B{3}, DEAD{9};
 
     net::TcpTransport tr(R, pal::ipv4_loopback, 0);

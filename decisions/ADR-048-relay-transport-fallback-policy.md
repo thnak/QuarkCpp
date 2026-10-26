@@ -301,10 +301,21 @@ different designs. Both are kept, named explicitly:
   forwards inbound frames with `to != self` unchanged (an end-to-end SecureTransport seal is never
   opened). Spokes address the destination through an ORDERED relay list (failover = first Open entry).
 
-Relay authentication (previously a non-goal): forwarding is opt-in and fail-closed. The node supplies
-`admit(origin, dest)` (wire to membership / the NodeAuthority-admitted set); a frame whose `from` differs
-from the connection's identified peer, an unknown destination, or a failed `admit` is refused and counted
-(`relay_refused()`). A forwarded frame never takes a second hop. Known limit: the connection identity is
-the HELLO claim at this layer, so the strength of the gate is the strength of `admit`. Still deferred:
-relay discovery, hop-local backpressure, ordering across a relay<->direct switch. Test:
-`tests/tcp_relay_forwarding_test.cpp`.
+Relay authentication (previously a non-goal): forwarding is opt-in and fail-closed. Admission is either
+a custom `admit(origin, dest)` or `set_relay_forwarding(const NodeAuthority&)`, which relays only when
+BOTH ends are admitted by the cluster trust anchor (so a relay is never an open proxy and revocation
+cuts the path). A frame whose `from` differs from the connection's identified peer, an unknown
+destination, or a failed admission is refused and counted (`relay_refused()`); forwarded frames are
+counted in `relayed_frames()` and never take a second hop. The relay forwards sealed bytes and holds no
+session: with SecureTransport at the two ends, the relay can neither read nor alter frames
+(`tests/tcp_relay_forwarding_test.cpp`, A -> R -> B). Residual: the connection identity is the HELLO
+claim at this layer, so the gate is as strong as the NodeAuthority; the A<->R hop is plain TCP
+carrying already-sealed frames (header metadata visible to the network).
+
+Ordering: shape B is used only for peers with NO known direct endpoint (hub-and-spoke), so a peer's
+frame stream never switches between relay and direct and FIFO holds by construction; a peer with a
+direct endpoint uses shape A's fenced cutover. Backpressure: the relay's per-destination outbound caps
+(ADR-046 C1) apply to forwarded frames, so a slow destination sheds at the relay hop (counted in
+`drops()`), never grows relay memory unbounded; an end-to-end congestion signal through the hop remains
+future work. Relay discovery stays a non-goal (the issue's proposal list asks only for forwarding,
+authentication and failover, all delivered).
