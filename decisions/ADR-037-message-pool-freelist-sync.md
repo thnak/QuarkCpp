@@ -239,3 +239,12 @@ Linux target (not WSL2), on the full `bench/caf_comparison` single-threaded
 tell benchmark plus a P∈{1,2,4,8} contended sweep**, and compare both the
 isolated round-trip cost *and* the Scheduler-integration cost/risk before
 promoting design 3 over the design 2 already accepted here.
+
+## Amendment (issue #15): the liveness token is the Partition
+
+The magazine's `weak_ptr<PartitionToken>` pinned only an empty tag, so a thread-exit flush that passed
+`lock()` could still race `~MessagePool` freeing the Partition's mutex/cells (found by inspection, not
+reproduced). Partitions are now `shared_ptr<Partition>`, magazines bind a `weak_ptr<Partition>`, and
+a successful `lock()` keeps the mutex, cells and `free_head` alive until the flush finishes. The hot
+path is unchanged: slot match compares `owner_before` against a `Partition::self` weak_ptr (no
+refcount traffic).

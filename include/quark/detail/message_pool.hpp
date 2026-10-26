@@ -45,7 +45,7 @@
 // throughput improvement across producer counts {1,2,4}.
 //
 // A magazine's `bound` Partition* is guarded against use-after-free / cross-pool address reuse by a
-// `std::weak_ptr<PartitionToken>` liveness check (owner_before-based, control-block identity, never a
+// `std::weak_ptr<Partition>` liveness check (owner_before-based, control-block identity, never a
 // raw address compare) — a Partition* recycled by the allocator into an unrelated LATER pool can
 // never satisfy this check against a stale binding from an earlier, now-destroyed pool. This closed
 // a fatal UAF the ADR-037 red team found in the original raw-`Partition*` draft (reproduced under
@@ -101,11 +101,6 @@ inline thread_local std::uint32_t t_pool_lane_id = 0xFFFF'FFFFu;  // sentinel: n
     return t_pool_lane_id;
 }
 
-// Empty tag whose control block gives each Partition a generation-safe identity: a raw Partition*
-// recycled by the allocator into an unrelated later pool can never satisfy owner_before() against a
-// stale weak_ptr bound to the old pool's token (ADR-037 S2 — closes the magazine UAF class).
-struct PartitionToken {};
-
 class MessagePool {
 public:
     // Inline payload capacity per cell. Sized for the local send path (small messages + an ask
@@ -123,10 +118,12 @@ public:
     // producer-side contention across independent partitions (see the file banner).
     explicit MessagePool(std::size_t capacity, std::size_t num_partitions = 1)
         : num_partitions_(num_partitions == 0 ? 1 : num_partitions),
-          partitions_(std::make_unique<Partition[]>(num_partitions_)) {
-        for (std::size_t i = 0; i < num_partitions_; ++i)
-            partitions_[i].alive_token = std::make_shared<PartitionToken>();
-        for (std::size_t i = 0; i < capacity; ++i) grow_one(partitions_[i % num_partitions_]);
+          partitions_(num_partitions_) {
+        for (auto& p : partitions_) {
+            p = std::make_shared<Partition>();
+            p->self = p;
+        }
+        for (std::size_t i = 0; i < capacity; ++i) grow_one(*partitions_[i % num_partitions_]);
     }
     MessagePool(const MessagePool&) = delete;
     MessagePool& operator=(const MessagePool&) = delete;
@@ -135,7 +132,7 @@ public:
     // partition's mutex-guarded free list only when the magazine is empty (ADR-037). Grows cold if
     // the partition is genuinely exhausted (pre-size to avoid it) — same cold-miss contract as before.
     [[nodiscard]] Slot acquire(void (*destroy)(void*) noexcept) noexcept {
-        Partition& p = partitions_[pool_lane_id() % num_partitions_];
+        Partition& p = *partitions_[pool_lane_id() % num_partitions_];
         LocalCache& lc = local_cache_for(p);
         if (lc.count == 0) refill(lc, p);
         Descriptor* d = lc.cells[--lc.count];
@@ -196,7 +193,8 @@ private:
         std::mutex mu;
         Descriptor* free_head = nullptr;
         std::vector<std::unique_ptr<Cell>> cells;
-        std::shared_ptr<PartitionToken> alive_token;  // constructed once, at pool-ctor time (ADR-037)
+        std::weak_ptr<Partition> self;  // own control block, set once at pool-ctor; compared via
+                                        // owner_before (no refcount traffic on the hot path)
     };
 
     // Descriptor is the first member (offset 0), so a Descriptor* IS a Cell*. Route through void*
@@ -218,7 +216,7 @@ private:
     // ---- ADR-037: the TLS magazine fronting each partition's mutex+free_head -----------------
     struct alignas(quark::cache_line_size) LocalCache {
         Partition* bound = nullptr;
-        std::weak_ptr<PartitionToken> bound_token;  // generation-safe identity of `bound`
+        std::weak_ptr<Partition> bound_token;  // generation-safe identity of `bound`; lock() pins it
         std::uint32_t count = 0;
         static constexpr std::uint32_t kCap = 64;
         static constexpr std::uint32_t kRefillBatch = 32;
@@ -236,6 +234,8 @@ private:
         LocalCache slots[kSlots];
 
         static void flush_all_locked(LocalCache& lc) noexcept {
+            // tok IS the Partition's owner: a successful lock() keeps the Partition (mutex, cells,
+            // free_head) alive for the whole flush even if the pool is destroyed concurrently.
             auto tok = lc.bound_token.lock();
             if (!tok) {
                 // Owning pool is already gone: the partition (and its mutex) may be freed. Safely
@@ -245,11 +245,11 @@ private:
                 lc.bound_token.reset();
                 return;
             }
-            std::lock_guard<std::mutex> g(lc.bound->mu);
+            std::lock_guard<std::mutex> g(tok->mu);
             for (std::uint32_t i = 0; i < lc.count; ++i) {
                 Descriptor* d = lc.cells[i];
-                d->link.next.store(lc.bound->free_head, std::memory_order_relaxed);
-                lc.bound->free_head = d;
+                d->link.next.store(tok->free_head, std::memory_order_relaxed);
+                tok->free_head = d;
             }
             lc.count = 0;
         }
@@ -271,16 +271,14 @@ private:
     static LocalCache& local_cache_for(Partition& p) noexcept {
         LocalCache& lc = t_cache_mag.slots[slot_for(&p)];
         // Slot match requires BOTH the raw pointer AND live-token agreement (owner_before, control-
-        // block identity) against p.alive_token — closes the address-reuse attack: a freed-and-
+        // block identity) against the partition's own control block — closes the address-reuse attack: a freed-and-
         // recycled Partition* at the same address can never satisfy this check because its token's
         // control block differs from the stale lc.bound_token's.
-        bool same = (lc.bound == &p) &&
-                    !lc.bound_token.owner_before(p.alive_token) &&
-                    !p.alive_token.owner_before(lc.bound_token);
+        bool same = (lc.bound == &p) && !lc.bound_token.owner_before(p.self) && !p.self.owner_before(lc.bound_token);
         if (!same) {
             if (lc.bound != nullptr && lc.count != 0) LocalCacheTable::flush_all_locked(lc);
             lc.bound = &p;
-            lc.bound_token = p.alive_token;
+            lc.bound_token = p.self;
             lc.count = 0;
         }
         return lc;
@@ -311,7 +309,7 @@ private:
     }
 
     std::size_t num_partitions_;
-    std::unique_ptr<Partition[]> partitions_;
+    std::vector<std::shared_ptr<Partition>> partitions_;
 };
 
 inline thread_local MessagePool::LocalCacheTable MessagePool::t_cache_mag{};

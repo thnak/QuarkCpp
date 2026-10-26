@@ -1,5 +1,5 @@
 // ADR-037 (TLS acquire/reclaim magazine, message_pool.hpp) S2/C3: a thread's magazine binds a
-// Partition* via a std::weak_ptr<PartitionToken> liveness check, never a raw pointer compare, so a
+// Partition* via a std::weak_ptr<Partition> liveness check, never a raw pointer compare, so a
 // MessagePool destroyed while a thread's magazine still references it can never let that thread's
 // NEXT pool (possibly allocated at the exact same address the allocator just freed) hand out a
 // stale, freed cell. This is the exact fatal use-after-free the ADR-037 red team found in the

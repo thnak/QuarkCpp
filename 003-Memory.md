@@ -144,7 +144,7 @@ counts {1, 2, 4} (see ADR-037 for the full evidence table).
 
 **Pool lifetime clause.** A `MessagePool` is safe to destroy at any time — no
 resident magazine cell is ever dereferenced after its owning pool dies, guarded by a
-generation-safe `std::weak_ptr<PartitionToken>` liveness check on every magazine
+generation-safe `std::weak_ptr<Partition>` liveness check on every magazine
 touch, never a raw pointer compare. Ordinary `Engine` shutdown (which joins every
 worker thread before any pool it fed a `ReclaimSink` to is destroyed) needs no
 extra step: a thread's magazines flush automatically, through the normal
