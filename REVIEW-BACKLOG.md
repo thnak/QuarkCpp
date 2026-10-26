@@ -69,10 +69,16 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
 - [x] B12 MED — transport nonce reuse when the handshake is disabled: a reconnect resets seq to 0 under
   the shared cipher (`secure_transport.hpp:139-143,387-399,755-759`).
 
-- [ ] B13 MED — PRE-EXISTING (fails identically on the initial commit 5c73ffe): `rocksdb_reminder_store_check` fails
-  ("a1/wake fields durable", "after remove+upsert: exactly 2 rows", ...). Found while building the adapters with
-  librocksdb-dev 9.11 on 2026-10-26; not investigated. Also audit `sqlite/rocksdb_reminder_store` for the same
-  swallowed-error / read-error-as-empty pattern fixed in the event-store adapters.
+- [x] B13 MED (fixed) — `rocksdb_reminder_store_check` failure, present since the initial commit. ROOT CAUSE: the due is
+  stored in the key as `due ^ 2^63` (so negative dues sort first) but `load_all` and the "I"-index lookup decoded it
+  raw => every reloaded reminder had its high bit flipped and a re-arm deleted the wrong key, leaving a duplicate.
+  Fix: `due_from_be`. Also hardened both reminder adapters like the event stores: mutex; only NotFound/DONE means
+  absent (a failed lookup/step is an error); `load_all` errors on a failed open / failed iterator / malformed row
+  instead of returning a short or empty list; the in-RAM checkpoint advances only after a durable write; a failed
+  open or schema creation leaves the SQLite store unhealthy. Tests: reminder_store_fault_checks.hpp +
+  {rocksdb,sqlite}_reminder_store_fault_check (exact due round-trip incl. negative/extreme, re-arm across the sign
+  boundary, failed-open errors, concurrency); 7 of the new checks FAIL on the old Rocks header; clean under TSan,
+  ASan and UBSan.
 - [ ] B14 LOW — the adapters' `last_seq` cannot carry an error through the Store concept (`SeqNo` return); it reports 0
   on a read error (every write path re-checks and fails). Consider `result<SeqNo>` if a caller ever relies on it.
 

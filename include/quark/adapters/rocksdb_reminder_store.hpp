@@ -19,10 +19,22 @@
 //   "I" + actor(16B BE) + name_hash(8B BE)               -> current due(8B BE)              [key -> due]
 //
 // NOT compiled unless the RocksDB dev headers are present (cmake/QuarkPersistenceAdapters.cmake).
+//
+// DUE-TIME BIAS (review B13). The due is stored in the key as `due ^ 2^63` (so negative dues sort before
+// positive ones under the unsigned comparator). Every READ of a due taken from a key or from the "I"
+// index must UNDO that bias (`due_from_be`); the first version decoded it raw, so every reloaded
+// reminder came back with its high bit flipped and a re-arm deleted the wrong key (leaving a duplicate).
+//
+// ERROR HANDLING (same rules as rocksdb_store.hpp, review B3-B6). Every public method takes `mu_`; only
+// `NotFound` means "absent" — an IOError/Corruption on a read is an ERROR (a failed "I" lookup used to
+// look like "no previous row", leaving a stale duplicate); a malformed row on replay is corruption, not a
+// silently dropped reminder; a failed open makes every op error; the in-RAM checkpoint is updated only
+// after the durable write succeeded.
 #pragma once
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -55,11 +67,14 @@ public:
     // due-keyed row; we find it via the "I" (key -> current due) index. The Delete(old R) + Put(new R) +
     // Put(I) go in ONE WriteBatch written with sync=true ⇒ atomic + durable, no duplicate row survives.
     [[nodiscard]] result<void> put(const ReminderRow& row) {
+        std::lock_guard<std::mutex> g(mu_);
         if (!db_) return fail(errc::internal, "rocksdb reminder store not open");
         const ReminderKey k = row.key();
         rocksdb::WriteBatch wb;
         std::int64_t old_due = 0;
-        if (lookup_due(k, old_due)) wb.Delete(rkey(k, old_due));  // drop the stale due-keyed row
+        const Lookup lk = lookup_due(k, old_due);
+        if (lk == Lookup::Error) return fail(errc::internal, "rocksdb reminder put: index lookup failed");
+        if (lk == Lookup::Found) wb.Delete(rkey(k, old_due));  // drop the stale due-keyed row
         wb.Put(rkey(k, row.scheduled_due_ns), encode_value(row));
         wb.Put(ikey(k), due_be(row.scheduled_due_ns));
         rocksdb::WriteOptions wo; wo.sync = true;
@@ -70,10 +85,13 @@ public:
     // Remove a reminder (cancel / one-shot completion): Delete both the due-keyed row and its I-index
     // entry in one synced batch. Removing an absent key is a no-op success.
     [[nodiscard]] result<void> remove(ReminderKey key) {
+        std::lock_guard<std::mutex> g(mu_);
         if (!db_) return fail(errc::internal, "rocksdb reminder store not open");
         rocksdb::WriteBatch wb;
         std::int64_t due = 0;
-        if (lookup_due(key, due)) wb.Delete(rkey(key, due));
+        const Lookup lk = lookup_due(key, due);
+        if (lk == Lookup::Error) return fail(errc::internal, "rocksdb reminder remove: index lookup failed");
+        if (lk == Lookup::Found) wb.Delete(rkey(key, due));
         wb.Delete(ikey(key));
         rocksdb::WriteOptions wo; wo.sync = true;
         if (!db_->Write(wo, &wb).ok()) return fail(errc::internal, "rocksdb reminder remove failed");
@@ -83,30 +101,36 @@ public:
     // Replay all live rows on cold open — a range scan over the "R" prefix returns them in
     // `scheduled_due_ns` order (big-endian due prefix), so the service rebuilds its due-index in order.
     [[nodiscard]] result<std::vector<ReminderRow>> load_all() {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!db_) return fail(errc::internal, "rocksdb reminder store not open");  // not "no reminders"
         std::vector<ReminderRow> out;
-        if (!db_) return out;
         std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
         for (it->Seek("R"); it->Valid(); it->Next()) {
             const rocksdb::Slice key = it->key();
             if (key.size() == 0 || key.data()[0] != 'R') break;   // left the R-range
-            if (key.size() != kRKeyLen) continue;                 // malformed
+            if (key.size() != kRKeyLen)
+                return fail(errc::internal, "rocksdb reminder load_all: malformed key (corrupt store)");
             ReminderRow r;
-            // key = 'R' + due(8) + actor_type(8) + actor_key(8) + name_hash(8)
-            r.scheduled_due_ns = static_cast<std::int64_t>(get_u64_be_raw(key.data() + 1));
+            // key = 'R' + due(8, biased) + actor_type(8) + actor_key(8) + name_hash(8)
+            r.scheduled_due_ns = due_from_be(key.data() + 1);
             r.actor.type.value = get_u64_be_raw(key.data() + 9);
             r.actor.key        = get_u64_be_raw(key.data() + 17);
-            if (!decode_value(it->value(), r)) continue;
+            if (!decode_value(it->value(), r))
+                return fail(errc::internal, "rocksdb reminder load_all: malformed value (corrupt store)");
             out.push_back(std::move(r));
         }
+        if (!it->status().ok())  // an iterator that died on an error is not the end of the range
+            return fail(errc::internal, "rocksdb reminder load_all failed");
         return out;
     }
 
     [[nodiscard]] result<void> checkpoint(std::int64_t bucket) {
-        checkpoint_ = bucket;
+        std::lock_guard<std::mutex> g(mu_);
         if (!db_) return fail(errc::internal, "rocksdb reminder store not open");
         rocksdb::WriteOptions wo; wo.sync = true;
         if (!db_->Put(wo, "C", i64_le(bucket)).ok())
             return fail(errc::internal, "rocksdb reminder checkpoint failed");
+        checkpoint_ = bucket;  // only after the durable write succeeded
         return {};
     }
     [[nodiscard]] std::int64_t checkpoint_bucket() const noexcept { return checkpoint_; }
@@ -128,12 +152,18 @@ private:
         return "I" + actor_bytes(k.actor) + u64_be(k.name_hash);
     }
 
-    // Current due for a key via the "I" index (so a re-arm can drop the stale due-keyed row).
-    [[nodiscard]] bool lookup_due(ReminderKey k, std::int64_t& out_due) {
+    enum class Lookup { Found, None, Error };
+
+    // Current due for a key via the "I" index (so a re-arm can drop the stale due-keyed row). The stored
+    // due is BIASED (see due_be); None only for a genuinely absent key, Error for a failed/garbled read.
+    [[nodiscard]] Lookup lookup_due(ReminderKey k, std::int64_t& out_due) {
+        if (!db_) return Lookup::Error;
         std::string v;
-        if (!db_ || !db_->Get(rocksdb::ReadOptions(), ikey(k), &v).ok() || v.size() < 8) return false;
-        out_due = static_cast<std::int64_t>(get_u64_be_raw(v.data()));
-        return true;
+        const rocksdb::Status st = db_->Get(rocksdb::ReadOptions(), ikey(k), &v);
+        if (st.IsNotFound()) return Lookup::None;
+        if (!st.ok() || v.size() < 8) return Lookup::Error;
+        out_due = due_from_be(v.data());
+        return Lookup::Found;
     }
 
     [[nodiscard]] std::int64_t load_checkpoint() {
@@ -175,6 +205,10 @@ private:
     [[nodiscard]] static std::string due_be(std::int64_t due) {
         return u64_be(static_cast<std::uint64_t>(due) ^ 0x8000'0000'0000'0000ULL);
     }
+    // The inverse of due_be: read 8 big-endian bytes and UNDO the 2^63 bias (review B13).
+    [[nodiscard]] static std::int64_t due_from_be(const char* p) {
+        return static_cast<std::int64_t>(get_u64_be_raw(p) ^ 0x8000'0000'0000'0000ULL);
+    }
 
     // ---- big-endian u64 (keys: lexicographic order == numeric order) --------------------------------
     [[nodiscard]] static std::string u64_be(std::uint64_t v) {
@@ -212,6 +246,7 @@ private:
         return v;
     }
 
+    std::mutex mu_;
     std::unique_ptr<rocksdb::DB> db_;
     std::int64_t checkpoint_ = -1;
 };
