@@ -61,3 +61,15 @@ jobs:
             cat "/tmp/$t.gdb" | cut -c1-240
             echo "::endgroup::"
           done
+
+      - name: Timing A/B (fake-stack use-after-return on vs off)
+        shell: bash
+        run: |
+          set +e
+          for t in ${{ inputs.tests }}; do
+            for uar in 1 0; do
+              s=$(date +%s)
+              ASAN_OPTIONS=abort_on_error=0:detect_stack_use_after_return=$uar timeout 400 "build/tests/$t" >/dev/null 2>&1
+              echo "RESULT $t detect_stack_use_after_return=$uar exit=$? elapsed=$(( $(date +%s) - s ))s"
+            done
+          done
