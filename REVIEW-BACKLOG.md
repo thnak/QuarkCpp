@@ -115,7 +115,7 @@ under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet 
 - [ ] E1 HIGH — every remote send copies the peer schema (≤32 KiB) under node-wide `schema_mu_`
   (`distribution.hpp:78-82`, `secure_transport.hpp:297-302`, linear `contains` at `wire.hpp:632-636`).
   Regression from F17. Use a `shared_ptr<const>` / sorted set and a boolean "accepts type" API.
-- [ ] E2 HIGH — rate limiters starve instead of limit: `last_ns` advances even when integer division adds
+- [x] E2 HIGH (fixed: shared detail::RateBucket + sustained-rate test in security_wire_hardening_test) — rate limiters starve instead of limit: `last_ns` advances even when integer division adds
   0 tokens (`distribution.hpp:348-355`, `cluster.hpp:1412-1419`). Above ~4 k frames/s a peer gets ~0
   admitted; on the control plane it sheds SWIM acks → false suspicion. Advance `last_ns` only by the
   time converted into tokens. Add a sustained-rate test.

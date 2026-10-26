@@ -52,6 +52,7 @@
 #include "quark/core/transport.hpp"    // Transport seam + MessageFrame
 #include "quark/core/wire.hpp"         // negotiate(), WireMode, PeerSchema, tagless codec (016)
 #include "quark/detail/hash.hpp"       // hash_combine (inbound registry key)
+#include "quark/detail/rate_bucket.hpp"
 #include "pal/pal.hpp"                 // platform_abi_tag
 
 namespace quark {
@@ -327,10 +328,7 @@ private:
             .count();
     }
 
-    struct PeerBudget {
-        std::int64_t last_ns = 0;
-        std::uint64_t tokens = 0;
-    };
+    using PeerBudget = detail::RateBucket;
     static constexpr std::size_t kBudgetSlots = 256;
 
     [[nodiscard]] bool admit_peer(NodeId peer, std::int64_t now) noexcept {
@@ -339,23 +337,7 @@ private:
             (peer.value * 0x9E3779B97F4A7C15ULL) >> 56) & (kBudgetSlots - 1);
         std::lock_guard<std::mutex> g(budget_mu_);
         if (peer_rate_per_sec_ == 0) return true;
-        const std::uint64_t rate = peer_rate_per_sec_;
-        const std::uint64_t burst = peer_burst_;
-        PeerBudget& b = peer_budgets_[idx];
-        if (b.last_ns == 0) {
-            b.last_ns = now;
-            b.tokens = burst;
-        } else if (now > b.last_ns) {
-            const std::int64_t elapsed = now - b.last_ns;
-            const std::uint64_t dt = static_cast<std::uint64_t>(
-                std::min<std::int64_t>(elapsed, 1'000'000'000LL));
-            const std::uint64_t add = dt * rate / 1'000'000'000ULL;
-            b.tokens = std::min(burst, b.tokens + add);
-            b.last_ns = now;
-        }
-        if (b.tokens == 0) return false;
-        --b.tokens;
-        return true;
+        return peer_budgets_[idx].admit(now, peer_rate_per_sec_, peer_burst_);
     }
 
     Membership* membership_;

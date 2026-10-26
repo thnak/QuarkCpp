@@ -77,6 +77,7 @@
 #include "quark/core/tls_identity.hpp"  // Fingerprint — ADR-040 Phase 5 revocation-gossip piggyback
 #include "quark/core/transport.hpp"
 #include "quark/detail/hash.hpp"
+#include "quark/detail/rate_bucket.hpp"
 #include "pal/pal.hpp"  // pal::now() — the canonical suspend-counting clock (018/019)
 
 namespace quark {
@@ -1396,30 +1397,13 @@ private:
     // (SWIM's time-bounded-detection property), the per-round order seeded so it is deterministic but
     // not a fixed bias. Rebuilds when the round is exhausted; peers tombstoned or erased since the
     // round was built are skipped (one rebuild at most per call).
-    struct ControlBudget {
-        std::int64_t last_ns = 0;
-        std::uint64_t tokens = 0;
-    };
+    using ControlBudget = detail::RateBucket;
 
     [[nodiscard]] bool admit_control(NodeId from, std::int64_t now) noexcept {
         if (cfg_.control_rate_per_sec == 0) return true;
         const std::size_t idx = static_cast<std::size_t>(
             (from.value * 0x9E3779B97F4A7C15ULL) >> 56) & 255;
-        ControlBudget& b = control_budgets_[idx];
-        if (b.last_ns == 0) {
-            b.last_ns = now;
-            b.tokens = cfg_.control_burst;
-        } else if (now > b.last_ns) {
-            const std::uint64_t dt = static_cast<std::uint64_t>(
-                std::min<std::int64_t>(now - b.last_ns, 1'000'000'000LL));
-            b.tokens = std::min<std::uint64_t>(
-                cfg_.control_burst,
-                b.tokens + dt * cfg_.control_rate_per_sec / 1'000'000'000ULL);
-            b.last_ns = now;
-        }
-        if (b.tokens == 0) return false;
-        --b.tokens;
-        return true;
+        return control_budgets_[idx].admit(now, cfg_.control_rate_per_sec, cfg_.control_burst);
     }
 
     [[nodiscard]] std::optional<NodeId> next_probe_target() {

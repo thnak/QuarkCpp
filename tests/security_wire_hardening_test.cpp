@@ -215,6 +215,46 @@ void swim_source_binding() {
     check(!swim.is_known(NodeId{5555}), "unverified ghost is reaped after the TTL");
 }
 
+// ---- 2b. Rate limiter must LIMIT, not starve ---------------------------------------------------
+// A sender faster than 1/rate (here 10k frames/s vs a 4096/s budget) must still get ~rate frames/s
+// admitted. The old refill moved the clock to `now` even when integer division yielded 0 tokens, so
+// after the burst such a sender was admitted ~never (starving SWIM acks → false suspicion).
+std::int64_t g_virtual_ns = 1'000'000'000;
+std::int64_t virtual_clock(void*) noexcept { return g_virtual_ns; }
+
+void rate_limiter_sustained() {
+    LoopbackFabric fab;
+    SwimMembership::Config cfg;
+    cfg.cluster_id = ClusterId{0xC0FFEE};
+    cfg.control_rate_per_sec = 4096;
+    cfg.control_burst = 1;
+    LoopbackTransport node_tx{fab, NodeId{1}};
+    SwimMembership swim{NodeId{1}, node_tx, cfg};
+    swim.set_clock(&virtual_clock, nullptr);
+    LoopbackTransport peer{fab, NodeId{2}};
+
+    constexpr int kFrames = 10'000;  // one virtual second at 100 us spacing
+    for (int i = 0; i < kFrames; ++i) {
+        g_virtual_ns += 100'000;
+        ControlMsg g;
+        g.kind = ControlKind::Gossip;
+        g.cluster = cfg.cluster_id;
+        g.from = NodeId{2};
+        MessageFrame f;
+        f.from = NodeId{2};
+        f.to = NodeId{1};
+        f.kind = FrameKind::Control;
+        f.payload = detail::encode_control(g);
+        peer.send(NodeId{1}, std::move(f));
+    }
+    const auto admitted = static_cast<std::int64_t>(kFrames) -
+                          static_cast<std::int64_t>(swim.control_sheds());
+    std::printf("  rate limiter: admitted %lld of %d (budget 4096/s)\n",
+                static_cast<long long>(admitted), kFrames);
+    check(admitted >= 3800 && admitted <= 4400,
+          "a sender above the budget is admitted at ~rate, not starved to zero");
+}
+
 // ---- 3. Checked tagless decode -----------------------------------------------------------------
 struct Blob {
     std::string text;
@@ -361,6 +401,7 @@ void custom_frame_cap() {
 int main() {
     aad_coverage();
     swim_source_binding();
+    rate_limiter_sustained();
     checked_tagless();
     pending_handshake_cap();
     per_ip_pending_cap();
