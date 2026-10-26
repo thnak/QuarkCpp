@@ -96,6 +96,10 @@ public:
 
     // Bound unidentified inbound sockets (a pre-auth connection flood). 0 disables the cap.
     void set_max_pending_inbound(std::uint32_t n) noexcept { max_pending_in_ = n; }
+    // Per-source-IP cap on unidentified inbound sockets (0 disables) and the deadline for a socket to
+    // send its hello (<=0 disables). Call before start().
+    void set_max_pending_inbound_per_ip(std::uint32_t n) noexcept { max_pending_per_ip_ = n; }
+    void set_pending_hello_timeout_ns(std::int64_t ns) noexcept { pending_hello_timeout_ns_ = ns; }
 
     void add_peer(Endpoint ep) {
         if (started_.load(std::memory_order_acquire))
@@ -269,6 +273,7 @@ private:
     struct Conn {
         NodeId peer{};
         pal::fd_t fd = pal::invalid_fd;
+        std::uint64_t accept_serial = 0;  // identifies an accepted socket across fd reuse
         std::uint64_t peer_addr = 0;    // accepted socket's source (IPv4, host order)
         std::uint16_t peer_port = 0;
         bool has_peer_addr = false;
@@ -441,8 +446,19 @@ private:
                 drops_.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            if (max_pending_per_ip_ != 0 && peer_addr != 0) {
+                std::uint32_t same_ip = 0;
+                for (const auto& [pfd, pc] : pending_in_)
+                    if (pc->has_peer_addr && pc->peer_addr == peer_addr) ++same_ip;
+                if (same_ip >= max_pending_per_ip_) {
+                    pal::close_fd(*fd);
+                    drops_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+            }
             auto c = std::make_unique<Conn>();
             c->in.set_max_body(max_frame_body_);
+            c->accept_serial = ++accept_serial_;
             c->fd = *fd;
             c->peer_addr = peer_addr;
             c->peer_port = peer_port;
@@ -456,6 +472,16 @@ private:
             by_fd_[raw->fd] = raw;
             raw->interest = EPOLLIN | EPOLLOUT;  // EPOLLOUT to push our hello out
             io_.add_fd(raw->fd, raw->interest, [this, f = raw->fd](std::uint32_t ev) { on_conn(f, ev); });
+            if (pending_hello_timeout_ns_ > 0) {
+                // A socket that never identifies must not pin a pending slot forever (slowloris).
+                // The serial guards against fd reuse after the original socket closed.
+                io_.post_after(pending_hello_timeout_ns_, [this, f = raw->fd, s = raw->accept_serial] {
+                    const auto pit = pending_in_.find(f);
+                    if (pit == pending_in_.end() || pit->second->accept_serial != s) return;
+                    drops_.fetch_add(1, std::memory_order_relaxed);
+                    handle_dead(pit->second.get());
+                });
+            }
         }
     }
 
@@ -1086,6 +1112,9 @@ private:
     std::uint16_t bind_port_;
     std::uint32_t max_frame_body_ = max_frame_body;
     std::uint32_t max_pending_in_ = 1024;
+    std::uint32_t max_pending_per_ip_ = 64;
+    std::int64_t pending_hello_timeout_ns_ = 5'000'000'000;  // 5s to identify
+    std::uint64_t accept_serial_ = 0;
     pal::fd_t listener_ = pal::invalid_fd;
 
     pal::IoContext io_;

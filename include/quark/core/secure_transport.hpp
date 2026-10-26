@@ -90,9 +90,8 @@ public:
         inner_->set_authenticated_transport(true);
     }
 
-    ~SecureTransport() override {
-        if (inner_) inner_->set_authenticated_transport(false);
-    }
+    // No destructor reset of the inner's flag: `inner_` is a non-owning pointer and the inner transport
+    // may already be destroyed (use-after-free). The flag only gates inner->start().
 
     // Optional audit sink for tamper/replay drops (cold path).
     void set_audit_sink(AuditSink sink) noexcept { audit_ = sink; }
@@ -608,6 +607,13 @@ private:
             std::lock_guard<std::mutex> g(pending_mu_);
             const auto it = pending_.find(peer.value);
             if (it != pending_.end()) {
+                // `frame.from` is unauthenticated pre-handshake. A frame for a parked engine that
+                // arrives from a different source address than the one that opened it is a spoof /
+                // hijack attempt: ignore it WITHOUT touching (or erasing) the legitimate engine.
+                if (source.valid && it->second.source_ip_valid && it->second.source_ip != source.addr) {
+                    handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
                 // A parked engine past the progress deadline is stale (e.g. it sent its opening
                 // frame, that frame was lost, and the peer is only now retrying with a FRESH engine)
                 // — discard it so the peer's retry meets a fresh server-role engine below, instead of
@@ -632,26 +638,29 @@ private:
                                    "secure transport: handshake admission rejected", 0});
                 return;
             }
-            std::lock_guard<std::mutex> g(pending_mu_);
-            std::size_t ip_count = 0;
-            std::size_t known_count = 0;
-            for (const auto& [id, ph] : pending_) {
-                (void)id;
-                if (source.valid && ph.source_ip_valid && ph.source_ip == source.addr) ++ip_count;
-                if (ph.known) ++known_count;
+            // Cap checks under the lock; the audit sink runs AFTER release (a re-entrant sink must not
+            // deadlock on pending_mu_).
+            const char* reject = nullptr;
+            {
+                std::lock_guard<std::mutex> g(pending_mu_);
+                std::size_t ip_count = 0;
+                std::size_t known_count = 0;
+                for (const auto& [id, ph] : pending_) {
+                    (void)id;
+                    if (source.valid && ph.source_ip_valid && ph.source_ip == source.addr) ++ip_count;
+                    if (ph.known) ++known_count;
+                }
+                // `known` rests on the UNAUTHENTICATED claimed NodeId, so it only unlocks the reserved
+                // slots of the global cap; it never bypasses the per-IP cap.
+                if (pending_.size() >= max_pending_handshakes_ &&
+                    (!known || known_count >= reserved_handshake_slots_))
+                    reject = "secure transport: pending handshake cap reached";
+                else if (max_pending_per_ip_ != 0 && source.valid && ip_count >= max_pending_per_ip_)
+                    reject = "secure transport: pending handshake per-IP cap reached";
             }
-            if (pending_.size() >= max_pending_handshakes_ &&
-                (!known || known_count >= reserved_handshake_slots_)) {
+            if (reject) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
-                audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, peer.value,
-                                   "secure transport: pending handshake cap reached", 0});
-                return;
-            }
-            if (!known && max_pending_per_ip_ != 0 && source.valid &&
-                ip_count >= max_pending_per_ip_) {
-                handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
-                audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, peer.value,
-                                   "secure transport: pending handshake per-IP cap reached", 0});
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, peer.value, reject, 0});
                 return;
             }
             engine = handshake_factory_->create(/*is_client=*/false, self_, peer, cluster_id_,

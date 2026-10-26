@@ -20,8 +20,8 @@
 
 #include "quark/core/engine_config.hpp"  // SecurityMode (013)
 #include "quark/core/error.hpp"
-#include "quark/core/principal.hpp"
-#include "quark/core/transport.hpp"  // Principal + attenuation algebra (020 §3)
+#include "quark/core/principal.hpp"  // Principal + attenuation algebra (020 §3)
+#include "quark/core/transport.hpp"  // Transport::is_plaintext() for validate_startup_security
 
 namespace quark {
 

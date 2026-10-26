@@ -15,6 +15,7 @@
 // No typeid/dynamic_cast — reflection-free, builds clean under -fno-rtti (ADR-016).
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -509,7 +510,9 @@ bool tagless_read_value_checked(const std::byte*& p, const std::byte* end, M& m)
             constexpr std::uint32_t kMaxTaglessElements = 1u << 20;
             if (n > kMaxTaglessElements || static_cast<std::size_t>(end - p) < n) return false;
             m.clear();
-            m.reserve(n);
+            // Reserve against the bytes actually present, not the declared count: sizeof(E) can be
+            // 32x the 1-byte-per-element lower bound (e.g. std::string), amplifying a small frame.
+            m.reserve(std::min<std::size_t>(n, 1024));
             for (std::uint32_t i = 0; i < n; ++i) {
                 E elem{};
                 if (!tagless_read_value_checked(p, end, elem)) return false;
