@@ -280,6 +280,18 @@ jobs:
         shell: cmd
         run: cmake --build build --config Release -j 4
 
+      # MSVC /fsanitize=address links the DYNAMIC runtime (clang_rt.asan_dynamic-x86_64.dll), which
+      # lives in the toolset's bin dir and is not on PATH: without this every test exits 0xc0000135
+      # (STATUS_DLL_NOT_FOUND) in ~10 ms. Put the pinned toolset's Hostx64\x64 dir on PATH.
+      - name: Locate MSVC ASan runtime
+        if: matrix.config.sanitize != ''
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dir = Join-Path $vs "VC\Tools\MSVC\$env:MSVC_VERSION\bin\Hostx64\x64"
+          if (-not (Test-Path (Join-Path $dir 'clang_rt.asan_dynamic-x86_64.dll'))) { throw "ASan runtime not found in $dir" }
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
       - name: Test
         shell: cmd
         # -j 2, not 4: matches the Linux legs' ctest_jobs (also sized to the runner's real core count,
