@@ -71,7 +71,7 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
 
 ## C. Memory
 
-- [ ] C1 HIGH — outbound TCP queues unbounded (`tcp_transport.hpp:347-350`; post queue in
+- [x] C1 HIGH (fixed: per-peer byte caps data 64 MiB soft / control 256 MiB hard + posted-bytes cap in send(); tcp_transport_backpressure_test) — outbound TCP queues unbounded (`tcp_transport.hpp:347-350`; post queue in
   `pal .../net.hpp:286`). ADR-046 gate only sees the peer's mailbox signal, not local socket backlog.
   Add a per-peer byte cap shedding data frames (never control), with a drop counter.
 - [ ] C2 HIGH — idle eviction frees nothing: `engine.hpp:1238` `lazy_owned` never erased;
