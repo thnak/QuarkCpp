@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -103,6 +104,12 @@ public:
     // Cap on IDENTIFIED inbound connections per source IP (0 disables). The hello NodeId is only a
     // claim at this layer, so this is what bounds a fake-id connection flood. Call before start().
     void set_max_inbound_per_ip(std::uint32_t n) noexcept { max_inbound_per_ip_ = n; }
+    // C1: per-peer outbound backlog caps, in encoded wire bytes (default 64 MiB data / 256 MiB control;
+    // 0 disables). Data frames past the data cap are shed (counted, dead-lettered 010); Control frames
+    // have their own much larger hard cap so SWIM/handshake traffic still flows. Set before start().
+    void set_max_outbound_data_bytes(std::uint64_t n) noexcept { max_outbound_data_bytes_ = n; }
+    void set_max_outbound_control_bytes(std::uint64_t n) noexcept { max_outbound_control_bytes_ = n; }
+
     // When true (default) a new inbound hello claiming the NodeId of a live, confirmed connection that
     // came from a different source IP is rejected instead of winning the dial-dedup. Disable only for
     // multi-homed peers that legitimately reconnect from a different address while the old link lives.
@@ -191,7 +198,23 @@ public:
     // --- Transport seam -------------------------------------------------------------------------
     void send(NodeId to, MessageFrame frame) override {
         if (to == self_) return;  // never dial ourselves; a self-addressed frame is a local concern
-        io_.post([this, to, f = std::move(frame)]() mutable { send_on_loop(to, std::move(f)); });
+        // C1: bound the cross-thread post queue too. Data frames posted but not yet encoded count against
+        // the data cap; past it they are shed here on the caller's thread (at-most-once: a shed frame is
+        // dead-lettered, never reordered - frames already posted keep their FIFO order).
+        const std::uint64_t sz = frame.payload.size();
+        if (frame.kind == FrameKind::Data) {
+            if (max_outbound_data_bytes_ != 0 &&
+                posted_data_bytes_.load(std::memory_order_relaxed) + sz > max_outbound_data_bytes_) {
+                outbound_data_drops_.fetch_add(1, std::memory_order_relaxed);
+                drops_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            posted_data_bytes_.fetch_add(sz, std::memory_order_relaxed);
+        }
+        io_.post([this, to, sz, f = std::move(frame)]() mutable {
+            if (f.kind == FrameKind::Data) posted_data_bytes_.fetch_sub(sz, std::memory_order_relaxed);
+            send_on_loop(to, std::move(f));
+        });
     }
 
     void on_receive(std::function<void(MessageFrame)> cb) override {
@@ -263,11 +286,45 @@ public:
     [[nodiscard]] std::uint64_t frames_received() const noexcept { return frames_received_.load(); }
     [[nodiscard]] std::uint64_t frames_sent() const noexcept { return frames_sent_.load(); }
     [[nodiscard]] std::uint64_t drops() const noexcept { return drops_.load(); }
+    [[nodiscard]] std::uint64_t outbound_data_drops() const noexcept { return outbound_data_drops_.load(); }
+    [[nodiscard]] std::uint64_t outbound_control_drops() const noexcept { return outbound_control_drops_.load(); }
+    // Total bytes queued across all peers (both lanes), measured on the loop thread. Blocks briefly.
+    [[nodiscard]] std::uint64_t outbound_queued_bytes() {
+        std::uint64_t r = 0;
+        run_on_loop_sync([&] {
+            for (const auto& [id, q] : outq_) r += q.control_bytes + q.data_bytes;
+        });
+        return r;
+    }
+    // C1 invariant check: every peer's byte counters equal the re-summed deque contents.
+    [[nodiscard]] bool outq_accounting_consistent() {
+        bool ok = true;
+        run_on_loop_sync([&] {
+            for (const auto& [id, q] : outq_) ok = ok && q.consistent();
+        });
+        return ok;
+    }
     [[nodiscard]] std::uint64_t dedup_closed() const noexcept { return dedup_closed_.load(); }
     [[nodiscard]] std::uint64_t reconnects() const noexcept { return reconnects_.load(); }
     [[nodiscard]] std::uint64_t connections_open() const noexcept { return conns_open_.load(); }
 
 private:
+    // Run `fn` on the loop thread and wait (or inline if the loop is not running).
+    template <class F>
+    void run_on_loop_sync(F&& fn) {
+        if (!started_.load(std::memory_order_acquire)) {
+            fn();
+            return;
+        }
+        std::promise<void> done;
+        auto fut = done.get_future();
+        io_.post([&] {
+            fn();
+            done.set_value();
+        });
+        fut.wait();
+    }
+
     bool authenticated_transport_ = false;    // F1: set by SecureTransport before the inner starts
     bool allow_insecure_plaintext_ = false;   // F1: explicit dev opt-in only
     bool plaintext_start_refused_ = false;    // F1: diagnostic for a refused start()
@@ -336,9 +393,44 @@ private:
     // rotates `Conn::out` to a new frame once the previous one is fully sent, so control can jump
     // ahead of not-yet-started data, but never preempts a frame whose transmission has already begun
     // (a raw byte splice at an arbitrary `out_sent` offset can land mid-frame and corrupt the stream).
+    //
+    // C1: `control_bytes`/`data_bytes` are the exact byte totals of the frames sitting in the two deques
+    // (NOT `Conn::out`, which is the one in-flight frame). Every push/pop goes through the helpers below
+    // so the totals cannot drift; `outq_accounting_consistent()` re-sums the deques to prove it.
     struct PeerQueue {
         std::deque<std::vector<std::byte>> control;
         std::deque<std::vector<std::byte>> data;
+        std::uint64_t control_bytes = 0;
+        std::uint64_t data_bytes = 0;
+
+        void push_back(std::vector<std::byte>&& b, bool is_control) {
+            (is_control ? control_bytes : data_bytes) += b.size();
+            (is_control ? control : data).push_back(std::move(b));
+        }
+        void push_front_control(std::vector<std::byte>&& b) {
+            control_bytes += b.size();
+            control.push_front(std::move(b));
+        }
+        // Pops the next frame, control first (ADR-046 S4). Empty vector if nothing queued.
+        std::vector<std::byte> pop_next() {
+            std::vector<std::byte> out;
+            if (!control.empty()) {
+                out = std::move(control.front());
+                control.pop_front();
+                control_bytes -= out.size();
+            } else if (!data.empty()) {
+                out = std::move(data.front());
+                data.pop_front();
+                data_bytes -= out.size();
+            }
+            return out;
+        }
+        [[nodiscard]] bool consistent() const noexcept {
+            std::uint64_t c = 0, d = 0;
+            for (const auto& f : control) c += f.size();
+            for (const auto& f : data) d += f.size();
+            return c == control_bytes && d == data_bytes;
+        }
     };
 
     // ---- send path (loop thread) ----------------------------------------------------------------
@@ -352,9 +444,23 @@ private:
             return;
         }
         std::vector<std::byte> bytes = encode_frame(frame);
-        std::deque<std::vector<std::byte>>& dst =
-            (frame.kind == FrameKind::Control) ? outq_[to.value].control : outq_[to.value].data;
-        dst.push_back(std::move(bytes));
+        const bool is_control = (frame.kind == FrameKind::Control);
+        PeerQueue& q = outq_[to.value];
+        // C1: bound the per-peer backlog. A frame is shed only if its lane is non-empty (a single
+        // oversized frame still gets through) and the cap would be exceeded. Data is shed at the soft
+        // cap; Control/Authenticate-class traffic has its own, much larger hard cap so SWIM and the
+        // handshake keep flowing past a data backlog but cannot grow without bound either. 0 = no cap.
+        // Only FrameKind::Data is soft-capped; Control/Authenticate/Schema are all "control-class" and
+        // measured against the hard cap over the peer's whole queue.
+        const bool is_data = (frame.kind == FrameKind::Data);
+        const std::uint64_t cap = is_data ? max_outbound_data_bytes_ : max_outbound_control_bytes_;
+        const std::uint64_t have = is_data ? q.data_bytes : q.control_bytes + q.data_bytes;
+        if (cap != 0 && have != 0 && have + bytes.size() > cap) {
+            (is_data ? outbound_data_drops_ : outbound_control_drops_).fetch_add(1, std::memory_order_relaxed);
+            drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        q.push_back(std::move(bytes), is_control);
         frames_sent_.fetch_add(1, std::memory_order_relaxed);
         // Flows now only if this connection has won dedup and is up; otherwise the frame waits in the
         // peer queue until a confirmed connection pumps it (on confirm / on writable / on reconnect).
@@ -370,14 +476,7 @@ private:
         c->out_sent = 0;
         const auto qit = outq_.find(c->peer.value);
         if (qit == outq_.end()) return;
-        PeerQueue& q = qit->second;
-        if (!q.control.empty()) {
-            c->out = std::move(q.control.front());
-            q.control.pop_front();
-        } else if (!q.data.empty()) {
-            c->out = std::move(q.data.front());
-            q.data.pop_front();
-        }
+        c->out = qit->second.pop_next();
     }
 
     // Kick the (confirmed) connection to pick up whatever is newly queued and flush.
@@ -392,7 +491,7 @@ private:
     // SecureTransport's per-lane replay guard (issue #16): the receiver picks the lane from the frame's
     // own `kind`, and the salvaged frame is the OLDEST unsent data frame, so data-lane FIFO still holds.
     void salvage_out(Conn* c) {
-        if (!c->out.empty() && c->out_sent == 0) outq_[c->peer.value].control.push_front(std::move(c->out));
+        if (!c->out.empty() && c->out_sent == 0) outq_[c->peer.value].push_front_control(std::move(c->out));
         c->out.clear();
         c->out_sent = 0;
     }
@@ -1156,6 +1255,8 @@ private:
     std::uint32_t max_frame_body_ = max_frame_body;
     std::uint32_t max_pending_in_ = 1024;
     std::uint32_t max_pending_per_ip_ = 64;
+    std::uint64_t max_outbound_data_bytes_ = 64ull << 20;      // C1: per-peer data backlog cap
+    std::uint64_t max_outbound_control_bytes_ = 256ull << 20;  // C1: per-peer control backlog hard cap
     std::uint32_t max_inbound_per_ip_ = 64;       // identified inbound connections per source IP
     bool strict_peer_addr_binding_ = true;        // a live peer's slot cannot be taken from another IP
     std::int64_t pending_hello_timeout_ns_ = 5'000'000'000;  // 5s to identify
@@ -1192,6 +1293,9 @@ private:
     std::atomic<std::uint64_t> frames_received_{0};
     std::atomic<std::uint64_t> frames_sent_{0};
     std::atomic<std::uint64_t> drops_{0};
+    std::atomic<std::uint64_t> outbound_data_drops_{0};     // C1
+    std::atomic<std::uint64_t> outbound_control_drops_{0};  // C1
+    std::atomic<std::uint64_t> posted_data_bytes_{0};       // C1: data payload bytes posted, not yet on loop
     std::atomic<std::uint64_t> dedup_closed_{0};
     std::atomic<std::uint64_t> reconnects_{0};
     std::atomic<std::uint64_t> conns_open_{0};
