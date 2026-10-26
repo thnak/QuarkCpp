@@ -40,19 +40,19 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
   counter. Add a test that two seals of the same context never share a nonce.
 - [x] B2 HIGH (fixed: fence acquired first; ordering test in engine_lazy_persistence_test, fails on old order) — recovery loads state **before** `acquire_fence` (`engine.hpp:1200` then `:1214`); a stale
   owner can write in between. Acquire the fence first, then load.
-- [ ] B3 HIGH — stores used from many threads with no locking (`file_store.hpp:162-172` `table_`;
+- [~] B3 HIGH (InMemoryStore + FileStore fixed with a mutex; SqliteStore/RocksStore still open) — stores used from many threads with no locking (`file_store.hpp:162-172` `table_`;
   `sqlite_store.hpp:61-67,114-120` shared connection). Spec 012 (lines 127-133) requires serialized
   access and a two-thread conformance stress; `store_conformance.hpp` has no threads.
 - [ ] B4 HIGH — fence/seq checks outside the write transaction (`sqlite_store.hpp:86-93,108-114`;
   `rocksdb_store.hpp:81-87,101-112`; `acquire_fence` is a non-atomic RMW at `:58-62`).
-- [ ] B5 HIGH — swallowed errors: SQLite `exec()` ignores return codes (`:162`); failed `COMMIT` returns
+- [~] B5 HIGH (FileStore/InMemoryStore: acquire_fence failure returns invalid token 0 and writes under 0 are refused; SQLite exec()/COMMIT/BEGIN error handling + Rocks still open) — swallowed errors: SQLite `exec()` ignores return codes (`:162`); failed `COMMIT` returns
   success (`:120`); failed `BEGIN` runs inserts in autocommit (partial batch, breaks ADR-009 C7);
   `acquire_fence` returns the *current* owner's token on failure (`file_store.hpp:73`,
   `sqlite_store.hpp:68`, `rocksdb_store.hpp:61`); `FileReminderStore` ignores `durable_flush` failure
   (`reminder_service.hpp:342,227`). Make `acquire_fence` return `result`.
 - [ ] B6 HIGH — read errors look like "no data" (SQLite `:73-82,124-131,164-173`; Rocks `:69-70,152`):
   recovery seeds default state and the next flush overwrites the real snapshot.
-- [ ] B7 HIGH — replay truncates at the first CRC mismatch and deletes later committed records
+- [~] B7 HIGH (FileStore fixed: mid-file CRC failure marks the log corrupt, no truncation, ops refused; torn tail still truncated; FileReminderStore still open) — replay truncates at the first CRC mismatch and deletes later committed records
   (`file_store.hpp:186-192`; `reminder_service.hpp:370-384`). A torn mid-file record in
   `FileReminderStore` (`:332-335`) drops later appends.
 - [ ] B8 MED — replay trusts record contents (`file_store.hpp:274-289` unchecked indexing, CRC32 is not a
@@ -64,7 +64,7 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
 - [ ] B10 MED — `ReminderService` re-register leaves a stale due-index entry (`:437-439,539-542`): fires
   early with the new due time; a later-rescheduled one-shot fires at the old time and is removed
   (`:431-440,494-515`). Store errors in `tick` ignored (`:509,513,522`).
-- [ ] B11 MED — stale snapshots can overwrite newer ones; no store rejects lower `through_seq`
+- [~] B11 MED (InMemoryStore + FileStore reject lower through_seq; adapters still open) — stale snapshots can overwrite newer ones; no store rejects lower `through_seq`
   (`persistence.hpp:182-195`). Spec 012 keys snapshots by (fence, through_seq).
 - [ ] B12 MED — transport nonce reuse when the handshake is disabled: a reconnect resets seq to 0 under
   the shared cipher (`secure_transport.hpp:139-143,387-399,755-759`).

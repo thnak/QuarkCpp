@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -64,28 +65,45 @@ public:
     FileStore& operator=(const FileStore&) = delete;
 
     // 012 fencing: journal + hand out a strictly-greater token, recorded as the current owner of `id`.
+    //
+    // THREAD SAFETY (012 adapters serialize access, review B3): every public method takes `mu_`
+    // (it guards `table_`, each Entry's in-RAM index and its write offset).
     [[nodiscard]] FenceToken acquire_fence(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
         Entry& e = entry(id);
+        if (e.corrupt) return FenceToken{0};  // unusable log: hand out no token (writes are refused)
         const FenceToken next{e.owner.value + 1};
         std::vector<std::byte> body;
         put_u8(body, kFence);
         put_u64(body, next.value);
-        if (!durable_append(e, body)) return e.owner;  // durability failed — keep the old owner
+        // Durability failed: return the INVALID token (0), not the current owner's. Handing back the
+        // owner's token let two activations share one token, defeating the fence (review B5); a store
+        // refuses every write under token 0.
+        if (!durable_append(e, body)) return FenceToken{0};
         e.owner = next;
         return e.owner;
     }
 
-    [[nodiscard]] SeqNo last_seq(ActorId id) { return entry(id).last_seq; }
+    [[nodiscard]] SeqNo last_seq(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        return entry(id).last_seq;
+    }
 
     [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
         Entry& e = entry(id);
+        if (e.corrupt) return corrupt_error();
         if (!e.snapshot.has_value()) return std::optional<SnapshotRecord>{};
         return std::optional<SnapshotRecord>{e.snapshot};
     }
 
     [[nodiscard]] result<void> save_snapshot(ActorId id, FenceToken tok, const SnapshotRecord& snap) {
+        std::lock_guard<std::mutex> g(mu_);
         Entry& e = entry(id);
-        if (tok < e.owner) return fenced_error();                    // superseded writer — reject
+        if (e.corrupt) return corrupt_error();
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();  // no/superseded token
+        if (e.snapshot.has_value() && snap.through_seq < e.snapshot->through_seq)  // review B11
+            return fail(errc::internal, "stale snapshot: through_seq older than the stored snapshot");
         if (snap.through_seq > e.last_seq)                           // 012: never ahead of the tail
             return fail(errc::internal, "snapshot through_seq ahead of the appended tail");
         std::vector<std::byte> body;
@@ -110,8 +128,10 @@ public:
     // before writing, then write ONE framed record + one fdatasync ⇒ all-or-none on disk.
     [[nodiscard]] result<void> append_batch(ActorId id, FenceToken tok,
                                             std::span<const EventRecord> batch) {
+        std::lock_guard<std::mutex> g(mu_);
         Entry& e = entry(id);
-        if (tok < e.owner) return fenced_error();                    // reject the whole batch
+        if (e.corrupt) return corrupt_error();
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();  // reject the whole batch
         SeqNo prev = e.last_seq;
         for (const EventRecord& r : batch) {
             if (r.seq <= prev) return fail(errc::internal, "commit sequence not strictly increasing");
@@ -131,7 +151,9 @@ public:
     }
 
     [[nodiscard]] result<EventCursor> read_log(ActorId id, SeqNo from) {
+        std::lock_guard<std::mutex> g(mu_);
         Entry& e = entry(id);
+        if (e.corrupt) return corrupt_error();
         EventCursor cur;
         for (const auto& ev : e.log)
             if (ev.seq >= from) cur.entries.push_back(ev);
@@ -139,8 +161,20 @@ public:
     }
 
     // --- Test/diagnostic introspection (not part of the Store seam) ---------------------------
-    [[nodiscard]] FenceToken current_owner(ActorId id) { return entry(id).owner; }
-    [[nodiscard]] std::size_t log_size(ActorId id) { return entry(id).log.size(); }
+    [[nodiscard]] FenceToken current_owner(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        return entry(id).owner;
+    }
+    [[nodiscard]] std::size_t log_size(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        return entry(id).log.size();
+    }
+    // True if `id`'s log failed its integrity check mid-file (a CRC-bad record with intact data after
+    // it). Such a log is NEVER truncated or served: every operation on it errors (review B7).
+    [[nodiscard]] bool corrupted(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        return entry(id).corrupt;
+    }
 
 private:
     // Record kinds in the WAL payload (after the {len, crc} frame header).
@@ -155,8 +189,15 @@ private:
         SeqNo last_seq = 0;
         std::optional<SnapshotRecord> snapshot;
         std::vector<EventRecord> log;
+        bool corrupt = false;  // mid-file corruption detected on replay: refuse to serve or truncate
         ~Entry() { pal::file_close(fd); }
     };
+
+    [[nodiscard]] static std::unexpected<error> corrupt_error() noexcept {
+        return fail(errc::internal,
+                    "FileStore: log is corrupt mid-file (CRC mismatch before intact records); "
+                    "refusing to serve or truncate it; restore from backup / repair offline");
+    }
 
     // Lazy open + replay of `id`'s WAL into an in-RAM Entry (one-time per actor).
     Entry& entry(ActorId id) {
@@ -185,9 +226,20 @@ private:
             const std::uint64_t body_off = off + 8;
             if (body_off + len > n) break;                          // torn: body not fully written
             std::span<const std::byte> body(file.data() + body_off, len);
-            if (crc32(body) != crc) break;                          // torn: corrupt trailing record
+            if (crc32(body) != crc) {
+                // A torn append only damages the TAIL: a bad record that ends exactly at EOF is that.
+                // A bad record with more data after it is MID-FILE corruption (bit-rot / bad sector):
+                // truncating here would durably delete every later acknowledged record, so keep the
+                // file untouched and mark the log unusable instead (review B7).
+                if (body_off + len < n) e.corrupt = true;
+                break;
+            }
             apply_record(e, body);
             off = body_off + len;                                   // advance past this good record
+        }
+        if (e.corrupt) {
+            e.write_off = n;  // never append behind (or truncate) a corrupt region
+            return;
         }
         if (off != n) (void)pal::file_truncate(e.fd, off);  // drop a torn tail
         e.write_off = off;
@@ -306,6 +358,7 @@ private:
     }
 
     std::string root_;
+    std::mutex mu_;
     std::unordered_map<ActorId, std::unique_ptr<Entry>> table_;
 };
 

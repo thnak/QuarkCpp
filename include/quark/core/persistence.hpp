@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -146,6 +147,11 @@ concept Store = requires(S& s, ActorId id, FenceToken tok, SeqNo seq,
     { s.read_log(id, seq) } -> std::same_as<result<EventCursor>>;
 };
 
+// A token of 0 means "no fence": real tokens start at 1 (acquire_fence returns owner+1). A store
+// refuses every write carried under it, so a failed/skipped acquire_fence (which returns 0) can never
+// be mistaken for a valid owner and silently write (review B5).
+[[nodiscard]] constexpr bool is_unfenced(FenceToken t) noexcept { return t.value == 0; }
+
 // The fence-rejection error (012): a stale/superseded writer's write is refused. `unavailable` is
 // the taxonomy slot for "a newer owner fenced this activation out" (007/010 partition semantics).
 [[nodiscard]] inline std::unexpected<error> fenced_error() noexcept {
@@ -162,26 +168,39 @@ concept Store = requires(S& s, ActorId id, FenceToken tok, SeqNo seq,
 class InMemoryStore {
 public:
     // 012 fencing: hand out a strictly-greater token and record it as the current owner of `id`.
+    //
+    // THREAD SAFETY (012 adapters serialize access, review B3): every public method takes `mu_`.
+    // The engine calls a store from every shard's broker and from worker threads (deactivation flush,
+    // commit), so unlocked `table_` mutation was a data race.
     [[nodiscard]] FenceToken acquire_fence(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
         auto& e = table_[id];
         e.owner = FenceToken{e.owner.value + 1};
         return e.owner;
     }
 
     [[nodiscard]] SeqNo last_seq(ActorId id) const noexcept {
+        std::lock_guard<std::mutex> g(mu_);
         const auto it = table_.find(id);
         return it == table_.end() ? SeqNo{0} : it->second.last_seq;
     }
 
     [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const {
+        std::lock_guard<std::mutex> g(mu_);
         const auto it = table_.find(id);
         if (it == table_.end() || !it->second.snapshot.has_value()) return std::optional<SnapshotRecord>{};
         return std::optional<SnapshotRecord>{it->second.snapshot};
     }
 
     [[nodiscard]] result<void> save_snapshot(ActorId id, FenceToken tok, const SnapshotRecord& snap) {
+        std::lock_guard<std::mutex> g(mu_);
         auto& e = table_[id];
-        if (tok < e.owner) return fenced_error();       // superseded writer — reject
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();  // no/superseded token
+        // 012: snapshots are keyed by (fence, through_seq); an older through_seq would roll the
+        // recovery point back behind a newer checkpoint (review B11). Equal is allowed (the
+        // snapshot-model flush always carries through_seq 0).
+        if (e.snapshot.has_value() && snap.through_seq < e.snapshot->through_seq)
+            return fail(errc::internal, "stale snapshot: through_seq older than the stored snapshot");
         // 012: a snapshot names the EXACT log prefix it subsumes, so `through_seq` must never run
         // ahead of the actual appended tail. An over-advanced through_seq would make recovery skip
         // un-replayed seqs (silent data loss) AND jump `last_seq` past never-appended seqs, wedging
@@ -196,8 +215,9 @@ public:
 
     [[nodiscard]] result<void> append(ActorId id, FenceToken tok, SeqNo seq,
                                       std::span<const std::byte> bytes) {
+        std::lock_guard<std::mutex> g(mu_);
         auto& e = table_[id];
-        if (tok < e.owner) return fenced_error();       // superseded writer — reject
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();  // no/superseded token
         // Commit sequence numbers are strictly increasing (012/ADR-009 C7); event seqs start at 1,
         // so a seq that does not advance past the last committed one is a caller bug, never normal.
         if (seq <= e.last_seq) return fail(errc::internal, "commit sequence not strictly increasing");
@@ -213,8 +233,9 @@ public:
     // completion, making a multi-event commit all-or-nothing.
     [[nodiscard]] result<void> append_batch(ActorId id, FenceToken tok,
                                             std::span<const EventRecord> batch) {
+        std::lock_guard<std::mutex> g(mu_);
         auto& e = table_[id];
-        if (tok < e.owner) return fenced_error();       // superseded writer — reject the whole batch
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();  // reject the whole batch
         SeqNo prev = e.last_seq;
         for (const EventRecord& r : batch) {
             if (r.seq <= prev) return fail(errc::internal, "commit sequence not strictly increasing");
@@ -227,6 +248,7 @@ public:
     }
 
     [[nodiscard]] result<EventCursor> read_log(ActorId id, SeqNo from) const {
+        std::lock_guard<std::mutex> g(mu_);
         EventCursor cur;
         const auto it = table_.find(id);
         if (it == table_.end()) return cur;
@@ -237,10 +259,12 @@ public:
 
     // --- Test/diagnostic introspection (not part of the Store seam) ---------------------------
     [[nodiscard]] std::size_t log_size(ActorId id) const noexcept {
+        std::lock_guard<std::mutex> g(mu_);
         const auto it = table_.find(id);
         return it == table_.end() ? 0 : it->second.log.size();
     }
     [[nodiscard]] FenceToken current_owner(ActorId id) const noexcept {
+        std::lock_guard<std::mutex> g(mu_);
         const auto it = table_.find(id);
         return it == table_.end() ? FenceToken{0} : it->second.owner;
     }
@@ -252,6 +276,7 @@ private:
         std::optional<SnapshotRecord> snapshot;
         std::vector<EventRecord> log;        // append-only, seq-ordered
     };
+    mutable std::mutex mu_;
     std::unordered_map<ActorId, Entry> table_;
 };
 
