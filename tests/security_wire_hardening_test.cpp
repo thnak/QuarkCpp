@@ -383,6 +383,60 @@ void per_ip_pending_cap() {
     check(secure.pending_handshake_count() == 10, "unreserved peer cannot exceed the reservation");
 }
 
+// A7: `frame.from` is unauthenticated before the handshake completes, so (a) a frame for a parked
+// engine from a DIFFERENT source IP than the one that opened it must be ignored without touching or
+// evicting the legitimate engine, and (b) a claimed-known NodeId must not bypass the per-IP cap.
+void handshake_spoof_resistance() {
+    LoopbackFabric fab;
+    LoopbackTransport node_tx{fab, NodeId{1}};
+    MockCipher cipher{1};
+    SecureTransport secure{node_tx, cipher, NodeId{1}};
+
+    auto identity = std::make_shared<const TlsIdentity>();
+    auto roots = std::make_shared<const TrustedRoots>();
+    IdentityMaterial identity_material{identity};
+    TrustStore trust{roots};
+    WantReadFactory factory;
+    secure.enable_handshake(factory, ClusterId{0xC0FFEE}, identity_material, trust);
+    secure.on_receive([](MessageFrame) {});
+    secure.set_max_pending_per_ip(2);
+    secure.set_known_peer([](NodeId n) { return n.value >= 777 && n.value <= 779; });
+
+    LoopbackTransport attacker{fab, NodeId{2}};
+    auto send = [&](std::uint64_t id, std::uint64_t ip) {
+        MessageFrame f;
+        f.from = NodeId{id};
+        f.to = NodeId{1};
+        f.kind = FrameKind::Authenticate;
+        f.payload = {std::byte{0x16}, std::byte{0x03}, std::byte{0x01}};
+        f.source_address = PeerAddress{ip, 4444, true};
+        attacker.send(NodeId{1}, std::move(f));
+    };
+    constexpr std::uint64_t kLegitIp = 0x0A000001;
+    constexpr std::uint64_t kAttackIp = 0x0A0000FF;
+
+    // (a) hijack attempt on a parked engine.
+    send(3000, kLegitIp);
+    check(secure.pending_handshake_count() == 1, "legit handshake is parked");
+    const std::uint64_t dropped0 = secure.handshake_pending_dropped();
+    send(3000, kAttackIp);  // same claimed id, different source
+    check(secure.pending_handshake_count() == 1,
+          "a spoofed frame from another IP does not evict the legit parked engine");
+    check(secure.handshake_pending_dropped() == dropped0 + 1,
+          "the spoofed frame is counted as dropped");
+    send(3000, kLegitIp);  // the real peer keeps going
+    check(secure.pending_handshake_count() == 1 && secure.handshake_pending_dropped() == dropped0 + 1,
+          "the legit peer's next frame is still accepted by its parked engine");
+
+    // (b) a known-peer claim must not bypass the per-IP cap.
+    const std::uint64_t base = secure.pending_handshake_count();
+    send(777, kAttackIp);
+    send(778, kAttackIp);
+    send(779, kAttackIp);  // third from one IP: over the cap of 2, `known` or not
+    check(secure.pending_handshake_count() == base + 2,
+          "a claimed-known NodeId does not bypass the per-IP pending cap");
+}
+
 void custom_frame_cap() {
     net::FrameStream fs{64};
     std::array<std::byte, 4 + 65> bytes{};
@@ -405,6 +459,7 @@ int main() {
     checked_tagless();
     pending_handshake_cap();
     per_ip_pending_cap();
+    handshake_spoof_resistance();
     custom_frame_cap();
     std::printf("%s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

@@ -10,9 +10,8 @@ Legend: `[ ]` open · `[~]` fixed in working tree, untested/uncommitted · `[x]`
 
 ## A. Fixed in the working tree (uncommitted, no new tests yet)
 
-Full suite on `root@192.168.0.138` (GCC 15.2, Release): 214/215 pass. The one failure,
-`stream_drain_zero_rmw`, is unrelated (`tests/stream_drain_rmw_check.sh` uses `set -o pipefail`
-under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet run.
+Full suite on `root@192.168.0.138` (GCC 15.2, Release): 216/216 pass. ASan/UBSan/TSan and Clang not yet run (A8).
+Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux side.
 
 - [~] A1 Handshake spoof/hijack: ignore Authenticate frames for a parked engine from a different
   source IP; `known` no longer bypasses the per-IP cap (`secure_transport.hpp`).
@@ -22,9 +21,12 @@ under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet 
 - [~] A4 Removed the `~SecureTransport` write through the raw `inner_` pointer.
 - [~] A5 Audit sink moved out from under `pending_mu_` in `handle_authenticate_frame`.
 - [~] A6 Stale include comment in `security.hpp`.
-- [ ] A7 Add tests: hello timeout, per-IP socket cap, hijack-ignore rule
-  (`tests/security_wire_hardening_test.cpp`). Check loopback-based tests against the new per-IP caps.
-- [ ] A8 Fix `tests/stream_drain_rmw_check.sh` shebang; run ASan/UBSan/TSan (`-j1`) on thnak-remote.
+- [x] A7 Tests added: hello timeout + per-IP socket caps (`tcp_transport_pre_auth_test`), handshake hijack-ignore
+  + known-peer-no-bypass (`security_wire_hardening_test::handshake_spoof_resistance`, verified to FAIL on the
+  pre-fix SecureTransport). Existing loopback tests pass with the new per-IP caps (full suite 216/216).
+- [ ] A8 Run ASan/UBSan/TSan (`-j1`) and Clang on thnak-remote. (The `stream_drain_zero_rmw` failure seen earlier
+  was a CRLF artifact of shipping a Windows checkout to Linux — the index has `*.sh eol=lf` — not a repo bug;
+  full suite is 216/216 once the CR is stripped.)
 - [ ] A9 Concurrent-overshoot of `max_pending_handshakes_` (cap check and insert are separate
   critical sections): harmless only if receive is single-threaded — confirm, or make atomic.
 
