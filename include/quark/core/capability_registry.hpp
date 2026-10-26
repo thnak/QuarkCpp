@@ -186,6 +186,7 @@ private:
         std::uint64_t incarnation = 0;
         std::uint32_t local_seq = 0;
         std::vector<std::byte> blob;  // encode_node_capabilities() output — opaque to SwimMembership
+        NodeCapabilities caps;        // decoded ONCE at accept time, so a republish never re-decodes
     };
 
     void claim_local(NodeId self, std::uint64_t self_incarnation) {
