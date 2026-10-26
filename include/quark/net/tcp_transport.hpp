@@ -139,6 +139,40 @@ public:
             relays_[peer.value] = relay_ep;
     }
 
+    // ADR-048 relay side (issue #14), shape B — NODE-SIDE FORWARDING, distinct from `set_relay`'s
+    // byte-transparent per-peer endpoint (shape A, TURN-style). A node that enables this forwards any
+    // inbound frame whose `to` is another node, byte-for-byte (the frame is re-encoded unchanged, so an
+    // end-to-end SecureTransport seal between origin and destination is never opened or altered here).
+    // It is a FAIL-CLOSED open-proxy guard: with no predicate installed nothing is forwarded (and the
+    // default is "not enabled", byte-identical to before). `admit(origin, dest)` is asked once per
+    // transit frame on the I/O thread — wire it to cluster membership / the NodeAuthority-admitted set
+    // so only peers admitted to the same cluster are relayed. `origin` is the connection's identified
+    // peer, and a frame whose `from` differs from it is refused (a relay never launders another node's
+    // identity). A destination this node has no endpoint/connection for is refused, never dialed
+    // blind, and a forwarded frame never takes a second relay hop (no loops). Call before start().
+    void set_relay_forwarding(std::function<bool(NodeId origin, NodeId dest)> admit) {
+        relay_admit_ = std::move(admit);
+        relay_forwarding_enabled_ = true;
+    }
+
+    // Client side of shape B: an ORDERED relay list for `peer` (failover = first entry whose connection
+    // is Open, else the first entry). Used only while `peer` has no Open direct connection AND either no
+    // direct endpoint is known for it (hub-and-spoke) or its direct connection is in Backoff; frames
+    // keep `to == peer` so the relay forwards them. Direct wins again as soon as it is Open. Each relay
+    // needs its own `add_peer` endpoint. Thread-safe, same started_-gated idiom as add_peer().
+    void set_relay_via(NodeId peer, std::vector<NodeId> relays) {
+        if (started_.load(std::memory_order_acquire))
+            io_.post([this, peer, r = std::move(relays)]() mutable { relay_via_[peer.value] = std::move(r); });
+        else
+            relay_via_[peer.value] = std::move(relays);
+    }
+    [[nodiscard]] std::uint64_t relayed_frames() const noexcept {
+        return relayed_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t relay_refused() const noexcept {
+        return relay_refused_.load(std::memory_order_relaxed);
+    }
+
     // F1: a bare plaintext TCP transport is DEV-ONLY. It refuses to start unless either an
     // authenticating wrapper (SecureTransport) marked it or the application explicitly opted into
     // insecure dev mode. This is a second, structural gate behind `validate_startup_security`:
@@ -437,7 +471,38 @@ private:
     // The outbound queue is PER PEER, not per connection: it outlives dial/dedup/reconnect churn, so a
     // frame is never lost when a connection object is dropped (dedup loser, RST during the race, teardown
     // before the survivor is identified). A confirmed connection PUMPs the peer queue onto its socket.
+    // Pick the connection target for `to`: `to` itself unless a shape-B relay list applies.
+    NodeId route_for(NodeId to) const {
+        const auto rv = relay_via_.find(to.value);
+        if (rv == relay_via_.end() || rv->second.empty()) return to;
+        const auto direct = conns_.find(to.value);
+        const bool direct_open = direct != conns_.end() && direct->second->st == St::Open;
+        const bool direct_dead = direct != conns_.end() && direct->second->st == St::Backoff;
+        if (direct_open || (peers_.count(to.value) != 0 && !direct_dead)) return to;
+        for (NodeId via : rv->second) {
+            const auto it = conns_.find(via.value);
+            if (it != conns_.end() && it->second->st == St::Open) return via;
+        }
+        return rv->second.front();
+    }
+
     void send_on_loop(NodeId to, MessageFrame frame) {
+        enqueue_to(route_for(to), std::move(frame));
+    }
+
+    // Relay forwarding of one inbound transit frame (set_relay_forwarding). Loop thread.
+    void forward_transit(NodeId origin, MessageFrame f) {
+        const NodeId dest = f.to;
+        if (!relay_admit_ || f.from != origin || !relay_admit_(origin, dest) ||
+            (conns_.count(dest.value) == 0 && peers_.count(dest.value) == 0)) {
+            relay_refused_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        relayed_.fetch_add(1, std::memory_order_relaxed);
+        enqueue_to(dest, std::move(f));
+    }
+
+    void enqueue_to(NodeId to, MessageFrame frame) {
         Conn* c = ensure_conn(to);
         if (!c) {  // no endpoint known for `to` ⇒ cannot dial; fire-and-forget drop (010 dead-letter)
             drops_.fetch_add(1, std::memory_order_relaxed);
@@ -706,9 +771,14 @@ private:
             }
             // Remaining bytes are length-prefixed frames — the "stream" reassembler emits each whole one.
             const PeerAddress src{c->peer_addr, c->peer_port, c->has_peer_addr};
-            const bool ok = c->in.feed(p, n, [this, src](MessageFrame f) {
+            const NodeId origin = c->peer;
+            const bool ok = c->in.feed(p, n, [this, src, origin](MessageFrame f) {
                 frames_received_.fetch_add(1, std::memory_order_relaxed);
                 f.source_address = src;  // transient: never encoded, used for pre-auth admission
+                if (relay_forwarding_enabled_ && f.to != self_ && f.to.value != 0) {
+                    forward_transit(origin, std::move(f));  // never delivered locally
+                    return;
+                }
                 if (receiver_) receiver_(std::move(f));
             });
             if (!ok) {  // protocol error on the stream (oversized/malformed) ⇒ untrustworthy, drop
@@ -1284,6 +1354,11 @@ private:
 
     // ADR-048 relay fallback state — all loop-thread-owned, like everything else above.
     std::int64_t fallback_timeout_ns_ = 0;  // 0 = NoRelayFallback (feature off, byte-identical to before)
+    std::function<bool(NodeId, NodeId)> relay_admit_;     // shape-B forwarding gate (null = refuse all)
+    bool relay_forwarding_enabled_ = false;               // set by set_relay_forwarding
+    std::unordered_map<std::uint64_t, std::vector<NodeId>> relay_via_;  // peer → ordered relay list
+    std::atomic<std::uint64_t> relayed_{0};
+    std::atomic<std::uint64_t> relay_refused_{0};
     std::unordered_map<std::uint64_t, Endpoint> relays_;  // peer → its designated relay Endpoint (set_relay)
     std::unordered_set<std::uint64_t> relay_routed_;      // peers currently dialed via their relay Endpoint
     std::unordered_map<std::uint64_t, pal::fd_t> pending_cutover_;  // peer → probed direct fd awaiting a

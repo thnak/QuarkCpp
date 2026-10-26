@@ -289,3 +289,22 @@ safety and correctness.
   implementations cannot silently diverge in behavior for the same caller mistake. Given 019's own
   parity contract ("unchanged between the Linux and Windows backends"), option (b) is preferable long
   term; this ADR does not implement it, only surfaces the asymmetry it uncovered.
+
+## Amendment (issue #14): two relay shapes, reconciled; relay side built
+
+The ADR's "thin forwarding hook" and `tcp_transport.hpp`'s byte-transparent per-peer endpoint were two
+different designs. Both are kept, named explicitly:
+
+- **Shape A — transparent endpoint** (`set_relay`): an external TURN-style allocation answering with the
+  peer's own HELLO. Client-side redial only; producing the allocation stays out of scope.
+- **Shape B — node-side forwarding** (`set_relay_forwarding` + `set_relay_via`): an ordinary cluster node
+  forwards inbound frames with `to != self` unchanged (an end-to-end SecureTransport seal is never
+  opened). Spokes address the destination through an ORDERED relay list (failover = first Open entry).
+
+Relay authentication (previously a non-goal): forwarding is opt-in and fail-closed. The node supplies
+`admit(origin, dest)` (wire to membership / the NodeAuthority-admitted set); a frame whose `from` differs
+from the connection's identified peer, an unknown destination, or a failed `admit` is refused and counted
+(`relay_refused()`). A forwarded frame never takes a second hop. Known limit: the connection identity is
+the HELLO claim at this layer, so the strength of the gate is the strength of `admit`. Still deferred:
+relay discovery, hop-local backpressure, ordering across a relay<->direct switch. Test:
+`tests/tcp_relay_forwarding_test.cpp`.
