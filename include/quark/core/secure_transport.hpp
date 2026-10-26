@@ -333,6 +333,16 @@ public:
     }
 
     // --- Test/diagnostic counters -------------------------------------------------------------
+    // True iff a handshake-established (or, without enable_handshake, auto-vivified) session with `peer`
+    // exists and is not revoked. A relay's admission gate (TcpTransport::set_relay_forwarding) uses it to
+    // require that a transit frame's origin AND destination have authenticated to THIS node (issue #14).
+    [[nodiscard]] bool has_session(NodeId peer) const {
+        const auto sess = try_get_session(peer);
+        if (!sess) return false;
+        std::lock_guard<std::mutex> g(sess->session_mu());
+        return !sess->revoked();
+    }
+
     [[nodiscard]] std::uint64_t sealed() const noexcept { return sealed_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t opened() const noexcept { return opened_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t replays_rejected() const noexcept {

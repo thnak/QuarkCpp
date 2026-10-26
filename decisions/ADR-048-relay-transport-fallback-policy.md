@@ -319,3 +319,21 @@ direct endpoint uses shape A's fenced cutover. Backpressure: the relay's per-des
 `drops()`), never grows relay memory unbounded; an end-to-end congestion signal through the hop remains
 future work. Relay discovery stays a non-goal (the issue's proposal list asks only for forwarding,
 authentication and failover, all delivered).
+
+### Amendment addendum (issue #14, round 2): discovery, authenticated identity, congestion path
+
+- **Discovery** (`net/relay_discovery.hpp`): a relay-willing node publishes `advertise_relay()` (a `relay`
+  flag + `relay_addr`/`relay_port` labels) through ADR-045 capability gossip. `discover_relays(view, self)`
+  returns live members only, ascending NodeId (the same failover order on every spoke), bounded to 8, with
+  malformed or non-member advertisements ignored; `apply_relay_discovery()` feeds the result into
+  `add_peer` + `set_relay_via`. Gossip says where a relay listens; it grants no trust.
+- **Identity beyond the HELLO claim**: the relay wraps its own link in SecureTransport and gates forwarding
+  on `has_session(origin) && has_session(dest)` (new `SecureTransport::has_session`), so only nodes that
+  completed the handshake with the relay are relayed for. A node that merely claims an id is refused, and
+  dropping a session at the relay cuts that node's path (`tests/tcp_relay_authenticated_origin_test.cpp`).
+  A and B still handshake end to end through the relay (their Authenticate frames are forwarded).
+- **Congestion path**: Control-lane frames cross the relay in both directions, so ADR-046's `Congested`
+  signal from a congested destination reaches the origin (B -> R -> A is tested), provided both spokes have
+  `set_relay_via` for each other. The relay's per-destination caps still shed at the hop.
+- **Residual (accepted)**: the A<->R link is TCP whose frame headers (from/to/kind) are visible on the wire;
+  payloads are sealed end to end. Link-level encryption of that hop is a separate hardening item.
