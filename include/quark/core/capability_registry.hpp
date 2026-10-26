@@ -113,7 +113,16 @@ class CapabilityRegistry {
 public:
     using CapMap = CapabilityView::CapMap;
 
-    CapabilityRegistry() { publish_snapshot(); }
+    // `max_entries` bounds the gossip-fed table (C5): a peer streaming entries for fabricated NodeIds
+    // can no longer grow it, or the per-merge snapshot rebuild, without limit. Entries for a node that
+    // is already present still update in place when full; only NEW nodes are refused (and counted).
+    explicit CapabilityRegistry(std::size_t max_entries = 4096) : max_entries_(max_entries) {
+        publish_snapshot();
+    }
+
+    // Number of inbound entries refused (table full, or blob that does not decode). Observability only.
+    [[nodiscard]] std::uint64_t rejected() const noexcept { return rejected_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::size_t size() const noexcept { return size_.load(std::memory_order_relaxed); }
 
     // Advertise (or replace) THIS node's capability set. Safe from ANY thread — the actual encode and
     // claim into the protocol-thread-owned table happens inside `pull()`. "Last store wins" if called
@@ -189,13 +198,23 @@ private:
         e.incarnation = self_incarnation;
         e.local_seq = ++local_seq_;
         e.blob = std::move(blob);
+        e.caps = *pending;
         publish_snapshot();  // self capabilities visible locally immediately, not just after a round trip
     }
 
     [[nodiscard]] bool merge_one(const CapabilityDigestEntry& in) {
         const auto it = table_.find(in.node.value);
         if (it == table_.end()) {
-            table_.emplace(in.node.value, Entry{in.incarnation, in.local_seq, in.blob});
+            if (table_.size() >= max_entries_) {  // C5: refuse a NEW node once the table is full
+                rejected_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            NodeCapabilities caps;
+            if (!detail::decode_node_capabilities(in.blob, caps)) {
+                rejected_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            table_.emplace(in.node.value, Entry{in.incarnation, in.local_seq, in.blob, std::move(caps)});
             return true;
         }
         Entry& cur = it->second;
@@ -208,28 +227,32 @@ private:
             supersedes = in.blob > cur.blob;  // last-resort tiebreak, genuine collisions only
         }
         if (!supersedes) return false;
+        NodeCapabilities caps;
+        if (!detail::decode_node_capabilities(in.blob, caps)) {
+            rejected_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        cur.caps = std::move(caps);
         cur.incarnation = in.incarnation;
         cur.local_seq = in.local_seq;
         cur.blob = in.blob;
         return true;
     }
 
-    // Rebuild the whole published CapMap from `table_`. Not incremental — control-plane cadence makes
-    // a full rebuild per (batched) merge/claim negligible; matches `SwimMembership::republish()`'s own
-    // whole-snapshot-per-change shape.
+    // Rebuild the published CapMap from `table_`'s already-decoded entries (a copy, no re-decode).
+    // Not incremental - control-plane cadence plus the `max_entries_` bound keep this negligible;
+    // matches `SwimMembership::republish()`'s own whole-snapshot-per-change shape.
     void publish_snapshot() {
         auto m = std::make_shared<CapMap>();
-        for (const auto& [node_value, e] : table_) {
-            NodeCapabilities caps;
-            if (detail::decode_node_capabilities(e.blob, caps)) m->emplace(node_value, std::move(caps));
-            // A stored blob that fails to decode should be unreachable (both claim_local and merge_one
-            // only ever store bytes this file itself encoded or that already passed the outer control
-            // decode's bounds check) — omitted rather than propagated as a corrupt CapabilityView entry.
-        }
+        for (const auto& [node_value, e] : table_) m->emplace(node_value, e.caps);
+        size_.store(table_.size(), std::memory_order_relaxed);
         published_.store(std::move(m), std::memory_order_release);
     }
 
     std::unordered_map<std::uint64_t, Entry> table_;  // protocol-thread owned, mirrors SwimMembership::members_
+    std::size_t max_entries_;
+    std::atomic<std::uint64_t> rejected_{0};
+    std::atomic<std::size_t> size_{0};
     std::uint32_t local_seq_ = 0;
     std::atomic<std::shared_ptr<const NodeCapabilities>> pending_local_;
     std::atomic<std::shared_ptr<const CapMap>> published_;

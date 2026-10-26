@@ -611,6 +611,12 @@ public:
 
     // Last-advertised resident_total for a peer (021 §9 observability; mirrors incarnation_of). 0 for
     // an unknown peer or one that has never gossiped pressure.
+    // Gossiped per-node entries (capability / pressure) refused by the C5 subject check or its bound.
+    [[nodiscard]] std::uint64_t gossip_rejected() const noexcept {
+        return gossip_rejected_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t pressure_entries() const noexcept { return last_pressure_.size(); }
+
     [[nodiscard]] std::uint64_t pressure_of(NodeId n) const {
         const auto it = last_pressure_.find(n.value);
         return it == last_pressure_.end() ? 0 : it->second;
@@ -859,6 +865,33 @@ private:
         ids_dirty_ = false;
     }
 
+    // C5: may a gossiped per-node entry (capability / pressure) about `node` be absorbed from `from`?
+    // Yes for the authenticated sender itself, or a verified live member; never for self; counted
+    // (`gossip_rejected()`) when refused.
+    [[nodiscard]] bool gossip_subject_ok(NodeId node, NodeId from) {
+        bool ok = false;
+        if (node != self_) {
+            if (node == from) ok = true;
+            else if (const auto it = members_.find(node.value); it != members_.end())
+                ok = it->second.verified && !is_tomb(it->second.status);
+        }
+        if (!ok) gossip_rejected_.fetch_add(1, std::memory_order_relaxed);
+        return ok;
+    }
+
+    // Record a peer's advertised load. `last_pressure_` is hard-bounded: when over `max_live_members`
+    // entries that no longer name a member are pruned, and a NEW id is refused if it is still full.
+    void record_pressure(const MailboxPressureEntry& e) {
+        if (last_pressure_.size() >= cfg_.max_live_members && !last_pressure_.contains(e.node.value)) {
+            std::erase_if(last_pressure_, [&](const auto& kv) { return !members_.contains(kv.first); });
+            if (last_pressure_.size() >= cfg_.max_live_members) {
+                gossip_rejected_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        last_pressure_[e.node.value] = e.resident_total;
+    }
+
     // --- inbound ------------------------------------------------------------------------------
     void on_frame(MessageFrame f) {
         if (f.to != self_) return;  // a transport may hand us frames addressed elsewhere; never act on them
@@ -929,9 +962,23 @@ private:
                              Src::Gossip, now);
             }
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
-            if (capability_merge_ && !m.capabilities.empty()) capability_merge_(m.capabilities);
-            for (const MailboxPressureEntry& e : m.pressure) last_pressure_[e.node.value] = e.resident_total;
-            if (pressure_merge_ && !m.pressure.empty()) pressure_merge_(m.pressure);
+            // C5: capability / pressure entries are keyed by node ids the (authenticated) sender
+            // chooses. Accept one only for the sender itself or a verified live member, never for
+            // self (a peer must not overwrite our own advertisement) or a fabricated id — otherwise
+            // the gossip-fed maps grow without bound and an unknown id can be given capabilities.
+            if (capability_merge_ && !m.capabilities.empty()) {
+                std::vector<CapabilityDigestEntry> caps;
+                for (const CapabilityDigestEntry& e : m.capabilities)
+                    if (gossip_subject_ok(e.node, m.from)) caps.push_back(e);
+                if (!caps.empty()) capability_merge_(caps);
+            }
+            if (!m.pressure.empty()) {
+                std::vector<MailboxPressureEntry> press;
+                for (const MailboxPressureEntry& e : m.pressure)
+                    if (gossip_subject_ok(e.node, m.from)) press.push_back(e);
+                for (const MailboxPressureEntry& e : press) record_pressure(e);
+                if (pressure_merge_ && !press.empty()) pressure_merge_(press);
+            }
         }
 
         switch (m.kind) {
@@ -1495,6 +1542,7 @@ private:
     std::shared_ptr<const std::vector<NodeId>> verified_snapshot_;
     std::array<ControlBudget, 256> control_budgets_{};
     std::atomic<std::uint64_t> control_sheds_{0};
+    std::atomic<std::uint64_t> gossip_rejected_{0};
     std::uint64_t epoch_ = 0;
 };
 

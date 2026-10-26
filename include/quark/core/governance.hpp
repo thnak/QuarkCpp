@@ -267,6 +267,11 @@ public:
         congested_until_ns_.store(until_ns, std::memory_order_release);
     }
 
+    // True while a congestion TTL is still in force at `now_ns` (C6: such a gate is never swept).
+    [[nodiscard]] bool congested(std::int64_t now_ns) const noexcept {
+        return now_ns < congested_until_ns_.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] Admit admit(std::int64_t now_ns, Cost cost = {}) noexcept {
         if (now_ns >= congested_until_ns_.load(std::memory_order_relaxed)) return Admit::Accept;
         std::lock_guard<std::mutex> g(bucket_mu_);
@@ -292,34 +297,52 @@ private:
 class PeerCongestionTable {
 public:
     PeerCongestionTable() = default;
-    explicit PeerCongestionTable(double bucket_capacity, double bucket_refill_per_sec) noexcept
-        : capacity_(bucket_capacity), refill_per_sec_(bucket_refill_per_sec) {}
+    explicit PeerCongestionTable(double bucket_capacity, double bucket_refill_per_sec,
+                                 std::size_t max_gates = 4096) noexcept
+        : capacity_(bucket_capacity), refill_per_sec_(bucket_refill_per_sec), max_gates_(max_gates) {}
+
+    // Live gate count (C6 observability): never exceeds `max_gates` — see gate_for().
+    [[nodiscard]] std::size_t size() const {
+        std::shared_lock<std::shared_mutex> g(mu_);
+        return gates_.size();
+    }
 
     [[nodiscard]] bool admit(NodeId peer, std::int64_t now_ns, Cost cost = {}) noexcept {
-        return gate_for(peer).admit(now_ns, cost) == Admit::Accept;
+        return gate_for(peer, now_ns)->admit(now_ns, cost) == Admit::Accept;
     }
 
     void mark_congested(NodeId peer, std::int64_t until_ns) noexcept {
-        gate_for(peer).mark_congested(until_ns);
+        gate_for(peer, 0)->mark_congested(until_ns);
     }
 
 private:
-    [[nodiscard]] PeerCongestionGate& gate_for(NodeId peer) noexcept {
+    // C6: the table is bounded by `max_gates_`. On a miss at the cap, gates not currently congested
+    // as of `now_ns` (an uncongested gate carries no state a fresh one would not) are swept; if the
+    // table is still full the caller gets a transient, unregistered gate (fail-open, never grows the
+    // map). Returned by shared_ptr so a sweep can never free a gate a sender is mid-`admit` on.
+    [[nodiscard]] std::shared_ptr<PeerCongestionGate> gate_for(NodeId peer, std::int64_t now_ns) noexcept {
         {
             std::shared_lock<std::shared_mutex> g(mu_);
             const auto it = gates_.find(peer.value);
-            if (it != gates_.end()) return *it->second;
+            if (it != gates_.end()) return it->second;
         }
         std::unique_lock<std::shared_mutex> g(mu_);
-        auto [it, inserted] = gates_.try_emplace(peer.value, nullptr);
-        if (inserted) it->second = std::make_unique<PeerCongestionGate>(capacity_, refill_per_sec_);
-        return *it->second;
+        if (const auto it = gates_.find(peer.value); it != gates_.end()) return it->second;
+        if (gates_.size() >= max_gates_) {
+            std::erase_if(gates_, [&](const auto& kv) { return !kv.second->congested(now_ns); });
+            if (gates_.size() >= max_gates_)
+                return std::make_shared<PeerCongestionGate>(capacity_, refill_per_sec_);
+        }
+        auto gate = std::make_shared<PeerCongestionGate>(capacity_, refill_per_sec_);
+        gates_.emplace(peer.value, gate);
+        return gate;
     }
 
     double capacity_ = 64.0;
     double refill_per_sec_ = 32.0;
+    std::size_t max_gates_ = 4096;
     mutable std::shared_mutex mu_;
-    std::unordered_map<std::uint64_t, std::unique_ptr<PeerCongestionGate>> gates_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<PeerCongestionGate>> gates_;
 };
 
 // ============================================================================================
