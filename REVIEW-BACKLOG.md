@@ -27,7 +27,7 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
 - [ ] A8 Run ASan/UBSan/TSan (`-j1`) and Clang on thnak-remote. (The `stream_drain_zero_rmw` failure seen earlier
   was a CRLF artifact of shipping a Windows checkout to Linux — the index has `*.sh eol=lf` — not a repo bug;
   full suite is 216/216 once the CR is stripped.)
-- [ ] A9 Concurrent-overshoot of `max_pending_handshakes_` (cap check and insert are separate
+- [x] A9 Concurrent-overshoot of `max_pending_handshakes_` (cap check and insert are separate
   critical sections): harmless only if receive is single-threaded — confirm, or make atomic.
 
 ## B. Persistence — not production-ready
@@ -66,7 +66,7 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
   (`:431-440,494-515`). Store errors in `tick` ignored (`:509,513,522`).
 - [~] B11 MED (InMemoryStore + FileStore reject lower through_seq; adapters still open) — stale snapshots can overwrite newer ones; no store rejects lower `through_seq`
   (`persistence.hpp:182-195`). Spec 012 keys snapshots by (fence, through_seq).
-- [ ] B12 MED — transport nonce reuse when the handshake is disabled: a reconnect resets seq to 0 under
+- [x] B12 MED — transport nonce reuse when the handshake is disabled: a reconnect resets seq to 0 under
   the shared cipher (`secure_transport.hpp:139-143,387-399,755-759`).
 
 ## C. Memory
@@ -95,20 +95,20 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
 
 ## D. Lock retention
 
-- [ ] D1 HIGH — `sweep_rotation`/`sweep_revocations` (`secure_transport.hpp:258-271,193-201`) take each
+- [x] D1 HIGH — `sweep_rotation`/`sweep_revocations` (`secure_transport.hpp:258-271,193-201`) take each
   session mutex while holding `map_mu_` (shared); a long seal blocks `on_peer_disconnected`
   (`:141`, needs `map_mu_` exclusive) and, on writer-preferring locks, every `try_get_session`.
   Copy session pointers out, release `map_mu_`, then inspect; make `generation`/`renegotiated_at` atomic.
 - [ ] D2 HIGH — timer service fires user code under its mutex (`timer_service.hpp:106-120,207-241`);
   catch-up after suspend = thousands of ticks under the lock; a message destructor cancelling a timer
   would self-deadlock (`:248`; plausible, not executed). Pop due entries under the lock, fire outside.
-- [ ] D3 MED — audit sink called under the session lock (`secure_transport.hpp:722,731`); same class as A5.
-- [ ] D4 MED — unsynchronized shared state (TSan would flag): `receiver_` (`:305` vs `:742`),
+- [x] D3 MED — audit sink called under the session lock (`secure_transport.hpp:722,731`); same class as A5.
+- [x] D4 MED — unsynchronized shared state (TSan would flag): `receiver_` (`:305` vs `:742`),
   `revoked_snapshot_` (`:179,191` vs `:515-517,592-594,666-668`), `frames_sealed_on_key()`
   (`:266`, `peer_session.hpp:80`).
 - [ ] D5 MED — handshake crypto runs on the single TCP I/O thread (`drive_handshake` → `advance()` from
   `do_read`, `tcp_transport.hpp:603-607`); add a per-IP *rate* limit and/or move to a pool.
-- [ ] D6 LOW — `send()` holds the session lock across `inner_->send` (`:241`); synchronous
+- [x] D6 LOW — `send()` holds the session lock across `inner_->send` (`:241`); synchronous
   `LoopbackTransport` SWIM Ping→Ack re-enters and self-deadlocks (tests only). Engines destroyed and
   256-entry scans under `pending_mu_` (`:508,585,626,825`).
 
