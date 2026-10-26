@@ -57,6 +57,11 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_SQLITE)
   target_link_libraries(sqlite_store_check PRIVATE quark::persistence_sqlite quark_warnings)
   add_test(NAME sqlite_store_check COMMAND sqlite_store_check)
 
+  add_executable(sqlite_store_fault_check tests/adapters/sqlite_store_fault_check.cpp)
+  target_include_directories(sqlite_store_fault_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(sqlite_store_fault_check PRIVATE quark::persistence_sqlite quark_warnings Threads::Threads)
+  add_test(NAME sqlite_store_fault_check COMMAND sqlite_store_fault_check)
+
   add_executable(sqlite_reminder_store_check tests/adapters/sqlite_reminder_store_check.cpp)
   target_include_directories(sqlite_reminder_store_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
   target_link_libraries(sqlite_reminder_store_check PRIVATE quark::persistence_sqlite quark_warnings)
@@ -67,6 +72,11 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_ROCKSDB)
   target_include_directories(rocksdb_store_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
   target_link_libraries(rocksdb_store_check PRIVATE quark::persistence_rocksdb quark_warnings)
   add_test(NAME rocksdb_store_check COMMAND rocksdb_store_check)
+
+  add_executable(rocksdb_store_fault_check tests/adapters/rocksdb_store_fault_check.cpp)
+  target_include_directories(rocksdb_store_fault_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(rocksdb_store_fault_check PRIVATE quark::persistence_rocksdb quark_warnings Threads::Threads)
+  add_test(NAME rocksdb_store_fault_check COMMAND rocksdb_store_fault_check)
 
   add_executable(rocksdb_reminder_store_check tests/adapters/rocksdb_reminder_store_check.cpp)
   target_include_directories(rocksdb_reminder_store_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

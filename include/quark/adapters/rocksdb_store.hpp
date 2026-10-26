@@ -17,11 +17,21 @@
 // FENCING / ATOMICITY / STRICT-SEQ are enforced exactly as the reference store; the batch is one
 // RocksDB `WriteBatch` written with `WriteOptions::sync = true`. NOT compiled unless the RocksDB dev
 // headers are present (see cmake/QuarkPersistenceAdapters.cmake).
+//
+// ERROR HANDLING (review B3-B6, B11). RocksDB holds an exclusive lock on the DB directory, so this
+// process is the only writer: a store-wide mutex makes every check-then-write (fence token, strict seq,
+// snapshot through_seq) atomic, closing the window the old unlocked read-modify-write left open (two
+// threads could be handed the same fence token). Every RocksDB Status is CHECKED: only `NotFound` means
+// "no data" — an IOError/Corruption on a read is an error, so recovery never seeds default state over a
+// snapshot it merely failed to read. `acquire_fence` returns a `result` and fails rather than hand out
+// a token it did not durably record. `last_seq` cannot carry an error through the Store concept's
+// signature and reports 0 on a read error; every WRITE path uses the checked internal read instead.
 #pragma once
 
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -40,7 +50,7 @@ namespace quark::adapters {
 class RocksStore {
 public:
     // Open (creating if absent) a RocksDB at `path`. A failed open leaves `db_` null and every op
-    // returns an error — a store that refuses writes, never a crash.
+    // returns an error — a store that refuses everything, never a crash and never silent data loss.
     explicit RocksStore(const std::string& path) {
         rocksdb::Options opts;
         opts.create_if_missing = true;
@@ -51,23 +61,33 @@ public:
     RocksStore(const RocksStore&) = delete;
     RocksStore& operator=(const RocksStore&) = delete;
 
-    [[nodiscard]] FenceToken acquire_fence(ActorId id) {
-        // NOTE: read-modify-write of the owner is serialized by the caller (activation registration is
-        // single-threaded per actor); a multi-writer deployment would use a RocksDB merge-operator or
-        // an optimistic transaction. Here: read current, write current+1, sync.
-        const std::uint64_t next = owner_of(id) + 1;
-        std::string v = u64_be(next);
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!db_) return unhealthy();
+        const std::optional<std::uint64_t> cur = owner_of(id);
+        if (!cur) return fail(errc::internal, "rocksdb acquire_fence: reading the owner failed");
+        const std::uint64_t next = *cur + 1;
         rocksdb::WriteOptions wo; wo.sync = true;
-        if (!db_ || !db_->Put(wo, mkey(id), v).ok()) return FenceToken{next - 1};
+        if (!db_->Put(wo, mkey(id), u64_be(next)).ok())
+            return fail(errc::internal, "rocksdb acquire_fence: recording the owner failed");
         return FenceToken{next};
     }
 
-    [[nodiscard]] SeqNo last_seq(ActorId id) { return max_seq(id); }
+    // The Store concept cannot carry an error here; a read failure reports 0 (writes re-check with the
+    // checked read and fail, so a bogus 0 can never be built upon).
+    [[nodiscard]] SeqNo last_seq(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        return max_seq(id).value_or(0);
+    }
 
     [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!db_) return unhealthy();
         std::string v;
-        if (!db_ || !db_->Get(rocksdb::ReadOptions(), skey(id), &v).ok())
-            return std::optional<SnapshotRecord>{};  // none
+        const rocksdb::Status st = db_->Get(rocksdb::ReadOptions(), skey(id), &v);
+        if (st.IsNotFound()) return std::optional<SnapshotRecord>{};  // genuinely none
+        if (!st.ok()) return fail(errc::internal, "rocksdb load_snapshot failed");
+        if (v.size() < 16) return fail(errc::internal, "rocksdb load_snapshot: malformed record");
         SnapshotRecord r;
         std::size_t p = 0;
         r.fence = FenceToken{get_u64_be(v, p)};
@@ -78,9 +98,27 @@ public:
     }
 
     [[nodiscard]] result<void> save_snapshot(ActorId id, FenceToken tok, const SnapshotRecord& snap) {
-        if (tok < FenceToken{owner_of(id)}) return fenced_error();
-        if (snap.through_seq > max_seq(id))
+        std::lock_guard<std::mutex> g(mu_);
+        if (!db_) return unhealthy();
+        const std::optional<std::uint64_t> owner = owner_of(id);
+        if (!owner) return fail(errc::internal, "rocksdb save_snapshot: reading the owner failed");
+        if (is_unfenced(tok) || tok < FenceToken{*owner}) return fenced_error();
+        const std::optional<SeqNo> tail = max_seq(id);
+        if (!tail) return fail(errc::internal, "rocksdb save_snapshot: reading the tail failed");
+        if (snap.through_seq > *tail)
             return fail(errc::internal, "snapshot through_seq ahead of the appended tail");
+        // Review B11: never roll the recovery point back behind a newer checkpoint.
+        std::string cur;
+        const rocksdb::Status gs = db_->Get(rocksdb::ReadOptions(), skey(id), &cur);
+        if (!gs.ok() && !gs.IsNotFound())
+            return fail(errc::internal, "rocksdb save_snapshot: reading the stored snapshot failed");
+        if (gs.ok()) {
+            if (cur.size() < 16)
+                return fail(errc::internal, "rocksdb save_snapshot: malformed stored snapshot");
+            std::size_t q = 8;  // skip the stored fence
+            if (snap.through_seq < get_u64_be(cur, q))
+                return fail(errc::internal, "stale snapshot: through_seq older than the stored snapshot");
+        }
         std::string v = u64_be(tok.value) + u64_be(snap.through_seq);
         v.append(reinterpret_cast<const char*>(snap.record.data()), snap.record.size());
         rocksdb::WriteOptions wo; wo.sync = true;
@@ -94,12 +132,19 @@ public:
         return append_batch(id, tok, std::span<const EventRecord>(&one, 1));
     }
 
-    // ATOMIC batch (012/ADR-009 C7): validate fence + strict monotonicity, then one RocksDB WriteBatch
-    // written with sync=true — RocksDB applies the whole batch atomically & durably, or not at all.
+    // ATOMIC batch (012/ADR-009 C7): validate fence + strict monotonicity (under `mu_`, so the check
+    // cannot go stale), then one RocksDB WriteBatch written with sync=true — RocksDB applies the whole
+    // batch atomically & durably, or not at all.
     [[nodiscard]] result<void> append_batch(ActorId id, FenceToken tok,
                                             std::span<const EventRecord> batch) {
-        if (tok < FenceToken{owner_of(id)}) return fenced_error();
-        SeqNo prev = max_seq(id);
+        std::lock_guard<std::mutex> g(mu_);
+        if (!db_) return unhealthy();
+        const std::optional<std::uint64_t> owner = owner_of(id);
+        if (!owner) return fail(errc::internal, "rocksdb append: reading the owner failed");
+        if (is_unfenced(tok) || tok < FenceToken{*owner}) return fenced_error();
+        const std::optional<SeqNo> tail = max_seq(id);
+        if (!tail) return fail(errc::internal, "rocksdb append: reading the tail failed");
+        SeqNo prev = *tail;
         for (const EventRecord& r : batch) {
             if (r.seq <= prev) return fail(errc::internal, "commit sequence not strictly increasing");
             prev = r.seq;
@@ -114,8 +159,9 @@ public:
     }
 
     [[nodiscard]] result<EventCursor> read_log(ActorId id, SeqNo from) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!db_) return unhealthy();
         EventCursor cur;
-        if (!db_) return cur;
         const std::string lo = ekey(id, from);
         const std::string prefix = "E" + actor_bytes(id);
         std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
@@ -129,14 +175,24 @@ public:
                 seq, std::vector<std::byte>(reinterpret_cast<const std::byte*>(val.data()),
                                             reinterpret_cast<const std::byte*>(val.data()) + val.size())});
         }
+        // An iterator that stopped on an error (not on the end of the range) would otherwise look like
+        // a short log; surface it.
+        if (!it->status().ok()) return fail(errc::internal, "rocksdb read_log failed");
         return cur;
     }
 
     // --- diagnostics (not part of the seam) ---
-    [[nodiscard]] FenceToken current_owner(ActorId id) { return FenceToken{owner_of(id)}; }
+    [[nodiscard]] FenceToken current_owner(ActorId id) {
+        std::lock_guard<std::mutex> g(mu_);
+        return FenceToken{owner_of(id).value_or(0)};
+    }
     [[nodiscard]] bool healthy() const noexcept { return db_ != nullptr; }
 
 private:
+    [[nodiscard]] static std::unexpected<error> unhealthy() {
+        return fail(errc::internal, "RocksStore: database is not open (failed open)");
+    }
+
     // 16-byte big-endian actor identity (type||key) so the bytewise comparator groups an actor's rows.
     [[nodiscard]] static std::string actor_bytes(ActorId id) {
         return u64_be(id.type.value) + u64_be(id.key);
@@ -147,25 +203,33 @@ private:
         return "E" + actor_bytes(id) + u64_be(seq);
     }
 
-    [[nodiscard]] std::uint64_t owner_of(ActorId id) {
+    // The owner token, 0 if the actor has none, nullopt on a READ ERROR (never confused with 0).
+    [[nodiscard]] std::optional<std::uint64_t> owner_of(ActorId id) {
+        if (!db_) return std::nullopt;
         std::string v;
-        if (!db_ || !db_->Get(rocksdb::ReadOptions(), mkey(id), &v).ok() || v.size() < 8) return 0;
+        const rocksdb::Status st = db_->Get(rocksdb::ReadOptions(), mkey(id), &v);
+        if (st.IsNotFound()) return std::uint64_t{0};
+        if (!st.ok() || v.size() < 8) return std::nullopt;
         std::size_t p = 0;
         return get_u64_be(v, p);
     }
     // last_seq: reverse-seek to the largest E-key for this actor (keys are ordered by BE seq).
-    [[nodiscard]] SeqNo max_seq(ActorId id) {
-        if (!db_) return 0;
+    // nullopt on a read error, 0 if the actor has no events.
+    [[nodiscard]] std::optional<SeqNo> max_seq(ActorId id) {
+        if (!db_) return std::nullopt;
         const std::string prefix = "E" + actor_bytes(id);
         std::string upper = prefix;
         upper.append(8, static_cast<char>(0xFF));  // just past this actor's largest seq key
         std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
         it->SeekForPrev(upper);
-        if (!it->Valid()) return 0;
+        if (!it->Valid()) {
+            if (!it->status().ok()) return std::nullopt;
+            return SeqNo{0};
+        }
         const rocksdb::Slice k = it->key();
         if (k.size() != prefix.size() + 8 ||
             std::memcmp(k.data(), prefix.data(), prefix.size()) != 0)
-            return 0;  // no event rows for this actor
+            return SeqNo{0};  // no event rows for this actor
         return get_u64_be_raw(k.data() + prefix.size());
     }
 
@@ -186,6 +250,7 @@ private:
         return v;
     }
 
+    std::mutex mu_;
     std::unique_ptr<rocksdb::DB> db_;
 };
 
