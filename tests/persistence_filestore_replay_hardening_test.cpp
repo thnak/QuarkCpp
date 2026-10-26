@@ -110,7 +110,7 @@ bool run_case(const Case& c, int idx, bool& ok) {
         if (c.expect_corrupt) {
             check(!store.read_log(id, 0).has_value(), (std::string(c.name) + ": read_log refused").c_str(), ok);
             check(!store.load_snapshot(id).has_value(), (std::string(c.name) + ": load_snapshot refused").c_str(), ok);
-            check(store.acquire_fence(id).value == 0, (std::string(c.name) + ": no fence handed out").c_str(), ok);
+            check(!store.acquire_fence(id).has_value(), (std::string(c.name) + ": acquire_fence fails (no token handed out)").c_str(), ok);
         } else {
             auto cur = store.read_log(id, 0);
             check(cur.has_value() && cur->entries.size() == 3 && store.last_seq(id) == 3,
@@ -130,7 +130,7 @@ bool test_dir_entry_made_durable(bool& ok) {
     {
         FileStore store(dir.string());
         const ActorId id{TypeKey{0x5E}, 99};
-        const FenceToken f = store.acquire_fence(id);
+        const FenceToken f = *store.acquire_fence(id);
         check(f.value >= 1 && std::filesystem::exists(wal_path(dir, id)), "new actor log created + fenced", ok);
         check(pal::durable_sync_dir(dir.string()), "PAL dir sync works on the store root", ok);
     }

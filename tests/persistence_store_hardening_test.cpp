@@ -62,7 +62,7 @@ void common_semantics(S& store, const char* label, bool& ok) {
           (l + ": save_snapshot under token 0 is refused").c_str(), ok);
 
     // ---- a real token still writes ------------------------------------------------------------
-    const FenceToken f = store.acquire_fence(id);
+    const FenceToken f = *store.acquire_fence(id);
     check(f.value >= 1, (l + ": a real fence token is >= 1").c_str(), ok);
     check(store.append(id, f, 1, std::span<const std::byte>(bytes(1))).has_value(),
           (l + ": append under a real token succeeds").c_str(), ok);
@@ -91,7 +91,7 @@ void concurrency(S& store, const char* label, bool& ok) {
     for (int t = 0; t < kThreads; ++t) {
         ts.emplace_back([&, t] {
             const ActorId id{TypeKey{0xC0C}, static_cast<std::uint64_t>(t + 1)};
-            const FenceToken f = store.acquire_fence(id);
+            const FenceToken f = *store.acquire_fence(id);
             for (int i = 1; i <= kEvents; ++i)
                 if (!store.append(id, f, static_cast<SeqNo>(i), std::span<const std::byte>(bytes(7)))
                          .has_value())
@@ -105,7 +105,7 @@ void concurrency(S& store, const char* label, bool& ok) {
     std::vector<std::thread> ts2;
     const ActorId shared{TypeKey{0xC0C}, 999};
     for (int t = 0; t < kThreads; ++t)
-        ts2.emplace_back([&, t] { toks[static_cast<std::size_t>(t)] = store.acquire_fence(shared).value; });
+        ts2.emplace_back([&, t] { toks[static_cast<std::size_t>(t)] = store.acquire_fence(shared)->value; });
     for (auto& th : ts) th.join();
     for (auto& th : ts2) th.join();
     std::sort(toks.begin(), toks.end());
@@ -149,7 +149,7 @@ int main() {
         const auto wal = wal_path(dir, id);
         {
             FileStore store(dir.string());
-            const FenceToken f = store.acquire_fence(id);  // record 1: FENCE
+            const FenceToken f = *store.acquire_fence(id);  // record 1: FENCE
             for (SeqNo s = 1; s <= 3; ++s)                 // records 2..4: one batch each
                 check(store.append(id, f, s, std::span<const std::byte>(bytes(static_cast<std::uint8_t>(s))))
                           .has_value(),
@@ -173,7 +173,7 @@ int main() {
             check(store.corrupted(id), "mid-file CRC failure is flagged as corruption", ok);
             check(!store.load_snapshot(id).has_value(), "a corrupt log refuses load_snapshot", ok);
             check(!store.read_log(id, 0).has_value(), "a corrupt log refuses read_log", ok);
-            check(store.acquire_fence(id).value == 0, "a corrupt log hands out no fence token", ok);
+            check(!store.acquire_fence(id).has_value(), "a corrupt log: acquire_fence fails", ok);
             check(!store.append(id, FenceToken{1}, 4, std::span<const std::byte>(bytes(4))).has_value(),
                   "a corrupt log refuses appends", ok);
         }
@@ -185,7 +185,7 @@ int main() {
         const auto wal2 = wal_path(dir, id2);
         {
             FileStore store(dir.string());
-            const FenceToken f = store.acquire_fence(id2);
+            const FenceToken f = *store.acquire_fence(id2);
             for (SeqNo s = 1; s <= 3; ++s)
                 check(store.append(id2, f, s, std::span<const std::byte>(bytes(static_cast<std::uint8_t>(s))))
                           .has_value(),

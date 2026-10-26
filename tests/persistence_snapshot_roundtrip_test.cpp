@@ -45,7 +45,7 @@ int main() {
 
     // A live activation is used ONLY to reach the quiescent snapshot point (Sequential ⇒ synchronous).
     Activation act(nullptr, DispatchTable{});
-    const FenceToken fence = store.acquire_fence(id);
+    const FenceToken fence = *store.acquire_fence(id);
 
     // The "live" actor state at snapshot time.
     AccountState live;

@@ -68,18 +68,18 @@ public:
     //
     // THREAD SAFETY (012 adapters serialize access, review B3): every public method takes `mu_`
     // (it guards `table_`, each Entry's in-RAM index and its write offset).
-    [[nodiscard]] FenceToken acquire_fence(ActorId id) {
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId id) {
         std::lock_guard<std::mutex> g(mu_);
         Entry& e = entry(id);
-        if (e.corrupt) return FenceToken{0};  // unusable log: hand out no token (writes are refused)
+        if (e.corrupt) return corrupt_error();  // unusable log: no token
         const FenceToken next{e.owner.value + 1};
         std::vector<std::byte> body;
         put_u8(body, kFence);
         put_u64(body, next.value);
-        // Durability failed: return the INVALID token (0), not the current owner's. Handing back the
-        // owner's token let two activations share one token, defeating the fence (review B5); a store
-        // refuses every write under token 0.
-        if (!durable_append(e, body)) return FenceToken{0};
+        // Durability failed: FAIL, do not hand out a token. Returning the current owner's token let
+        // two activations share one token, defeating the fence (review B5).
+        if (!durable_append(e, body))
+            return fail(errc::internal, "FileStore: could not durably record the new fence owner");
         e.owner = next;
         return e.owner;
     }
@@ -256,8 +256,8 @@ private:
     }
 
     // Apply one replayed record to the in-RAM Entry (records are in append order). Every read is
-    // bounds-checked against the record (review B8): returns false — leaving the caller to mark the log
-    // corrupt — for a truncated field, an oversized blob/count, an unknown kind, trailing bytes, or a
+    // bounds-checked against the record (review B8): returns false â€” leaving the caller to mark the log
+    // corrupt â€” for a truncated field, an oversized blob/count, an unknown kind, trailing bytes, or a
     // batch whose seqs are not strictly increasing (the same invariant append_batch enforces).
     [[nodiscard]] static bool apply_record(Entry& e, std::span<const std::byte> body) {
         Reader r{body};

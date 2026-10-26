@@ -57,7 +57,7 @@ struct PersistedCounter : Actor<PersistedCounter, Sequential, Persistent<Snapsho
 
 // A store whose load_snapshot always fails — proves the recovery-failure dead-letter path.
 struct FailingStore {
-    [[nodiscard]] FenceToken acquire_fence(ActorId) { return FenceToken{1}; }
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId) { return FenceToken{1}; }
     [[nodiscard]] SeqNo last_seq(ActorId) const noexcept { return 0; }
     [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId) const {
         return fail(errc::internal, "FailingStore: deliberately broken load_snapshot");
@@ -84,7 +84,7 @@ struct OrderRecordingStore {
         std::lock_guard<std::mutex> g(mu);
         calls.push_back(c);
     }
-    [[nodiscard]] FenceToken acquire_fence(ActorId id) {
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId id) {
         note('F');
         return inner.acquire_fence(id);
     }
@@ -108,6 +108,45 @@ struct OrderRecordingStore {
     }
 };
 static_assert(Store<OrderRecordingStore>, "OrderRecordingStore must model the 012 Store seam");
+// A store whose acquire_fence always FAILS (item 2): the broker must dead-letter the first message —
+// an activation that cannot be fenced against the previous owner may not run or flush.
+struct FenceFailStore {
+    InMemoryStore inner;
+    std::atomic<int> acquires{0};
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId) {
+        acquires.fetch_add(1, std::memory_order_relaxed);
+        return fail(errc::internal, "FenceFailStore: deliberately cannot record the new owner");
+    }
+    [[nodiscard]] SeqNo last_seq(ActorId id) const noexcept { return inner.last_seq(id); }
+    [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const {
+        return inner.load_snapshot(id);
+    }
+    [[nodiscard]] result<void> save_snapshot(ActorId id, FenceToken t, const SnapshotRecord& r) {
+        return inner.save_snapshot(id, t, r);
+    }
+    [[nodiscard]] result<void> append(ActorId id, FenceToken t, SeqNo q, std::span<const std::byte> b) {
+        return inner.append(id, t, q, b);
+    }
+    [[nodiscard]] result<void> append_batch(ActorId id, FenceToken t, std::span<const EventRecord> b) {
+        return inner.append_batch(id, t, b);
+    }
+    [[nodiscard]] result<EventCursor> read_log(ActorId id, SeqNo from) const {
+        return inner.read_log(id, from);
+    }
+};
+static_assert(Store<FenceFailStore>, "FenceFailStore must model the 012 Store seam");
+struct CountedMsg2 {
+    static inline std::atomic<int> destructed{0};
+    ~CountedMsg2() { destructed.fetch_add(1, std::memory_order_release); }
+};
+struct NeedsFenceStore : Actor<NeedsFenceStore, Sequential, Persistent<Snapshot>> {
+    using protocol = Protocol<CountedMsg2>;
+    using PersistState = CounterState;
+    static inline std::atomic<int> handled{0};
+    [[nodiscard]] CounterState snapshot_state() const { return CounterState{}; }
+    void restore_state(CounterState) {}
+    void handle(const CountedMsg2&) noexcept { handled.fetch_add(1, std::memory_order_relaxed); }
+};
 struct OrderedPersisted : Actor<OrderedPersisted, Sequential, Persistent<Snapshot>> {
     using protocol = Protocol<Ping>;
     using PersistState = CounterState;
@@ -178,7 +217,7 @@ int main() {
     // ---- 1) a pre-seeded snapshot IS recovered before the first handle() runs -------------------
     const ActorId seeded_id = actor_id_of<PersistedCounter>(1);
     {
-        const FenceToken f = store.acquire_fence(seeded_id);
+        const FenceToken f = *store.acquire_fence(seeded_id);
         check(save_snapshot<CounterState>(store, seeded_id, f, /*through_seq=*/0, CounterState{42})
                   .has_value(),
               "pre-seed a snapshot (n=42)", ok);
@@ -295,6 +334,29 @@ int main() {
                   ok);
         }
         eng4.stop();
+    }
+
+    // ---- 6) item 2: a failed acquire_fence dead-letters the first message ----------------------
+    {
+        FenceFailStore fstore;
+        auto built5 = ConfigBuilder{}.workers(2).shards(2).default_drain_budget(64).build();
+        check(built5.has_value(), "fifth ConfigBuilder", ok);
+        Engine<> eng5(*built5);
+        detail::MessagePool pool5(64);
+        check(eng5.declare_lazy<NeedsFenceStore>(fstore).has_value(),
+              "declare_lazy<NeedsFenceStore>(fstore)", ok);
+        eng5.start();
+        LocalRouter router5(eng5.post_courier(), pool5);
+        CountedMsg2 m;
+        router5.tell<NeedsFenceStore>(actor_id_of<NeedsFenceStore>(1), std::move(m));
+        check(wait_until([&] { return CountedMsg2::destructed.load(std::memory_order_acquire) >= 1; },
+                         std::chrono::seconds(2)),
+              "a failed acquire_fence dead-letters the first message", ok);
+        check(fstore.acquires.load() >= 1, "the broker did try to acquire a fence", ok);
+        check(NeedsFenceStore::handled.load() == 0, "the actor never handled a message", ok);
+        check(eng5.resolve(actor_id_of<NeedsFenceStore>(1)) == nullptr,
+              "an unfenced activation is never published to the id table", ok);
+        eng5.stop();
     }
 
     eng.stop();

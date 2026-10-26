@@ -120,9 +120,9 @@ int main() {
     MsgKey reserve_id_happy{};
     {
         InMemoryStore store;
-        Inventory inv(store, store.acquire_fence(inv_id));
+        Inventory inv(store, *store.acquire_fence(inv_id));
 
-        FenceToken f = store.acquire_fence(order_id);
+        FenceToken f = *store.acquire_fence(order_id);
         EffectivelyOnceLane<InMemoryStore> order(store, order_id, f, store.last_seq(order_id) + 1);
 
         const MsgKey inbound{client_id.hash(), 1};
@@ -185,7 +185,7 @@ int main() {
         // Activation A: handle, derive the outbound id, but CRASH before commit (drop the Commit).
         MsgKey derived_a{};
         {
-            FenceToken fa = store.acquire_fence(order_id);
+            FenceToken fa = *store.acquire_fence(order_id);
             EffectivelyOnceLane<InMemoryStore> a(store, order_id, fa, store.last_seq(order_id) + 1);
             auto c = a.begin(inbound);
             check(c.event(Reserved{9}).has_value(), "crash-pre: A stages effect", ok);
@@ -197,7 +197,7 @@ int main() {
         check(store.log_size(order_id) == 0, "crash-pre: NOTHING durable after a crash before commit", ok);
 
         // Recovery: activation B acquires a fresh (higher) fence, rebuilds from the empty log.
-        FenceToken fb = store.acquire_fence(order_id);
+        FenceToken fb = *store.acquire_fence(order_id);
         EffectivelyOnceLane<InMemoryStore> b(store, order_id, fb, store.last_seq(order_id) + 1);
         check(b.recover([](std::span<const std::byte>) -> result<void> { return {}; }).has_value(),
               "crash-pre: recovery from empty log", ok);
@@ -227,7 +227,7 @@ int main() {
         // Activation A: commit the effect + outbox, then CRASH before drain_outbox.
         MsgKey derived_a{};
         {
-            FenceToken fa = store.acquire_fence(order_id);
+            FenceToken fa = *store.acquire_fence(order_id);
             EffectivelyOnceLane<InMemoryStore> a(store, order_id, fa, store.last_seq(order_id) + 1);
             auto c = a.begin(inbound);
             check(c.event(Reserved{4}).has_value(), "crash-post: A stages effect", ok);
@@ -240,7 +240,7 @@ int main() {
         check(count_effects<Reserved>(store, order_id) == 1, "crash-post: effect is durable", ok);
 
         // Recovery: activation B rebuilds watermark + outbox + reply cache from the WAL.
-        FenceToken fb = store.acquire_fence(order_id);
+        FenceToken fb = *store.acquire_fence(order_id);
         EffectivelyOnceLane<InMemoryStore> b(store, order_id, fb, store.last_seq(order_id) + 1);
         std::size_t domain_events_replayed = 0;
         check(b.recover([&](std::span<const std::byte>) -> result<void> {
@@ -255,7 +255,7 @@ int main() {
               "crash-post: re-drained outbox carries the SAME deterministic id", ok);
 
         // Inventory (fresh node here) receives the re-drained Reserve.
-        Inventory inv(store, store.acquire_fence(inv_id));
+        Inventory inv(store, *store.acquire_fence(inv_id));
         auto sent = b.drain_outbox([&](const OutboxRecord& o) { return inv.deliver(o); });
         check(sent.has_value() && *sent == 1, "crash-post: recovery re-drains the outbox → Reserve sent", ok);
         check(count_effects<Stocked>(store, inv_id) == 1, "crash-post: Inventory effect once", ok);

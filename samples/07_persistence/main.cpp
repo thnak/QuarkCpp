@@ -64,7 +64,7 @@ int main() {
         InMemoryStore store;
         const ActorId id{TypeKey{0xACC0}, 42};
         Activation act(nullptr, DispatchTable{});  // used only to reach the quiescent snapshot point
-        const FenceToken fence = store.acquire_fence(id);
+        const FenceToken fence = *store.acquire_fence(id);
 
         AccountState live{123456, "iot-viet-solution", {10, 20, 30, 40, 50}};
         auto saved = snapshot_sequential<AccountState>(act, store, id, fence, /*through_seq=*/0, live);
@@ -82,7 +82,7 @@ int main() {
     {
         InMemoryStore store;
         const ActorId id{TypeKey{0x1ED9}, 7};
-        const FenceToken f = store.acquire_fence(id);
+        const FenceToken f = *store.acquire_fence(id);
         EventLog<Moved, InMemoryStore> log(store, id, f, /*next_seq=*/store.last_seq(id) + 1);
 
         Ledger online;
@@ -110,11 +110,11 @@ int main() {
         InMemoryStore store;
         const ActorId id{TypeKey{0xF3AC}, 1};
 
-        const FenceToken a = store.acquire_fence(id);   // activation A takes ownership (token 1)
+        const FenceToken a = *store.acquire_fence(id);   // activation A takes ownership (token 1)
         auto a_ok = save_snapshot<Counter>(store, id, a, /*through_seq=*/0, Counter{100});
         ok &= a_ok.has_value();
 
-        const FenceToken b = store.acquire_fence(id);   // activation B takes over (token 2)
+        const FenceToken b = *store.acquire_fence(id);   // activation B takes over (token 2)
         // From here A is SUPERSEDED. Its writes must be refused; B's must succeed.
         auto a_stale = save_snapshot<Counter>(store, id, a, 0, Counter{999});
         auto b_ok = save_snapshot<Counter>(store, id, b, 0, Counter{200});

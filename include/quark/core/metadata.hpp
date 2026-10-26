@@ -200,14 +200,16 @@ using FlushFn = result<void> (*)(void* self, void* store, ActorId id, FenceToken
 // time (closes the pre-existing gap where `declare_lazy<A>(store,...)` never called
 // `store.acquire_fence(id)` at all). A pure function of `S` alone — set for EVERY store-taking
 // `register_type<A,S>` call, independent of `A`'s persistence policy.
-using FenceAcquireFn = FenceToken (*)(void* store, ActorId id);
+using FenceAcquireFn = result<FenceToken> (*)(void* store, ActorId id);
 
 template <class A, class S>
 [[nodiscard]] FlushFn make_flush_fn() noexcept;  // defined after has_persist_state<A> below
 
 template <class S>
 [[nodiscard]] FenceAcquireFn make_fence_acquire_fn() noexcept {
-    return +[](void* store, ActorId id) -> FenceToken { return static_cast<S*>(store)->acquire_fence(id); };
+    return +[](void* store, ActorId id) -> result<FenceToken> {
+        return static_cast<S*>(store)->acquire_fence(id);
+    };
 }
 
 // The RECONSTRUCT factory (007/ADR-009 §Restart): destroy the actor's state in place and

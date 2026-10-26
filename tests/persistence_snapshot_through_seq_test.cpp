@@ -38,7 +38,7 @@ int main() {
     bool ok = true;
     InMemoryStore store;
     const ActorId id{TypeKey{0x5A11}, 1};
-    const FenceToken f = store.acquire_fence(id);
+    const FenceToken f = *store.acquire_fence(id);
 
     // Commit exactly ONE event → the appended tail is seq 1.
     EventLog<Debit, InMemoryStore> log(store, id, f, store.last_seq(id) + 1);

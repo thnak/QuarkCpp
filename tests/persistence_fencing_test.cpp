@@ -43,7 +43,7 @@ int main() {
     const ActorId id{TypeKey{0xFECE}, 1};
 
     // --- Activation A acquires the first fencing token and writes durably --------------------
-    const FenceToken a = store.acquire_fence(id);
+    const FenceToken a = *store.acquire_fence(id);
     check(a == FenceToken{1}, "first activation gets fence token 1", ok);
     EventLog<Note, InMemoryStore> log_a(store, id, a, store.last_seq(id) + 1);
     log_a.stage(Note{10});
@@ -51,7 +51,7 @@ int main() {
     check(store.log_size(id) == 1, "A's event is durable", ok);
 
     // --- Activation B takes over (re-placement / restart): a NEWER fencing token ------------
-    const FenceToken b = store.acquire_fence(id);
+    const FenceToken b = *store.acquire_fence(id);
     check(b == FenceToken{2}, "new activation gets a strictly-greater fence token 2", ok);
     check(store.current_owner(id) == b, "store now recognises B as the owner", ok);
     EventLog<Note, InMemoryStore> log_b(store, id, b, store.last_seq(id) + 1);
@@ -79,7 +79,7 @@ int main() {
           "current owner B can snapshot", ok);
 
     // A THIRD activation C fences BOTH A and B (monotonic tokens); B is now stale too.
-    const FenceToken c = store.acquire_fence(id);
+    const FenceToken c = *store.acquire_fence(id);
     check(c == FenceToken{3}, "third activation gets fence token 3", ok);
     log_b.stage(Note{40});
     auto b_after_c = log_b.commit();

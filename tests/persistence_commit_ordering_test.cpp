@@ -44,7 +44,7 @@ int main() {
     {
         InMemoryStore store;
         const ActorId id{TypeKey{0xC0DE}, 1};
-        const FenceToken f = store.acquire_fence(id);
+        const FenceToken f = *store.acquire_fence(id);
         EventLog<Debit, InMemoryStore> log(store, id, f, store.last_seq(id) + 1);
 
         // Single-event commits: each takes the next seq (1,2,3,…).
@@ -92,7 +92,7 @@ int main() {
     {
         InMemoryStore store;
         const ActorId id{TypeKey{0xC0DE}, 2};
-        const FenceToken f = store.acquire_fence(id);
+        const FenceToken f = *store.acquire_fence(id);
         EventLog<Debit, InMemoryStore> log(store, id, f, store.last_seq(id) + 1);
 
         // POISON handler: stage debit(100) … then throw → rollback (commit nothing).

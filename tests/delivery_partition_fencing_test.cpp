@@ -64,10 +64,10 @@ bool run_partition(bool low_commits_first) {
     const MsgKey inbound{client_id.hash(), 1};
 
     // Activation A (the eventual ZOMBIE) takes the fence first: token 1.
-    FenceToken tok_a = store.acquire_fence(order_id);
+    FenceToken tok_a = *store.acquire_fence(order_id);
     // Activation B (the TAKEOVER) is re-placed under partition and acquires a strictly higher token:
     // token 2. Acquiring it makes B the current owner — A is now fenced out.
-    FenceToken tok_b = store.acquire_fence(order_id);
+    FenceToken tok_b = *store.acquire_fence(order_id);
     check(tok_a < tok_b, "partition: B's fencing token strictly supersedes A's", ok);
 
     EffectivelyOnceLane<InMemoryStore> a(store, order_id, tok_a, store.last_seq(order_id) + 1);
@@ -119,7 +119,7 @@ bool run_partition(bool low_commits_first) {
     check(za.has_value() && *za == 0 && zombie_sent == 0, "partition: the ZOMBIE sends NOTHING", ok);
 
     std::size_t reserves_delivered = 0;
-    EffectivelyOnceLane<InMemoryStore> inv(store, inv_id, store.acquire_fence(inv_id),
+    EffectivelyOnceLane<InMemoryStore> inv(store, inv_id, *store.acquire_fence(inv_id),
                                            store.last_seq(inv_id) + 1);
     auto zb = b.drain_outbox([&](const OutboxRecord& o) -> result<void> {
         ++reserves_delivered;

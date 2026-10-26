@@ -1205,7 +1205,18 @@ private:
             // could append after our read; our later flush (under the fresh, valid token) would then
             // overwrite state derived from the pre-append snapshot.
             FenceToken fence{};
-            if (m->fence_acquire != nullptr) fence = m->fence_acquire(m->store, w.id);
+            if (m->fence_acquire != nullptr) {
+                // A failed acquire means this activation cannot be fenced against the previous owner
+                // (item 2 / review B5): dead-letter `first` exactly like a recovery failure — never a
+                // half-activated actor that would flush under a token the store never recorded.
+                result<FenceToken> got = m->fence_acquire(m->store, w.id);
+                if (!got) {
+                    m->destroy(actor);
+                    w.first_reclaim(w.first);
+                    return;
+                }
+                fence = *got;
+            }
             // ADR-028 Phase 5: A declared Persistent<Snapshot,...> via declare_lazy<A>(store, ...) —
             // recover its persisted state (or seed from its own default via snapshot_state()) exactly
             // once, before the actor's first message dispatches. A failure dead-letters `first`

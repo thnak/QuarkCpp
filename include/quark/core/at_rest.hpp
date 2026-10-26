@@ -187,7 +187,7 @@ public:
     [[nodiscard]] S& inner() noexcept { return *inner_; }
     [[nodiscard]] const S& inner() const noexcept { return *inner_; }
 
-    [[nodiscard]] FenceToken acquire_fence(ActorId id) { return inner_->acquire_fence(id); }
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId id) { return inner_->acquire_fence(id); }
     [[nodiscard]] SeqNo last_seq(ActorId id) const noexcept { return inner_->last_seq(id); }
 
     [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const {

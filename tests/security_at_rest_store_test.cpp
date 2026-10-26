@@ -88,7 +88,7 @@ int main() {
         EncryptedStore<InMemoryStore> store(inner, ring);
         static_assert(Store<decltype(store)>, "EncryptedStore satisfies Store");
 
-        const FenceToken fence = store.acquire_fence(actor);
+        const FenceToken fence = *store.acquire_fence(actor);
         check(store.append(actor, fence, SeqNo{1}, ev1).has_value(), "append event 1", ok);
         const EventRecord b2{2, ev2}, b3{3, ev3};
         const EventRecord batch[] = {b2, b3};
@@ -146,7 +146,7 @@ int main() {
         // Cross-actor splice: put actor A's sealed snapshot into actor B's slot. Same key, same
         // fence/through_seq, but the AAD actor differs ⇒ rejected.
         const ActorId other{TypeKey{0xBEEF}, 9};
-        const FenceToken other_fence = inner.acquire_fence(other);
+        const FenceToken other_fence = *inner.acquire_fence(other);
         auto raw_a = inner.load_snapshot(actor);
         if (raw_a && raw_a->has_value()) {
             SnapshotRecord stolen = **raw_a;
@@ -176,7 +176,7 @@ int main() {
         {
             FileStore file(dir.string());
             EncryptedStore<FileStore> store(file, ring);
-            const FenceToken fence = store.acquire_fence(actor);
+            const FenceToken fence = *store.acquire_fence(actor);
             check(store.append(actor, fence, SeqNo{1}, ev1).has_value(), "FileStore append", ok);
             SnapshotRecord snap;
             snap.fence = fence;

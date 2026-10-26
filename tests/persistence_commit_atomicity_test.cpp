@@ -35,7 +35,7 @@ public:
     InMemoryStore inner;
     bool fail_batch = false;
 
-    FenceToken acquire_fence(ActorId id) { return inner.acquire_fence(id); }
+    result<FenceToken> acquire_fence(ActorId id) { return inner.acquire_fence(id); }
     SeqNo last_seq(ActorId id) const noexcept { return inner.last_seq(id); }
     result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const { return inner.load_snapshot(id); }
     result<void> save_snapshot(ActorId id, FenceToken t, const SnapshotRecord& s) {
@@ -69,7 +69,7 @@ int main() {
     {
         FlakyStore store;
         const ActorId id{TypeKey{0xBEEF}, 1};
-        const FenceToken f = store.acquire_fence(id);
+        const FenceToken f = *store.acquire_fence(id);
         EventLog<Debit, FlakyStore> log(store, id, f, store.last_seq(id) + 1);
 
         store.fail_batch = true;  // the store's atomic batch append will fail
@@ -113,7 +113,7 @@ int main() {
     {
         InMemoryStore store;
         const ActorId id{TypeKey{0xBEEF}, 2};
-        const FenceToken f = store.acquire_fence(id);
+        const FenceToken f = *store.acquire_fence(id);
 
         auto enc = [](std::int64_t a) { return *encode_durable(Debit{a}); };
         std::vector<EventRecord> batch;

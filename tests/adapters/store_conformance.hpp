@@ -36,7 +36,7 @@ int run_store_conformance(const char* label, Make make) {
     // 1) write, "crash" (destroy), reopen, verify durable.
     {
         auto fs = make();
-        const FenceToken t = fs.acquire_fence(id);
+        const FenceToken t = *fs.acquire_fence(id);
         check(t == FenceToken{1}, "first fence token is 1");
         check(fs.append(id, t, 1, cbytes("event-one")).has_value(), "append seq 1");
         check(fs.append(id, t, 2, cbytes("event-two")).has_value(), "append seq 2");
@@ -62,7 +62,7 @@ int run_store_conformance(const char* label, Make make) {
               "event 3 bytes durable");
 
         // 2) fencing durable across reopen.
-        const FenceToken t2 = fs.acquire_fence(id);
+        const FenceToken t2 = *fs.acquire_fence(id);
         check(t2 == FenceToken{2}, "new owner strictly greater than the durable token");
         auto stale = fs.append(id, FenceToken{1}, 4, cbytes("stale"));
         check(!stale.has_value() && stale.error().code == errc::unavailable, "stale writer fenced out");

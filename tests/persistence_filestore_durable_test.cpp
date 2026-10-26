@@ -69,7 +69,7 @@ int main() {
     // ---- 1) write, "crash" (destroy), reopen, verify everything is durable --------------------
     {
         FileStore fs(root);
-        const FenceToken t = fs.acquire_fence(id);
+        const FenceToken t = *fs.acquire_fence(id);
         check(t == FenceToken{1}, "first fence token is 1", ok);
         check(fs.append(id, t, 1, B("event-one")).has_value(), "append seq 1", ok);
         check(fs.append(id, t, 2, B("event-two")).has_value(), "append seq 2", ok);
@@ -102,7 +102,7 @@ int main() {
               "read_log(from=3) tail", ok);
 
         // ---- 2) fencing is durable across the reopen -----------------------------------------
-        const FenceToken t2 = fs.acquire_fence(id);
+        const FenceToken t2 = *fs.acquire_fence(id);
         check(t2 == FenceToken{2}, "new owner strictly greater than the durable token", ok);
         auto stale = fs.append(id, FenceToken{1}, 4, B("stale"));
         check(!stale.has_value() && stale.error().code == errc::unavailable,
@@ -131,7 +131,7 @@ int main() {
         const ActorId eid{TypeKey{0x5011}, 1};
         {
             FileStore fs(root);
-            const FenceToken f = fs.acquire_fence(eid);
+            const FenceToken f = *fs.acquire_fence(eid);
             EventLog<Added, FileStore> log(fs, eid, f, fs.last_seq(eid) + 1);
             log.stage(Added{10});
             log.stage(Added{5});

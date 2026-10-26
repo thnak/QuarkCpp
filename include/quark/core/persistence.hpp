@@ -126,7 +126,10 @@ struct EventCursor {
 // ============================================================================================
 //
 // FENCING CONTRACT. `acquire_fence(id)` returns a token strictly greater than every token yet
-// issued for `id`, and marks it the current owner. `save_snapshot`/`append` carry a token; the
+// issued for `id`, and marks it the current owner. It returns a `result`: a store that cannot
+// durably record the new owner (I/O error, corrupt log, lost connection) FAILS instead of handing
+// out a token it did not record — an unrecorded token would not fence the previous owner out
+// (review B5/item 2). Callers must treat failure as "this activation may not write". `save_snapshot`/`append` carry a token; the
 // store rejects (errc::unavailable) any write whose token is OLDER than the current owner — that is
 // the split-brain fence. A write from the current owner is accepted. `last_seq(id)` reports the
 // highest committed sequence so a recovering activation continues the count.
@@ -134,7 +137,7 @@ template <class S>
 concept Store = requires(S& s, ActorId id, FenceToken tok, SeqNo seq,
                          std::span<const std::byte> bytes, std::span<const EventRecord> batch,
                          const SnapshotRecord& snap) {
-    { s.acquire_fence(id) } -> std::same_as<FenceToken>;
+    { s.acquire_fence(id) } -> std::same_as<result<FenceToken>>;
     { s.last_seq(id) } -> std::same_as<SeqNo>;
     { s.load_snapshot(id) } -> std::same_as<result<std::optional<SnapshotRecord>>>;
     { s.save_snapshot(id, tok, snap) } -> std::same_as<result<void>>;
@@ -148,8 +151,9 @@ concept Store = requires(S& s, ActorId id, FenceToken tok, SeqNo seq,
 };
 
 // A token of 0 means "no fence": real tokens start at 1 (acquire_fence returns owner+1). A store
-// refuses every write carried under it, so a failed/skipped acquire_fence (which returns 0) can never
-// be mistaken for a valid owner and silently write (review B5).
+// refuses every write carried under it, so a default-constructed / never-acquired token can never be
+// mistaken for a valid owner and silently write (review B5). acquire_fence itself now reports failure
+// through its `result`, not through a 0 token.
 [[nodiscard]] constexpr bool is_unfenced(FenceToken t) noexcept { return t.value == 0; }
 
 // The fence-rejection error (012): a stale/superseded writer's write is refused. `unavailable` is
@@ -172,7 +176,7 @@ public:
     // THREAD SAFETY (012 adapters serialize access, review B3): every public method takes `mu_`.
     // The engine calls a store from every shard's broker and from worker threads (deactivation flush,
     // commit), so unlocked `table_` mutation was a data race.
-    [[nodiscard]] FenceToken acquire_fence(ActorId id) {
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId id) {
         std::lock_guard<std::mutex> g(mu_);
         auto& e = table_[id];
         e.owner = FenceToken{e.owner.value + 1};

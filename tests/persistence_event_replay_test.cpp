@@ -75,7 +75,7 @@ int main() {
     const ActorId id{TypeKey{0x1ED6E7}, 7};
 
     // --- ONLINE: an EventSourced actor stages+commits N events -------------------------------
-    const FenceToken f1 = store.acquire_fence(id);
+    const FenceToken f1 = *store.acquire_fence(id);
     EventLog<Moved, InMemoryStore> log(store, id, f1, /*next_seq=*/store.last_seq(id) + 1);
 
     Ledger online;
@@ -122,7 +122,7 @@ int main() {
     // --- MIGRATION on replay: append an OLD (v1) event, recover as the NEW (v2) shape ----------
     InMemoryStore store2;
     const ActorId id2{TypeKey{0x1ED6E8}, 1};
-    const FenceToken f2 = store2.acquire_fence(id2);
+    const FenceToken f2 = *store2.acquire_fence(id2);
     // Write a v1 record directly (as an older binary would have), then replay as v2.
     auto v1bytes = encode_durable(MovedV1{static_cast<std::int32_t>(-5)});
     check(v1bytes.has_value(), "encode a v1 event", ok);

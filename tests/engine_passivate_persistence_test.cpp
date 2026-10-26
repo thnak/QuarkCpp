@@ -45,7 +45,7 @@ struct PersistedCounter : Actor<PersistedCounter, Sequential, Persistent<Snapsho
 
 // A store whose save_snapshot always fails -- proves the best-effort, never-fatal flush contract.
 struct FailingSaveStore {
-    [[nodiscard]] FenceToken acquire_fence(ActorId id) { return inner.acquire_fence(id); }
+    [[nodiscard]] result<FenceToken> acquire_fence(ActorId id) { return inner.acquire_fence(id); }
     [[nodiscard]] SeqNo last_seq(ActorId id) const noexcept { return inner.last_seq(id); }
     [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const {
         return inner.load_snapshot(id);
