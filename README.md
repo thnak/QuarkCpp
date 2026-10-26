@@ -199,7 +199,7 @@ that still blocks a platform-wide commitment — see [PRODUCTION-READINESS.md](P
 
 ## Quick start
 
-Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 20.1**).
+Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 22.1**).
 
 ```bash
 # Build + run the full correctness gate (Release)

@@ -78,6 +78,6 @@ This dev box has 32 cores and **can hang or power off if a build/benchmark satur
 - **Pin every test and benchmark to ≤ 4 cores**: `taskset -c 0-3 ...`; single-thread microbenchmarks
   to one core (`taskset -c 0 ...`). Never spawn `std::thread` counts == `hardware_concurrency()`;
   multi-thread stress ≤ 4 threads. Per-core ns / percentile numbers stay valid under the cap.
-- Compile clean under **both g++ 14 and clang++ 20**, `-std=c++23 -Wall -Wextra`.
+- Compile clean under **both g++ 14 and clang++ 22**, `-std=c++23 -Wall -Wextra`.
 - Correctness tests run under **ASan/UBSan**, and **TSan** for anything with cross-thread edges.
 - A load-bearing invariant without a test, or a hot path without a bench, is not done.

@@ -19,7 +19,7 @@ jobs:
   diag:
     runs-on: ubuntu-24.04-arm
     container:
-      image: ghcr.io/thnak/quark-ci@sha256:25a8819b9dee2399a54d00e876d1a36af24242f014c56e4a5152a9a54e53ad91
+      image: ghcr.io/thnak/quark-ci@sha256:13686cb105f4d2650dd83c469945f85d2ca603a3b674c7799499098d370bcebe
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
