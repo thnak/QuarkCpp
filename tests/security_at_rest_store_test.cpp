@@ -110,8 +110,9 @@ int main() {
         if (raw) {
             check(!contains((*raw).entries[0].record, ev1),
                   "raw inner event bytes are not the canonical plaintext", ok);
-            check((*raw).entries[0].record.size() == ev1.size() + cipher.tag_size(),
-                  "sealed event carries ciphertext + tag", ok);
+            check((*raw).entries[0].record.size() ==
+                      kAtRestNonceBytes + ev1.size() + cipher.tag_size(),
+                  "sealed event carries nonce + ciphertext + tag", ok);
         }
 
         SnapshotRecord snap;
@@ -239,6 +240,43 @@ int main() {
             }
         }
         std::filesystem::remove_all(dir);
+    }
+
+    // ---------------- B1: sealing the SAME position twice must never reuse a nonce ---------------
+    // Snapshot flushes seal different plaintexts at an identical (actor, kind, through_seq, fence);
+    // a positional nonce would repeat under one key (GCM keystream XOR leak + tag forgery).
+    {
+        const AtRestContext ctx{actor, AtRestKind::Snapshot, 0, FenceToken{5}};
+        const auto a = seal_at_rest(cipher, ctx, std::span<const std::byte>(snap_bytes));
+        const auto b = seal_at_rest(cipher, ctx, std::span<const std::byte>(snap_bytes));
+        check(a != b, "two seals of the same context differ (fresh nonce)", ok);
+        check(a.size() == snap_bytes.size() + kAtRestNonceBytes + cipher.tag_size(),
+              "sealed layout is [nonce][ciphertext][tag]", ok);
+        check(!std::equal(a.begin(), a.begin() + kAtRestNonceBytes, b.begin()),
+              "the stored nonce prefix differs between seals", ok);
+        const auto oa = open_at_rest(cipher, ctx, std::span<const std::byte>(a));
+        const auto ob = open_at_rest(cipher, ctx, std::span<const std::byte>(b));
+        check(oa && *oa == snap_bytes && ob && *ob == snap_bytes, "both seals round-trip", ok);
+
+        auto forged = a;
+        forged[0] = static_cast<std::byte>(static_cast<unsigned char>(forged[0]) ^ 0x01);
+        check(!open_at_rest(cipher, ctx, std::span<const std::byte>(forged)).has_value(),
+              "a tampered nonce prefix is rejected", ok);
+        check(!open_at_rest(cipher, ctx, std::span<const std::byte>(a.data(), kAtRestNonceBytes - 1))
+                   .has_value(),
+              "a record shorter than the nonce prefix is rejected", ok);
+
+        // Many seals of one context: all nonce prefixes are distinct.
+        std::vector<std::uint64_t> seen;
+        for (int i = 0; i < 4096; ++i) {
+            const auto s = seal_at_rest(cipher, ctx, std::span<const std::byte>(snap_bytes));
+            std::uint64_t n = 0;
+            std::memcpy(&n, s.data(), sizeof(n));
+            seen.push_back(n);
+        }
+        std::sort(seen.begin(), seen.end());
+        check(std::adjacent_find(seen.begin(), seen.end()) == seen.end(),
+              "4096 seals of one context produce 4096 distinct nonces", ok);
     }
 
     std::printf("security_at_rest_store_test: %s\n", ok ? "OK" : "FAIL");

@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <random>
 #include <span>
 #include <utility>
 #include <vector>
@@ -101,8 +102,8 @@ private:
 // Store-level context (P4): a durable record also needs the ACTOR and the RECORD KIND in
 // the AAD, or a record could be spliced between actors that share a key (StaticKeyring) or between
 // a snapshot and an event with the same seq. `fence` is bound for snapshots (the record carries it);
-// events bind actor+seq (the store's event record has no fence). Nonce = an injective hash of the
-// same context, so a record can only be opened at the position it was sealed for.
+// events bind actor+seq (the store's event record has no fence). The AAD binds the position, so a
+// record can only be opened at the position it was sealed for; the nonce is random per record (below).
 // ============================================================================================
 enum class AtRestKind : std::uint8_t { Snapshot = 1, Event = 2 };
 
@@ -126,28 +127,44 @@ struct AtRestContext {
     return aad;
 }
 
-[[nodiscard]] inline std::uint64_t at_rest_nonce(const AtRestContext& ctx) noexcept {
-    std::uint64_t h = detail::hash_combine(ctx.actor.type.value, ctx.actor.key);
-    h = detail::hash_combine(h, static_cast<std::uint64_t>(ctx.kind));
-    h = detail::hash_combine(h, ctx.seq);
-    h = detail::hash_combine(h, ctx.fence.value);
-    return detail::splitmix64(h);
+// A deterministic nonce derived from the record POSITION is UNSAFE here: a snapshot flush can seal a
+// different plaintext at the same (actor, kind, through_seq, fence) — snapshot-model flushes always
+// pass through_seq=0 and a Dormant activation (same fence) is reused on wake — so a positional nonce
+// repeats under one key (GCM: keystream XOR leak + tag forgery). Every store-level record therefore
+// gets a FRESH random nonce, stored as an 8-byte little-endian prefix: [nonce:8][ciphertext||tag].
+// The nonce is still bound by the tag (a wrong prefix fails open); the AAD still binds the position.
+// Random 64-bit nonces are collision-safe to ~2^32 records per key; rotate the data key before that
+// (a production adapter with a 96-bit nonce widens the margin).
+inline constexpr std::size_t kAtRestNonceBytes = 8;
+
+[[nodiscard]] inline std::uint64_t fresh_at_rest_nonce() {
+    static thread_local std::random_device rd;
+    return (static_cast<std::uint64_t>(rd()) << 32) ^ static_cast<std::uint64_t>(rd());
 }
 
 [[nodiscard]] inline std::vector<std::byte> seal_at_rest(const Aead& cipher, const AtRestContext& ctx,
                                                          std::span<const std::byte> canonical) {
     const std::vector<std::byte> aad = at_rest_aad(ctx);
+    const std::uint64_t nonce = fresh_at_rest_nonce();
     std::vector<std::byte> out;
-    cipher.seal(at_rest_nonce(ctx), std::span<const std::byte>(aad), canonical, out);
+    out.reserve(kAtRestNonceBytes + canonical.size() + cipher.tag_size());
+    for (std::size_t b = 0; b < kAtRestNonceBytes; ++b)
+        out.push_back(static_cast<std::byte>((nonce >> (b * 8)) & 0xFF));
+    cipher.seal(nonce, std::span<const std::byte>(aad), canonical, out);  // appends after the prefix
     return out;
 }
 
 [[nodiscard]] inline result<std::vector<std::byte>> open_at_rest(const Aead& cipher,
                                                                  const AtRestContext& ctx,
                                                                  std::span<const std::byte> sealed) {
+    if (sealed.size() < kAtRestNonceBytes)
+        return fail(errc::serialization, "at-rest record too short (missing nonce prefix)");
+    std::uint64_t nonce = 0;
+    for (std::size_t b = 0; b < kAtRestNonceBytes; ++b)
+        nonce |= static_cast<std::uint64_t>(static_cast<unsigned char>(sealed[b])) << (b * 8);
     const std::vector<std::byte> aad = at_rest_aad(ctx);
     std::vector<std::byte> out;
-    if (!cipher.open(at_rest_nonce(ctx), std::span<const std::byte>(aad), sealed, out))
+    if (!cipher.open(nonce, std::span<const std::byte>(aad), sealed.subspan(kAtRestNonceBytes), out))
         return fail(errc::serialization,
                     "at-rest AEAD open failed (tamper / wrong actor/seq/fence / wrong key)");
     return out;

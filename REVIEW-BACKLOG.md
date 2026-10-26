@@ -30,7 +30,7 @@ under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet 
 
 ## B. Persistence — not production-ready
 
-- [ ] **B1 CRITICAL — snapshot nonce reuse.** `at_rest.hpp:129-135,191`: nonce is a deterministic hash of
+- [x] **B1 CRITICAL — snapshot nonce reuse (fixed: random per-record nonce stored as 8-byte prefix; test added).** `at_rest.hpp:129-135,191`: nonce is a deterministic hash of
   (actor, kind, through_seq, fence). Snapshot flushes always pass `through_seq = 0`
   (`metadata.hpp:411`) and a Dormant activation (same fence) is reused on wake
   (`engine.hpp:1170-1172,1214,1227`), so different plaintexts are sealed under one nonce → GCM
