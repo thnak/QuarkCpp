@@ -134,7 +134,7 @@ jobs:
             build_jobs: 2
             ctest_jobs: 2
             # detect_leaks on; the one deliberate-OOB control sets its own ASAN_OPTIONS in CMake.
-            ctest_env: "ASAN_OPTIONS=abort_on_error=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
+            ctest_env: "ASAN_OPTIONS=abort_on_error=0${QUARK_ASAN_UAR:+:detect_stack_use_after_return=$QUARK_ASAN_UAR} UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
           - name: tsan
             cxx: g++-14
             build_type: Debug
@@ -194,6 +194,11 @@ jobs:
           fi
 
       - name: Test
+        env:
+          # arm64 ASan only: the fake-stack (use-after-return) runtime is >400x slower there (e.g.
+          # topology_fifo_under_relay_test >400s vs 1s; every tiny Debug frame hits FakeStack::Allocate),
+          # so that one check is off on arm64; x86-64 ASan keeps it. See arm64-asan-diag.yml.
+          QUARK_ASAN_UAR: ${{ matrix.arch == 'arm64' && '0' || '' }}
         run: ${{ matrix.config.ctest_env }} ctest --test-dir build -j ${{ matrix.config.ctest_jobs }} --output-on-failure --timeout 1800
 
       # P5: the same shared targets under libFuzzer + ASan/UBSan against the generated corpus. The
