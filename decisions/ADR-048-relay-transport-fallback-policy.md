@@ -332,8 +332,17 @@ authentication and failover, all delivered).
   completed the handshake with the relay are relayed for. A node that merely claims an id is refused, and
   dropping a session at the relay cuts that node's path (`tests/tcp_relay_authenticated_origin_test.cpp`).
   A and B still handshake end to end through the relay (their Authenticate frames are forwarded).
-- **Congestion path**: Control-lane frames cross the relay in both directions, so ADR-046's `Congested`
-  signal from a congested destination reaches the origin (B -> R -> A is tested), provided both spokes have
-  `set_relay_via` for each other. The relay's per-destination caps still shed at the hop.
-- **Residual (accepted)**: the A<->R link is TCP whose frame headers (from/to/kind) are visible on the wire;
-  payloads are sealed end to end. Link-level encryption of that hop is a separate hardening item.
+- **Congestion path** (full flow, `tests/tcp_relay_congestion_flow_test.cpp`): two real `SwimMembership`
+  nodes over real TCP that know only the relay. B's pressure crosses the watermark, B broadcasts
+  `Congested`, the Control frame crosses the relay (`m.from == frame.from == B`, so SWIM's impersonation
+  check passes), A's membership marks B congested on A's own transport, `admit_send(B)` sheds, and the TTL
+  self-heals it with no second frame. Needs `set_relay_via` for the peer on both spokes.
+- **Shape C — sealed-hop relay** (`net/sealed_relay_transport.hpp`, `tests/tcp_sealed_relay_test.cpp`):
+  closes the header-visibility residual of shape B. The inner frame is encoded into the payload of an
+  outer frame addressed to the relay and sent through the HOP SecureTransport, so a wire observer sees
+  only {origin, relay} and a sealed blob (a wire tap at the origin verifies no frame names the
+  destination or carries the inner target). The relay learns the origin from its authenticated hop
+  session, refuses an inner `from` that differs, applies `admit(origin, dest)`, and re-wraps for the
+  destination under its own session. A node accepts a transit delivery only from a configured relay.
+  End-to-end SecureTransport stacks on top, so the relay can neither read nor alter payloads. Shape B
+  stays for deployments where header visibility on the hop is acceptable.
