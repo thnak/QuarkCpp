@@ -134,6 +134,28 @@ inline void file_close(file_t f) noexcept {
     return ::MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
 }
 
+// Windows has no portable "fsync a directory" (a directory handle cannot be flushed with
+// FlushFileBuffers without backup semantics + write access); NTFS journals directory metadata, and the
+// rename below uses MOVEFILE_WRITE_THROUGH instead. So this is a successful no-op (review B9) — kept
+// so portable callers can request a directory barrier unconditionally.
+[[nodiscard]] inline bool durable_sync_dir(const std::string& dir) noexcept {
+    (void)dir;
+    return true;
+}
+
+// The directory that contains `path` (either separator; "." for a bare filename).
+[[nodiscard]] inline std::string parent_dir(const std::string& path) {
+    const auto slash = path.find_last_of("/\\");
+    if (slash == std::string::npos) return ".";
+    return slash == 0 ? path.substr(0, 1) : path.substr(0, slash);
+}
+
+// MoveFileEx with MOVEFILE_WRITE_THROUGH: does not return until the move is flushed to disk.
+[[nodiscard]] inline bool durable_rename(const std::string& from, const std::string& to) noexcept {
+    return ::MoveFileExA(from.c_str(), to.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
 // Idempotent: a pre-existing directory is not an error (mirrors ::mkdir's EEXIST-ignoring call
 // sites — a missing/unwritable parent surfaces at file_open() instead).
 inline void make_dir(const std::string& path) noexcept {

@@ -89,6 +89,29 @@ inline void file_close(file_t f) noexcept {
     return ::rename(from.c_str(), to.c_str()) == 0;
 }
 
+// fsync a DIRECTORY so a just-created / just-renamed entry in it survives power loss (a file's own
+// fdatasync does not make its directory entry durable — review B9).
+[[nodiscard]] inline bool durable_sync_dir(const std::string& dir) noexcept {
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+// The directory that contains `path` ("." for a bare filename).
+[[nodiscard]] inline std::string parent_dir(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return ".";
+    return slash == 0 ? "/" : path.substr(0, slash);
+}
+
+// rename(2) + fsync of the destination directory: the replacement is durable once this returns true.
+[[nodiscard]] inline bool durable_rename(const std::string& from, const std::string& to) noexcept {
+    if (::rename(from.c_str(), to.c_str()) != 0) return false;
+    return durable_sync_dir(parent_dir(to));
+}
+
 // Idempotent: a pre-existing directory is not an error (mirrors the original `::mkdir` call sites,
 // which discarded the return value entirely — a missing/unwritable dir surfaces at file_open()).
 inline void make_dir(const std::string& path) noexcept {
