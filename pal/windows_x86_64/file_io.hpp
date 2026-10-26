@@ -143,6 +143,13 @@ inline void file_close(file_t f) noexcept {
     return true;
 }
 
+// The directory that contains `path` (either separator; "." for a bare filename).
+[[nodiscard]] inline std::string parent_dir(const std::string& path) {
+    const auto slash = path.find_last_of("/\\");
+    if (slash == std::string::npos) return ".";
+    return slash == 0 ? path.substr(0, 1) : path.substr(0, slash);
+}
+
 // MoveFileEx with MOVEFILE_WRITE_THROUGH: does not return until the move is flushed to disk.
 [[nodiscard]] inline bool durable_rename(const std::string& from, const std::string& to) noexcept {
     return ::MoveFileExA(from.c_str(), to.c_str(),

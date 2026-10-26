@@ -206,7 +206,12 @@ private:
         auto e = std::make_unique<Entry>();
         const std::string path = path_for(id);
         e->fd = pal::file_open(path, pal::FileOpenMode::kReadWriteCreate);
-        if (e->fd != pal::invalid_file) replay(*e);
+        if (e->fd != pal::invalid_file) {
+            replay(*e);
+            // A brand-new (empty) log: fdatasync on the file never makes its DIRECTORY ENTRY durable, so
+            // a crash could lose the whole file though every record in it was acknowledged (review B9).
+            if (e->write_off == 0 && !e->corrupt) (void)pal::durable_sync_dir(root_);
+        }
         Entry& ref = *e;
         table_.emplace(id, std::move(e));
         return ref;
@@ -234,7 +239,12 @@ private:
                 if (body_off + len < n) e.corrupt = true;
                 break;
             }
-            apply_record(e, body);
+            if (!apply_record(e, body)) {
+                // CRC-valid but malformed / unknown / non-monotonic content (review B8): a CRC is not a
+                // MAC and a torn write cannot produce a valid CRC, so this is corruption, not a tail.
+                e.corrupt = true;
+                break;
+            }
             off = body_off + len;                                   // advance past this good record
         }
         if (e.corrupt) {
@@ -245,30 +255,44 @@ private:
         e.write_off = off;
     }
 
-    // Apply one replayed record to the in-RAM Entry (records are in append order).
-    static void apply_record(Entry& e, std::span<const std::byte> body) {
-        std::uint64_t p = 0;
-        const std::uint8_t kind = get_u8(body, p);
+    // Apply one replayed record to the in-RAM Entry (records are in append order). Every read is
+    // bounds-checked against the record (review B8): returns false — leaving the caller to mark the log
+    // corrupt — for a truncated field, an oversized blob/count, an unknown kind, trailing bytes, or a
+    // batch whose seqs are not strictly increasing (the same invariant append_batch enforces).
+    [[nodiscard]] static bool apply_record(Entry& e, std::span<const std::byte> body) {
+        Reader r{body};
+        const std::uint8_t kind = r.u8();
         if (kind == kFence) {
-            e.owner = FenceToken{get_u64(body, p)};
+            const std::uint64_t tok = r.u64();
+            if (!r.ok || !r.done()) return false;
+            e.owner = FenceToken{tok};
         } else if (kind == kSnapshot) {
             SnapshotRecord s;
-            s.fence = FenceToken{get_u64(body, p)};
-            s.through_seq = get_u64(body, p);
-            s.record = get_blob(body, p);
+            s.fence = FenceToken{r.u64()};
+            s.through_seq = r.u64();
+            s.record = r.blob();
+            if (!r.ok || !r.done()) return false;
             e.snapshot = std::move(s);       // latest snapshot wins (later record overwrites)
         } else if (kind == kBatch) {
-            const std::uint32_t count = get_u32(body, p);
-            for (std::uint32_t i = 0; i < count; ++i) {
-                EventRecord r;
-                r.seq = get_u64(body, p);
-                r.record = get_blob(body, p);
-                e.last_seq = r.seq;
-                e.log.push_back(std::move(r));
+            const std::uint32_t count = r.u32();
+            SeqNo prev = e.last_seq;
+            std::vector<EventRecord> evs;    // staged: a bad record must not half-apply
+            for (std::uint32_t i = 0; i < count && r.ok; ++i) {
+                EventRecord ev;
+                ev.seq = r.u64();
+                ev.record = r.blob();
+                if (!r.ok) break;
+                if (ev.seq <= prev) return false;   // non-monotonic replay
+                prev = ev.seq;
+                evs.push_back(std::move(ev));
             }
+            if (!r.ok || !r.done()) return false;
+            for (auto& ev : evs) e.log.push_back(std::move(ev));
+            e.last_seq = prev;
+        } else {
+            return false;  // unknown kind: refuse rather than guess (forward-compat skipping is a seam)
         }
-        // An unknown kind (a newer format written by a future version) stops nothing here because the
-        // CRC already validated the bytes; forward-compat record skipping is a documented seam.
+        return true;
     }
 
     // Frame `body` as {u32 len, u32 crc32(body), body}, write it, and fdatasync. All-or-none per call.
@@ -323,22 +347,40 @@ private:
         const auto* s = static_cast<const std::byte*>(p);
         b.insert(b.end(), s, s + n);
     }
-    static std::uint8_t get_u8(std::span<const std::byte> b, std::uint64_t& p) {
-        return static_cast<std::uint8_t>(b[p++]);
-    }
-    static std::uint32_t get_u32(std::span<const std::byte> b, std::uint64_t& p) {
-        std::uint32_t v = 0; std::memcpy(&v, b.data() + p, 4); p += 4; return v;
-    }
-    static std::uint64_t get_u64(std::span<const std::byte> b, std::uint64_t& p) {
-        std::uint64_t v = 0; std::memcpy(&v, b.data() + p, 8); p += 8; return v;
-    }
-    static std::vector<std::byte> get_blob(std::span<const std::byte> b, std::uint64_t& p) {
-        const std::uint32_t len = get_u32(b, p);
-        std::vector<std::byte> v(b.begin() + static_cast<std::ptrdiff_t>(p),
-                                 b.begin() + static_cast<std::ptrdiff_t>(p) + len);
-        p += len;
-        return v;
-    }
+    // Bounds-checked cursor over one record body: any over-read clears `ok` and yields zeros/empty,
+    // never touching bytes outside the span (review B8).
+    struct Reader {
+        std::span<const std::byte> b;
+        std::uint64_t p = 0;
+        bool ok = true;
+        [[nodiscard]] bool done() const noexcept { return p == b.size(); }
+        [[nodiscard]] bool need(std::uint64_t n) noexcept {
+            if (!ok || n > b.size() - p) { ok = false; return false; }
+            return true;
+        }
+        std::uint8_t u8() {
+            if (!need(1)) return 0;
+            return static_cast<std::uint8_t>(b[p++]);
+        }
+        std::uint32_t u32() {
+            std::uint32_t v = 0;
+            if (!need(4)) return 0;
+            std::memcpy(&v, b.data() + p, 4); p += 4; return v;
+        }
+        std::uint64_t u64() {
+            std::uint64_t v = 0;
+            if (!need(8)) return 0;
+            std::memcpy(&v, b.data() + p, 8); p += 8; return v;
+        }
+        std::vector<std::byte> blob() {
+            const std::uint32_t len = u32();
+            if (!need(len)) return {};
+            std::vector<std::byte> v(b.begin() + static_cast<std::ptrdiff_t>(p),
+                                     b.begin() + static_cast<std::ptrdiff_t>(p) + len);
+            p += len;
+            return v;
+        }
+    };
 
     // CRC32 (IEEE 802.3) over the record body â€” torn/corrupt trailing-record detection on replay.
     static std::uint32_t crc32(std::span<const std::byte> data) noexcept {

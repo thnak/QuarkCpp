@@ -183,51 +183,74 @@ class FileReminderStore {
 public:
     enum class Kind : std::uint8_t { kPut = 1, kRemove = 2, kCheckpoint = 3 };
 
-    explicit FileReminderStore(std::string path) : path_(std::move(path)) { replay(); open_append(); }
+    explicit FileReminderStore(std::string path) : path_(std::move(path)) { replay(); if (!corrupt_) open_append(); }
     ~FileReminderStore() { pal::file_close(fd_); }
     FileReminderStore(const FileReminderStore&) = delete;
     FileReminderStore& operator=(const FileReminderStore&) = delete;
 
+    // The in-RAM map is mutated only AFTER the durable append succeeds, so a failed write never leaves
+    // RAM ahead of the log.
     [[nodiscard]] result<void> put(const ReminderRow& row) {
-        rows_[row.key()] = row;
         std::vector<std::byte> body = encode_put(row);
-        return durable_append(Kind::kPut, body);
+        if (auto e = durable_append(Kind::kPut, body); !e) return e;
+        rows_[row.key()] = row;
+        return {};
     }
     [[nodiscard]] result<void> remove(ReminderKey key) {
-        rows_.erase(key);
         std::vector<std::byte> body = encode_key(key);
-        return durable_append(Kind::kRemove, body);
+        if (auto e = durable_append(Kind::kRemove, body); !e) return e;
+        rows_.erase(key);
+        return {};
     }
     [[nodiscard]] result<std::vector<ReminderRow>> load_all() const {
+        if (corrupt_) return corrupt_error();
         std::vector<ReminderRow> out;
         out.reserve(rows_.size());
         for (const auto& [k, r] : rows_) out.push_back(r);
         return out;
     }
     [[nodiscard]] result<void> checkpoint(std::int64_t bucket) {
-        checkpoint_ = bucket;
         std::array<std::byte, 8> b{};
         put_i64(b.data(), bucket);
-        return durable_append(Kind::kCheckpoint, {b.data(), b.size()});
+        if (auto e = durable_append(Kind::kCheckpoint, {b.data(), b.size()}); !e) return e;
+        checkpoint_ = bucket;
+        return {};
     }
     [[nodiscard]] std::int64_t checkpoint_bucket() const noexcept { return checkpoint_; }
     [[nodiscard]] std::size_t live_rows() const noexcept { return rows_.size(); }
+    // True if the log failed its integrity check mid-file (a CRC-bad / malformed record with intact data
+    // after it): it is NEVER truncated or served and every operation errors (review B7).
+    [[nodiscard]] bool corrupted() const noexcept { return corrupt_; }
 
     // Rewrite the log to only the live rows + the current checkpoint — bounds rebuild to O(live).
     // (ADR-017 residual #3: 10⁴ re-arms of one reminder ⇒ 1 live row, not 10⁴ log records.)
+    //
+    // FAILURE SAFE (review B9): the live fd_ stays open on the OLD file until the new one is fully
+    // written, flushed (a flush failure aborts BEFORE the rename) and durably renamed into place; any
+    // failure removes the tmp file and leaves the store appending to the old log.
     [[nodiscard]] result<void> compact() {
-        if (fd_ != pal::invalid_file) { pal::file_close(fd_); fd_ = pal::invalid_file; }
+        if (corrupt_) return corrupt_error();
+        if (fd_ == pal::invalid_file) return fail(errc::internal, "reminder store: not open");
         const std::string tmp = path_ + ".compact";
         pal::file_t t = pal::file_open(tmp, pal::FileOpenMode::kWriteCreateTrunc);
         if (t == pal::invalid_file) return fail(errc::internal, "reminder compact: open tmp failed");
+        auto abort_tmp = [&](result<void> e) { pal::file_close(t); (void)std::remove(tmp.c_str()); return e; };
         for (const auto& [k, r] : rows_)
-            if (auto e = frame_write(t, Kind::kPut, encode_put(r)); !e) { pal::file_close(t); return e; }
+            if (auto e = frame_write(t, Kind::kPut, encode_put(r)); !e) return abort_tmp(e);
         { std::array<std::byte, 8> b{}; put_i64(b.data(), checkpoint_);
-          if (auto e = frame_write(t, Kind::kCheckpoint, {b.data(), b.size()}); !e) { pal::file_close(t); return e; } }
-        (void)pal::durable_flush(t);
+          if (auto e = frame_write(t, Kind::kCheckpoint, {b.data(), b.size()}); !e) return abort_tmp(e); }
+        if (!pal::durable_flush(t)) return abort_tmp(fail(errc::internal, "reminder compact: flush failed"));
         pal::file_close(t);
-        if (!pal::file_rename(tmp, path_)) return fail(errc::internal, "reminder compact: rename failed");
+        if (!pal::durable_rename(tmp, path_)) {
+            (void)std::remove(tmp.c_str());
+            return fail(errc::internal, "reminder compact: rename failed");
+        }
+        // The new file is in place. Swap the append handle onto it; if that fails the store cannot
+        // append, which every later write reports ("not open") rather than writing to an unlinked file.
+        pal::file_close(fd_);
+        fd_ = pal::invalid_file;
         open_append();
+        if (fd_ == pal::invalid_file) return fail(errc::internal, "reminder compact: reopen failed");
         return {};
     }
 
@@ -316,6 +339,12 @@ private:
         return k;
     }
 
+    [[nodiscard]] static std::unexpected<error> corrupt_error() noexcept {
+        return fail(errc::internal,
+                    "FileReminderStore: log is corrupt mid-file (bad record before intact records); "
+                    "refusing to serve, append or truncate it; restore from backup / repair offline");
+    }
+
     [[nodiscard]] result<void> frame_write(pal::file_t fd, Kind kind, std::span<const std::byte> body) {
         std::vector<std::byte> framed;
         std::array<std::byte, 4> h{};
@@ -336,17 +365,41 @@ private:
         }
         return {};
     }
+    // Append one record to the live log. On ANY failure (short/failed write, or flush) the file is cut
+    // back to the last good offset, so no torn record is left MID-file for later appends to hide behind
+    // (review B7). If even that rollback fails the store refuses further appends rather than risk it.
     [[nodiscard]] result<void> durable_append(Kind kind, std::span<const std::byte> body) {
+        if (corrupt_) return corrupt_error();
         if (fd_ == pal::invalid_file) return fail(errc::internal, "reminder store: not open");
-        if (auto e = frame_write(fd_, kind, body); !e) return e;
-        (void)pal::durable_flush(fd_);  // ADR-017 F1p: exactly one durable_flush per durable op
+        auto st = frame_write(fd_, kind, body);
+        if (st && !pal::durable_flush(fd_)) st = fail(errc::internal, "reminder store: flush failed");
+        if (!st) {
+            // Reopen for truncation: the append handle may lack write-data access (FILE_APPEND_DATA).
+            pal::file_t t = pal::file_open(path_, pal::FileOpenMode::kWriteExisting);
+            const bool cut = t != pal::invalid_file && pal::file_truncate(t, write_off_);
+            pal::file_close(t);
+            if (!cut) { pal::file_close(fd_); fd_ = pal::invalid_file; }
+            return st;
+        }
+        // ADR-017 F1p: exactly one durable_flush per durable op (above).
+        if (auto sz = pal::file_size(fd_)) write_off_ = *sz;
         return {};
     }
 
-    void open_append() { fd_ = pal::file_open(path_, pal::FileOpenMode::kWriteCreateAppend); }
+    void open_append() {
+        fd_ = pal::file_open(path_, pal::FileOpenMode::kWriteCreateAppend);
+        if (fd_ == pal::invalid_file) return;
+        auto sz = pal::file_size(fd_);
+        write_off_ = sz ? *sz : 0;
+        // A new file's directory entry is not made durable by the data flush (review B9).
+        if (write_off_ == 0) (void)pal::durable_sync_dir(pal::parent_dir(path_));
+    }
 
-    // Replay the log into the live-row map; a torn trailing record (bad len/crc from a crash
-    // mid-write) is detected and the file is truncated to the last good record.
+    // Replay the log into the live-row map. A torn trailing record (bad len/crc from a crash
+    // mid-write: the bad record ends at EOF) is truncated to the last good record. A CRC-bad record
+    // with intact data AFTER it, or a CRC-valid record that fails to decode, is MID-FILE corruption:
+    // truncating would durably delete later committed reminders, so the file is left untouched and the
+    // store refuses to serve/append instead (review B7; same rule as FileStore).
     void replay() {
         pal::file_t fd = pal::file_open(path_, pal::FileOpenMode::kReadOnly);
         if (fd == pal::invalid_file) return;
@@ -369,15 +422,31 @@ private:
             std::uint32_t crc = get_u32(buf.data() + pos + 4);
             if (len == 0 || pos + 8 + len > buf.size()) break;  // torn tail
             std::span<const std::byte> kb{buf.data() + pos + 8, len};
-            if (crc32(kb) != crc) break;                        // torn / corrupt tail
+            if (crc32(kb) != crc) {
+                if (pos + 8 + len < buf.size()) corrupt_ = true;  // intact data follows: not a torn tail
+                break;
+            }
             auto kind = static_cast<Kind>(static_cast<std::uint8_t>(kb[0]));
             std::span<const std::byte> body{kb.data() + 1, kb.size() - 1};
-            if (kind == Kind::kPut) { if (auto r = decode_put(body)) rows_[r->key()] = std::move(*r); }
-            else if (kind == Kind::kRemove) { if (auto k = decode_key(body)) rows_.erase(*k); }
-            else if (kind == Kind::kCheckpoint) { if (body.size() >= 8) checkpoint_ = get_i64(body.data()); }
+            if (kind == Kind::kPut) {
+                auto r = decode_put(body);
+                if (!r) { corrupt_ = true; break; }
+                rows_[r->key()] = std::move(*r);
+            } else if (kind == Kind::kRemove) {
+                auto k = decode_key(body);
+                if (!k) { corrupt_ = true; break; }
+                rows_.erase(*k);
+            } else if (kind == Kind::kCheckpoint) {
+                if (body.size() < 8) { corrupt_ = true; break; }
+                checkpoint_ = get_i64(body.data());
+            } else {
+                corrupt_ = true;  // unknown kind under a valid CRC
+                break;
+            }
             pos += 8 + len;
             good = pos;
         }
+        if (corrupt_) return;  // never truncate or append behind a corrupt region
         if (good < buf.size()) {  // torn tail — truncate so future appends start clean
             pal::file_t t = pal::file_open(path_, pal::FileOpenMode::kWriteExisting);
             if (t != pal::invalid_file) { (void)pal::file_truncate(t, good); pal::file_close(t); }
@@ -386,6 +455,8 @@ private:
 
     std::string path_;
     pal::file_t fd_ = pal::invalid_file;
+    std::uint64_t write_off_ = 0;  // end of the last good record: the rollback point for a failed append
+    bool corrupt_ = false;         // mid-file corruption seen on replay (see replay())
     std::unordered_map<ReminderKey, ReminderRow> rows_;
     std::int64_t checkpoint_ = -1;
 };
@@ -420,6 +491,8 @@ public:
     // so what loads is exactly the still-pending set; overdue rows fire as catch-up on the next tick.
     void open() {
         index_.clear();
+        by_key_.clear();
+        ready_.clear();
         auto rows = store_.load_all();
         if (!rows) return;
         for (auto& r : *rows) insert_index(r);
@@ -433,8 +506,10 @@ public:
         ReminderRow row{actor, std::move(name), due.ns, period_ns, std::move(payload)};
         ReminderKey k = row.key();
         if (auto e = store_.put(row); !e) return e;   // durable first
-        // Drop any stale in-RAM index entry for this key (upsert semantics) by bumping its epoch.
-        by_key_[k] = row;
+        (void)k;
+        // UPSERT: insert_index gives the key a fresh epoch, which orphans every older due-index / ready
+        // entry for it (they are skipped when drained), so a re-register can neither fire early at the
+        // new time nor fire at the old time.
         insert_index(row);
         return {};
     }
@@ -446,7 +521,7 @@ public:
     }
     [[nodiscard]] result<void> cancel(ActorId actor, std::string_view name) {
         ReminderKey k{actor, reminder_name_hash(name)};
-        by_key_.erase(k);                              // in-RAM: lazily skipped in the index on drain
+        by_key_.erase(k);                              // in-RAM: its index entries are skipped on drain
         return store_.remove(k);                       // durable
     }
 
@@ -459,7 +534,10 @@ public:
         const std::int64_t now_bucket = bucket_of(now.ns);
         std::size_t added = 0;
         for (auto it = index_.begin(); it != index_.end() && it->first <= now_bucket;) {
-            for (const ReminderKey& key : it->second) { ready_.push_back(ReadyItem{key, drain_rank(key)}); ++added; }
+            for (const IndexEntry& ie : it->second) {
+                ready_.push_back(ReadyItem{ie.key, ie.epoch, drain_rank(ie.key)});
+                ++added;
+            }
             it = index_.erase(it);
         }
         if (added > 0)
@@ -492,8 +570,9 @@ public:
         for (; drained < ready_.size() && fired < budget; ++drained) {
             const ReadyItem& item = ready_[drained];
             auto rit = by_key_.find(item.key);
-            if (rit == by_key_.end()) continue;         // canceled — lazily skipped
-            const ReminderRow& row = rit->second;
+            if (rit == by_key_.end() || rit->second.epoch != item.epoch)
+                continue;  // canceled / superseded by a re-register: skipped
+            const ReminderRow row = rit->second.row;  // copy: the map entry is rewritten below
 
             // (3) FIRE — model the `tell` on the actor's own lane (011 local delivery vehicle).
             FireEvent ev{row.actor, row.name, item.key.name_hash, row.scheduled_due_ns, now.ns,
@@ -503,15 +582,22 @@ public:
 
             // (4) COMPLETION-GATED durable confirmation — AFTER the fire (ADR-017 S2p). A crash before
             //     this leaves the old row ⇒ re-fires with the same (name, scheduled_due) on reopen.
-            if (row.period_ns > 0) {
+            //     A FAILED confirmation must neither drop the reminder nor mark it done: the durable row
+            //     is unchanged, so keep it live and re-queue it for the next tick (it re-fires with the
+            //     same (name, scheduled_due) dedup key; at-least-once, handlers are idempotent).
+            //     If the handler itself re-registered / cancelled this key, that newer registration
+            //     wins and there is nothing to confirm.
+            auto cur = by_key_.find(item.key);
+            if (cur == by_key_.end() || cur->second.epoch != item.epoch) {
+                // superseded during the fire callback
+            } else if (row.period_ns > 0) {
                 ReminderRow next = row;
                 next.scheduled_due_ns = row.scheduled_due_ns + row.period_ns;  // from SCHEDULED, no drift
-                (void)store_.put(next);                 // advance durably
-                by_key_[item.key] = next;
-                insert_index(next);
+                if (store_.put(next)) insert_index(next);    // advance durably, then in RAM
+                else insert_index(row);
             } else {
-                (void)store_.remove(item.key);          // one-shot — resolved
-                by_key_.erase(item.key);
+                if (store_.remove(item.key)) by_key_.erase(item.key);  // one-shot: resolved
+                else insert_index(row);
             }
             if (cfg_.fire_rate != 0) tokens_ -= 1.0;
         }
@@ -519,6 +605,7 @@ public:
         if (drained > 0) ready_.erase(ready_.begin(), ready_.begin() + static_cast<std::ptrdiff_t>(drained));
 
         // (5) Checkpoint once the wave for buckets ≤ now is fully drained (rebuild-skip optimization).
+        // Best-effort by design: open() does not depend on the checkpoint, so a failed one loses nothing.
         if (ready_.empty() && index_.empty()) (void)store_.checkpoint(now_bucket);
         return fired;
     }
@@ -534,11 +621,16 @@ public:
     }
 
 private:
-    struct ReadyItem { ReminderKey key; std::uint64_t rank; };
+    // `epoch` identifies WHICH registration of the key an index/ready entry belongs to; only an entry
+    // whose epoch equals the key's live epoch is real, every other one is a stale orphan.
+    struct IndexEntry { ReminderKey key; std::uint64_t epoch; };
+    struct ReadyItem { ReminderKey key; std::uint64_t epoch; std::uint64_t rank; };
+    struct Live { ReminderRow row; std::uint64_t epoch; };
 
     void insert_index(const ReminderRow& row) {
-        by_key_[row.key()] = row;  // keep the live copy for fire + upsert
-        index_[bucket_of(row.scheduled_due_ns)].push_back(row.key());
+        const std::uint64_t epoch = ++epoch_counter_;
+        by_key_[row.key()] = Live{row, epoch};  // keep the live copy for fire + upsert
+        index_[bucket_of(row.scheduled_due_ns)].push_back(IndexEntry{row.key(), epoch});
     }
 
     StoreT& store_;
@@ -546,9 +638,10 @@ private:
     ReminderConfig cfg_;
     // Ordered due-index: bucket → keys due in it. std::map ⇒ begin-peek is O(log S), so a tick that
     // pulls only due buckets is O(due-now), independent of total population (ADR-017 F2).
-    std::map<std::int64_t, std::vector<ReminderKey>> index_;
-    std::unordered_map<ReminderKey, ReminderRow> by_key_;  // live rows (upsert / cancel / fire lookup)
+    std::map<std::int64_t, std::vector<IndexEntry>> index_;
+    std::unordered_map<ReminderKey, Live> by_key_;          // live rows (upsert / cancel / fire lookup)
     std::vector<ReadyItem> ready_;                         // the due segment, drained under the token bucket
+    std::uint64_t epoch_counter_ = 0;
     double tokens_ = 0.0;
     std::int64_t last_tick_ns_ = -1;
     std::uint64_t fired_total_ = 0;
