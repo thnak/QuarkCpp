@@ -3,7 +3,7 @@
 // header, never a per-OS one directly and never `<fcntl.h>`/`<unistd.h>`/`<windows.h>` (019 §"The one
 // rule"). See pal/linux_x86_64/file_io.hpp / pal/windows_x86_64/file_io.hpp for the concrete surface
 // (file_t, FileOpenMode, file_open/file_pread/file_pwrite/file_read/file_write/file_truncate/
-// file_size/durable_flush/file_close/file_rename/make_dir) — identical on both backends.
+// file_size/durable_flush/file_close/file_rename/durable_rename/durable_sync_dir/make_dir) — identical on both backends.
 #pragma once
 
 #if defined(_WIN32)
