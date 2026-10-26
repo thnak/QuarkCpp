@@ -58,7 +58,7 @@ build-samples/samples/01_hello_counter
 cmake -S . -B build -DQUARK_WITH_SQLITE=ON -DQUARK_WITH_ROCKSDB=ON
 ```
 
-Compiles clean under **g++ 14.2** and **clang++ 20.1**, `-std=c++23 -Wall -Wextra`. New test files
+Compiles clean under **g++ 14.2** and **clang++ 22.1**, `-std=c++23 -Wall -Wextra`. New test files
 (`*_test.cpp` in `tests/`) and benches (`*_bench.cpp` in `bench/`) are picked up by `CONFIGURE_DEPENDS`
 glob — re-run cmake (or build, which reconfigures) after adding one.
 
