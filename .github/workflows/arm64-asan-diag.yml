@@ -78,8 +78,8 @@ jobs:
         shell: bash
         run: |
           set +e
-          g++-14 --version | head -1; clang++-20 --version | head -1
-          for cxx in g++-14 clang++-20; do
+          g++-14 --version | head -1; clang++-22 --version | head -1
+          for cxx in g++-14 clang++-22; do
             $cxx -std=c++23 -O0 -g -fsanitize=address,undefined ci/diag/asan_fakestack_micro.cpp -o /tmp/micro_$cxx 2>&1 | tail -3
             for uar in 1 0; do
               echo -n "RESULT micro $cxx uar=$uar: "

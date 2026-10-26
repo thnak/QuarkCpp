@@ -32,8 +32,8 @@
 #               real re-baseline — arm64 numbers here are collected for that future re-baseline, not
 #               enforced as a merge gate yet.
 #
-# Toolchain: Quark is C++23 and is verified on g++-14.2 + clang-20.1 (CONVENTIONS.md). The setup step
-# installs g++-14 and LLVM 20; bump these together with the locally-verified compilers. Both are
+# Toolchain: Quark is C++23 and is verified on g++-14.2 + clang-22.1 (CONVENTIONS.md). The setup step
+# installs g++-14 and LLVM 22; bump these together with the locally-verified compilers. Both are
 # available from the same apt sources on arm64 Ubuntu 24.04 — no per-arch toolchain substitution.
 # Windows uses the pinned `windows-2022` image's MSVC (the toolset version is captured in the SBOM);
 # QuarkWarnings.cmake asks for `/std:c++latest` rather than a fixed `/std:c++NN`, so it tracks
@@ -122,7 +122,7 @@ jobs:
             build_jobs: 2
             ctest_jobs: 2
           - name: clang-release
-            cxx: clang++-20
+            cxx: clang++-22
             build_type: Release
             sanitize: ""
             build_jobs: 2
@@ -154,7 +154,7 @@ jobs:
           - arch: arm64
             config:
               name: asan-ubsan
-              cxx: clang++-20
+              cxx: clang++-22
               build_type: Debug
               sanitize: "address;undefined"
               build_jobs: 2
@@ -219,7 +219,7 @@ jobs:
         if: matrix.arch == 'x86_64' && matrix.config.name == 'clang-release'
         run: |
           cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_COMPILER=clang++-20 -DQUARK_BUILD_TESTS=ON \
+            -DCMAKE_CXX_COMPILER=clang++-22 -DQUARK_BUILD_TESTS=ON \
             -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_FUZZ=ON -DQUARK_SANITIZE=address
           cmake --build build-fuzz --target fuzz_decoders fuzz_seed_corpus -j 2
           mkdir -p build-fuzz/corpus

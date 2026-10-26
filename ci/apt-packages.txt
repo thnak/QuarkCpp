@@ -8,12 +8,12 @@ g++-14=14.2.0-4ubuntu2~24.04.1
 cmake=3.28.3-1build7
 ninja-build=1.11.1-2
 gdb=15.1-1ubuntu1~24.04.1
-# apt.llvm.org llvm-toolchain-noble-20 (the hash-pinned installer only adds the repo; these are
+# apt.llvm.org llvm-toolchain-noble-22 (the hash-pinned installer only adds the repo; these are
 # installed exactly after it):
-clang-20=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
-libc++-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
-libc++abi-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
-libclang-rt-20-dev=1:20.1.8~++20250804090239+87f0227cb601-1~exp1~20250804210352.139
+clang-22=1:22.1.8~++20260714014902+ca7933e47d3a-1~exp1~20260714135019.80
+libc++-22-dev=1:22.1.8~++20260714014902+ca7933e47d3a-1~exp1~20260714135019.80
+libc++abi-22-dev=1:22.1.8~++20260714014902+ca7933e47d3a-1~exp1~20260714135019.80
+libclang-rt-22-dev=1:22.1.8~++20260714014902+ca7933e47d3a-1~exp1~20260714135019.80
 # Container/runner prerequisites used by the CI image and the jobs: checkout/HTTP, audit/SBOM
 # Python, and the release CLI. Exact for the same noble snapshot as the toolchain.
 git=1:2.43.0-1ubuntu7.4
