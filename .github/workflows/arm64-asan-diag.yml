@@ -43,6 +43,7 @@ jobs:
           ASAN_OPTIONS: abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
+          set +e
           nproc; uname -m
           # The container has no ptrace-attach, so launch the test under gdb and stop it with a
           # signal gdb catches (SIGUSR1) instead of `gdb -p`.
