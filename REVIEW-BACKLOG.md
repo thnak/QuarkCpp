@@ -52,16 +52,16 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
   (`reminder_service.hpp:342,227`). Make `acquire_fence` return `result`.
 - [ ] B6 HIGH — read errors look like "no data" (SQLite `:73-82,124-131,164-173`; Rocks `:69-70,152`):
   recovery seeds default state and the next flush overwrites the real snapshot.
-- [~] B7 HIGH (FileStore fixed: mid-file CRC failure marks the log corrupt, no truncation, ops refused; torn tail still truncated; FileReminderStore still open) — replay truncates at the first CRC mismatch and deletes later committed records
+- [x] B7 HIGH (FileStore + FileReminderStore: mid-file CRC failure marks the log corrupt, no truncation, ops refused; torn tail still truncated; failed/partial reminder append is rolled back to the last good offset) — replay truncates at the first CRC mismatch and deletes later committed records
   (`file_store.hpp:186-192`; `reminder_service.hpp:370-384`). A torn mid-file record in
   `FileReminderStore` (`:332-335`) drops later appends.
-- [ ] B8 MED — replay trusts record contents (`file_store.hpp:274-289` unchecked indexing, CRC32 is not a
+- [~] B8 MED (FileStore replay now bounds-checked; malformed/unknown-kind/non-monotonic CRC-valid records mark the log corrupt; rollback/truncation detection and plaintext FENCE under EncryptedStore NOT done - need a design decision) — replay trusts record contents (`file_store.hpp:274-289` unchecked indexing, CRC32 is not a
   MAC, batch seq can go backwards `:209-216`); FENCE records are plaintext under `EncryptedStore`;
   truncation/rollback of the file is undetectable.
-- [ ] B9 MED — no directory fsync after create/rename (`file_store.hpp:167`; `reminder_service.hpp:229`;
+- [x] B9 MED (PAL durable_rename/durable_sync_dir; FileStore + FileReminderStore sync the dir on create/rename; compact() checks flush before rename and keeps the old handle on failure. Windows backend UNCOMPILED) — no directory fsync after create/rename (`file_store.hpp:167`; `reminder_service.hpp:229`;
   `pal/linux_x86_64/file_io.hpp:88-89`; Windows `MoveFileEx` without write-through). Reminder
   `compact()` ignores flush failure, then renames; failed compaction leaves `fd_` closed (`:219-229`).
-- [ ] B10 MED — `ReminderService` re-register leaves a stale due-index entry (`:437-439,539-542`): fires
+- [x] B10 MED (per-key epoch drops stale index/ready entries; tick no longer ignores store put/remove errors; checkpoint left best-effort) — `ReminderService` re-register leaves a stale due-index entry (`:437-439,539-542`): fires
   early with the new due time; a later-rescheduled one-shot fires at the old time and is removed
   (`:431-440,494-515`). Store errors in `tick` ignored (`:509,513,522`).
 - [~] B11 MED (InMemoryStore + FileStore reject lower through_seq; adapters still open) — stale snapshots can overwrite newer ones; no store rejects lower `through_seq`
