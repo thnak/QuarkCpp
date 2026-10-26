@@ -138,13 +138,21 @@ public:
     // the client-role side re-handshake on its next send (S2), exactly as on a cold start. Wire this to
     // `[&secure](NodeId p){ secure.on_peer_disconnected(p); }` via `net::TcpTransport::set_peer_down_hook`.
     void on_peer_disconnected(NodeId peer) {
-        {
+        // B12: with the handshake DISABLED every session shares one non-owned cipher, so there is no
+        // per-connection key to retire — and dropping the session would restart its seq spaces at 0 under
+        // that same key (AEAD nonce reuse, and a reset replay window). Keep it; only the handshake-gated
+        // shape has per-connection state to drop.
+        if (handshake_factory_) {
             std::unique_lock<std::shared_mutex> g(map_mu_);
             sessions_.erase(peer.value);
         }
+        std::unique_ptr<HandshakeEngine> doomed;  // destroyed after pending_mu_ is released (D6)
         {
             std::lock_guard<std::mutex> g(pending_mu_);
-            pending_.erase(peer.value);
+            if (const auto it = pending_.find(peer.value); it != pending_.end()) {
+                doomed = std::move(it->second.engine);
+                pending_.erase(it);
+            }
         }
         {
             std::lock_guard<std::mutex> g(schema_mu_);
@@ -177,7 +185,7 @@ public:
     // revoked-but-unexpired cert before any session is created — distinct from sweep_revocations
     // (Phase 5), which enforces revocation against sessions that are ALREADY open.
     void set_revoked(std::shared_ptr<const std::unordered_set<Fingerprint>> revoked) noexcept {
-        revoked_snapshot_ = std::move(revoked);
+        revoked_snapshot_.store(std::move(revoked));
     }
 
     // Phase 5: enforce revocation against sessions that are ALREADY OPEN — distinct from set_revoked()
@@ -189,10 +197,10 @@ public:
     // now drop unconditionally) — the peer's own SWIM keepalive traffic rides this same session, so it
     // silently stops passing keepalives and falls through SWIM's existing suspicion→dead→close cycle.
     void sweep_revocations(std::shared_ptr<const std::unordered_set<Fingerprint>> revoked) {
-        revoked_snapshot_ = revoked;
+        revoked_snapshot_.store(revoked);
         if (!revoked || revoked->empty()) return;
-        std::shared_lock<std::shared_mutex> g(map_mu_);
-        for (auto& [id, session] : sessions_) {
+        // D1: inspect OUTSIDE map_mu_ — peer_fingerprint() takes a session-side lock.
+        for (const auto& session : snapshot_sessions()) {
             if (session->revoked()) continue;
             if (revoked->contains(session->peer_fingerprint())) {
                 session->revoke();
@@ -256,20 +264,19 @@ public:
         if (!handshake_factory_) return;  // rotation needs the handshake seam; no-op if handshakes are off
         const IdentityMaterial::Snapshot snap = identity_->snapshot(now_ns);
         std::vector<NodeId> due;
-        {
-            std::shared_lock<std::shared_mutex> g(map_mu_);
-            for (auto& [id, session] : sessions_) {
-                if (session->revoked()) continue;
-                const std::uint64_t session_gen = session->generation();
-                const bool own_identity_stale =
-                    session_gen != snap.generation &&
-                    !(snap.previous && session_gen == snap.previous_generation);
-                const bool frames_over_budget = session->frames_sealed_on_key() >= max_frames_per_key_;
-                const bool idle_timer_due =
-                    now_ns - session->renegotiated_at_ns() >= renegotiate_interval_ns_;
-                if (own_identity_stale || frames_over_budget || idle_timer_due) due.push_back(session->peer());
-            }
-        }  // map_mu_ released before driving any handshake — never hold it across inner_->send() (F2-revised)
+        // D1: pointers copied out, map_mu_ released, THEN inspected (all reads below are lock-free
+        // atomics) — never hold map_mu_ across anything session-side or inner_->send() (F2-revised).
+        for (const auto& session : snapshot_sessions()) {
+            if (session->revoked()) continue;
+            const std::uint64_t session_gen = session->generation();
+            const bool own_identity_stale =
+                session_gen != snap.generation &&
+                !(snap.previous && session_gen == snap.previous_generation);
+            const bool frames_over_budget = session->frames_sealed_on_key() >= max_frames_per_key_;
+            const bool idle_timer_due =
+                now_ns - session->renegotiated_at_ns() >= renegotiate_interval_ns_;
+            if (own_identity_stale || frames_over_budget || idle_timer_due) due.push_back(session->peer());
+        }
         for (NodeId peer : due) try_renegotiate(peer);
     }
 
@@ -312,7 +319,7 @@ public:
     }
 
     void on_receive(std::function<void(MessageFrame)> cb) override {
-        receiver_ = std::move(cb);
+        receiver_.store(std::make_shared<const std::function<void(MessageFrame)>>(std::move(cb)));
         inner_->on_receive([this](MessageFrame frame) { this->deliver(std::move(frame)); });
     }
 
@@ -407,6 +414,15 @@ private:
                                                         /*generation=*/0, Fingerprint{}, now_ns());
         }
         return it->second;
+    }
+
+    // D1: copy the session pointers out under a brief shared map_mu_; callers inspect them unlocked.
+    [[nodiscard]] std::vector<std::shared_ptr<PeerSession>> snapshot_sessions() const {
+        std::vector<std::shared_ptr<PeerSession>> out;
+        std::shared_lock<std::shared_mutex> g(map_mu_);
+        out.reserve(sessions_.size());
+        for (const auto& entry : sessions_) out.push_back(entry.second);
+        return out;
     }
 
     [[nodiscard]] std::shared_ptr<PeerSession> try_get_session(NodeId peer) const {
@@ -512,10 +528,12 @@ private:
     void try_renegotiate(NodeId peer) {
         if (!local_is_client(self_, peer)) return;
         std::unique_ptr<HandshakeEngine> engine;
+        std::unique_ptr<HandshakeEngine> stale;  // destroyed after pending_mu_ is released (D6)
         {
             std::lock_guard<std::mutex> g(pending_mu_);
             if (const auto it = pending_.find(peer.value); it != pending_.end()) {
                 if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_) return;
+                stale = std::move(it->second.engine);
                 pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             }
@@ -523,9 +541,10 @@ private:
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
+            reserve_pending_locked(peer, nullptr, false);  // A9: cap check + slot claim are one section
             engine = handshake_factory_->create(/*is_client=*/true, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
-                                                revoked_snapshot_);
+                                                revoked_snapshot_.load());
         }
         renegotiations_attempted_.fetch_add(1, std::memory_order_relaxed);
         if (metrics_) metrics_->security_handshakes_attempted.inc();
@@ -543,6 +562,7 @@ private:
         std::vector<std::byte> out;
         const HandshakeEngine::Step step = engine->advance(in, out);
         if (step == HandshakeEngine::Step::Done) {
+            release_reservation(peer);
             const bool was_renegotiate = install_session_from_result(peer, engine->take_result());
             if (metrics_) (was_renegotiate ? metrics_->security_rotations_completed
                                            : metrics_->security_handshakes_succeeded)
@@ -554,6 +574,7 @@ private:
             return;
         }
         if (step == HandshakeEngine::Step::Failed) {
+            release_reservation(peer);
             audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, peer.value,
                                engine->failure_reason(), 0});
             if (metrics_) metrics_->security_handshakes_failed.inc();
@@ -580,19 +601,47 @@ private:
                 ph.source_ip_valid = true;
             }
             ph.known = known;
-            std::lock_guard<std::mutex> g(pending_mu_);
-            pending_[peer.value] = std::move(ph);
+            std::unique_ptr<HandshakeEngine> displaced;  // the reservation/old engine dies unlocked (D6)
+            {
+                std::lock_guard<std::mutex> g(pending_mu_);
+                auto& slot = pending_[peer.value];
+                displaced = std::move(slot.engine);
+                slot = std::move(ph);
+            }
         }
         if (!out.empty()) send_authenticate_frame(peer, std::move(out));
+    }
+
+    // A9: claim a pending_ slot (engine filled in later by drive_handshake) in the SAME critical section
+    // as the cap check, so concurrent callers can never collectively overshoot max_pending_handshakes_.
+    // Caller holds pending_mu_. A null-engine entry counts toward the caps and reads as "in flight".
+    void reserve_pending_locked(NodeId peer, const PeerAddress* source, bool known) {
+        PendingHandshake ph;
+        ph.last_progress_ns = now_ns();
+        if (source && source->valid) {
+            ph.source_ip = source->addr;
+            ph.source_ip_valid = true;
+        }
+        ph.known = known;
+        pending_[peer.value] = std::move(ph);
+    }
+
+    // Drops an unfilled reservation (the handshake finished or failed without parking an engine).
+    void release_reservation(NodeId peer) {
+        std::lock_guard<std::mutex> g(pending_mu_);
+        const auto it = pending_.find(peer.value);
+        if (it != pending_.end() && !it->second.engine) pending_.erase(it);
     }
 
     void ensure_handshake(NodeId peer) {
         if (!local_is_client(self_, peer)) return;  // server side waits for the peer's opening message
         std::unique_ptr<HandshakeEngine> engine;
+        std::unique_ptr<HandshakeEngine> stale;  // destroyed after pending_mu_ is released (D6)
         {
             std::lock_guard<std::mutex> g(pending_mu_);
             if (const auto it = pending_.find(peer.value); it != pending_.end()) {
                 if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_) return;  // already in flight
+                stale = std::move(it->second.engine);
                 pending_.erase(it);  // stalled (e.g. a lost opening frame) — abandon it, retry fresh
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             }
@@ -600,9 +649,10 @@ private:
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
+            reserve_pending_locked(peer, nullptr, false);  // A9: cap check + slot claim are one section
             engine = handshake_factory_->create(/*is_client=*/true, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
-                                                revoked_snapshot_);
+                                                revoked_snapshot_.load());
         }
         if (metrics_) metrics_->security_handshakes_attempted.inc();
         drive_handshake(peer, std::move(engine), std::span<const std::byte>{});
@@ -614,6 +664,7 @@ private:
         const PeerAddress source = frame.source_address;
         const bool known = known_peer_ && known_peer_(peer);
         std::unique_ptr<HandshakeEngine> engine;
+        std::unique_ptr<HandshakeEngine> stale;  // destroyed after pending_mu_ is released (D6)
         {
             std::lock_guard<std::mutex> g(pending_mu_);
             const auto it = pending_.find(peer.value);
@@ -632,8 +683,10 @@ private:
                 // longer matches what the peer just sent.
                 if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_)
                     engine = std::move(it->second.engine);
-                else
+                else {
+                    stale = std::move(it->second.engine);
                     handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
+                }
                 pending_.erase(it);
             }
         }
@@ -668,6 +721,7 @@ private:
                     reject = "secure transport: pending handshake cap reached";
                 else if (max_pending_per_ip_ != 0 && source.valid && ip_count >= max_pending_per_ip_)
                     reject = "secure transport: pending handshake per-IP cap reached";
+                if (!reject) reserve_pending_locked(peer, &source, known);  // A9: check + claim atomic
             }
             if (reject) {
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -676,7 +730,7 @@ private:
             }
             engine = handshake_factory_->create(/*is_client=*/false, self_, peer, cluster_id_,
                                                 identity_->snapshot(now_ns()), trust_->snapshot(now_ns()),
-                                                revoked_snapshot_);
+                                                revoked_snapshot_.load());
             if (metrics_) metrics_->security_handshakes_attempted.inc();
         }
         drive_handshake(peer, std::move(engine), std::span<const std::byte>(frame.payload), &source,
@@ -722,6 +776,9 @@ private:
             session = get_or_create_session(frame.from);
         }
         std::vector<std::byte> plaintext;
+        // D3: record the drop reason under the session lock, run the audit sink AFTER releasing it.
+        const char* drop_detail = nullptr;
+        errc drop_code = errc::ok;
         {
             std::lock_guard<std::mutex> g(session->session_mu());
             if (session->revoked()) {
@@ -730,19 +787,20 @@ private:
             }
             if (!session->recv_cipher().open(nonce, std::span<const std::byte>(aad), sealed, plaintext)) {
                 tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
-                audit_(AuditRecord{AuditKind::AuthnFailure, errc::serialization, frame.from.value,
-                                   "secure transport: AEAD open failed (tamper/wrong key)", 0});
-                return;
-            }
-            // Per-session, per-lane replay guard: strictly-increasing seq per sender per lane. A
-            // replayed frame has seq <= its lane's high-water mark ⇒ reject (composes with 017 dedup;
-            // stops an adversarial wire replay).
-            if (!session->accept_recv_seq(lane, seq)) {
+                drop_code = errc::serialization;
+                drop_detail = "secure transport: AEAD open failed (tamper/wrong key)";
+            } else if (!session->accept_recv_seq(lane, seq)) {
+                // Per-session, per-lane replay guard: strictly-increasing seq per sender per lane. A
+                // replayed frame has seq <= its lane's high-water mark => reject (composes with 017
+                // dedup; stops an adversarial wire replay).
                 replays_rejected_.fetch_add(1, std::memory_order_relaxed);
-                audit_(AuditRecord{AuditKind::AuthnFailure, errc::unavailable, frame.from.value,
-                                   "secure transport: replayed sequence number rejected", 0});
-                return;
+                drop_code = errc::unavailable;
+                drop_detail = "secure transport: replayed sequence number rejected";
             }
+        }
+        if (drop_detail) {
+            audit_(AuditRecord{AuditKind::AuthnFailure, drop_code, frame.from.value, drop_detail, 0});
+            return;
         }
         opened_.fetch_add(1, std::memory_order_relaxed);
         frame.payload = std::move(plaintext);
@@ -750,7 +808,7 @@ private:
             handle_schema_frame(std::move(frame));
             return;
         }
-        if (receiver_) receiver_(std::move(frame));
+        if (const auto r = receiver_.load(); r && *r) (*r)(std::move(frame));
     }
 
     // The replay/seq lane a frame travels on — must match the inner transport's FIFO lanes (TcpTransport
@@ -801,7 +859,8 @@ private:
     Transport* inner_;
     NodeId self_;
     std::shared_ptr<const Aead> shared_cipher_;  // aliasing shared_ptr over cipher_ (non-owning)
-    std::function<void(MessageFrame)> receiver_;
+    // D4: set by on_receive (any thread) and read per frame on the I/O thread ⇒ atomic shared_ptr.
+    std::atomic<std::shared_ptr<const std::function<void(MessageFrame)>>> receiver_;
     AuditSink audit_{};
     ShardCounters* metrics_ = nullptr;  // ADR-040 Phase 8; see set_metrics() banner
 
@@ -814,7 +873,8 @@ private:
     ClusterId cluster_id_{};
     const IdentityMaterial* identity_ = nullptr;
     const TrustStore* trust_ = nullptr;
-    std::shared_ptr<const std::unordered_set<Fingerprint>> revoked_snapshot_;
+    // D4: written by set_revoked/sweep_revocations, read at every handshake creation ⇒ atomic shared_ptr.
+    std::atomic<std::shared_ptr<const std::unordered_set<Fingerprint>>> revoked_snapshot_;
 
     // ADR-040 Phase 6: rotation/renegotiate policy + the reset-hook fallback (set_reset_hook banner above).
     std::function<void(NodeId)> reset_hook_;
@@ -829,10 +889,12 @@ private:
     // Handshakes in flight, keyed by peer. Touched only in short, independent critical sections (see
     // drive_handshake's banner) — never held across advance()/inner_->send().
     // Erase EVERY parked handshake with no progress for the timeout (not just the current peer).
-    void reap_stale_pending(std::int64_t now) noexcept {
+    void reap_stale_pending(std::int64_t now) {
+        std::vector<std::unique_ptr<HandshakeEngine>> doomed;  // declared first: destroyed after unlock (D6)
         std::lock_guard<std::mutex> g(pending_mu_);
         for (auto it = pending_.begin(); it != pending_.end();) {
             if (now - it->second.last_progress_ns >= handshake_timeout_ns_) {
+                if (it->second.engine) doomed.push_back(std::move(it->second.engine));
                 it = pending_.erase(it);
                 handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
             } else {

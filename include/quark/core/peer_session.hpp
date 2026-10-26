@@ -76,18 +76,46 @@ public:
 
     // C5 bookkeeping: count frames sealed under the CURRENT send key, so sweep_rotation (secure_
     // transport.hpp) can trigger a renegotiate once a policy threshold (kMaxFramesPerKey) is reached.
-    void note_sealed() noexcept { ++frames_sealed_on_key_; }
-    [[nodiscard]] std::uint64_t frames_sealed_on_key() const noexcept { return frames_sealed_on_key_; }
+    // Written only under session_mu() (plain load+store, no RMW) but READ lock-free by sweep_rotation,
+    // hence the atomic (D4).
+    void note_sealed() noexcept {
+        frames_sealed_on_key_.store(frames_sealed_on_key_.load(std::memory_order_relaxed) + 1,
+                                    std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t frames_sealed_on_key() const noexcept {
+        return frames_sealed_on_key_.load(std::memory_order_relaxed);
+    }
+
+    // B12: seq-space continuity across a session RECREATE under a shared (non-renegotiated) cipher. With
+    // the handshake disabled every session reuses one cipher, so a recreated session restarting at seq 0
+    // would reuse (key, nonce) pairs. SecureTransport snapshots the counters when it drops a session and
+    // seeds the replacement with them. Both take the session lock themselves (cold path).
+    struct SeqState {
+        std::array<std::uint64_t, kLanes> send{};
+        std::array<std::uint64_t, kLanes> recv{};
+    };
+    [[nodiscard]] SeqState seq_state() const noexcept {
+        std::lock_guard<std::mutex> g(session_mu_);
+        return SeqState{send_seq_, recv_high_};
+    }
+    void seed_seq_state(const SeqState& st) noexcept {
+        std::lock_guard<std::mutex> g(session_mu_);
+        for (std::size_t i = 0; i < kLanes; ++i) {
+            if (st.send[i] > send_seq_[i]) send_seq_[i] = st.send[i];
+            if (st.recv[i] > recv_high_[i]) recv_high_[i] = st.recv[i];
+        }
+    }
 
     // --- Cold path: sweep/diagnostics/handshake-completion. Each call is independently thread-safe. -
     [[nodiscard]] NodeId peer() const noexcept { return peer_; }
 
+    // Lock-free reads (D1/D4): sweeps must not queue behind a long seal on session_mu().
     [[nodiscard]] std::uint64_t generation() const noexcept {
-        std::lock_guard<std::mutex> g(session_mu_);
-        return generation_;
+        return generation_.load(std::memory_order_acquire);
     }
+    // The 32-byte fingerprint is not atomic; it has its own tiny lock so a sweep never waits on session_mu_.
     [[nodiscard]] Fingerprint peer_fingerprint() const noexcept {
-        std::lock_guard<std::mutex> g(session_mu_);
+        std::lock_guard<std::mutex> g(fp_mu_);
         return peer_fingerprint_;
     }
 
@@ -95,8 +123,7 @@ public:
     // "idle-timer poll" trigger (a session untouched for renegotiate_interval_ns gets rekeyed even with
     // zero application traffic) and diagnostics. Set at construction and on every install_renegotiated.
     [[nodiscard]] std::int64_t renegotiated_at_ns() const noexcept {
-        std::lock_guard<std::mutex> g(session_mu_);
-        return renegotiated_at_ns_;
+        return renegotiated_at_ns_.load(std::memory_order_acquire);
     }
 
     // Installs a freshly (re)negotiated key pair — a fresh handshake means a fresh nonce space, so
@@ -108,12 +135,15 @@ public:
         std::lock_guard<std::mutex> g(session_mu_);
         send_cipher_ = std::move(send_cipher);
         recv_cipher_ = std::move(recv_cipher);
-        generation_ = generation;
-        peer_fingerprint_ = peer_fingerprint;
+        {
+            std::lock_guard<std::mutex> fg(fp_mu_);
+            peer_fingerprint_ = peer_fingerprint;
+        }
         send_seq_ = {};
         recv_high_ = {};
-        frames_sealed_on_key_ = 0;
-        renegotiated_at_ns_ = now_ns;
+        frames_sealed_on_key_.store(0, std::memory_order_relaxed);
+        generation_.store(generation, std::memory_order_release);
+        renegotiated_at_ns_.store(now_ns, std::memory_order_release);
     }
 
     // S5: mark this session revoked. Lock-free (atomic) since sweep_revocations scans many sessions
@@ -126,13 +156,14 @@ private:
     mutable std::mutex session_mu_;
     std::shared_ptr<const Aead> send_cipher_;
     std::shared_ptr<const Aead> recv_cipher_;
-    std::uint64_t generation_;
+    std::atomic<std::uint64_t> generation_;
+    mutable std::mutex fp_mu_;
     Fingerprint peer_fingerprint_;
     std::array<std::uint64_t, kLanes> send_seq_{};
     std::array<std::uint64_t, kLanes> recv_high_{};
-    std::uint64_t frames_sealed_on_key_ = 0;
+    std::atomic<std::uint64_t> frames_sealed_on_key_{0};
     std::atomic<bool> revoked_{false};
-    std::int64_t renegotiated_at_ns_ = 0;
+    std::atomic<std::int64_t> renegotiated_at_ns_{0};
 };
 
 }  // namespace quark
