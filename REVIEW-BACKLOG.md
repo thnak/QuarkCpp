@@ -38,7 +38,7 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
   (`engine.hpp:1170-1172,1214,1227`), so different plaintexts are sealed under one nonce → GCM
   keystream XOR leak and tag forgery. Fix: random 96-bit nonce stored with the record, or a persisted
   counter. Add a test that two seals of the same context never share a nonce.
-- [ ] B2 HIGH — recovery loads state **before** `acquire_fence` (`engine.hpp:1200` then `:1214`); a stale
+- [x] B2 HIGH (fixed: fence acquired first; ordering test in engine_lazy_persistence_test, fails on old order) — recovery loads state **before** `acquire_fence` (`engine.hpp:1200` then `:1214`); a stale
   owner can write in between. Acquire the fence first, then load.
 - [ ] B3 HIGH — stores used from many threads with no locking (`file_store.hpp:162-172` `table_`;
   `sqlite_store.hpp:61-67,114-120` shared connection). Spec 012 (lines 127-133) requires serialized

@@ -1192,6 +1192,20 @@ private:
                     return;
                 }
             }
+            // ADR-028 Phase 8: acquire this activation's fencing token NOW, once, before any message
+            // dispatches — closing a prior gap where `declare_lazy<A>(store,...)` never actually called
+            // `store.acquire_fence(id)` at all (recovery/register_type only ever passed a default-
+            // constructed FenceToken{} through, which the deactivation-time flush below would have
+            // written under a stale/never-issued token). Set only for actors registered through the
+            // store-taking `register_type<A,S>` overload (m->fence_acquire is null otherwise).
+            //
+            // ORDER MATTERS (review B2, 012 fencing): the fence is acquired BEFORE recovery reads the
+            // store. Once the new token exists the store rejects any write by the previous owner, so
+            // what recovery reads is final. Recovering first left a window in which a stale owner
+            // could append after our read; our later flush (under the fresh, valid token) would then
+            // overwrite state derived from the pre-append snapshot.
+            FenceToken fence{};
+            if (m->fence_acquire != nullptr) fence = m->fence_acquire(m->store, w.id);
             // ADR-028 Phase 5: A declared Persistent<Snapshot,...> via declare_lazy<A>(store, ...) —
             // recover its persisted state (or seed from its own default via snapshot_state()) exactly
             // once, before the actor's first message dispatches. A failure dead-letters `first`
@@ -1204,14 +1218,6 @@ private:
                     return;
                 }
             }
-            // ADR-028 Phase 8: acquire this activation's fencing token NOW, once, before any message
-            // dispatches — closing a prior gap where `declare_lazy<A>(store,...)` never actually called
-            // `store.acquire_fence(id)` at all (recovery/register_type only ever passed a default-
-            // constructed FenceToken{} through, which the deactivation-time flush below would have
-            // written under a stale/never-issued token). Set only for actors registered through the
-            // store-taking `register_type<A,S>` overload (m->fence_acquire is null otherwise).
-            FenceToken fence{};
-            if (m->fence_acquire != nullptr) fence = m->fence_acquire(m->store, w.id);
             auto act = std::make_unique<Activation>(actor, m->dispatch, m->reclaim, m->max_concurrency,
                                                     m->supervision);
             act->set_reconstruct(m->reconstruct);

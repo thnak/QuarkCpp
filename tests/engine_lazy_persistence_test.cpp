@@ -6,10 +6,13 @@
 // contract), (3) a failing store dead-letters the original message through the SAME
 // construct/destroy/reclaim shape Phase 4 already proved for a wire failure — never a
 // half-constructed actor, never a lost message.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <mutex>
 #include <thread>
+#include <vector>
 #include <utility>
 
 #include "quark/core/actor.hpp"
@@ -69,6 +72,50 @@ struct FailingStore {
     [[nodiscard]] result<EventCursor> read_log(ActorId, SeqNo) const { return EventCursor{}; }
 };
 static_assert(Store<FailingStore>, "FailingStore must model the 012 Store seam");
+
+// Records the ORDER of store calls the broker makes while lazily activating an actor (review B2):
+// the fence must be acquired BEFORE recovery reads the store, or a stale owner can write between the
+// read and the fence acquisition. Delegates to an InMemoryStore so recovery behaves normally.
+struct OrderRecordingStore {
+    InMemoryStore inner;
+    mutable std::mutex mu;
+    mutable std::vector<char> calls;  // 'F' = acquire_fence, 'L' = load_snapshot / read_log
+    void note(char c) const {
+        std::lock_guard<std::mutex> g(mu);
+        calls.push_back(c);
+    }
+    [[nodiscard]] FenceToken acquire_fence(ActorId id) {
+        note('F');
+        return inner.acquire_fence(id);
+    }
+    [[nodiscard]] SeqNo last_seq(ActorId id) const noexcept { return inner.last_seq(id); }
+    [[nodiscard]] result<std::optional<SnapshotRecord>> load_snapshot(ActorId id) const {
+        note('L');
+        return inner.load_snapshot(id);
+    }
+    [[nodiscard]] result<void> save_snapshot(ActorId id, FenceToken t, const SnapshotRecord& r) {
+        return inner.save_snapshot(id, t, r);
+    }
+    [[nodiscard]] result<void> append(ActorId id, FenceToken t, SeqNo q, std::span<const std::byte> b) {
+        return inner.append(id, t, q, b);
+    }
+    [[nodiscard]] result<void> append_batch(ActorId id, FenceToken t, std::span<const EventRecord> b) {
+        return inner.append_batch(id, t, b);
+    }
+    [[nodiscard]] result<EventCursor> read_log(ActorId id, SeqNo from) const {
+        note('L');
+        return inner.read_log(id, from);
+    }
+};
+static_assert(Store<OrderRecordingStore>, "OrderRecordingStore must model the 012 Store seam");
+struct OrderedPersisted : Actor<OrderedPersisted, Sequential, Persistent<Snapshot>> {
+    using protocol = Protocol<Ping>;
+    using PersistState = CounterState;
+    static inline std::atomic<int> handled{0};
+    [[nodiscard]] CounterState snapshot_state() const { return CounterState{}; }
+    void restore_state(CounterState) {}
+    void handle(const Ping&) noexcept { handled.fetch_add(1, std::memory_order_release); }
+};
 
 // The pre-Phase-4 synchronous dead-letter regression pin (mirrors engine_lazy_activation_test.cpp):
 // a message type whose destructor is counted, delivered when construction fails.
@@ -221,6 +268,33 @@ int main() {
         check(RacePersisted::recover_calls.load(std::memory_order_relaxed) == 1,
               "S3: recover() runs exactly once across all racing first-touches", ok);
         eng3.stop();
+    }
+
+    // ---- 5) B2: the fence is acquired BEFORE recovery reads the store ----------------------------
+    {
+        OrderRecordingStore ostore;
+        auto built4 = ConfigBuilder{}.workers(2).shards(2).default_drain_budget(64).build();
+        check(built4.has_value(), "fourth ConfigBuilder", ok);
+        Engine<> eng4(*built4);
+        detail::MessagePool pool4(64);
+        check(eng4.declare_lazy<OrderedPersisted>(ostore).has_value(),
+              "declare_lazy<OrderedPersisted>(ostore)", ok);
+        eng4.start();
+        LocalRouter router4(eng4.post_courier(), pool4);
+        router4.tell<OrderedPersisted>(actor_id_of<OrderedPersisted>(1), Ping{});
+        check(wait_until([&] { return OrderedPersisted::handled.load(std::memory_order_acquire) == 1; },
+                         std::chrono::seconds(2)),
+              "the ordered-store actor activates and handles its first message", ok);
+        {
+            std::lock_guard<std::mutex> g(ostore.mu);
+            const auto f = std::find(ostore.calls.begin(), ostore.calls.end(), 'F');
+            const auto l = std::find(ostore.calls.begin(), ostore.calls.end(), 'L');
+            check(f != ostore.calls.end() && l != ostore.calls.end(),
+                  "activation both acquires a fence and reads the store", ok);
+            check(f < l, "B2: acquire_fence happens BEFORE the recovery read (stale owner is fenced out)",
+                  ok);
+        }
+        eng4.stop();
     }
 
     eng.stop();
