@@ -201,8 +201,7 @@ int main() {
     }
 
 #else
-    std::printf("  (case 4 needs a source-address-bound client socket: Linux only, skipped)
-");
+    std::printf("  (case 4 needs a source-address-bound client socket: Linux only, skipped)\n");
 #endif
 
     std::printf("tcp_transport_pre_auth_test: %s\n", ok ? "OK" : "FAIL");
