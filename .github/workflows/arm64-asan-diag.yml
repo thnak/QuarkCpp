@@ -37,36 +37,26 @@ jobs:
         shell: bash
         run: cmake --build build -j 2 --target ${{ inputs.tests }}
 
-      - name: Run with periodic backtraces
+      - name: Run under gdb, snapshot stacks on SIGUSR1
         shell: bash
         env:
           ASAN_OPTIONS: abort_on_error=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           nproc; uname -m
+          # The container has no ptrace-attach, so launch the test under gdb and stop it with a
+          # signal gdb catches (SIGUSR1) instead of `gdb -p`.
           for t in ${{ inputs.tests }}; do
             echo "::group::$t"
-            start=$(date +%s)
-            "build/tests/$t" >"/tmp/$t.log" 2>&1 &
-            pid=$!
-            n=0
-            while kill -0 "$pid" 2>/dev/null; do
-              sleep 5
-              el=$(( $(date +%s) - start ))
-              # snapshots at 20s, 60s, 120s: identical stacks across snapshots = livelock/stall
-              if [[ $el -ge 20 && $n -eq 0 ]] || [[ $el -ge 60 && $n -eq 1 ]] || [[ $el -ge 120 && $n -eq 2 ]]; then
-                n=$((n+1))
-                echo "--- backtrace snapshot $n at ${el}s ---"
-                sudo gdb -p "$pid" -batch -ex "set pagination off" -ex "thread apply all bt 12" -ex detach -ex quit 2>&1 | grep -E '^(Thread|#)' || true
-                echo "--- per-thread CPU (top) ---"
-                top -H -b -n1 -p "$pid" | head -20 || true
-              fi
-              if [[ $el -ge ${{ inputs.cap_seconds }} ]]; then
-                echo "::warning::$t exceeded ${{ inputs.cap_seconds }}s cap — killing"
-                kill -9 "$pid"; break
-              fi
+            gdb -batch -ex "set pagination off" -ex "handle SIGUSR1 stop nopass"                 -ex run -ex "thread apply all bt 25" -ex "info threads"                 -ex continue -ex "thread apply all bt 25" -ex kill                 --args "build/tests/$t" >"/tmp/$t.gdb" 2>&1 &
+            gpid=$!
+            for at in 30 60; do
+              sleep $(( at == 30 ? 30 : 30 ))
+              pkill -USR1 -x "${t:0:15}" || echo "(test already exited)"
+              sleep 3
             done
-            wait "$pid" 2>/dev/null; echo "$t exit=$? elapsed=$(( $(date +%s) - start ))s"
-            tail -n 30 "/tmp/$t.log"
+            kill -9 "$gpid" 2>/dev/null; pkill -9 -x "${t:0:15}" 2>/dev/null
+            wait "$gpid" 2>/dev/null
+            cat "/tmp/$t.gdb" | cut -c1-240
             echo "::endgroup::"
           done
