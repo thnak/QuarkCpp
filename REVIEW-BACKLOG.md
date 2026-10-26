@@ -99,9 +99,12 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
   session mutex while holding `map_mu_` (shared); a long seal blocks `on_peer_disconnected`
   (`:141`, needs `map_mu_` exclusive) and, on writer-preferring locks, every `try_get_session`.
   Copy session pointers out, release `map_mu_`, then inspect; make `generation`/`renegotiated_at` atomic.
-- [ ] D2 HIGH — timer service fires user code under its mutex (`timer_service.hpp:106-120,207-241`);
+- [x] D2 HIGH — timer service fires user code under its mutex (`timer_service.hpp:106-120,207-241`);
   catch-up after suspend = thousands of ticks under the lock; a message destructor cancelling a timer
   would self-deadlock (`:248`; plausible, not executed). Pop due entries under the lock, fire outside.
+  FIXED (verified real: old code deadlocked in tests): tick pops due entries under `mu_`, fires/destroys
+  outside it (adv_mu_ keeps tick order); cancel racing a popped entry is at-most-once. Test:
+  `tests/timer_service_reentrancy_test.cpp`.
 - [x] D3 MED — audit sink called under the session lock (`secure_transport.hpp:722,731`); same class as A5.
 - [x] D4 MED — unsynchronized shared state (TSan would flag): `receiver_` (`:305` vs `:742`),
   `revoked_snapshot_` (`:179,191` vs `:515-517,592-594,666-668`), `frames_sealed_on_key()`
