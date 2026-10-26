@@ -94,6 +94,11 @@ void destroy_payload(void* p) noexcept {
 // fetch_add only needs distinct values (no ordering with anything else), so relaxed suffices.
 inline std::atomic<std::uint32_t> g_next_pool_lane_id{0};
 inline thread_local std::uint32_t t_pool_lane_id = 0xFFFF'FFFFu;  // sentinel: not yet assigned
+#ifdef QUARK_MESSAGE_POOL_TEST_HOOKS
+// Test seam (issue #15): runs on the flushing thread between the liveness lock() and the partition
+// lock, so a test can destroy the pool at exactly the racy instant. Absent in production builds.
+inline thread_local void (*t_after_token_lock_hook)() = nullptr;
+#endif
 
 [[nodiscard]] inline std::uint32_t pool_lane_id() noexcept {
     if (t_pool_lane_id == 0xFFFF'FFFFu)
@@ -237,6 +242,9 @@ private:
             // tok IS the Partition's owner: a successful lock() keeps the Partition (mutex, cells,
             // free_head) alive for the whole flush even if the pool is destroyed concurrently.
             auto tok = lc.bound_token.lock();
+#ifdef QUARK_MESSAGE_POOL_TEST_HOOKS
+            if (t_after_token_lock_hook != nullptr) t_after_token_lock_hook();  // issue #15: the race window
+#endif
             if (!tok) {
                 // Owning pool is already gone: the partition (and its mutex) may be freed. Safely
                 // forfeit the residual cells instead of touching freed memory (ADR-037 S2).
