@@ -172,6 +172,7 @@ jobs:
       # effort: never fails the job, so the real ctest run below still gets a bounded, clean signal.
       - name: Diagnose potential hang (arm64 release only)
         if: matrix.arch == 'arm64' && matrix.config.sanitize == ''
+        shell: bash
         run: |
           BIN=build/tests/topology_fifo_under_relay_test
           if [[ -x "$BIN" ]]; then
