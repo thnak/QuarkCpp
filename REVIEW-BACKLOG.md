@@ -86,11 +86,11 @@ Note: when shipping the tree from Windows, strip CRs from `*.sh` on the Linux si
 - [ ] C4 HIGH — `FileStore` keeps all history in RAM and one fd per actor (`file_store.hpp:128,157,309`);
   replay reads whole file (`:177,249-260`); no compaction (ADR-024/012 `CompactEvery` unimplemented);
   each passivation appends a full snapshot (`metadata.hpp:411`).
-- [ ] C5 HIGH — uncapped gossip-fed maps: `last_pressure_` (`cluster.hpp:932,1502`),
+- [x] C5 HIGH (fixed in S4: subject check + caps + counters; third-party revocation needs signed revocations - 020 has none, left as residual) — uncapped gossip-fed maps: `last_pressure_` (`cluster.hpp:932,1502`),
   `RevocationRegistry` union-only with full copy per change (`revocation_registry.hpp:33-41,85-86`;
   any member can revoke any other's cert), `CapabilityRegistry` (`capability_registry.hpp:195-200`).
   Accept entries only for `m.from`/verified members; cap the revocation set.
-- [ ] C6 LOW — congestion `gates_` never evicted (`governance.hpp:313-316`); `peer_schemas_` not cleared
+- [x] C6 LOW (gates_ half fixed in S4; peer_schemas_ part is secure_transport, not S4) — congestion `gates_` never evicted (`governance.hpp:313-316`); `peer_schemas_` not cleared
   on failed renegotiation (`secure_transport.hpp:555-561`).
 
 ## D. Lock retention

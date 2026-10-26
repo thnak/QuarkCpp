@@ -11,6 +11,17 @@
 // replaying a stale gossip digest would defeat the whole mechanism. There is deliberately no un-revoke
 // API here; reinstating a node means issuing it a FRESH identity (a new fingerprint), not clearing this
 // set.
+//
+// TRUST AND BOUNDS (C5): 020 specifies NO issuer authentication for revocations - they ride the same
+// mTLS-authenticated-member gossip trust boundary as membership (020 S"Capability gossip decode
+// discipline" residual-risk paragraph), so any admitted member can still publish a revocation; no
+// CA-signed revocation exists to verify, and inventing one is out of scope here. What IS enforced:
+//   * the gossip-fed set is capped (`max_entries`); once full, NEW gossiped fingerprints are refused
+//     and counted (`rejected()`), so a member cannot grow the set / the per-change snapshot copy
+//     without bound. Locally-originated revocations (operator action) are never refused.
+//   * `protect(fp)` pins THIS node's own fingerprint: a gossiped revocation of it is dropped, so a
+//     peer cannot unilaterally sever us. (A peer revoking a THIRD party's cert remains possible -
+//     that needs the signed-revocation design above.)
 #pragma once
 
 #include <algorithm>
@@ -25,7 +36,22 @@ namespace quark {
 
 class RevocationRegistry {
 public:
-    RevocationRegistry() { republish_locked(); }
+    explicit RevocationRegistry(std::size_t max_entries = 4096) : max_entries_(max_entries) {
+        republish_locked();
+    }
+
+    // Pin a fingerprint (this node's own) so a GOSSIPED revocation of it is ignored. Local
+    // `revoke_locally` still wins (an operator may deliberately revoke their own identity).
+    void protect(Fingerprint fp) {
+        std::lock_guard<std::mutex> g(mu_);
+        protected_.insert(fp);
+    }
+
+    // Gossiped fingerprints refused (set full, or a protected fingerprint). Observability only.
+    [[nodiscard]] std::uint64_t rejected() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return rejected_;
+    }
 
     // Merge a peer's gossiped revocation set into ours (union). Returns true iff this added at least
     // one NEW fingerprint — callers (e.g. a future gossip-priority policy) can use this to decide
@@ -35,7 +61,13 @@ public:
         std::lock_guard<std::mutex> g(mu_);
         bool changed = false;
         for (const Fingerprint& fp : incoming) {
-            if (set_.insert(fp).second) changed = true;
+            if (set_.contains(fp)) continue;  // dedupe: already revoked is not a change
+            if (protected_.contains(fp) || set_.size() >= max_entries_) {
+                ++rejected_;
+                continue;
+            }
+            set_.insert(fp);
+            changed = true;
         }
         if (changed) republish_locked();
         return changed;
@@ -88,6 +120,9 @@ private:
 
     mutable std::mutex mu_;
     std::unordered_set<Fingerprint> set_;
+    std::unordered_set<Fingerprint> protected_;
+    std::size_t max_entries_;
+    std::uint64_t rejected_ = 0;
     std::shared_ptr<const std::unordered_set<Fingerprint>> snapshot_;
 };
 
