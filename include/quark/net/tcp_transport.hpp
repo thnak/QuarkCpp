@@ -100,6 +100,13 @@ public:
     // send its hello (<=0 disables). Call before start().
     void set_max_pending_inbound_per_ip(std::uint32_t n) noexcept { max_pending_per_ip_ = n; }
     void set_pending_hello_timeout_ns(std::int64_t ns) noexcept { pending_hello_timeout_ns_ = ns; }
+    // Cap on IDENTIFIED inbound connections per source IP (0 disables). The hello NodeId is only a
+    // claim at this layer, so this is what bounds a fake-id connection flood. Call before start().
+    void set_max_inbound_per_ip(std::uint32_t n) noexcept { max_inbound_per_ip_ = n; }
+    // When true (default) a new inbound hello claiming the NodeId of a live, confirmed connection that
+    // came from a different source IP is rejected instead of winning the dial-dedup. Disable only for
+    // multi-homed peers that legitimately reconnect from a different address while the old link lives.
+    void set_strict_peer_addr_binding(bool on) noexcept { strict_peer_addr_binding_ = on; }
 
     void add_peer(Endpoint ep) {
         if (started_.load(std::memory_order_acquire))
@@ -616,7 +623,43 @@ private:
     // Associate a just-identified connection with its peer, applying the lower-NodeId dial-dedup RULE
     // (021 §2). Returns true if `c` SURVIVES (or is now the registered connection), false if `c` was the
     // loser and has been closed (the caller must stop touching it).
+    // Pre-auth admission for an INBOUND connection that just sent its hello (review C3). The hello's
+    // NodeId is only a CLAIM at this layer (identity is proven later, by the secure handshake), so:
+    //  * a per-source-IP cap bounds how many identified inbound connections one host can hold (each
+    //    pins an fd, a Conn and up to a frame of reassembly buffer) — the pending-socket caps alone
+    //    are escaped by simply sending a hello with a fresh fake NodeId;
+    //  * a hello claiming the NodeId of a live, confirmed connection from a DIFFERENT source IP must
+    //    not displace it (it would win the dial-dedup on the larger-id node and black-hole the real
+    //    peer). The rejected dialer just retries with backoff; the live connection is untouched.
+    // Must run BEFORE `c->identified`/`c->peer` are set: handle_dead() on an unidentified conn only
+    // removes it from pending_in_ and never touches conns_[peer].
+    [[nodiscard]] bool admit_inbound_identity(const Conn* c, NodeId peer) const {
+        const auto it = conns_.find(peer.value);
+        const Conn* existing = it != conns_.end() ? it->second.get() : nullptr;
+        if (strict_peer_addr_binding_ && existing != nullptr && existing->st == St::Open &&
+            existing->confirmed && existing->has_peer_addr && c->has_peer_addr &&
+            existing->peer_addr != c->peer_addr)
+            return false;
+        if (max_inbound_per_ip_ != 0 && c->has_peer_addr) {
+            std::uint32_t same_ip = 0;
+            for (const auto& [id, oc] : conns_) {
+                (void)id;
+                if (oc.get() == existing) continue;  // a reconnect replaces it; do not count it twice
+                if (!oc->initiated_by_self && oc->confirmed && oc->has_peer_addr &&
+                    oc->peer_addr == c->peer_addr)
+                    ++same_ip;
+            }
+            if (same_ip >= max_inbound_per_ip_) return false;
+        }
+        return true;
+    }
+
     bool register_identified(Conn* c, NodeId peer) {
+        if (!c->initiated_by_self && !admit_inbound_identity(c, peer)) {
+            drops_.fetch_add(1, std::memory_order_relaxed);
+            handle_dead(c);
+            return false;
+        }
         c->peer = peer;
         c->identified = true;
         // Move an accepted conn out of pending_in_ (keyed by fd) if that is where it lives.
@@ -1113,6 +1156,8 @@ private:
     std::uint32_t max_frame_body_ = max_frame_body;
     std::uint32_t max_pending_in_ = 1024;
     std::uint32_t max_pending_per_ip_ = 64;
+    std::uint32_t max_inbound_per_ip_ = 64;       // identified inbound connections per source IP
+    bool strict_peer_addr_binding_ = true;        // a live peer's slot cannot be taken from another IP
     std::int64_t pending_hello_timeout_ns_ = 5'000'000'000;  // 5s to identify
     std::uint64_t accept_serial_ = 0;
     pal::fd_t listener_ = pal::invalid_fd;

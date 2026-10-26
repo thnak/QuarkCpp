@@ -16,7 +16,7 @@ under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet 
 
 - [~] A1 Handshake spoof/hijack: ignore Authenticate frames for a parked engine from a different
   source IP; `known` no longer bypasses the per-IP cap (`secure_transport.hpp`).
-- [~] A2 Pending inbound TCP sockets: 5 s hello deadline + per-IP cap of 64 (`tcp_transport.hpp`).
+- [x] A2 Pending inbound TCP sockets: 5 s hello deadline + per-IP cap of 64 (`tcp_transport.hpp`); tested in tcp_transport_pre_auth_test.
   **Incomplete — see C3.**
 - [~] A3 Tagless decode `reserve` capped at 1024 (`wire.hpp`).
 - [~] A4 Removed the `~SecureTransport` write through the raw `inner_` pointer.
@@ -75,7 +75,7 @@ under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet 
 - [ ] C2 HIGH — idle eviction frees nothing: `engine.hpp:1238` `lazy_owned` never erased;
   `close_out_retire` only goes Dormant (`activation.hpp:665-671,709`). ADR-028 residual #3 does not
   disclose this.
-- [ ] C3 HIGH — **unauthenticated hello bypasses the pending-socket caps** (`tcp_transport.hpp:628-637`
+- [x] C3 HIGH (fixed: per-IP cap on identified inbound conns + strict peer-address binding; tcp_transport_pre_auth_test) — **unauthenticated hello bypasses the pending-socket caps** (`tcp_transport.hpp:628-637`
   `register_identified`): a fresh fake NodeId moves the socket into `conns_`, escaping `max_pending_in_`
   and the per-IP cap; each holds fd + `Conn` + up to 4 MiB reassembly. Also (security, not executed):
   on the larger-id node a hello claiming a *real* peer's id wins dedup against the legitimate inbound
