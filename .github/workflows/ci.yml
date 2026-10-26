@@ -134,7 +134,7 @@ jobs:
             build_jobs: 2
             ctest_jobs: 2
             # detect_leaks on; the one deliberate-OOB control sets its own ASAN_OPTIONS in CMake.
-            ctest_env: "ASAN_OPTIONS=abort_on_error=0${QUARK_ASAN_UAR:+:detect_stack_use_after_return=$QUARK_ASAN_UAR} UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
+            ctest_env: "ASAN_OPTIONS=abort_on_error=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
           - name: tsan
             cxx: g++-14
             build_type: Debug
@@ -144,6 +144,22 @@ jobs:
             build_jobs: 1
             ctest_jobs: 2
             ctest_env: "TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1"
+        exclude:
+          # g++-14.2 ASan is >500x slower on aarch64 with stack-use-after-return on (fake-stack
+          # allocator; reproduced without Quark in ci/diag/asan_fakestack_micro.cpp: >300s vs 0.6s,
+          # while clang++-20 takes 0.7s). So arm64 ASan+UBSan uses clang, keeping the check on.
+          - arch: arm64
+            config: {name: asan-ubsan}
+        include:
+          - arch: arm64
+            config:
+              name: asan-ubsan
+              cxx: clang++-20
+              build_type: Debug
+              sanitize: "address;undefined"
+              build_jobs: 2
+              ctest_jobs: 2
+              ctest_env: "ASAN_OPTIONS=abort_on_error=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
@@ -194,11 +210,6 @@ jobs:
           fi
 
       - name: Test
-        env:
-          # arm64 ASan only: the fake-stack (use-after-return) runtime is >400x slower there (e.g.
-          # topology_fifo_under_relay_test >400s vs 1s; every tiny Debug frame hits FakeStack::Allocate),
-          # so that one check is off on arm64; x86-64 ASan keeps it. See arm64-asan-diag.yml.
-          QUARK_ASAN_UAR: ${{ matrix.arch == 'arm64' && '0' || '' }}
         run: ${{ matrix.config.ctest_env }} ctest --test-dir build -j ${{ matrix.config.ctest_jobs }} --output-on-failure --timeout 1800
 
       # P5: the same shared targets under libFuzzer + ASan/UBSan against the generated corpus. The
