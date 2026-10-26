@@ -151,7 +151,33 @@ inline void file_close(file_t f) noexcept {
 }
 
 // MoveFileEx with MOVEFILE_WRITE_THROUGH: does not return until the move is flushed to disk.
+//
+// FIRST choice is a POSIX-semantics rename (FileRenameInfoEx, Win10 1809+/NTFS): like rename(2) it
+// replaces `to` even while another handle (compact()'s live append fd) has it open. Plain MoveFileEx
+// REPLACE_EXISTING fails with ERROR_ACCESS_DENIED in that case regardless of FILE_SHARE_DELETE, which
+// is exactly the compact() shape (review B9). Falls back to MoveFileEx where that is unsupported.
 [[nodiscard]] inline bool durable_rename(const std::string& from, const std::string& to) noexcept {
+    wchar_t wto[MAX_PATH * 2];
+    const int n = ::MultiByteToWideChar(CP_ACP, 0, to.c_str(), -1, wto, MAX_PATH * 2);
+    wchar_t full[MAX_PATH * 2];
+    const DWORD fl = n > 0 ? ::GetFullPathNameW(wto, MAX_PATH * 2, full, nullptr) : 0;
+    if (fl > 0 && fl < MAX_PATH * 2) {
+        const HANDLE h = ::CreateFileA(from.c_str(), DELETE | GENERIC_WRITE | SYNCHRONIZE, kShareAll,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            alignas(FILE_RENAME_INFO) unsigned char buf[sizeof(FILE_RENAME_INFO) + MAX_PATH * 2 * sizeof(wchar_t)]{};
+            auto* ri = reinterpret_cast<FILE_RENAME_INFO*>(buf);
+            ri->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            ri->RootDirectory = nullptr;
+            ri->FileNameLength = static_cast<DWORD>(fl * sizeof(wchar_t));
+            for (DWORD i = 0; i < fl; ++i) ri->FileName[i] = full[i];
+            const bool ok = ::SetFileInformationByHandle(h, FileRenameInfoEx, ri,
+                                                         static_cast<DWORD>(sizeof(buf))) != 0;
+            if (ok) (void)::FlushFileBuffers(h);  // the moved file's data+metadata are on disk
+            ::CloseHandle(h);
+            if (ok) return true;
+        }
+    }
     return ::MoveFileExA(from.c_str(), to.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
