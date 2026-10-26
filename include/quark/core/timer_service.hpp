@@ -14,12 +14,22 @@
 // exactly what the per-shard version reuses; only the "who advances the clock" wrapper differs.
 //
 // THREADING & THE FIRE-vs-CANCEL RACE. The standalone service is multi-writer (arbitrary threads
-// `schedule`/`cancel`; a driver thread ticks), so it serializes wheel access under one mutex. Every
-// operation on an entry — insert, cancel-flag, fire, recycle (which bumps `gen`) — happens under
-// that mutex, so there is no data race, and the pooled-entry `gen` gate makes a `cancel` that races
-// a fire resolve to EXACTLY ONE outcome with no use-after-free (see cancel_entry / on_expire). The
-// per-shard seam replaces the mutex with the single-writer + gen-gated lazy-cancel discipline (011
-// §Cancellation) — same gen-gate, no lock. // TODO(seam-002): per-shard single-writer wheel.
+// `schedule`/`cancel`; a driver thread ticks), so wheel/pool/flag access is serialized under `mu_`.
+// USER CODE NEVER RUNS UNDER `mu_` (review D2): a tick, under `mu_`, only advances the wheel and
+// moves the due entries into a batch; `mu_` is released; the batch is then fired (`tell` — which can
+// copy a message, enter lazy activation, or reclaim through a user destructor) and its one-shot
+// payloads destroyed OUTSIDE it; `mu_` is retaken only to re-arm / recycle. So schedule()/cancel()
+// are never blocked behind a long catch-up, and a message copy-ctor/destructor may itself call
+// cancel()/schedule() on this service. `adv_mu_` serializes whole advances (so tick batches fire in
+// tick order even with the driver and a caller polling concurrently); order is adv_mu_ -> mu_, and
+// schedule/cancel take only `mu_`. A fire callback must not itself tick/poll the same service.
+//
+// CANCEL vs FIRE. A cancel that lands before the entry is popped (under `mu_`) means 0 fires. Once an
+// entry is popped it is IN FLIGHT: a one-shot's cancel is then a no-op (it fires — at most once);
+// a periodic's cancel still stops the re-arm (at most one in-flight fire, then recycled). The pooled
+// `gen` gate keeps a stale handle from ever touching a recycled/reused slot. The per-shard seam
+// replaces `mu_` with the single-writer + gen-gated lazy-cancel discipline (011 §Cancellation) —
+// same gen-gate, no lock. // TODO(seam-002): per-shard single-writer wheel.
 #pragma once
 
 #include <atomic>
@@ -32,6 +42,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "quark/core/actor_ref.hpp"
 #include "quark/core/timer_wheel.hpp"
@@ -103,12 +114,12 @@ public:
     // Advance the wheel by exactly one tick and fire everything that comes due. Use these for
     // deterministic tests; scheduling is relative to the wheel's LOGICAL now, so no wall-clock.
     void tick() {
-        std::lock_guard<std::mutex> g(mu_);
-        tick_locked();
+        std::lock_guard<std::mutex> adv(adv_mu_);
+        step();
     }
     void advance_ticks(std::uint64_t n) {
-        std::lock_guard<std::mutex> g(mu_);
-        for (std::uint64_t i = 0; i < n; ++i) tick_locked();
+        std::lock_guard<std::mutex> adv(adv_mu_);
+        for (std::uint64_t i = 0; i < n; ++i) step();
     }
     void advance(std::chrono::nanoseconds by) {
         advance_ticks(static_cast<std::uint64_t>(by.count() <= 0 ? 0 : by.count()) / tick_ns_);
@@ -116,8 +127,12 @@ public:
 
     // Advance the wheel to track real (`pal`) time — the worker-driven "active advance" (011).
     void poll() {
-        std::lock_guard<std::mutex> g(mu_);
-        poll_locked();
+        std::lock_guard<std::mutex> adv(adv_mu_);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 pal::now() - start_tp_)
+                                 .count();
+        const std::uint64_t target = static_cast<std::uint64_t>(elapsed < 0 ? 0 : elapsed) / tick_ns_;
+        while (now_ticks() < target) step();  // adv_mu_ is the only ticker, so now_ticks() is stable
     }
 
     [[nodiscard]] std::uint64_t now_ticks() const noexcept {
@@ -204,46 +219,57 @@ private:
         return t == 0 ? 1 : t;
     }
 
-    void tick_locked() {
-        wheel_.tick([this](detail::TimerEntry* e) noexcept { on_expire(e); });
-    }
-
-    void poll_locked() {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 pal::now() - start_tp_)
-                                 .count();
-        const std::uint64_t target = static_cast<std::uint64_t>(elapsed < 0 ? 0 : elapsed) / tick_ns_;
-        while (wheel_.now_ticks() < target) tick_locked();
-    }
-
-    // Called (under mu_) for each entry whose bucket came due. Lazy-cancel is honored here: a
-    // tombstoned entry is dropped, never told. A live one-shot fires once and recycles; a live
-    // periodic fires and re-arms (same entry, new expiry — `gen` unchanged so its handle stays
-    // valid until it is actually cancelled + recycled).
-    void on_expire(detail::TimerEntry* e) noexcept {
-        if (e->cancelled) {
-            recycle(e);
-            return;
+    // One tick, in three phases so no user code runs under `mu_` (caller holds adv_mu_).
+    //  1. under mu_: advance the wheel; every due entry is moved into `batch_`, tagged live/cancelled.
+    //  2. unlocked: fire the live ones; destroy the payload of one-shots and of tombstones.
+    //  3. under mu_: periodic + not cancelled mid-flight -> re-arm; everything else -> recycle. A
+    //     periodic cancelled mid-flight still owns a live payload, so it is destroyed unlocked first.
+    void step() {
+        batch_.clear();  // capacity is kept: 0 allocation once warmed up
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            wheel_.tick([this](detail::TimerEntry* e) noexcept {
+                batch_.push_back(Due{e, !e->cancelled});
+            });
         }
-        e->fire_fn(e->storage);
-        if (e->period_ticks != 0) {
-            e->expiry_ticks += e->period_ticks;
-            e->deadline_ns += static_cast<std::int64_t>(e->period_ticks * tick_ns_);
-            wheel_.insert(e);  // re-arm (targets a future bucket — never the one being drained)
-        } else {
-            recycle(e);
+        if (batch_.empty()) return;
+
+        for (const Due& d : batch_) {
+            if (d.live) d.e->fire_fn(d.e->storage);
+            if (!d.live || d.e->period_ticks == 0) d.e->destroy_fn(d.e->storage);
+        }
+
+        std::size_t late = 0;  // periodic entries cancelled while in flight (payload still alive)
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            for (Due& d : batch_) {
+                detail::TimerEntry* e = d.e;
+                if (!d.live || e->period_ticks == 0) {
+                    e->destroy_fn = nullptr;  // already destroyed above
+                    pool_.release(e);
+                } else if (e->cancelled) {
+                    batch_[late++] = d;  // d.e only: compacting in place (late <= current index)
+                } else {
+                    e->expiry_ticks += e->period_ticks;
+                    e->deadline_ns += static_cast<std::int64_t>(e->period_ticks * tick_ns_);
+                    wheel_.insert(e);  // re-arm (targets a future bucket — never the one drained)
+                }
+            }
+        }
+        if (late == 0) return;
+        for (std::size_t i = 0; i < late; ++i) batch_[i].e->destroy_fn(batch_[i].e->storage);
+        std::lock_guard<std::mutex> g(mu_);
+        for (std::size_t i = 0; i < late; ++i) {
+            batch_[i].e->destroy_fn = nullptr;
+            pool_.release(batch_[i].e);
         }
     }
 
-    void recycle(detail::TimerEntry* e) noexcept {
-        if (e->destroy_fn != nullptr) e->destroy_fn(e->storage);
-        pool_.release(e);  // bumps gen → any stale handle's cancel() no-ops (gen-gate)
-    }
-
-    // Gen-gated lazy cancel. Under mu_, so it is serialized against fire/recycle: it either flips the
-    // tombstone before the bucket fires (→ the entry is dropped, 0 fires) or observes a bumped gen
-    // after recycle (→ no-op). Exactly one outcome; the entry memory is pool-owned, never freed under
-    // a handle, so no use-after-free even if the slot was already reused for a newer timer.
+    // Gen-gated lazy cancel. Under mu_ (never held across user code), so it is serialized against the
+    // pop and the recycle: it either flips the tombstone before the entry is popped (-> 0 fires) or,
+    // for an in-flight/periodic entry, is honored at re-arm time, or observes a bumped gen after
+    // recycle (-> no-op). The entry memory is pool-owned, never freed under a handle, so no
+    // use-after-free even if the slot was already reused for a newer timer.
     void cancel_entry(detail::TimerEntry* e, std::uint64_t gen) noexcept {
         std::lock_guard<std::mutex> g(mu_);
         if (e->active && e->gen == gen) e->cancelled = true;
@@ -259,7 +285,14 @@ private:
 
     friend class TimerHandle;
 
-    mutable std::mutex mu_;
+    struct Due {
+        detail::TimerEntry* e;
+        bool live;  // false = tombstone popped (payload to destroy, never fired)
+    };
+
+    std::mutex adv_mu_;          // serializes advances (batch_ + fire order); taken before mu_
+    std::vector<Due> batch_;     // due entries of the tick in flight; guarded by adv_mu_
+    mutable std::mutex mu_;      // wheel + pool + entry flags; never held across user code
     std::uint64_t tick_ns_;
     detail::TimerEntryPool pool_;
     detail::TimingWheel wheel_;
