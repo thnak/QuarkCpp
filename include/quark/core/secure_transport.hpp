@@ -33,6 +33,7 @@
 // under Strict+multi-node (security.hpp `validate_security`).
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -301,6 +302,15 @@ public:
         return it->second;
     }
 
+    [[nodiscard]] bool peer_accepts_type(NodeId peer, std::uint64_t key,
+                                         std::uint32_t abi_tag) const override {
+        std::lock_guard<std::mutex> g(schema_mu_);
+        const auto it = peer_schemas_.find(peer.value);
+        // `types` is stored sorted (see handle_schema_frame): O(log n), no copy.
+        return it != peer_schemas_.end() && it->second.abi_tag == abi_tag &&
+               std::binary_search(it->second.types.begin(), it->second.types.end(), key);
+    }
+
     void on_receive(std::function<void(MessageFrame)> cb) override {
         receiver_ = std::move(cb);
         inner_->on_receive([this](MessageFrame frame) { this->deliver(std::move(frame)); });
@@ -455,6 +465,7 @@ private:
                                "secure transport: malformed schema advertisement", 0});
             return;
         }
+        std::sort(adv.types.begin(), adv.types.end());  // enables binary search in peer_accepts_type
         std::lock_guard<std::mutex> g(schema_mu_);
         peer_schemas_[frame.from.value] = std::move(adv);
     }

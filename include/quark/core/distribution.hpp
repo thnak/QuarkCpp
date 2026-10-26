@@ -77,10 +77,10 @@ public:
           // ABI only when it can decode this schema; otherwise no tagless. `set_peer_schema_provider`
           // remains an explicit override for tests/embedded transports.
           peer_schema_([this](NodeId owner, TypeKey tk) -> PeerSchema {
-              const std::optional<SchemaAdvertisement> adv = transport_->peer_schema(owner);
-              if (!adv || adv->abi_tag != pal::platform_abi_tag || !adv->contains(tk.value))
+              // Boolean query: no per-send copy of the peer's advertisement (review E1).
+              if (!transport_->peer_accepts_type(owner, tk.value, pal::platform_abi_tag))
                   return PeerSchema{~0ull, ~0u};
-              return PeerSchema{tk.value, adv->abi_tag};
+              return PeerSchema{tk.value, pal::platform_abi_tag};
           }) {
         transport_->on_receive([this](MessageFrame f) { deliver(f); });
     }

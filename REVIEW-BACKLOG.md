@@ -112,7 +112,7 @@ under a plain `sh`; make the shebang `bash`). ASan/UBSan/TSan and Clang not yet 
 
 ## E. Performance
 
-- [ ] E1 HIGH — every remote send copies the peer schema (≤32 KiB) under node-wide `schema_mu_`
+- [x] E1 HIGH (fixed: Transport::peer_accepts_type, sorted advert + binary search, test in security_handshake_test) — every remote send copies the peer schema (≤32 KiB) under node-wide `schema_mu_`
   (`distribution.hpp:78-82`, `secure_transport.hpp:297-302`, linear `contains` at `wire.hpp:632-636`).
   Regression from F17. Use a `shared_ptr<const>` / sorted set and a boolean "accepts type" API.
 - [x] E2 HIGH (fixed: shared detail::RateBucket + sustained-rate test in security_wire_hardening_test) — rate limiters starve instead of limit: `last_ns` advances even when integer division adds

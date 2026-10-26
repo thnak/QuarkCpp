@@ -121,6 +121,15 @@ public:
         return std::nullopt;
     }
 
+    // Per-send hot-path form of `peer_schema`: does `peer` advertise message TypeKey `key` under ABI
+    // `abi_tag`? The default copies the advertisement (fine for test doubles); a transport that holds
+    // adverts overrides it to answer WITHOUT copying the (up to 32 KiB) schema (review E1).
+    [[nodiscard]] virtual bool peer_accepts_type(NodeId peer, std::uint64_t key,
+                                                 std::uint32_t abi_tag) const {
+        const std::optional<SchemaAdvertisement> adv = peer_schema(peer);
+        return adv && adv->abi_tag == abi_tag && adv->contains(key);
+    }
+
     // ADR-046 cross-node backpressure — the 010 open question this resolves. Called by
     // `DistributedRouter::send_remote` BEFORE `send()`, on the CALLER's thread, so a congested peer
     // is stalled/shed before a frame is even constructed for the wire. Default: never throttle — a

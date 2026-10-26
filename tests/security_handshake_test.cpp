@@ -345,6 +345,24 @@ int main() {
         check(p2.has_value() && p2->abi_tag == pal::platform_abi_tag && p2->types.size() == 2 &&
                   p2->types[0] == 0x11 && p2->types[1] == 0x22,
               "F17: n2 stored n1's authenticated schema advertisement", ok);
+
+        // E1: the per-send boolean query answers without copying the advertisement, and works for an
+        // UNSORTED advertisement (the receiver sorts it so lookups can binary-search).
+        check(n1_secure.peer_accepts_type(n2, 0x33, pal::platform_abi_tag),
+              "E1: peer_accepts_type true for an advertised key + matching ABI", ok);
+        check(!n1_secure.peer_accepts_type(n2, 0x11, pal::platform_abi_tag),
+              "E1: peer_accepts_type false for a key the peer did not advertise", ok);
+        check(!n1_secure.peer_accepts_type(n2, 0x33, pal::platform_abi_tag + 1),
+              "E1: peer_accepts_type false on an ABI mismatch", ok);
+        check(!n1_secure.peer_accepts_type(NodeId{999}, 0x33, pal::platform_abi_tag),
+              "E1: peer_accepts_type false for an unknown peer", ok);
+        n1_secure.set_local_schema(SchemaAdvertisement{pal::platform_abi_tag, {0x99, 0x11, 0x55}});
+        while (fabric.pending() > 0) fabric.pump_one();
+        check(n2_secure.peer_accepts_type(n1, 0x99, pal::platform_abi_tag) &&
+                  n2_secure.peer_accepts_type(n1, 0x11, pal::platform_abi_tag) &&
+                  n2_secure.peer_accepts_type(n1, 0x55, pal::platform_abi_tag) &&
+                  !n2_secure.peer_accepts_type(n1, 0x22, pal::platform_abi_tag),
+              "E1: an unsorted advertisement is matched correctly (sorted on receipt)", ok);
         check(p1.has_value() && p1->contains(0x33) && !p1->contains(0x44),
               "F17: the tagless gate matches exact advertised type keys", ok);
     }
