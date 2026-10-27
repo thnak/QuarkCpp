@@ -13,7 +13,8 @@
 //   T <ms> node=<id> epoch=<e> inc=<self incarnation> conns=<open> st=<one char per node 1..n>
 // where st is A(live) S(suspect) D(dead or unknown) L(left) and '*' for self.
 //
-// Usage: swim_chaos_node <self_id> <n> <seed_id_or_0> [port=7400] [duration_ms=60000] [rejoin=0]
+// Usage: swim_chaos_node <self_id> <n> <seed_id_or_0> [port=7400] [duration_ms=60000] [rejoin=0] [wire_version]
+//   wire_version: SWIM wire version override (ADR-053 mixed-version runs; default = current)
 //   rejoin=1: while this node's roster is short of n, re-send Join to the seed every 2 s.
 #include <atomic>
 #include <chrono>
@@ -52,6 +53,7 @@ int main(int argc, char** argv) {
     SwimMembership::Config cfg;
     cfg.cluster_id = kClusterId;
     cfg.seed = self_id;
+    if (argc > 7) cfg.wire_version = static_cast<std::uint8_t>(std::atoi(argv[7]));  // ADR-053 mixed N / N-1 run
     SwimMembership swim{NodeId{self_id}, transport, cfg};
 
     if (!transport.start()) {

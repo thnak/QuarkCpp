@@ -13,6 +13,7 @@
 #
 # Usage: tests/netem/run_swim_chaos.sh <build-dir> [scenario...]
 #   scenarios: form isolate asym split flaky   (default: all)
+# Mixed-version run (ADR-053): WIRE_VERSIONS="2 1 2 1 2" assigns each node i its SWIM wire version.
 set -u
 BUILD=${1:?usage: run_swim_chaos.sh <build-dir> [scenario...]}
 shift
@@ -66,7 +67,9 @@ start() {
   for i in $(seq 1 $N); do
     local seed=1
     [ "$i" = 1 ] && seed=0
-    nsx qn$i sudo -u "$RUN_AS" "$BIN" $i $N $seed $PORT "$1" "$2" > "$OUT/$SC.node$i.log" 2>&1 &
+    local wv=""
+    if [ -n "${WIRE_VERSIONS:-}" ]; then read -ra WVS <<<"$WIRE_VERSIONS"; wv=${WVS[$((i-1))]:-}; fi  # ADR-053
+    nsx qn$i sudo -u "$RUN_AS" "$BIN" $i $N $seed $PORT "$1" "$2" $wv > "$OUT/$SC.node$i.log" 2>&1 &
     PIDS+=($!)
     [ "$i" = 1 ] && sleep 0.3
   done

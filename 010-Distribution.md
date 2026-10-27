@@ -71,6 +71,14 @@ suspicion. Excluding on suspicion would migrate actors off a node on every
 transient blip, the very thrash the stabilization window (021) exists to damp.
 A `Dead` node is excluded; a refuted node (higher incarnation) stays.
 
+**Membership events and health ([ADR-053](decisions/ADR-053-membership-events-and-wire-version-window.md)).**
+`Membership::add_event_sink` delivers `Joined` / `Suspect` / `Recovered` / `Dead` / `Left` /
+`VersionRefused`, each stamped with the node, its incarnation and the roster epoch after the change;
+`Membership::health(node)` returns state, incarnation, last-seen protocol version and any sticky
+refusal reason. Delivery is synchronous on the membership driving thread — no new thread — and runs
+before the tick / frame / `leave()` that caused the change returns (0 protocol ticks of added
+latency; a remote crash is reported after the SWIM detection time, bounded in the ADR).
+
 Since [ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md) the view is
 precisely the **non-tombstone** set (`Alive`/`Suspect`). `Dead` is adopted only from a
 node's own suspicion timer, never from gossip; `Left` is a separate, authoritative

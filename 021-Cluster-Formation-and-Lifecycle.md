@@ -451,12 +451,19 @@ the roll:
 - **Wire compatibility** — 016's schema-fingerprint negotiation falls back to the
   canonical tagged encoding when two peers differ, so new and old nodes interoperate
   without a flag day.
-- **Membership-protocol compatibility** — SWIM's on-wire format is versioned and
-  back-compatible within a supported window (a support-policy open question).
-  **ADR-049 is outside that window:** it adds wire status 3 (Left) and relay-echo
-  fields in Ack. An older node treats Left as live, and an older subject does not echo
-  the relay token, so its indirect pings stay inert. Rolling across ADR-049 needs a
-  SWIM wire-version gate (not built yet) or a flag-day restart.
+- **Membership-protocol compatibility** — SWIM's on-wire format carries a protocol version
+  (ADR-053). **Supported window: a node accepts peers at its own version N and at N-1 / N+1
+  (so a roll works in either direction) and REFUSES anything two or more versions apart (N-2)** with a
+  distinct reason (`WireVersionTooOld` / `WireVersionTooNew`), surfaced as a `VersionRefused`
+  membership event (010) and in per-node health metadata — never as a mere timeout. v1 is the legacy
+  byte layout; v2 appends one version byte that v1 decoders ignore, so the current format is
+  byte-compatible. The TCP hello uses the same window (its layout and value are unchanged).
+  **ADR-049 is outside the v1 window's guarantees:** it adds wire status 3 (Left) and relay-echo
+  fields in Ack. A pre-ADR-049 node treats Left as live and does not echo the relay token. Rolling
+  across ADR-049 still needs a flag-day, because a pre-ADR-049 node carries no version byte and is
+  indistinguishable from v1; from v2 on the gate is real. A change an N-1 node cannot parse must bump
+  the version AND shrink the window via a new ADR. A refused peer behaves as partitioned (its gossip is
+  never absorbed) — not an in-band negotiation.
 
 The stabilization window above also means the brief per-node absence during its
 restart does not thrash placement across the rest of the cluster.

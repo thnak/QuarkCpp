@@ -58,6 +58,21 @@ namespace quark::net {
 inline constexpr std::uint32_t hello_magic = 0x51'52'4B'31u;  // 'Q','R','K','1'
 inline constexpr std::uint16_t hello_version = 1;
 inline constexpr std::size_t hello_size = 4 + 2 + 8;  // 14 bytes
+// ADR-053: supported HELLO version window. A peer is accepted iff |peer - ours| <= hello_version_window
+// (N and its neighbours); anything further is REFUSED with a distinct, observable reason (see
+// TcpTransport::set_hello_refusal_handler) instead of the old silent "version != ours => drop". The
+// layout and the current value (1) are unchanged, so existing peers interoperate byte-for-byte.
+inline constexpr std::uint16_t hello_version_window = 1;
+
+enum class HelloVerdict : std::uint8_t { Ok, BadMagic, VersionTooOld, VersionTooNew };
+
+// What a refused hello reports: who claimed to dial us (an UNAUTHENTICATED claim at this layer), the
+// version it presented, and why it was refused.
+struct HelloRefusal {
+    NodeId claimed_node{};
+    std::uint16_t peer_version = 0;
+    HelloVerdict reason = HelloVerdict::Ok;  // VersionTooOld / VersionTooNew only
+};
 
 // Reconnect backoff (021 §"Reconnect with jittered exponential backoff, capped").
 inline constexpr std::int64_t reconnect_base_ns = 20'000'000;    // 20 ms
@@ -94,6 +109,18 @@ public:
             io_.post([this] {
                 for (auto& [id, c] : conns_) c->in.set_max_body(max_frame_body_);
             });
+    }
+
+    // ADR-053: the HELLO version this transport speaks (default `hello_version`). Call before start().
+    // Exists so a rolling upgrade (and the N / N-1 / N-2 tests) can run nodes at different versions.
+    void set_hello_version(std::uint16_t v) noexcept { hello_ver_ = v; }
+    // ADR-053: invoked (on the transport's IO thread, never while holding a lock) when a peer's hello is
+    // refused for an out-of-window VERSION. Bad magic stays silent (not a Quark peer). Bridge it to
+    // SwimMembership::note_transport_refusal (thread-safe) to surface a VersionRefused membership event.
+    // Call before start().
+    void set_hello_refusal_handler(std::function<void(const HelloRefusal&)> fn) { hello_refusal_ = std::move(fn); }
+    [[nodiscard]] std::uint64_t hello_version_refusals() const noexcept {
+        return hello_version_refusals_.load(std::memory_order_relaxed);
     }
 
     // Bound unidentified inbound sockets (a pre-auth connection flood). 0 disables the cap.
@@ -766,7 +793,7 @@ private:
                 n -= take;
                 if (c->hello_in_.size() < hello_size) return;  // partial hello — wait for more
                 NodeId learned{};
-                if (!parse_hello(c->hello_in_.data(), learned)) {  // bad magic/version ⇒ drop
+                if (!check_hello(c->hello_in_.data(), learned)) {  // bad magic / out-of-window version ⇒ drop
                     handle_dead(c);
                     return;
                 }
@@ -1210,7 +1237,7 @@ private:
                 p->hello_in.insert(p->hello_in.end(), buf.data(), buf.data() + *r);
             }
             NodeId learned{};
-            if (!parse_hello(p->hello_in.data(), learned) || learned != p->peer) {
+            if (!check_hello(p->hello_in.data(), learned) || learned != p->peer) {
                 fail_probe(fd);  // wrong/garbled answer — not the peer we're trying to recover
                 return;
             }
@@ -1305,10 +1332,22 @@ private:
                 h[off + static_cast<std::size_t>(i)] = static_cast<std::byte>((v >> (8 * i)) & 0xFF);
         };
         put(0, hello_magic, 4);
-        put(4, hello_version, 2);
+        put(4, hello_ver_, 2);
         put(6, self_.value, 8);
     }
-    [[nodiscard]] static bool parse_hello(const std::byte* p, NodeId& out) noexcept {
+    // Parse + version-gate a peer hello. Returns true iff accepted; on a version refusal it records the
+    // distinct reason (counter + handler) BEFORE returning false.
+    [[nodiscard]] bool check_hello(const std::byte* p, NodeId& out) {
+        std::uint16_t ver = 0;
+        const HelloVerdict v = parse_hello(p, out, ver);
+        if (v == HelloVerdict::Ok) return true;
+        if (v != HelloVerdict::BadMagic) {
+            hello_version_refusals_.fetch_add(1, std::memory_order_relaxed);
+            if (hello_refusal_) hello_refusal_(HelloRefusal{out, ver, v});
+        }
+        return false;
+    }
+    [[nodiscard]] HelloVerdict parse_hello(const std::byte* p, NodeId& out, std::uint16_t& ver) const noexcept {
         auto get = [&](std::size_t off, int bytes) {
             std::uint64_t v = 0;
             for (int i = 0; i < bytes; ++i)
@@ -1316,10 +1355,13 @@ private:
                      << (8 * i);
             return v;
         };
-        if (static_cast<std::uint32_t>(get(0, 4)) != hello_magic) return false;
-        if (static_cast<std::uint16_t>(get(4, 2)) != hello_version) return false;
+        if (static_cast<std::uint32_t>(get(0, 4)) != hello_magic) return HelloVerdict::BadMagic;
+        ver = static_cast<std::uint16_t>(get(4, 2));
         out = NodeId{get(6, 8)};
-        return true;
+        if (static_cast<unsigned>(ver) + hello_version_window < hello_ver_) return HelloVerdict::VersionTooOld;
+        if (static_cast<unsigned>(ver) > static_cast<unsigned>(hello_ver_) + hello_version_window)
+            return HelloVerdict::VersionTooNew;
+        return HelloVerdict::Ok;
     }
 
     // ADR-046 gate's own clock — independent of the caller's thread/context, mirrors the
@@ -1328,6 +1370,10 @@ private:
         return std::chrono::duration_cast<std::chrono::nanoseconds>(pal::now().time_since_epoch())
             .count();
     }
+
+    std::uint16_t hello_ver_ = hello_version;
+    std::function<void(const HelloRefusal&)> hello_refusal_;
+    std::atomic<std::uint64_t> hello_version_refusals_{0};
 
     NodeId self_;
     std::uint64_t bind_addr_;

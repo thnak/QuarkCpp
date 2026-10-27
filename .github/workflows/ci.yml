@@ -362,3 +362,57 @@ jobs:
 
       - name: Build benches + run 023 gate (informational)
         run: cmake --build build --target bench-gate -j 2
+
+  # Issue #17 — named mixed-ABI conformance gate. tests/mixed_abi_cluster_conformance_test.cpp starts two
+  # Quark nodes over real loopback TCP in ONE process, forces differing ABI tags (the simulation of a
+  # Windows<->Linux pair; see MIXED-OS-AND-BULK-TRANSFER.md) and asserts 016's canonical-fallback
+  # negotiation + a same-ABI tagless positive control, SeedListDiscovery join, request/reply both ways and
+  # a clean leave. It is also run by the full `test`/`test-windows` legs (auto-globbed); this job exists so
+  # the claim has its own named, never-skipped status on BOTH OSes.
+  #
+  # FOLLOW-UP (not implemented): a true cross-runner job, a Windows runner and a Linux runner running
+  # one node each and reaching each other over a reachable address (needs a rendezvous: a tunnel or a
+  # self-hosted pair, because GitHub-hosted runners are not mutually routable). Until that exists the
+  # real Windows-vs-Linux `platform_abi_tag` pair is covered only by this simulation.
+  mixed-os-conformance-linux:
+    name: mixed-os-conformance (linux)
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:13686cb105f4d2650dd83c469945f85d2ca603a3b674c7799499098d370bcebe
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Build + run
+        run: |
+          bash ci/install-deps.sh
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BUILD_BENCH=OFF
+          cmake --build build --target mixed_abi_cluster_conformance_test -j 2
+          ctest --test-dir build -R mixed_abi_cluster_conformance --output-on-failure --timeout 300
+
+  mixed-os-conformance-windows:
+    name: mixed-os-conformance (windows)
+    needs: supply-chain
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Read toolchain pins
+        shell: bash
+        run: |
+          set -a
+          source ci/pins.env
+          set +a
+          echo "MSVC_VERSION=$MSVC_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build + run
+        shell: cmd
+        run: |
+          cmake -S . -B build -A x64 -T "version=%MSVC_VERSION%" -DQUARK_BUILD_BENCH=OFF
+          cmake --build build --config Release --target mixed_abi_cluster_conformance_test -j 4
+          ctest --test-dir build -C Release -R mixed_abi_cluster_conformance --output-on-failure --timeout 300

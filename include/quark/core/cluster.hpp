@@ -147,7 +147,16 @@ private:
 // Dead and Left are TOMBSTONES (ADR-048): kept for `tombstone_ttl_ns` so stale gossip cannot resurrect
 // the node, then erased. Dead is adopted only first-hand (this node's own suspicion timer); Left is an
 // authoritative graceful departure (leave()), lifted only by the subject's own Join.
-enum class MemberStatus : std::uint8_t { Alive = 0, Suspect = 1, Dead = 2, Left = 3 };
+// (`enum class MemberStatus` lives in membership.hpp with the event/health types - issue #21.)
+
+// ADR-053 SWIM wire version. v1 = the pre-gate byte layout (NO trailer). v2 = identical bytes plus ONE
+// trailing version byte after `congestion_remaining_ns`; v1 decoders ignore trailing bytes, so v2 -> v1
+// is byte-compatible and an absent trailer decodes as v1. Supported window = [self-1, self+1]: a node
+// accepts its own version and its neighbours (rolling upgrade, either direction) and REFUSES two or more
+// apart. Bump kSwimWireVersion only for a change an N-1 node can still parse (additive trailer fields);
+// anything breaking needs a window-shrinking ADR.
+inline constexpr std::uint8_t kSwimWireVersion = 2;
+inline constexpr std::uint8_t kSwimWireWindow = 1;
 
 enum class ControlKind : std::uint8_t {
     Ping = 1,        // direct probe: are you alive?
@@ -232,6 +241,8 @@ struct ControlMsg {
     // reconstruction, reusing 006's existing vocabulary rather than inventing a new one). Unused
     // (left 0) for every other `ControlKind`.
     std::int64_t congestion_remaining_ns = 0;
+    // ADR-053: sender's SWIM wire version. 1 (default) = legacy layout, no trailer emitted.
+    std::uint8_t wire_version = 1;
 };
 
 namespace detail {
@@ -316,6 +327,7 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         put_u64(b, e.resident_total);
     }
     put_u64(b, static_cast<std::uint64_t>(m.congestion_remaining_ns));
+    if (m.wire_version != 1) put_u8(b, m.wire_version);  // ADR-053 trailer (v1 stays byte-identical)
     return b;
 }
 
@@ -372,6 +384,7 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         out.pressure.push_back(e);
     }
     out.congestion_remaining_ns = static_cast<std::int64_t>(r.u64());
+    out.wire_version = (r.ok && r.p < r.end) ? r.u8() : std::uint8_t{1};  // absent trailer == v1
     return r.ok;
 }
 
@@ -507,6 +520,8 @@ public:
         // P2: gossip-only (unverified) members that never answer directly are erased after this.
         // 0 disables the reaper. Placement already excludes them; this bounds the convergence view.
         std::int64_t unverified_ttl_ns = 30'000'000'000;
+        // ADR-053: the wire version this node speaks (default = current). Tests/rolling upgrades only.
+        std::uint8_t wire_version = kSwimWireVersion;
     };
 
     // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
@@ -527,6 +542,8 @@ public:
         me.cluster = cfg_.cluster_id;
         me.incarnation = self_incarnation_;
         me.verified = true;
+        me.reported = 1;  // self is never announced as Joined; it is born live
+        me.wire_version = cfg_.wire_version;
         members_[self_.value] = me;
         republish();
         transport_->on_receive([this](MessageFrame f) { on_frame(std::move(f)); });
@@ -649,6 +666,7 @@ public:
         if (auto it = members_.find(joiner.value); it != members_.end() && is_tomb(it->second.status))
             inc = it->second.incarnation + 1;
         apply_update(joiner, inc, MemberStatus::Alive, Src::Join, now_ns());  // roster grows, epoch++
+        flush_events();
         return true;
     }
 
@@ -674,9 +692,12 @@ public:
             me.status = MemberStatus::Left;
             self_left_ = true;
             republish();
+            note_transition(self_, me, MemberStatus::Alive);
+            flush_events();
             return;
         }
         apply_update(who, incarnation_of(who) + kLeftBand, MemberStatus::Left, Src::Local, now_ns());
+        flush_events();
     }
 
     // --- The SWIM protocol period (021 §3). One call = one protocol tick. Reads the injected clock; a
@@ -695,6 +716,58 @@ public:
         gossip_round(now);    // disseminate the member digest to a fanout subset
         monitor_congestion(now);  // ADR-046: watermark-crossing ⇒ broadcast Congested
         if (sweep_hook_) sweep_hook_(now);  // ADR-040 Phase 5/6: revocation + rotation sweeps
+        flush_events();  // #21: every transition this tick is delivered before tick() returns
+    }
+
+    // --- #21/ADR-053 events + health -----------------------------------------------------------------
+    // Subscribers run synchronously on the driving thread, in transition order, BEFORE the call that
+    // caused the transition (tick / inbound frame / leave / admit) returns. Change-to-callback latency
+    // is therefore 0 protocol ticks for anything this node observes; end-to-end latency from a REMOTE
+    // crash is the detection time (bounds in ADR-053 / cluster_membership_events_test).
+    void add_event_sink(MembershipEventSink sink) override { sinks_.push_back(std::move(sink)); }
+
+    [[nodiscard]] std::optional<NodeHealth> health(NodeId n) const override {
+        NodeHealth h{};
+        h.node = n;
+        bool found = false;
+        if (const auto it = members_.find(n.value); it != members_.end()) {
+            h.state = it->second.status;
+            h.incarnation = it->second.incarnation;
+            h.protocol_version = it->second.wire_version;
+            h.verified = it->second.verified;
+            found = true;
+        }
+        if (const auto r = refusals_.find(n.value); r != refusals_.end()) {
+            h.last_refusal = r->second.reason;
+            h.refused_version = r->second.version;
+            found = true;
+        }
+        return found ? std::optional<NodeHealth>(h) : std::nullopt;
+    }
+    [[nodiscard]] std::vector<NodeHealth> health_snapshot() const {
+        std::vector<NodeHealth> out;
+        for (const auto& [id, m] : members_)
+            if (auto h = health(NodeId{id})) out.push_back(*h);
+        std::sort(out.begin(), out.end(), [](const NodeHealth& a, const NodeHealth& b) {
+            return a.node.value < b.node.value;
+        });
+        return out;
+    }
+    [[nodiscard]] std::uint8_t wire_version() const noexcept { return cfg_.wire_version; }
+    // Frames refused for an out-of-window wire version (counted per frame; events dedupe per peer).
+    [[nodiscard]] std::uint64_t version_refusals() const noexcept {
+        return version_refusals_.load(std::memory_order_relaxed);
+    }
+
+    // Transport -> membership bridge for a TCP HELLO refusal (tcp_transport.hpp set_hello_refusal_handler).
+    // THREAD-SAFE (the transport calls it from its IO thread): the report is queued and surfaces as a
+    // VersionRefused event on the next tick()/inbound frame of the driving thread (<= 1 tick of latency).
+    void note_transport_refusal(NodeId peer, std::uint16_t peer_version, bool peer_too_old) {
+        std::lock_guard<std::mutex> g(ext_mu_);
+        if (ext_refusals_.size() < 256)  // bounded: a hostile dialer cannot grow this without limit
+            ext_refusals_.push_back({peer, static_cast<std::uint8_t>(std::min<std::uint16_t>(peer_version, 255)),
+                                     peer_too_old ? RefusalReason::WireVersionTooOld
+                                                  : RefusalReason::WireVersionTooNew});
     }
 
     // Observe a specific member's status (tests / 009 observability).
@@ -736,6 +809,8 @@ private:
         // from minting ghost nodes that receive placed actors (F12).
         bool verified = false;
         std::int64_t first_seen_ns = 0;  // P2: start of the unverified TTL
+        std::uint8_t wire_version = 0;   // ADR-053: last wire version heard directly (0 = never)
+        std::uint8_t reported = 0;       // last state shown to subscribers: 0 none, 1 live, 2 Dead, 3 Left
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -785,6 +860,7 @@ private:
         m.cluster = cfg_.cluster_id;
         m.from = self_;
         m.from_incarnation = self_incarnation_;
+        m.wire_version = cfg_.wire_version;
         fill_digest(to, m.updates);
         if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
         if (capability_pull_)
@@ -909,6 +985,7 @@ private:
         ControlMsg m;
         if (!detail::decode_control(f.payload.data(), f.payload.size(), m)) return;  // malformed → drop
         handle_control(m, f.from);
+        flush_events();
     }
 
     // Stateless relay correlation (ADR-048): a relay remembers nothing about a PingReq. It stamps the
@@ -939,6 +1016,42 @@ private:
         // is detected). Every other control from a foreign cluster is dropped (accidental-merge guard).
         if (m.kind != ControlKind::Join && m.cluster != cfg_.cluster_id) return;
         const std::int64_t now = now_ns();
+
+        // ADR-053: a JoinReject carrying a version reason is the seed telling us WE are out of its
+        // window. It is exempt from the version gate (we could not otherwise ever hear why) and is
+        // processed before gossip absorption.
+        if (m.kind == ControlKind::JoinReject) {
+            const auto why = static_cast<RefusalReason>(m.seq);
+            if (why == RefusalReason::WireVersionTooOld || why == RefusalReason::WireVersionTooNew)
+                refuse(m.from, m.wire_version, why, /*by_peer=*/true);
+            return;
+        }
+        // ADR-053 version gate. Out-of-window peers are refused BEFORE any state is touched (no gossip
+        // absorbed, no liveness evidence recorded): to the protocol they behave as a partitioned peer,
+        // but the refusal is counted and reported with a distinct reason instead of looking like a
+        // timeout. A refused Join gets an explicit JoinReject(reason) so the joiner learns why.
+        ctx_from_ = NodeId{};
+        if (m.cluster == cfg_.cluster_id) {
+            const RefusalReason why = wire_verdict(m.wire_version);
+            if (why != RefusalReason::None) {
+                refuse(m.from, m.wire_version, why, /*by_peer=*/false);
+                if (m.kind == ControlKind::Join) {
+                    ControlMsg rej;
+                    rej.kind = ControlKind::JoinReject;
+                    rej.subject = m.subject;
+                    rej.seq = static_cast<std::uint64_t>(why);
+                    send_control(m.from, rej);
+                }
+                return;
+            }
+            if (m.from != self_) {
+                refusals_.erase(m.from.value);  // back in window: a future regression re-reports
+                if (auto it = members_.find(m.from.value); it != members_.end())
+                    it->second.wire_version = m.wire_version;
+                ctx_from_ = m.from;
+                ctx_version_ = m.wire_version;
+            }
+        }
 
         // Absorb piggybacked gossip — but ONLY from a same-cluster frame, so a mismatched Join cannot
         // smuggle its roster in via the digest and defeat the accidental-merge guard below.
@@ -1064,7 +1177,7 @@ private:
                 break;
             }
             case ControlKind::JoinReject:
-                break;  // joiner side: mismatch observed
+                break;  // handled above (ADR-053); a cluster-mismatch reject never reaches here
             case ControlKind::Congested: {
                 // C1 epoch gen-gate (proven): a stale pre-restart signal never advances the throttle —
                 // mirrors apply_update's Alive-branch precedence (strictly-not-older incarnation wins).
@@ -1269,11 +1382,13 @@ private:
                 m.last_probe_ns = now;
                 ++tomb_count_;
             }
-            members_.emplace(node.value, m);
+            if (node == ctx_from_) m.wire_version = ctx_version_;
+            Member& ins = members_.emplace(node.value, m).first->second;
             ids_dirty_ = true;
             // The convergence view includes every live member (verified or not); the separate
             // placement_view() filters unverified ones. Republish for either kind.
             if (!is_tomb(st)) republish();
+            note_transition(node, ins, MemberStatus::Alive);
             enforce_tomb_cap();
             return;
         }
@@ -1320,9 +1435,11 @@ private:
             if (!was_verified && cur.verified) {
                 set_tx(cur, piggyback_count());
                 republish();
+                note_transition(node, cur, cur.status);
             }
             return;
         }
+        const MemberStatus prev_status = cur.status;
         if (cur.incarnation != inc || cur.status != next) set_tx(cur, piggyback_count());
         cur.incarnation = inc;
         cur.status = next;
@@ -1344,6 +1461,7 @@ private:
             set_tx(cur, piggyback_count());
             republish();
         }
+        note_transition(node, cur, prev_status);  // after republish: the event carries the new epoch
         enforce_tomb_cap();  // may erase entries: `cur` is NOT touched after this line
     }
 
@@ -1352,8 +1470,10 @@ private:
     void reap_suspects(std::int64_t now) {
         bool changed = false;
         const std::uint8_t tx = piggyback_count();
+        std::vector<std::uint64_t> died;
         for (auto& [id, m] : members_) {
             if (m.status == MemberStatus::Suspect && now >= m.suspect_deadline_ns) {
+                died.push_back(id);
                 m.status = MemberStatus::Dead;
                 m.death_ns = now;
                 m.last_probe_ns = now;
@@ -1364,6 +1484,10 @@ private:
             }
         }
         if (changed) republish();
+        std::sort(died.begin(), died.end());  // deterministic event order (unordered_map iteration is not)
+        for (std::uint64_t id : died)
+            if (auto it = members_.find(id); it != members_.end())
+                note_transition(NodeId{id}, it->second, MemberStatus::Suspect);
         enforce_tomb_cap();
     }
 
@@ -1478,6 +1602,115 @@ private:
     static std::uint64_t mix(std::uint64_t a, std::uint64_t b, std::uint64_t c) noexcept {
         return detail::splitmix64(detail::splitmix64(a ^ (b + 0x9E3779B97F4A7C15ULL)) ^ c);
     }
+
+    // --- #21/ADR-053 internals ------------------------------------------------------------------------
+    [[nodiscard]] RefusalReason wire_verdict(std::uint8_t peer) const noexcept {
+        const unsigned self = cfg_.wire_version;
+        const unsigned p = peer;
+        if (p + kSwimWireWindow < self) return RefusalReason::WireVersionTooOld;
+        if (p > self + kSwimWireWindow) return RefusalReason::WireVersionTooNew;
+        return RefusalReason::None;
+    }
+
+    void push_event(MembershipEventKind k, NodeId node, const Member& m) {
+        if (sinks_.empty()) return;
+        MembershipEvent e{};
+        e.kind = k;
+        e.node = node;
+        e.incarnation = m.incarnation;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            e.epoch = epoch_;
+        }
+        e.protocol_version = m.wire_version;
+        e.at_ns = now_ns();
+        pending_events_.push_back(e);
+    }
+
+    // Map a state change to subscriber-visible events. `Member::reported` makes this idempotent and
+    // keeps unverified gossip ghosts invisible (they are not in the placement view either).
+    void note_transition(NodeId node, Member& m, MemberStatus prev) {
+        using K = MembershipEventKind;
+        if (is_tomb(m.status)) {
+            if (m.reported != 0 && m.reported != static_cast<std::uint8_t>(m.status)) {
+                m.reported = static_cast<std::uint8_t>(m.status);
+                push_event(m.status == MemberStatus::Left ? K::Left : K::Dead, node, m);
+            }
+            return;
+        }
+        if (!m.verified && node != self_) return;
+        if (m.reported != 1) {
+            m.reported = 1;
+            push_event(K::Joined, node, m);
+        } else if (m.status == MemberStatus::Suspect && prev != MemberStatus::Suspect) {
+            push_event(K::Suspect, node, m);
+        } else if (m.status == MemberStatus::Alive && prev == MemberStatus::Suspect) {
+            push_event(K::Recovered, node, m);
+        }
+    }
+
+    void refuse(NodeId node, std::uint8_t ver, RefusalReason why, bool by_peer) {
+        version_refusals_.fetch_add(1, std::memory_order_relaxed);
+        const auto it = refusals_.find(node.value);
+        const bool fresh = it == refusals_.end() || it->second.reason != why || it->second.version != ver;
+        if (!fresh) return;
+        if (it != refusals_.end() || refusals_.size() < cfg_.max_live_members)
+            refusals_[node.value] = Refusal{why, ver};
+        if (sinks_.empty()) return;
+        MembershipEvent e{};
+        e.kind = MembershipEventKind::VersionRefused;
+        e.node = node;
+        e.protocol_version = ver;
+        e.refusal = why;
+        e.refused_by_peer = by_peer;
+        e.at_ns = now_ns();
+        if (const auto m = members_.find(node.value); m != members_.end()) e.incarnation = m->second.incarnation;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            e.epoch = epoch_;
+        }
+        pending_events_.push_back(e);
+    }
+
+    void flush_events() {
+        if (flushing_) return;  // a callback re-entered us: the outer loop drains what it queued
+        std::vector<ExtRefusal> ext;
+        {
+            std::lock_guard<std::mutex> g(ext_mu_);
+            ext.swap(ext_refusals_);
+        }
+        for (const ExtRefusal& r : ext) refuse(r.node, r.version, r.reason, /*by_peer=*/false);
+        if (pending_events_.empty()) return;
+        flushing_ = true;
+        struct Reset {
+            bool& f;
+            ~Reset() { f = false; }
+        } reset{flushing_};
+        for (std::size_t i = 0; i < pending_events_.size(); ++i) {
+            const MembershipEvent e = pending_events_[i];
+            for (std::size_t j = 0; j < sinks_.size(); ++j) sinks_[j](e);
+        }
+        pending_events_.clear();
+    }
+
+    struct Refusal {
+        RefusalReason reason = RefusalReason::None;
+        std::uint8_t version = 0;
+    };
+    struct ExtRefusal {
+        NodeId node{};
+        std::uint8_t version = 0;
+        RefusalReason reason = RefusalReason::None;
+    };
+    std::vector<MembershipEventSink> sinks_;
+    std::vector<MembershipEvent> pending_events_;
+    bool flushing_ = false;
+    std::unordered_map<std::uint64_t, Refusal> refusals_;  // protocol-thread owned, bounded
+    NodeId ctx_from_{};                                    // sender of the frame being handled
+    std::uint8_t ctx_version_ = 0;
+    std::mutex ext_mu_;
+    std::vector<ExtRefusal> ext_refusals_;
+    std::atomic<std::uint64_t> version_refusals_{0};
 
     // Publish an immutable snapshot of the current live (non-tombstone) node set and bump the epoch.
     void republish() {
