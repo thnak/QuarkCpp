@@ -6,7 +6,9 @@
 // file_size/durable_flush/file_close/file_rename/durable_rename/durable_sync_dir/make_dir) — identical on both backends.
 #pragma once
 
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+#include "pal/windows_arm64/file_io.hpp"  // ADR-059
+#elif defined(_WIN32)
 #include "pal/windows_x86_64/file_io.hpp"
 #else
 #include "pal/linux_x86_64/file_io.hpp"

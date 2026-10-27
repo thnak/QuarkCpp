@@ -18,12 +18,16 @@
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>  // _mm_pause (pal::cpu_relax) — MSVC has no __builtin_ia32_pause
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+#include <intrin.h>  // __yield (pal::cpu_relax) — MSVC/ARM64 has no GNU `asm volatile` (ADR-059)
 #endif
 
 // BootClock/WallClock — the canonical suspend-counting monotonic clock + civil wall clock, one
 // concrete backend per OS (019 §"Per-OS backends"). Compile-time selection, not a vtable (019
 // §"Compile-time backend selection, not a vtable").
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+#include "pal/windows_arm64/clock.hpp"  // ADR-059: thin arch-selector over the arch-generic Windows code
+#elif defined(_WIN32)
 #include "pal/windows_x86_64/clock.hpp"
 #else
 #include "pal/linux_x86_64/clock.hpp"  // also the POSIX/Linux fallback used elsewhere in this header
@@ -43,7 +47,11 @@ namespace quark::pal {
 // tag has not been proven to gate on struct-layout/ABI equivalence across the two toolchains (MSVC
 // vs GCC/Clang), so the conservative default is "no tagless fast path between them yet" until that
 // is checked and the two are deliberately unified.
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+// Windows/ARM64: its own tag (ADR-059) — not x86, and never assumed struct/ABI-equivalent to the
+// x86-64 tags, so peers fall back to the tagged/TLV path (016) until that is proven.
+inline constexpr std::uint32_t platform_abi_tag = 0x41'36'34'57;  // 'A','64','W' (Windows/ARM64)
+#elif defined(_WIN32)
 inline constexpr std::uint32_t platform_abi_tag = 0x78'86'64'57;  // 'x','86','64','W' (Windows)
 #else
 inline constexpr std::uint32_t platform_abi_tag = 0x78'86'64'4C;  // 'x','86','64','L' (Linux)
@@ -76,6 +84,8 @@ QUARK_ALWAYS_INLINE void cpu_relax() noexcept {
     _mm_pause();  // MSVC has no __builtin_ia32_pause; this is its PAUSE-instruction intrinsic
 #elif defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
+#elif defined(_MSC_VER) && !defined(__clang__) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+    __yield();  // MSVC ARM64 intrinsic for the AArch64 YIELD hint (no GNU inline asm on MSVC)
 #elif defined(__aarch64__) || defined(_M_ARM64)
     asm volatile("yield" ::: "memory");
 #else

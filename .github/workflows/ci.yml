@@ -315,6 +315,64 @@ jobs:
           path: build/Testing/**/*.log
           if-no-files-found: ignore
 
+  # ADR-059 (#13): Windows/ARM64 correctness leg on a GitHub-hosted native ARM64 runner. NOT YET RUN —
+  # added from a machine with no ARM64 hardware (the PAL was only cross-compiled there), so it is
+  # informational (continue-on-error) like the Linux arm64 perf leg until a green run is observed and
+  # promoted. Not pinned to ci/pins.env's MSVC_VERSION (that pin is the x64 toolset on windows-2022);
+  # uses the runner image's default Visual Studio ARM64 toolset. Mirrors test-windows msvc-release.
+  test-windows-arm64:
+    name: test-windows-arm64 (msvc-release, informational, unrun)
+    needs: supply-chain
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -A ARM64 -DQUARK_BUILD_BENCH=OFF
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config Release -j 4
+
+      - name: Test
+        shell: cmd
+        run: ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 1800
+
+      - name: Upload ctest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ctest-msvc-release-windows-arm64
+          path: build/Testing/**/*.log
+          if-no-files-found: ignore
+
+  # ADR-059 (#13): the opt-in IOCP reactor (-DQUARK_WIN_IOCP=ON) on Windows/x86-64 — the network-facing
+  # tests only (the rest of the suite does not touch pal::IoContext). Informational until promoted to
+  # the default IoContext. Verified locally (VS 2026/MSVC, 39 tests green); the CI leg itself is unrun.
+  test-windows-iocp:
+    name: test-windows-iocp (informational, unrun)
+    needs: supply-chain
+    runs-on: windows-2022
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -A x64 -DQUARK_BUILD_BENCH=OFF -DQUARK_WIN_IOCP=ON
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config Release -j 4
+
+      - name: Test (network-facing subset)
+        shell: cmd
+        run: ctest --test-dir build -C Release -j 2 --output-on-failure --timeout 900 -R "tcp_|secure_transport|iocp|mixed_abi|distribution|rotation_sweep"
+
   perf-gate:
     name: perf-gate (023 budgets, x86-64)
     needs: supply-chain

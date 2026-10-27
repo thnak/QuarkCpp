@@ -299,24 +299,24 @@ struct WakePair { fd_t read_end; fd_t write_end; };
 // shape and threading contract as pal/linux_x86_64/net.hpp's IoContext (see that file's banner):
 // add_fd/mod_fd/del_fd/post_after are loop-thread-only; post()/stop() are thread-safe.
 // ================================================================================================
-class IoContext {
+class WsaPollContext {
 public:
     using ReadyHandler = std::function<void(std::uint32_t /*EPOLLIN|EPOLLOUT|EPOLLERR|EPOLLHUP*/)>;
 
-    IoContext() {
+    WsaPollContext() {
         ensure_winsock();
         const WakePair wp = make_wake_pair();
         wake_read_ = wp.read_end;
         wake_write_ = wp.write_end;
     }
 
-    ~IoContext() {
+    ~WsaPollContext() {
         close_fd(wake_read_);
         close_fd(wake_write_);
     }
 
-    IoContext(const IoContext&) = delete;
-    IoContext& operator=(const IoContext&) = delete;
+    WsaPollContext(const WsaPollContext&) = delete;
+    WsaPollContext& operator=(const WsaPollContext&) = delete;
 
     // --- loop-thread-only: fd interest registry -------------------------------------------------
     // Unlike epoll_ctl, WSAPoll takes an explicit array every call — there is no persistent kernel-
@@ -463,4 +463,18 @@ private:
     std::multimap<std::int64_t, std::function<void()>> timers_;  // fire_ns → callback (loop-thread only)
 };
 
+}  // namespace quark::pal
+
+// ADR-059: the IOCP-based reactor (readiness via AFD poll over an I/O completion port). Opt-in at
+// build time with -DQUARK_WIN_IOCP=ON (CMake option); the default IoContext remains WSAPoll until the
+// IOCP backend is promoted (see ADR-059 for what is and is not yet proven). IocpContext is always
+// compiled so it can be unit-tested directly on any Windows build.
+#include "pal/windows_x86_64/iocp_context.hpp"
+
+namespace quark::pal {
+#if defined(QUARK_WIN_IOCP)
+using IoContext = IocpContext;
+#else
+using IoContext = WsaPollContext;
+#endif
 }  // namespace quark::pal

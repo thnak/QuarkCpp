@@ -96,6 +96,16 @@ struct FanOutReceipt {
     std::uint32_t departed = 0;
 };
 
+// In-band gap notice (ADR-056). Ids `first..last` (inclusive, per-publisher sequence) were published
+// while this subscriber was attached but dropped at its full lane (`EvictAfter`); `count == last-first+1`.
+// The subscriber must resync (e.g. fresh state snapshot). count == 0 means "no gap".
+struct FanOutGap {
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    std::uint64_t count = 0;
+    explicit operator bool() const noexcept { return count != 0; }
+};
+
 // A lane slot: a reference to the shared payload + its (per-publisher) sequence id. 16 B, trivially
 // copyable — required by `StreamChannel<F>`'s inline-slot regime.
 template <class M>
@@ -144,14 +154,44 @@ public:
         // subscriber" (ADR-039 C3) means. A no-op (one relaxed-ish fence + a false exchange) on the
         // EvictAfter instantiation, since that policy never arms `stalled_`.
         [[nodiscard]] bool try_pop(M& out) {
+            FanOutGap ignored;
+            return try_pop(out, ignored);  // keeps gap accounting coherent for mixed use
+        }
+
+        // try_pop plus the ADR-056 in-band gap notice. `gap` is overwritten every call: if non-empty, the
+        // ids gap.first..gap.last were dropped IMMEDIATELY BEFORE the returned message (exact position in
+        // the per-subscriber FIFO). Derived purely from the consumer-side id discontinuity: the producer
+        // path pays nothing and the 16 B envelope is unchanged. The first message after attach sets the
+        // baseline (pre-attach history is not a gap).
+        [[nodiscard]] bool try_pop(M& out, FanOutGap& gap) {
+            gap = {};
             if (channel_.occupancy() == 0) return false;
             const std::uint64_t idx = channel_.advance_dispatch();
             const FanOutEnvelope<M> e = channel_.slot_at(idx);
+            if (have_base_ && e.id.value != next_expected_) {
+                gap = FanOutGap{next_expected_, e.id.value - 1, e.id.value - next_expected_};
+                gap_reported_ += gap.count;
+            }
+            have_base_ = true;
+            next_expected_ = e.id.value + 1;
             out = e.payload->value();
             e.payload->release();
             channel_.advance_tail();
             channel_.poll_unstall();
             return true;
+        }
+
+        // Trailing gap: drops after the last popped message with nothing queued behind them, so no later
+        // message can carry the notice in-band. Only reports when the lane is observed empty; marks the
+        // range reported (a second call returns an empty gap). Consumer-thread only.
+        [[nodiscard]] FanOutGap take_trailing_gap() noexcept {
+            if (!have_base_ || channel_.occupancy() != 0) return {};
+            const std::uint64_t pending = evicted_.load(std::memory_order_relaxed) - gap_reported_;
+            if (pending == 0) return {};
+            FanOutGap g{next_expected_, next_expected_ + pending - 1, pending};
+            gap_reported_ += pending;
+            next_expected_ += pending;
+            return g;
         }
 
         // Exactly-once, non-silent FanOut-boundary drop count (EvictAfter only; always 0 under Block).
@@ -166,6 +206,10 @@ public:
         Channel channel_;
         std::atomic<bool> active_{true};      // false once unsubscribed; also Block's keep_going flag
         std::atomic<std::uint64_t> evicted_{0};
+        // Consumer-thread-only (ADR-056 gap derivation); never touched by the producer.
+        bool have_base_ = false;
+        std::uint64_t next_expected_ = 0;
+        std::uint64_t gap_reported_ = 0;
     };
 
     explicit FanOut(std::size_t lane_capacity = kDefaultLaneCapacity, std::size_t payload_pool_warm = 1024,

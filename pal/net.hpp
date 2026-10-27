@@ -6,7 +6,9 @@
 // shape on both backends.
 #pragma once
 
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(_M_ARM64EC))
+#include "pal/windows_arm64/net.hpp"  // ADR-059
+#elif defined(_WIN32)
 #include "pal/windows_x86_64/net.hpp"
 #else
 #include "pal/linux_x86_64/net.hpp"

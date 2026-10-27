@@ -274,6 +274,13 @@ ticks.unsubscribe(clockRef.id());                // no delivery after this retur
     counter (`LaneEntry::evicted()`) — the subscriber stays attached
     (bounded-lag, not ejection). This is **not** an end-to-end delivery
     guarantee into the subscriber's own mailbox; see 017.
+    **Gap notice (ADR-056):** `lane->try_pop(out, gap)` reports, immediately
+    before the first message that follows a drop, a `FanOutGap{first,last,count}`
+    (inclusive per-publisher id range dropped while attached); drops with
+    nothing queued behind them are reported by `lane->take_trailing_gap()`.
+    Delivered ids plus gap ranges partition the published ids exactly. A gap
+    means "resync (e.g. fresh snapshot)", not "retry". The notice is derived
+    consumer-side from id discontinuity: zero producer cost, 16 B envelope.
   - `Block`: the whole `publish()` call stalls on the slowest **live**
     subscriber's lane until it drains or departs — fully reliable/gap-free,
     at the cost of an unbounded-by-time producer stall. A subscriber that

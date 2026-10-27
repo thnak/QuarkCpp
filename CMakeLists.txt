@@ -17,9 +17,10 @@ endif()
 # on real AArch64 hardware and windows-latest, .github/workflows/ci.yml) but not yet spec-Accepted —
 # the formal weak-memory-model re-gate of the TODO(arm64) seams, a 023 arm64 re-baseline, and a real
 # IOCP proactor backend (Windows currently runs WSAPoll — see pal/windows_x86_64/net.hpp) are still
-# open. Anything else (macOS, other arches) has no PAL backend yet.
+# open. Windows/ARM64 (ADR-059) is accepted here and cross-compiles, but is unproven on real ARM64
+# hardware until the windows-11-arm CI leg has run. Anything else (macOS, other arches) has no PAL backend yet.
 if(NOT ((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|aarch64|arm64")
-    OR (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")))
+    OR (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|ARM64|arm64")))
   message(WARNING "Quark is verified on Linux/x86-64 and CI-verified on Linux/arm64 and "
                   "Windows/x86-64; this is ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}. Other "
                   "platforms need their PAL backend (spec 019).")
@@ -34,6 +35,13 @@ include(QuarkWarnings)
 # indirectly before a pal header does.
 if(WIN32)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# ADR-059: make the Windows IoContext the IOCP reactor (AFD-poll readiness over a completion port)
+# instead of WSAPoll. OFF by default until promoted; pal::IocpContext is always compiled/tested.
+option(QUARK_WIN_IOCP "Windows: use the IOCP reactor for pal::IoContext (ADR-059)" OFF)
+if(WIN32 AND QUARK_WIN_IOCP)
+  add_compile_definitions(QUARK_WIN_IOCP=1)
 endif()
 
 # ---- Core library ----------------------------------------------------------
