@@ -240,6 +240,34 @@ enum class SealState : std::uint8_t {
 
 class Activation;
 
+// ADR-054: per-drain-call accumulator for the per-type message-bytes counter. The drain loop adds into
+// a register-resident local and the destructor publishes ONCE per drain_step call (every return path),
+// replacing a per-message load+store dependency chain on the shared cell with one flush per batch.
+// Drain-owner-exclusive: the flush is MetricCounter::inc() (relaxed load+store, no RMW). Empty under
+// -DQUARK_NO_TYPE_ACCOUNTING.
+namespace detail {
+#ifndef QUARK_NO_TYPE_ACCOUNTING
+struct TypeBytesAcc {
+    TypeCell* cell;
+    std::uint64_t n = 0;
+    explicit TypeBytesAcc(TypeCell* c) noexcept : cell(c) {}
+    TypeBytesAcc(const TypeBytesAcc&) = delete;
+    TypeBytesAcc& operator=(const TypeBytesAcc&) = delete;
+    QUARK_ALWAYS_INLINE void add(std::uint64_t payload_size) noexcept {
+        n += payload_size + sizeof(Descriptor);
+    }
+    ~TypeBytesAcc() {
+        if (cell != nullptr && n != 0) cell->bytes.inc(n);
+    }
+};
+#else
+struct TypeBytesAcc {
+    explicit TypeBytesAcc(TypeCell*) noexcept {}
+    QUARK_ALWAYS_INLINE void add(std::uint64_t) noexcept {}
+};
+#endif
+}  // namespace detail
+
 // The quiescence guard (015 step 4/5). While held, the caller has exclusive access to actor state
 // with NO handler running. Destruction (step 5) clears the seal so the lane resumes admitting queued
 // messages in FIFO order. Move-only; state-access only (no ActorRef-to-self — the guard-reentry
@@ -322,6 +350,12 @@ public:
     // counter block this activation's shard owns. Null ⇒ unwired (standalone/test Activation usage
     // outside an Engine), every increment site below is guarded — zero behavior change when unset.
     void set_metrics(ShardCounters* sc) noexcept { metrics_ = sc; }
+
+    // ADR-054 / 009 §Cardinality: the per-actor-type cell (this shard's slot for A's type), resolved
+    // COLD by the engine at spawn/lazy-construct. Null (default, or QUARK_NO_TYPE_ACCOUNTING) => the
+    // activation does no per-type accounting. `Engine::run_activation` reads it for the busy-time pair.
+    void set_type_cell(TypeCell* c) noexcept { type_cell_ = c; }
+    [[nodiscard]] TypeCell* type_cell() const noexcept { return type_cell_; }
 
     // ADR-028 Phase 2 wiring (cold, set at registration by Engine::spawn<A>()/register_activation):
     // the actor's declared `IdleTimeout<Ms>` converted to a wheel-tick count. 0 = KeepAlive/no timeout
@@ -505,6 +539,15 @@ public:
     // ---- Worker ownership seam (002) -----------------------------------------------------
     [[nodiscard]] QUARK_ALWAYS_INLINE bool try_acquire() noexcept { return exec_.try_acquire(); }
 
+    // ADR-054: attribute this message's logical bytes (descriptor + inline payload) to the receiving
+    // actor type. Drain-owner-exclusive => MetricCounter::inc() (relaxed load+store, NOT an RMW).
+    QUARK_ALWAYS_INLINE void account_type_bytes([[maybe_unused]] const Descriptor* d) noexcept {
+#ifndef QUARK_NO_TYPE_ACCOUNTING
+        if (type_cell_ != nullptr)
+            type_cell_->bytes.inc(static_cast<std::uint64_t>(d->payload_size) + sizeof(Descriptor));
+#endif
+    }
+
     // ---- The drain (single-executor; call ONLY while holding Running) ---------------------
     DrainOutcome drain_step(std::uint32_t budget) noexcept {
         if (rc_) return drain_step_reentrant(budget);  // 015 reentrant path (one predictable branch)
@@ -515,6 +558,7 @@ public:
         // the `Empty` exit (drain_step_governed_seq/drain_step_reentrant are unaffected — see their
         // own scoping notes). Zero 015 machinery is touched.
         // ====================================================================================
+        detail::TypeBytesAcc tbytes(type_cell_);  // ADR-054
         std::uint32_t remaining = budget;
         std::uint32_t dispatched_this_call = 0;
         for (;;) {
@@ -575,6 +619,7 @@ public:
             current_ctx_.deadline_ns = d->deadline_ns;
             current_ctx_.trace_id = d->trace_id;
             current_ctx_.principal = resolve_principal(d, claim_flags);  // ADR-044 C1r/S2r
+            tbytes.add(d->payload_size);  // ADR-054: per-type message bytes (flushed once per call)
 
             // ==== ADR-009 D1 handler-boundary guard (zero-cost on the no-throw path) ============
             // The ONE try/catch that contains a throwing handler. Itanium ABI: the success path pays
@@ -1147,6 +1192,7 @@ private:
         const std::uint32_t bound = g.bound();
         const bool drop_oldest = bound != 0 && g.overflow() == Overflow::DropOldest;
         const bool shed_doomed = g.cfg.deadline_shed;
+        detail::TypeBytesAcc tbytes(type_cell_);  // ADR-054
         std::uint32_t remaining = budget;
         for (;;) {
             if (remaining == 0) return DrainOutcome::BudgetExhausted;
@@ -1202,6 +1248,7 @@ private:
             current_ctx_.deadline_ns = d->deadline_ns;
             current_ctx_.trace_id = d->trace_id;
             current_ctx_.principal = resolve_principal(d, claim_flags);  // ADR-044 C1r/S2r
+            tbytes.add(d->payload_size);  // ADR-054: per-type message bytes (flushed once per call)
 
             DispatchOutcome o;
 #ifndef QUARK_SUPERVISION_NO_GUARD
@@ -1329,6 +1376,7 @@ private:
         // principal from a sibling frame even without an explicit reset (stronger than the reused-
         // current_ctx_ sites, which need the unconditional resolve_principal() overwrite instead).
         f->ctx.principal = resolve_principal(d, claim_flags);
+        account_type_bytes(d);  // ADR-054
         f->stop = std::stop_source{};
         f->ctx.stop = f->stop.get_token();
         rc_->live.push_back(std::move(frame));
@@ -1870,6 +1918,7 @@ private:
     WireFn wire_ = nullptr;
     const ResourceScope* wire_scope_ = nullptr;
     ShardCounters* metrics_ = nullptr;  // 009: this activation's shard block, wired by set_metrics()
+    TypeCell* type_cell_ = nullptr;     // ADR-054: per-type busy-ns/bytes cell (null = no accounting)
     // ADR-028 Phase 8: both default-null (no-op, zero cost) — see close_out_retire().
     DeactivateHookSink deactivate_hook_{};
     DeactivateFlushSink deactivate_flush_{};

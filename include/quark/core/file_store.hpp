@@ -33,8 +33,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -230,6 +234,110 @@ public:
         return {};
     }
 
+    // ADR-055 backup seam (see `BackupableStore`). Holds `mu_` for the whole copy (lazily replaying
+    // every WAL in the directory), so the image is one global committed cut; writers wait.
+    [[nodiscard]] result<void> snapshot_to(BackupImage& out) {
+        std::lock_guard<std::mutex> g(mu_);
+        out = BackupImage{};
+        std::error_code ec;
+        std::vector<ActorId> ids;
+        for (const auto& de : std::filesystem::directory_iterator(root_, ec)) {
+            if (const auto id = parse_name(de.path().filename().string())) ids.push_back(*id);
+        }
+        if (ec) return fail(errc::internal, "FileStore: backup: cannot enumerate the store directory");
+        std::sort(ids.begin(), ids.end(), [](const ActorId& a, const ActorId& b) {
+            return a.type.value != b.type.value ? a.type.value < b.type.value : a.key < b.key;
+        });
+        for (const ActorId& id : ids) {
+            Entry& e = entry(id);
+            if (e.corrupt) return corrupt_error();
+            out.epoch.value = std::max(out.epoch.value, e.owner.value);
+            out.actors.push_back(ActorBackup{id, e.owner, e.last_seq, e.snapshot, e.log});
+        }
+        return {};
+    }
+
+    // Load `img` into a FRESH store (no loaded actors, no non-empty .qwal in the directory) and install
+    // the fencing epoch durably (a FENCE record per actor, so it survives a reopen). Each actor's WAL is
+    // written as ONE flushed buffer {fence, events, snapshot}; on failure the files written by this
+    // call are removed. Not crash-atomic across actors: after a crash mid-restore discard the directory
+    // and restore again (restore targets a fresh store, so nothing is lost).
+    [[nodiscard]] result<FencingEpoch> restore_from(const BackupImage& img,
+                                                    FencingEpoch min_epoch = {}) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!table_.empty()) return fail(errc::validation, "restore_from: target store is not empty");
+        if (auto v = validate_backup(img); !v) return std::unexpected(v.error());
+        std::error_code ec;
+        for (const auto& de : std::filesystem::directory_iterator(root_, ec)) {
+            std::error_code sec;
+            if (parse_name(de.path().filename().string()) && de.file_size(sec) > 0)
+                return fail(errc::validation, "restore_from: target directory already holds actor logs");
+        }
+        const FencingEpoch ep = restore_epoch(img, min_epoch);
+        std::vector<std::string> written;
+        std::unordered_map<ActorId, std::unique_ptr<Entry>> staged;
+        auto undo = [&] {
+            staged.clear();  // close handles before unlinking (Windows)
+            for (const auto& p : written) (void)std::remove(p.c_str());
+        };
+        for (const ActorBackup& a : img.actors) {
+            std::vector<std::byte> out;
+            auto frame = [&out](const std::vector<std::byte>& body) {
+                put_u32(out, static_cast<std::uint32_t>(body.size()));
+                put_u32(out, crc32(std::span<const std::byte>(body)));
+                out.insert(out.end(), body.begin(), body.end());
+            };
+            {
+                std::vector<std::byte> b;
+                put_u8(b, kFence);
+                put_u64(b, ep.value);
+                frame(b);
+            }
+            if (!a.log.empty()) {  // events BEFORE the snapshot: replay keeps seqs monotonic
+                std::vector<std::byte> b;
+                put_u8(b, kBatch);
+                put_u32(b, static_cast<std::uint32_t>(a.log.size()));
+                for (const EventRecord& r : a.log) {
+                    put_u64(b, r.seq);
+                    put_blob(b, r.record);
+                }
+                frame(b);
+            }
+            if (a.snapshot) {
+                std::vector<std::byte> b;
+                put_u8(b, kSnapshot);
+                put_u64(b, a.snapshot->fence.value);
+                put_u64(b, a.snapshot->through_seq);
+                put_blob(b, a.snapshot->record);
+                frame(b);
+            }
+            const std::string path = path_for(a.id);
+            auto e = std::make_unique<Entry>();
+            e->fd = pal::file_open(path, pal::FileOpenMode::kReadWriteCreate);
+            if (e->fd == pal::invalid_file) {
+                undo();
+                return fail(errc::internal, "FileStore: restore: cannot create actor log");
+            }
+            written.push_back(path);
+            if (pal::file_pwrite(e->fd, out.data(), out.size(), 0) !=
+                    static_cast<std::int64_t>(out.size()) ||
+                !pal::durable_flush(e->fd)) {
+                staged.emplace(a.id, std::move(e));
+                undo();
+                return fail(errc::internal, "FileStore: restore: durable write failed");
+            }
+            e->write_off = out.size();
+            e->owner = ep;
+            e->last_seq = a.last_seq;
+            e->snapshot = a.snapshot;
+            e->log = a.log;
+            staged.emplace(a.id, std::move(e));
+        }
+        (void)pal::durable_sync_dir(root_);
+        for (auto& [id, e] : staged) table_.emplace(id, std::move(e));
+        return ep;
+    }
+
     // --- Test/diagnostic introspection (not part of the Store seam) ---------------------------
     [[nodiscard]] FenceToken current_owner(ActorId id) {
         std::lock_guard<std::mutex> g(mu_);
@@ -385,6 +493,18 @@ private:
         return {};
     }
 
+    // Inverse of path_for: "<16 hex>-<16 hex>.qwal" -> ActorId (ignores `.compact` temps / strays).
+    [[nodiscard]] static std::optional<ActorId> parse_name(const std::string& n) {
+        if (n.size() != 38 || n[16] != '-' || n.compare(33, 5, ".qwal") != 0) return std::nullopt;
+        for (std::size_t i = 0; i < 33; ++i) {
+            if (i == 16) continue;
+            if (!std::isxdigit(static_cast<unsigned char>(n[i]))) return std::nullopt;
+        }
+        const auto t = std::strtoull(n.substr(0, 16).c_str(), nullptr, 16);
+        const auto k = std::strtoull(n.substr(17, 16).c_str(), nullptr, 16);
+        return ActorId{TypeKey{t}, k};
+    }
+
     [[nodiscard]] std::string path_for(ActorId id) const {
         char name[64];
         std::snprintf(name, sizeof(name), "/%016llx-%016llx.qwal",
@@ -477,5 +597,6 @@ private:
 
 static_assert(Store<FileStore>, "FileStore must model the 012 Store seam");
 static_assert(CompactableStore<FileStore>, "FileStore supports ADR-052 truncate_log");
+static_assert(BackupableStore<FileStore>, "FileStore supports ADR-055 backup/restore");
 
 }  // namespace quark

@@ -22,6 +22,8 @@
 // (`quark/adapters/…`, built when `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`). See PersistenceAdapters.md.
 #pragma once
 
+#include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -29,6 +31,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -159,6 +162,79 @@ template <class S>
 concept CompactableStore = Store<S> && requires(S& s, ActorId id, FenceToken tok, SeqNo seq) {
     { s.truncate_log(id, tok, seq) } -> std::same_as<result<void>>;
 };
+
+// ============================================================================================
+// ADR-055 (#23) — online backup / restore with a FENCING EPOCH. OPTIONAL refinement of `Store` (not
+// in the base concept: third-party adapters keep compiling), in the CompactableStore style.
+//
+// `BackupImage` is the store-neutral in-memory image: per actor {owner token, last_seq, latest
+// snapshot, tail log}. Byte (de)serialization + file helpers live in `backup.hpp`.
+//
+// CONSISTENCY MODEL. `snapshot_to(img)` copies EVERY actor's state under the store's own lock, so
+// the image is ONE global cut: for each actor it is exactly a committed prefix (snapshot + events
+// up to last_seq), and because the lock is held for the whole copy it is also consistent ACROSS
+// actors (no commit is half-visible). Writers are blocked only for the duration of the copy; they
+// are not stopped or fenced. A store that cannot hold one lock across the copy (a DB adapter with
+// per-key transactions) may only promise the weaker per-actor cut and must say so.
+//
+// FENCING EPOCH. `restore_from(img, min_epoch)` into a FRESH store sets every restored actor's
+// owner token to `restore_epoch(img, min_epoch)` = 1 + max(every token/fence in the image,
+// img.epoch, min_epoch). Any writer holding a token <= that value (every pre-restore owner whose
+// token the image or the operator's `min_epoch` covers) is rejected by the normal fence check;
+// the next `acquire_fence` returns epoch+1. `min_epoch` exists because an old owner may have
+// acquired a token AFTER the cut: the operator passes the highest token the old cluster is known
+// to have issued (or any safe upper bound). Same shape a leader-lease epoch (#22) needs.
+// ============================================================================================
+using FencingEpoch = FenceToken;  // a store-wide token floor; same total order as per-actor tokens
+
+struct ActorBackup {
+    ActorId id{};
+    FenceToken owner{};  // highest issued token for this actor at the cut
+    SeqNo last_seq = 0;
+    std::optional<SnapshotRecord> snapshot;
+    std::vector<EventRecord> log;
+};
+
+struct BackupImage {
+    FencingEpoch epoch{};  // max token over all actors at the cut
+    std::vector<ActorBackup> actors;
+};
+
+// The epoch a restore installs: strictly greater than every token in the image and `min_epoch`.
+[[nodiscard]] inline FencingEpoch restore_epoch(const BackupImage& img,
+                                                FencingEpoch min_epoch = {}) noexcept {
+    std::uint64_t m = std::max(img.epoch.value, min_epoch.value);
+    for (const ActorBackup& a : img.actors) {
+        m = std::max(m, a.owner.value);
+        if (a.snapshot) m = std::max(m, a.snapshot->fence.value);
+    }
+    return FencingEpoch{m + 1};
+}
+
+// Structural validation shared by every adapter (a decoded image is untrusted): unique ids, strictly
+// increasing log seqs, last_seq >= tail and snapshot through_seq. Fails before any store mutation.
+[[nodiscard]] inline result<void> validate_backup(const BackupImage& img) {
+    std::unordered_set<ActorId> seen;
+    for (const ActorBackup& a : img.actors) {
+        if (!seen.insert(a.id).second) return fail(errc::validation, "backup: duplicate actor id");
+        SeqNo prev = 0;
+        for (const EventRecord& e : a.log) {
+            if (e.seq <= prev) return fail(errc::validation, "backup: log seq not strictly increasing");
+            prev = e.seq;
+        }
+        if (prev > a.last_seq) return fail(errc::validation, "backup: log ahead of last_seq");
+        if (a.snapshot && a.snapshot->through_seq > a.last_seq)
+            return fail(errc::validation, "backup: snapshot ahead of last_seq");
+    }
+    return {};
+}
+
+template <class S>
+concept BackupableStore = Store<S> &&
+    requires(S& s, BackupImage& out, const BackupImage& in, FencingEpoch e) {
+        { s.snapshot_to(out) } -> std::same_as<result<void>>;
+        { s.restore_from(in, e) } -> std::same_as<result<FencingEpoch>>;
+    };
 
 // 012 §Compaction (ADR-024 documented fixed-count fallback, implemented per ADR-052): snapshot +
 // truncate after `N` committed events past the last snapshot. A policy TAG consumed by
@@ -293,6 +369,34 @@ public:
         return {};
     }
 
+    // ADR-055 backup seam (see `BackupableStore`): one global cut under `mu_`.
+    [[nodiscard]] result<void> snapshot_to(BackupImage& out) const {
+        std::lock_guard<std::mutex> g(mu_);
+        out = BackupImage{};
+        for (const auto& [id, e] : table_) {
+            out.epoch.value = std::max(out.epoch.value, e.owner.value);
+            out.actors.push_back(ActorBackup{id, e.owner, e.last_seq, e.snapshot, e.log});
+        }
+        return {};
+    }
+
+    // Load `img` into a FRESH store (refuses a non-empty one) and install the fencing epoch.
+    [[nodiscard]] result<FencingEpoch> restore_from(const BackupImage& img,
+                                                    FencingEpoch min_epoch = {}) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!table_.empty()) return fail(errc::validation, "restore_from: target store is not empty");
+        if (auto v = validate_backup(img); !v) return std::unexpected(v.error());
+        const FencingEpoch ep = restore_epoch(img, min_epoch);
+        for (const ActorBackup& a : img.actors) {
+            Entry& e = table_[a.id];
+            e.owner = ep;
+            e.last_seq = a.last_seq;
+            e.snapshot = a.snapshot;
+            e.log = a.log;
+        }
+        return ep;
+    }
+
     // --- Test/diagnostic introspection (not part of the Store seam) ---------------------------
     [[nodiscard]] std::size_t log_size(ActorId id) const noexcept {
         std::lock_guard<std::mutex> g(mu_);
@@ -317,5 +421,6 @@ private:
 };
 
 static_assert(Store<InMemoryStore>, "InMemoryStore must model the 012 Store seam");
+static_assert(BackupableStore<InMemoryStore>, "InMemoryStore supports ADR-055 backup/restore");
 
 }  // namespace quark

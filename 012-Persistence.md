@@ -197,6 +197,15 @@ acquires a monotonically increasing **fencing token** persisted with the state;
 the store rejects writes carrying a stale token, so a partitioned old activation
 cannot corrupt state after re-placement.
 
+### Online backup / restore with a fencing epoch (ADR-055)
+
+An optional `BackupableStore` refinement (not part of `Store`) offers `snapshot_to(BackupImage&)`
+(one consistent cut taken under the store lock while writers continue) and
+`restore_from(image, min_epoch)` (loads into a FRESH store and installs a fencing epoch strictly
+above every token in the image and `min_epoch`, so any pre-restore writer is rejected).
+`quark/core/backup.hpp` adds the byte codec and `snapshot_to_file` / `restore_from_file`.
+Implemented for `InMemoryStore` and `FileStore`; see ADR-055 for caveats.
+
 ## Encryption at rest (optional)
 
 Durable records may hold sensitive state. **At-rest encryption is optional

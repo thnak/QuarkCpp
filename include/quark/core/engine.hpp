@@ -149,6 +149,11 @@ public:
         resolve_node_shard_resources(resource_plan);
         // 009: register every shard's embedded ShardCounters (cold, one-time; register_shard just
         // stores a pointer) so metrics_snapshot()/metrics_prometheus() aggregate across all shards.
+#ifndef QUARK_NO_TYPE_ACCOUNTING
+        // ADR-054: per-actor-type cells, one flat max_types-sized array per shard, allocated ONCE here
+        // (cold) and never resized. Compile out with -DQUARK_NO_TYPE_ACCOUNTING.
+        for (std::uint32_t sh = 0; sh < cfg_.shard_count; ++sh) shards_[sh].metrics.init_type_cells(cfg_.max_types);
+#endif
         for (std::uint32_t sh = 0; sh < cfg_.shard_count; ++sh) metrics_.register_shard(shards_[sh].metrics);
         // ADR-028 Phase 4: one ActivationBroker per shard, constructed unconditionally (cheap:
         // Sequential, KeepAlive, silent unless `declare_lazy` is ever used). Stored directly on
@@ -281,6 +286,7 @@ public:
                               std::max<std::uint64_t>(1, idle_ms / cfg_.idle_tick_ms));
 
         const ActorId id = actor_id_of<A>(key);
+        act->set_type_cell(type_cell_for(shard_of(id), type_key_of<A>(), detail::canonical_type_name<A>()));  // ADR-054
         register_activation(id, *act, static_cast<std::uint16_t>(priority_band_of<A>()),
                             drain_budget_of<A>(), idle_ticks);
         wire_escalation<A>(*act, id);  // 007 §Escalation: no-op if no matching supervisor is registered
@@ -316,7 +322,9 @@ public:
         static_assert(priority_band_of<A>() < Policy::bands,
                       "declare_lazy<A>: Priority<P> exceeds the engine's PriorityBands<K> (P < K) — "
                       "ADR-010");
-        return type_registry_.register_type<A>(std::forward<WireCheck>(check), scope, reclaim);
+        auto r = type_registry_.register_type<A>(std::forward<WireCheck>(check), scope, reclaim);
+        if (r) (void)metrics_.assign_type_slot(type_key_of<A>(), detail::canonical_type_name<A>(), cfg_.max_types);  // ADR-054 (name for the label)
+        return r;
     }
     template <class A>
     [[nodiscard]] result<std::uint16_t> declare_lazy(const ResourceScope* scope = nullptr,
@@ -355,7 +363,9 @@ public:
                       "declare_lazy<A>(store, ...): A must declare Persistent<Snapshot,...> to use the "
                       "store-taking overload (ADR-028 Phase 5); use declare_lazy<A>(scope, reclaim) "
                       "otherwise");
-        return type_registry_.register_type<A>(store, scope, reclaim);
+        auto r = type_registry_.register_type<A>(store, scope, reclaim);
+        if (r) (void)metrics_.assign_type_slot(type_key_of<A>(), detail::canonical_type_name<A>(), cfg_.max_types);  // ADR-054
+        return r;
     }
 
     // Read-only access to the compiled metadata registry (008) — e.g. `find(type_key_of<A>())` to
@@ -1303,6 +1313,7 @@ private:
                     ? 0
                     : static_cast<std::uint32_t>(
                           std::max<std::uint64_t>(1, m->idle_timeout_ms / cfg_.idle_tick_ms));
+            act->set_type_cell(type_cell_for(sid, m->key, {}));  // ADR-054
             std::unique_ptr<Schedulable> s =
                 build_schedulable(sid, *act, m->band, m->drain_budget, idle_ticks);
             Schedulable* raw = s.get();
@@ -1773,8 +1784,41 @@ private:
         sh.evict_.evict_ack.store(g, std::memory_order_release);
     }
 
-    // Run ONE activation exactly as the 001 Activation banner documents.
+    // ADR-054: per-type handler busy-time. ONE clock-read pair per run_activation call (an activation's
+    // scheduling quantum: up to `budget` messages plus its close-out), charged to the activation's type
+    // cell. Drain-owner-exclusive (run_activation only ever runs under the shard's drain_owner), so it is
+    // a relaxed load+store, no RMW. Granularity caveat: the interval includes dequeue/linger/close-out
+    // overhead, and async continuations resumed on a carrier via complete_parked() are NOT counted.
     void run_activation(std::uint32_t sid, Schedulable* s) noexcept {
+#ifndef QUARK_NO_TYPE_ACCOUNTING
+        if (TypeCell* tc = s->activation->type_cell(); tc != nullptr) {
+            const auto t0 = pal::now();
+            run_activation_impl(sid, s);
+            const auto dt = pal::now() - t0;
+            tc->busy_ns.inc(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count()));
+            return;
+        }
+#endif
+        run_activation_impl(sid, s);
+    }
+
+    // ADR-054 (COLD): resolve the (shard, type) accounting cell, assigning the dense type slot on first
+    // sight. Null when per-type accounting is compiled out, the type table is full (max_types), or the
+    // shard has no cells.
+    [[nodiscard]] TypeCell* type_cell_for([[maybe_unused]] std::uint32_t sid, [[maybe_unused]] TypeKey key,
+                                          [[maybe_unused]] std::string_view name) {
+#ifndef QUARK_NO_TYPE_ACCOUNTING
+        const int slot = metrics_.assign_type_slot(key, name, cfg_.max_types);
+        if (slot < 0) return nullptr;
+        return shards_[sid].metrics.type_cell(static_cast<std::uint32_t>(slot));
+#else
+        return nullptr;
+#endif
+    }
+
+    // Run ONE activation exactly as the 001 Activation banner documents.
+    void run_activation_impl(std::uint32_t sid, Schedulable* s) noexcept {
         Activation* act = s->activation;
         if (!act->try_acquire()) return;  // Scheduled→Running; false ⇒ skip, never block
 

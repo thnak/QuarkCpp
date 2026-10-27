@@ -34,11 +34,15 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "quark/core/config.hpp"
+#include "quark/core/ids.hpp"  // TypeKey (ADR-054 per-actor-type accounting)
 
 namespace quark {
 
@@ -141,6 +145,19 @@ private:
     std::atomic<std::uint64_t> max_{0};
 };
 
+// --- TypeCell: ADR-054 per-actor-type accounting cell (one per (shard, type slot)) -----------------
+// Drain-owner-exclusive like messages_processed: written with MetricCounter::inc() (relaxed
+// load+store, no RMW) by whichever worker owns the shard's drain. `busy_ns` is wall time the drain
+// lane spent running activations of this type, measured with ONE clock-read pair per
+// Engine::run_activation call (an activation's scheduling quantum, up to `budget` messages) — NOT per
+// message; `bytes` is the logical message bytes (Descriptor + inline payload) of messages dispatched
+// to this type. Cells live in flat per-shard arrays indexed by the type slot (no map/string on the
+// hot path); the Activation caches a direct pointer to its cell.
+struct TypeCell {
+    MetricCounter busy_ns;
+    MetricCounter bytes;
+};
+
 // --- ShardCounters: the per-shard block (009 §Storage). Cache-aligned so two shards' counters ---
 // never share a line (023 false-sharing avoidance). Named engine hot events + user slots + two
 // histograms. Non-copyable/non-movable (holds atomics) — owned in place, referenced by pointer.
@@ -180,12 +197,33 @@ struct QUARK_CACHE_ALIGNED ShardCounters {
     Histogram mailbox_depth;       // observed mailbox depth at drain
     Histogram broker_stall_ns;     // ADR-028 Phase 7: Wake enqueue -> handle_wake dispatch-start latency
 
+    // ADR-054: flat per-type cells, sized ONCE cold (init_type_cells) and never reallocated. Empty
+    // (count 0) => per-type accounting off for this shard.
+    std::unique_ptr<TypeCell[]> type_cells;
+    std::uint32_t type_cell_count = 0;
+    void init_type_cells(std::uint32_t n) {
+        type_cells = n != 0 ? std::make_unique<TypeCell[]>(n) : nullptr;
+        type_cell_count = n;
+    }
+    [[nodiscard]] TypeCell* type_cell(std::uint32_t slot) noexcept {
+        return slot < type_cell_count ? &type_cells[slot] : nullptr;
+    }
+
     ShardCounters() = default;
     ShardCounters(const ShardCounters&) = delete;
     ShardCounters& operator=(const ShardCounters&) = delete;
 };
 
-// --- Aggregated snapshot (plain ints — trivially copyable; safe to hand to tests/embedders) -----
+// ADR-054: one aggregated per-actor-type row (summed across shards at snapshot time).
+struct TypeMetric {
+    TypeKey key{};
+    std::string name;              // canonical type name if known at slot assignment, else empty
+    std::uint64_t busy_ns = 0;     // handler busy wall-time (ns), batch-granular — see TypeCell
+    std::uint64_t bytes = 0;       // logical message bytes dispatched to this type
+};
+
+// --- Aggregated snapshot (a copyable value; safe to hand to tests/embedders) ---------------------
+// (ADR-054: no longer trivially copyable — `types` is a std::vector filled cold at snapshot time.)
 struct MetricsSnapshot {
     std::uint64_t messages_processed = 0;
     std::uint64_t mailbox_enqueued = 0;
@@ -207,6 +245,7 @@ struct MetricsSnapshot {
     HistogramSnapshot message_latency_ns{};
     HistogramSnapshot mailbox_depth{};
     HistogramSnapshot broker_stall_ns{};  // ADR-028 Phase 7
+    std::vector<TypeMetric> types;        // ADR-054: per-actor-type busy-ns / bytes (one row per slot)
 };
 
 // --- MetricsSink seam (009 §Export). The default is the in-memory snapshot below; heavy backends
@@ -244,6 +283,22 @@ public:
 
     [[nodiscard]] std::size_t shard_count() const noexcept { return shards_.size(); }
 
+    // ADR-054 (COLD; thread-safe — spawn/lazy-construct may run on broker lanes): find-or-assign the
+    // dense per-type slot for `key`. Returns the slot, or -1 if the table is full (`cap` slots) — the
+    // type then simply gets no per-type accounting (never an error, never an allocation on a hot path).
+    [[nodiscard]] int assign_type_slot(TypeKey key, std::string_view name, std::uint32_t cap) {
+        std::lock_guard<std::mutex> lk(type_mu_);
+        for (std::size_t i = 0; i < type_info_.size(); ++i) {
+            if (type_info_[i].key == key) {
+                if (type_info_[i].name.empty() && !name.empty()) type_info_[i].name = std::string(name);
+                return static_cast<int>(i);
+            }
+        }
+        if (type_info_.size() >= cap) return -1;
+        type_info_.push_back(TypeInfo{key, std::string(name)});
+        return static_cast<int>(type_info_.size() - 1);
+    }
+
     [[nodiscard]] MetricsSnapshot snapshot() const {
         MetricsSnapshot s;
         for (const ShardCounters* sc : shards_) {
@@ -267,6 +322,22 @@ public:
             s.message_latency_ns.merge(sc->message_latency_ns.snapshot());
             s.mailbox_depth.merge(sc->mailbox_depth.snapshot());
             s.broker_stall_ns.merge(sc->broker_stall_ns.snapshot());
+        }
+        {  // ADR-054: per-type rows — flat per-shard arrays summed per slot (cold, off the hot path)
+            std::lock_guard<std::mutex> lk(type_mu_);
+            s.types.reserve(type_info_.size());
+            for (std::size_t slot = 0; slot < type_info_.size(); ++slot) {
+                TypeMetric tm;
+                tm.key = type_info_[slot].key;
+                tm.name = type_info_[slot].name;
+                for (ShardCounters* sc : shards_) {
+                    if (slot < sc->type_cell_count) {
+                        tm.busy_ns += sc->type_cells[slot].busy_ns.load();
+                        tm.bytes += sc->type_cells[slot].bytes.load();
+                    }
+                }
+                s.types.push_back(std::move(tm));
+            }
         }
         return s;
     }
@@ -317,10 +388,42 @@ public:
         histogram(out, "message_latency_ns", s.message_latency_ns);
         histogram(out, "mailbox_depth", s.mailbox_depth);
         histogram(out, "broker_stall_ns", s.broker_stall_ns);
+        // ADR-054: per-actor-type series, labelled by type_key (hex) + canonical name when known.
+        if (!s.types.empty()) {
+            type_series(out, "actor_type_handler_busy_ns_total", s.types, true);
+            type_series(out, "actor_type_message_bytes_total", s.types, false);
+        }
         return out;
     }
 
 private:
+    static void type_series(std::string& out, const char* name, const std::vector<TypeMetric>& rows,
+                            bool busy) {
+        out += "# TYPE quark_";
+        out += name;
+        out += " counter\n";
+        for (const TypeMetric& t : rows) {
+            char hex[19];
+            std::snprintf(hex, sizeof(hex), "0x%016llx", static_cast<unsigned long long>(t.key.value));
+            out += "quark_";
+            out += name;
+            out += "{type_key=\"";
+            out += hex;
+            out += '"';
+            if (!t.name.empty()) {
+                out += ",type=\"";
+                for (char c : t.name) {
+                    if (c == '"' || c == '\\') out += '\\';
+                    out += c;
+                }
+                out += '"';
+            }
+            out += "} ";
+            out += std::to_string(busy ? t.busy_ns : t.bytes);
+            out += '\n';
+        }
+    }
+
     static void histogram(std::string& out, const char* name, const HistogramSnapshot& h) {
         out += "# TYPE quark_";
         out += name;
@@ -350,6 +453,12 @@ private:
         out += '\n';
     }
 
+    struct TypeInfo {
+        TypeKey key;
+        std::string name;
+    };
+    mutable std::mutex type_mu_;       // ADR-054: guards type_info_ (cold assign vs scrape only)
+    std::vector<TypeInfo> type_info_;  // slot -> (TypeKey, name); the slot indexes every shard's type_cells
     std::vector<ShardCounters*> shards_;
     std::vector<std::unique_ptr<ShardCounters>> owned_;
     std::array<std::string, kUserCounterSlots> user_names_{};

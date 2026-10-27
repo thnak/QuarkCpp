@@ -23,6 +23,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/supervision_bench.cpp")
   target_compile_definitions(supervision_bench_noguard PRIVATE QUARK_SUPERVISION_NO_GUARD)
 endif()
 
+# ADR-054: the OFF control twin of type_accounting_bench (per-actor-type accounting compiled out).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/type_accounting_bench.cpp")
+  add_executable(type_accounting_bench_off type_accounting_bench.cpp)
+  target_link_libraries(type_accounting_bench_off PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_options(type_accounting_bench_off PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>)
+  target_compile_definitions(type_accounting_bench_off PRIVATE QUARK_NO_TYPE_ACCOUNTING)
+endif()
+
 # ---- 023 performance regression gate ----------------------------------------------------------
 # `cmake --build <dir> --target bench-gate` builds every bench and runs ci_bench_gate.sh, which
 # FAILS (non-zero) on a Hard-budget violation ([MISS]) and WARNS (green) on a Goal regression
