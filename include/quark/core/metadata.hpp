@@ -119,8 +119,24 @@ template <class T>
 // Fold an actor's protocol message set into its type key (008 §Type identity: "for actors, fold the
 // protocol/handler set"). Seeded with the actor's own canonical-name hash so same-protocol actors
 // stay distinct; each message key is order-sensitively combined so a reordered protocol differs.
+// #18: two distinct Described messages of ONE protocol with equal keys would share a wire/durable
+// identity (remote dispatch to the wrong handler). Reject at compile time; the fix is a distinct
+// `static constexpr std::uint64_t quark_type_salt` on one of them (016).
+template <class... Ms>
+[[nodiscard]] constexpr bool protocol_keys_distinct() noexcept {
+    constexpr std::size_t n = sizeof...(Ms);
+    const std::uint64_t keys[n + 1] = {single_type_key<Ms>()..., 0};
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = i + 1; j < n; ++j)
+            if (keys[i] == keys[j]) return false;
+    return true;
+}
+
 template <class A, class... Ms>
 [[nodiscard]] constexpr std::uint64_t fold_protocol(Protocol<Ms...>*) noexcept {
+    static_assert(protocol_keys_distinct<Ms...>(),
+                  "two message types in this Protocol share one type key (same layout): add a "
+                  "distinct `static constexpr std::uint64_t quark_type_salt` to one (#18, 016)");
     std::uint64_t h = fnv1a(canonical_type_name<A>());
     ((h = hash_combine(h, single_type_key<Ms>())), ...);
     return h;

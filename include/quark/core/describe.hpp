@@ -14,6 +14,7 @@
 
 #include <bit>
 #include <cstddef>
+#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -256,6 +257,12 @@ public:
 
     [[nodiscard]] constexpr std::uint64_t value() const noexcept { return hash_; }
 
+    // Fold an explicit identity salt (see `quark_type_salt` in compute_fingerprint).
+    constexpr void salt(std::uint64_t v) noexcept {
+        fold(0xA5);
+        fold_bytes(v);
+    }
+
 private:
     template <class U>
     constexpr void fold_type() noexcept {
@@ -297,6 +304,11 @@ constexpr std::uint64_t compute_fingerprint() noexcept {
     FingerprintFolder folder;
     T sample{};
     quark_describe(folder, sample);
+    // Optional identity salt (008/016, #18): a type may declare `static constexpr std::uint64_t
+    // quark_type_salt` to separate its durable/wire key from any other type with the same layout.
+    if constexpr (requires { { T::quark_type_salt } -> std::convertible_to<std::uint64_t>; }) {
+        folder.salt(static_cast<std::uint64_t>(T::quark_type_salt));
+    }
     return folder.value();
 }
 

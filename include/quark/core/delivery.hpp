@@ -119,6 +119,8 @@ inline constexpr std::uint64_t outbound_derivation_stride = std::uint64_t{1} << 
 // A durable per-sender high-water-mark advance: after processing an inbound with `seq`, the receiver
 // records `watermark[sender] = seq`. Recovery replays these (last-wins per sender) to rebuild dedup.
 struct WatermarkRecord {
+    // #18: internal-record identity salt — a user event with the same layout must not be routed here.
+    static constexpr std::uint64_t quark_type_salt = 0x51574D5231ULL;
     std::uint64_t sender = 0;  // inbound sender ActorId hash
     std::uint64_t seq = 0;     // new high-water-mark (highest processed seq from `sender`)
 };
@@ -129,6 +131,8 @@ QUARK_SERIALIZE(WatermarkRecord, (1, sender), (2, seq))
 // (opaque — the dispatcher hands it to the local sink / 010 transport). `body` is a raw byte blob
 // stored as a length-delimited string (may contain NULs).
 struct OutboxRecord {
+    // #18: internal-record identity salt — a user event with the same layout must not be routed here.
+    static constexpr std::uint64_t quark_type_salt = 0x51574F5231ULL;
     std::uint64_t target_type = 0;  // target ActorId.type.value
     std::uint64_t target_key = 0;   // target ActorId.key
     std::uint64_t out_sender = 0;   // derived MsgKey.sender (this actor's hash)
@@ -142,6 +146,8 @@ QUARK_SERIALIZE(OutboxRecord, (1, target_type), (2, target_key), (3, out_sender)
 // identical reply WITHOUT reprocessing (017 §"Reply cache"). Keyed by sender; carries the inbound
 // `seq` it answers so a re-ask of the same seq gets exactly its reply.
 struct ReplyRecord {
+    // #18: internal-record identity salt — a user event with the same layout must not be routed here.
+    static constexpr std::uint64_t quark_type_salt = 0x5157525031ULL;
     std::uint64_t reply_to = 0;  // inbound sender ActorId hash the reply is addressed to
     std::uint64_t in_seq = 0;    // the inbound seq this reply answers
     std::string body;            // encode_durable(reply) — 016 canonical tagged durable bytes
