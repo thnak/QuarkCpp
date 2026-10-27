@@ -67,6 +67,12 @@ struct EngineConfig {
     // word and lives here instead. `idle_timeout_ms_of<A>() / idle_tick_ms` (rounded up, min 1) is
     // resolved once per `spawn<A>()` into the actor's `idle_ticks` count.
     std::uint32_t idle_tick_ms = 100;
+    // ADR-052 (#24b): opt-in reclamation of evicted lazy activations. 0 (default) = never free (the
+    // pre-ADR-052 behavior). >0: an evicted lazily-activated actor's {actor, Activation, Schedulable,
+    // id_table entry} are freed after its idle-timeout + this grace (twice: unlink, then free).
+    // This bounds how long a producer may sit between resolve() and post() before it risks a
+    // use-after-free — see ADR-052 caveats; choose >> the longest producer stall you tolerate.
+    std::uint32_t lazy_reclaim_grace_ms = 0;
     // 009 §"Build-time budget gate" / ADR-022: worst-case metrics grid/arena footprint ceiling. A
     // caller computes the exact footprint via `sizeof()` (metrics_cardinality.hpp's
     // `TypeMetricsGrid<Spec>::footprint_bytes` / `InstanceMetricsArena<Spec>::footprint_bytes`) and
@@ -232,6 +238,10 @@ public:
         return *this;
     }
     ConfigBuilder& idle_tick_ms(std::uint32_t ms) noexcept { cfg_.idle_tick_ms = ms; return *this; }
+    ConfigBuilder& lazy_reclaim_grace_ms(std::uint32_t ms) noexcept {
+        cfg_.lazy_reclaim_grace_ms = ms;
+        return *this;
+    }
     ConfigBuilder& metrics_memory_budget_bytes(std::size_t n) noexcept {
         cfg_.metrics_memory_budget_bytes = n;
         return *this;

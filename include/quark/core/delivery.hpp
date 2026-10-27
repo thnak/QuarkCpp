@@ -37,19 +37,22 @@
 //   * Cross-node retry TRANSPORT for AtLeastOnce / outbox delivery over the network — 010
 //     (`Transport`). In-process, `drain_outbox` hands each pending outbound to a local sink/router;
 //     the sink IS the transport seam.
-//   * Watermark GC / idle-sender TTL reclamation (017 open question) — a permanently-silent sender
-//     leaves a stale watermark entry. The hook is `watermark_` being a plain map keyed by sender;
-//     the reaper is NOT built here.
-//   * Durable OUTBOX ack-watermark / shard-batched outbox for throughput (017 open question) —
-//     `drain_outbox` re-sends every committed outbox record on each call (honest AtLeastOnce from a
-//     durable record); marking an entry delivered needs its own fenced commit. The per-actor outbox
-//     is the honest core; a shard-batched outbox and a durable ack-cursor are deferred.
+//   * Watermark GC is a CAP, not a TTL: `set_limits` bounds the watermark and reply-cache maps with
+//     oldest-touched-first eviction (ADR-051; trade-off documented there and on `set_limits`).
+//   * The durable OUTBOX delivered marker (`DeliveredRecord`, written by `mark_delivered` when the
+//     receiver acks; `drain_outbox` skips delivered entries; `recover` rebuilds it) - ADR-051.
+//   * AtLeastOnce retry+ack for plain remote sends: `ReliableSender` / `ReliableReceiver` below
+//     (transport-agnostic go-back-N over a caller-supplied sink; 010 owns the real wire).
 // ============================================================================================
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <iterator>
+#include <list>
 #include <optional>
 #include <span>
 #include <string>
@@ -154,7 +157,65 @@ struct ReplyRecord {
 };
 QUARK_SERIALIZE(ReplyRecord, (1, reply_to), (2, in_seq), (3, body))
 
+// A durable "outbox entry delivered" marker (#19): written (fenced) when the receiver ACKs the
+// outbound `(out_sender, out_seq)`. After it, `drain_outbox` skips the entry and `recover` does not
+// resurrect it as pending.
+struct DeliveredRecord {
+    // #18/ADR-050: internal-record identity salt.
+    static constexpr std::uint64_t quark_type_salt = 0x5157444C31ULL;
+    std::uint64_t out_sender = 0;
+    std::uint64_t out_seq = 0;
+};
+QUARK_SERIALIZE(DeliveredRecord, (1, out_sender), (2, out_seq))
+
 namespace detail {
+
+// Bounded map keyed by uint64 with oldest-touched-first eviction (cap 0 = unbounded). `find` does NOT
+// refresh recency (keeps const lookups const); `touch` does. Off the hot path (durable-commit side).
+template <class V>
+class BoundedMap {
+public:
+    void set_cap(std::size_t cap) {
+        cap_ = cap;
+        trim();
+    }
+    [[nodiscard]] const V* find(std::uint64_t k) const noexcept {
+        const auto it = map_.find(k);
+        return it == map_.end() ? nullptr : &it->second.v;
+    }
+    // Insert-if-absent, mark most recent, enforce the cap (k is newest so is never the victim).
+    V& touch(std::uint64_t k) {
+        auto it = map_.find(k);
+        if (it == map_.end()) {
+            order_.push_back(k);
+            it = map_.emplace(k, Entry{V{}, std::prev(order_.end())}).first;
+        } else {
+            order_.splice(order_.end(), order_, it->second.pos);
+        }
+        V& ref = it->second.v;
+        trim();
+        return ref;
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return map_.size(); }
+    [[nodiscard]] std::size_t evictions() const noexcept { return evictions_; }
+
+private:
+    struct Entry {
+        V v;
+        std::list<std::uint64_t>::iterator pos;
+    };
+    void trim() {
+        while (cap_ != 0 && map_.size() > cap_) {
+            map_.erase(order_.front());
+            order_.pop_front();
+            ++evictions_;
+        }
+    }
+    std::size_t cap_ = 0;
+    std::size_t evictions_ = 0;
+    std::unordered_map<std::uint64_t, Entry> map_;
+    std::list<std::uint64_t> order_;
+};
 
 // Raw-byte blob <-> std::string (the durable record `body` field). std::string holds arbitrary
 // bytes (NULs included); the tagged codec length-prefixes it, so it round-trips exactly.
@@ -239,21 +300,21 @@ public:
     // --- (a) DEDUP (017 §"The mechanism" step 1) ------------------------------------------------
     // A message from `sender` with `in_seq` is a DUPLICATE iff `in_seq <= watermark[sender]`.
     [[nodiscard]] bool is_duplicate(std::uint64_t sender, std::uint64_t in_seq) const noexcept {
-        const auto it = watermark_.find(sender);
-        return it != watermark_.end() && in_seq <= it->second;
+        const std::uint64_t* w = watermark_.find(sender);
+        return w != nullptr && in_seq <= *w;
     }
     [[nodiscard]] bool is_duplicate(MsgKey m) const noexcept { return is_duplicate(m.sender, m.seq); }
 
     [[nodiscard]] std::uint64_t watermark_of(std::uint64_t sender) const noexcept {
-        const auto it = watermark_.find(sender);
-        return it == watermark_.end() ? std::uint64_t{0} : it->second;
+        const std::uint64_t* w = watermark_.find(sender);
+        return w == nullptr ? std::uint64_t{0} : *w;
     }
 
     // The recorded reply for `sender` (for a duplicate `ask` to re-emit WITHOUT reprocessing).
     [[nodiscard]] std::optional<CachedReply> cached_reply(std::uint64_t sender) const {
-        const auto it = reply_cache_.find(sender);
-        if (it == reply_cache_.end()) return std::nullopt;
-        return it->second;
+        const CachedReply* r = reply_cache_.find(sender);
+        if (r == nullptr) return std::nullopt;
+        return *r;
     }
 
     // Decode a cached/committed reply body back into its typed form.
@@ -349,9 +410,9 @@ public:
             // Durable — now advance the sequence and reflect the commit in the in-memory mirrors so
             // subsequent dedup/dispatch see it without re-reading the store.
             lane_->next_seq_ = seq;
-            std::uint64_t& wm = lane_->watermark_[inbound_.sender];
+            std::uint64_t& wm = lane_->watermark_.touch(inbound_.sender);
             if (inbound_.seq > wm) wm = inbound_.seq;
-            if (reply_) lane_->reply_cache_[inbound_.sender] = CachedReply{reply_->in_seq, reply_->body};
+            if (reply_) lane_->reply_cache_.touch(inbound_.sender) = CachedReply{reply_->in_seq, reply_->body};
             for (OutboxRecord& o : outbox_) lane_->outbox_.push_back(std::move(o));
 
             return CommitResult{seq == 0 ? SeqNo{0} : seq - 1, batch.size()};
@@ -376,14 +437,12 @@ public:
     }
 
     // --- (d) POST-COMMIT DISPATCH (017 §"The mechanism" step 4) ---------------------------------
-    // Drain the DURABLE outbox: hand each pending outbound to `sink` (the local router / 010
-    // transport seam). AtLeastOnce — every committed outbox record is (re-)sent on each call, since a
-    // zombie's commit never lands here (its outbox is not durable) and a crash-after-commit recovery
-    // re-drains the SAME durable records (with the SAME deterministic ids, dedup'd downstream). The
-    // sink returns `result<void>`; a failed send leaves the record pending for a later drain. Returns
-    // the number of records successfully handed off.
-    //
-    // `sink(const OutboxRecord&) -> result<void>`.
+    // Drain the DURABLE outbox: hand each PENDING (not yet delivered-marked) outbound to `sink`.
+    // AtLeastOnce - a pending record is (re-)sent on each call until `mark_delivered` records the
+    // receiver's ack (a zombie's commit never lands; a crash-after-commit recovery re-drains the SAME
+    // durable records with the SAME deterministic ids, dedup'd downstream). A failed send leaves the
+    // record pending. Returns the number of records handed off. `sink(const OutboxRecord&) ->
+    // result<void>`.
     template <class Sink>
     [[nodiscard]] result<std::size_t> drain_outbox(Sink&& sink) {
         std::size_t sent = 0;
@@ -394,6 +453,65 @@ public:
         }
         return sent;
     }
+
+    // ACK-AWARE dispatch (#19): `sink(const OutboxRecord&) -> result<bool>`; `true` means the receiver
+    // ACKED, so the entry is durably marked delivered (fenced commit) and never re-sent, even across
+    // crash+recover. `false` = no ack yet (lost frame) -> stays pending for the next call. A sink error
+    // or a fenced mark aborts. Returns the number of entries acked+marked this call.
+    template <class Sink>
+    [[nodiscard]] result<std::size_t> deliver_outbox(Sink&& sink) {
+        std::size_t acked = 0;
+        // Snapshot the ids: mark_delivered mutates outbox_.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ids;
+        ids.reserve(outbox_.size());
+        for (const OutboxRecord& o : outbox_) ids.emplace_back(o.out_sender, o.out_seq);
+        for (const auto& [snd, seq] : ids) {
+            const OutboxRecord* rec = nullptr;
+            for (const OutboxRecord& o : outbox_) {
+                if (o.out_sender == snd && o.out_seq == seq) { rec = &o; break; }
+            }
+            if (rec == nullptr) continue;
+            auto r = sink(*rec);
+            if (!r) return std::unexpected(r.error());
+            if (*r) {
+                auto m = mark_delivered(snd, seq);
+                if (!m) return std::unexpected(m.error());
+                ++acked;
+            }
+        }
+        return acked;
+    }
+
+    // Durably record that outbound `(out_sender, out_seq)` was acked, and drop it from the pending
+    // outbox. Idempotent: an unknown / already-delivered id is a no-op (duplicate acks are normal).
+    // Fenced like every commit: a stale token is rejected and the entry stays pending.
+    [[nodiscard]] result<void> mark_delivered(std::uint64_t out_sender, std::uint64_t out_seq) {
+        const auto it = std::find_if(outbox_.begin(), outbox_.end(), [&](const OutboxRecord& o) {
+            return o.out_sender == out_sender && o.out_seq == out_seq;
+        });
+        if (it == outbox_.end()) return {};
+        auto b = encode_durable(DeliveredRecord{out_sender, out_seq});
+        if (!b) return std::unexpected(b.error());
+        EventRecord er{next_seq_, std::move(*b)};
+        auto rc = store_->append_batch(self_, fence_, std::span<const EventRecord>(&er, 1));
+        if (!rc) return std::unexpected(rc.error());
+        ++next_seq_;
+        outbox_.erase(it);
+        return {};
+    }
+
+    // Bound the in-memory dedup watermark and reply-cache maps (0 = unbounded, the default).
+    // Oldest-TOUCHED-first eviction. TRADE-OFF (ADR-051): an evicted sender's next duplicate is no
+    // longer recognized by RAM state, so effectively-once degrades to at-least-once for senders idle
+    // beyond the cap; an evicted reply is not re-emitted. The durable log keeps everything; the cap
+    // only bounds memory (recover() re-applies it). Size the cap >= active senders.
+    void set_limits(std::size_t watermark_cap, std::size_t reply_cache_cap) {
+        watermark_.set_cap(watermark_cap);
+        reply_cache_.set_cap(reply_cache_cap);
+    }
+    [[nodiscard]] std::size_t watermark_evictions() const noexcept { return watermark_.evictions(); }
+    [[nodiscard]] std::size_t reply_cache_size() const noexcept { return reply_cache_.size(); }
+    [[nodiscard]] std::size_t reply_cache_evictions() const noexcept { return reply_cache_.evictions(); }
 
     [[nodiscard]] std::size_t outbox_pending() const noexcept { return outbox_.size(); }
     [[nodiscard]] const std::vector<OutboxRecord>& outbox() const noexcept { return outbox_; }
@@ -414,6 +532,7 @@ public:
         const TypeKey wm_key{fingerprint_v<WatermarkRecord>};
         const TypeKey ob_key{fingerprint_v<OutboxRecord>};
         const TypeKey rp_key{fingerprint_v<ReplyRecord>};
+        const TypeKey dl_key{fingerprint_v<DeliveredRecord>};
 
         for (const EventRecord& rec : *cur) {
             auto hdr = peek_record_header(rec.record.data(), rec.record.size());
@@ -422,7 +541,7 @@ public:
             if (hdr->type == wm_key) {
                 auto wm = decode_durable<WatermarkRecord>(rec.record);
                 if (!wm) return std::unexpected(wm.error());
-                std::uint64_t& hi = watermark_[wm->sender];
+                std::uint64_t& hi = watermark_.touch(wm->sender);
                 if (wm->seq > hi) hi = wm->seq;
             } else if (hdr->type == ob_key) {
                 auto ob = decode_durable<OutboxRecord>(rec.record);
@@ -431,7 +550,14 @@ public:
             } else if (hdr->type == rp_key) {
                 auto rp = decode_durable<ReplyRecord>(rec.record);
                 if (!rp) return std::unexpected(rp.error());
-                reply_cache_[rp->reply_to] = CachedReply{rp->in_seq, rp->body};
+                reply_cache_.touch(rp->reply_to) = CachedReply{rp->in_seq, rp->body};
+            } else if (hdr->type == dl_key) {
+                // The delivered marker always follows its outbox record in log order.
+                auto dl = decode_durable<DeliveredRecord>(rec.record);
+                if (!dl) return std::unexpected(dl.error());
+                std::erase_if(outbox_, [&](const OutboxRecord& o) {
+                    return o.out_sender == dl->out_sender && o.out_seq == dl->out_seq;
+                });
             } else {
                 // A domain event — hand its opaque durable bytes to the caller's state fold.
                 auto rc = on_event(std::span<const std::byte>(rec.record.data(), rec.record.size()));
@@ -451,9 +577,95 @@ private:
 
     // In-memory MIRRORS of durable dedup state (rebuilt by `recover`). Watermark GC / idle-sender TTL
     // (017 open question) would prune permanently-silent senders from `watermark_`; not built here.
-    std::unordered_map<std::uint64_t, std::uint64_t> watermark_;    // sender hash -> high-water-mark
-    std::unordered_map<std::uint64_t, CachedReply> reply_cache_;    // sender hash -> recorded reply
+    detail::BoundedMap<std::uint64_t> watermark_;    // sender hash -> high-water-mark (capped, ADR-051)
+    detail::BoundedMap<CachedReply> reply_cache_;    // sender hash -> recorded reply (capped)
     std::vector<OutboxRecord> outbox_;                              // committed pending outbound
+};
+
+// ============================================================================================
+// AtLeastOnce retry + ack for remote sends (#19, ADR-051). Transport-agnostic go-back-N over a
+// per-(sender, receiver) consecutive seq space starting at 1 (NOT the outbox's strided ids).
+//   Sender  : enqueue() -> seq; pump(sink) re-sends unacked frames in order each call;
+//             on_ack(cum) drops all frames <= cum (cumulative ack).
+//   Receiver: accept(frame) -> Deliver (seq == wm+1: first time, advance), Duplicate (seq <= wm: re-ack,
+//             do not redeliver) or Gap (a predecessor was lost: drop, sender re-sends in order).
+//             The cumulative ack is `ack_for(sender)`. The watermark map is capped (LRU); a frame
+//             carries `base` = oldest unacked seq so a receiver that evicted/never saw the sender can
+//             re-admit it at `seq == base` (everything below base was already acked => delivered).
+// Allocation: std::deque/std::string live on this retry path, NOT the mailbox hot path; no virtual/RTTI.
+// ============================================================================================
+struct ReliableFrame {
+    std::uint64_t sender = 0;
+    std::uint64_t seq = 0;
+    std::uint64_t base = 0;  // oldest unacked seq at the sender when this frame was (re)sent
+};
+
+class ReliableSender {
+public:
+    explicit ReliableSender(std::uint64_t sender_hash) noexcept : sender_(sender_hash) {}
+
+    std::uint64_t enqueue(std::string body) {
+        pending_.push_back(Item{next_, std::move(body)});
+        return next_++;
+    }
+    // Re-send up to `window` oldest unacked frames (0 = all) via
+    // `sink(const ReliableFrame&, const std::string& body) -> void`. A lossy sink simply drops; the
+    // next pump retries.
+    template <class Sink>
+    std::size_t pump(Sink&& sink, std::size_t window = 0) {
+        std::size_t n = 0;
+        for (const Item& it : pending_) {
+            if (window != 0 && n == window) break;
+            sink(ReliableFrame{sender_, it.seq, pending_.front().seq}, it.body);
+            ++n;
+        }
+        return n;
+    }
+    void on_ack(std::uint64_t cumulative) {
+        while (!pending_.empty() && pending_.front().seq <= cumulative) pending_.pop_front();
+    }
+    [[nodiscard]] std::size_t pending() const noexcept { return pending_.size(); }
+    [[nodiscard]] std::uint64_t sender() const noexcept { return sender_; }
+
+private:
+    struct Item {
+        std::uint64_t seq;
+        std::string body;
+    };
+    std::uint64_t sender_;
+    std::uint64_t next_ = 1;
+    std::deque<Item> pending_;
+};
+
+class ReliableReceiver {
+public:
+    enum class Verdict : std::uint8_t { Deliver, Duplicate, Gap };
+
+    // `max_senders` bounds the watermark map (0 = unbounded); see ADR-051 for the eviction trade-off.
+    explicit ReliableReceiver(std::size_t max_senders = 0) { wm_.set_cap(max_senders); }
+
+    [[nodiscard]] Verdict accept(const ReliableFrame& f) {
+        const std::uint64_t* w = wm_.find(f.sender);
+        if (w == nullptr) {
+            if (f.seq != f.base) return Verdict::Gap;  // not the oldest unacked: wait for it
+            wm_.touch(f.sender) = f.seq;
+            return Verdict::Deliver;
+        }
+        if (f.seq <= *w) return Verdict::Duplicate;
+        if (f.seq != *w + 1) return Verdict::Gap;
+        wm_.touch(f.sender) = f.seq;
+        return Verdict::Deliver;
+    }
+    // The cumulative ack to send back for `sender` (0 if unknown: acks nothing).
+    [[nodiscard]] std::uint64_t ack_for(std::uint64_t sender) const noexcept {
+        const std::uint64_t* w = wm_.find(sender);
+        return w == nullptr ? 0 : *w;
+    }
+    [[nodiscard]] std::size_t tracked_senders() const noexcept { return wm_.size(); }
+    [[nodiscard]] std::size_t evictions() const noexcept { return wm_.evictions(); }
+
+private:
+    detail::BoundedMap<std::uint64_t> wm_;
 };
 
 }  // namespace quark

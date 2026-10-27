@@ -930,6 +930,9 @@ public:
     // false — a cheap post-hoc observer, not consulted by any hot-path decision. No caller is wired
     // in this pass (added now so Phase 2's engine-side wiring doesn't need to reopen this file).
     [[nodiscard]] bool went_dormant() const noexcept { return exec_.state() == ExecState::Dormant; }
+    // ADR-052 reclaim seam (Engine::reclaim_sweep, shard drain owner only).
+    [[nodiscard]] bool retire_from_dormant() noexcept { return exec_.retire_from_dormant(); }
+    [[nodiscard]] bool readmit_from_retired() noexcept { return exec_.readmit_from_retired(); }
     [[nodiscard]] Mailbox& mailbox() noexcept { return mailbox_; }
     [[nodiscard]] const MessageContext& current_context() const noexcept { return current_ctx_; }
     [[nodiscard]] bool is_reentrant() const noexcept { return rc_ != nullptr; }

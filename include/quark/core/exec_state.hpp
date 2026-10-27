@@ -25,6 +25,8 @@ enum class ExecState : std::uint8_t {
     Parked = 3,     // sealed: an async/blocking/fiber leaf is in flight (ADR-015); admission fails
     Dormant = 4,    // sealed: evicted on idle-timeout (ADR-028 Phase 1); no live actor object right
                     // now — admission fails until a future reactivation path re-admits (Phase 4 seam).
+    Retired = 5,    // sealed: unlinked from the id table, pending free (ADR-052 reclaim); only the
+                    // owning shard's reclaim sweep leaves this state (Retired->Scheduled rescue, or free).
 };
 
 // The per-actor exec-state atomic + its transition protocol. All memory orders are load-bearing.
@@ -107,6 +109,19 @@ public:
     // Same shape as readmit_from_parked() — a structurally new third-party waker (broker → actor).
     [[nodiscard]] bool readmit_from_dormant() noexcept {
         ExecState expected = ExecState::Dormant;
+        return s_.compare_exchange_strong(expected, ExecState::Scheduled,
+                                          std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    // ADR-052: Dormant -> Retired (sweep, drain-owner only). CAS so a racing readmit wins cleanly.
+    [[nodiscard]] bool retire_from_dormant() noexcept {
+        ExecState expected = ExecState::Dormant;
+        return s_.compare_exchange_strong(expected, ExecState::Retired,
+                                          std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    // ADR-052: Retired -> Scheduled (rescue: a stale-pointer producer stranded a message).
+    [[nodiscard]] bool readmit_from_retired() noexcept {
+        ExecState expected = ExecState::Retired;
         return s_.compare_exchange_strong(expected, ExecState::Scheduled,
                                           std::memory_order_acq_rel, std::memory_order_acquire);
     }

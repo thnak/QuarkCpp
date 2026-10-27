@@ -87,6 +87,26 @@ public:
         return seq - 1;
     }
 
+    // ADR-052 (#24b) — CompactEveryNEvents<N>. Call AFTER `commit()` with the state already folded
+    // through every committed event. If >= N events were committed since the last snapshot, write a
+    // snapshot at `through_seq = next_seq()-1` and truncate the log prefix it subsumes. Returns true
+    // iff a compaction ran. A failed snapshot leaves the log untouched; a failed truncate leaves the
+    // (valid) snapshot and un-truncated log — both retryable, neither loses data, and recovery is
+    // correct either way (snapshot + tail from through_seq). Off the hot path (handler completion).
+    template <class Cadence, Described State>
+        requires CompactableStore<S>
+    [[nodiscard]] result<bool> compact_if_due(const State& state_through_last_commit) {
+        const SeqNo last = next_seq_ == 0 ? SeqNo{0} : next_seq_ - 1;
+        if (last - snap_seq_ < Cadence::every) return false;
+        if (auto rc = save_snapshot<State>(*store_, id_, fence_, last, state_through_last_commit); !rc)
+            return std::unexpected(rc.error());
+        snap_seq_ = last;
+        if (auto rc = store_->truncate_log(id_, fence_, last); !rc) return std::unexpected(rc.error());
+        return true;
+    }
+    // A recovering actor passes the loaded snapshot's `through_seq` so the cadence counts from it.
+    void set_last_snapshot_seq(SeqNo s) noexcept { snap_seq_ = s; }
+
     // THROWING-HANDLER PATH (ADR-009 C7). Discard the staging buffer — commit nothing. Nothing this
     // handler staged ever reaches the store, so replay cannot resurrect a partial pre-throw append.
     void rollback() noexcept { staged_.clear(); }
@@ -96,6 +116,7 @@ private:
     ActorId id_;
     FenceToken fence_;
     SeqNo next_seq_;
+    SeqNo snap_seq_ = 0;  // through_seq of the last snapshot (ADR-052 cadence base)
     // INTERIM: this is ONE staging buffer PER ACTOR, not per in-flight handler. It is correct for a
     // Sequential actor (at most one handler in flight, so at most one un-committed batch), which is
     // why `Persistent<EventSourced>` is forbidden at COMPILE TIME on Reentrant / MaxConcurrency<N>

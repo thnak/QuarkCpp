@@ -25,9 +25,9 @@
 // `ftruncate`) on Linux, Win32 (`WriteFile`/`FlushFileBuffers`/`SetEndOfFile`) on Windows, both
 // behind the identical `pal::file_*` surface (019 §"The one rule"). The durable byte format is
 // host-endian — correct on the x86-64 target; a portable version byte-swaps the fixed-width
-// integers, a noted seam. Compaction (truncating the log prefix a snapshot subsumes) is a documented
-// future optimization — correctness never depends on it (recovery reads snapshot + tail-from-
-// through_seq), only file size does.
+// integers, a noted seam. Compaction (truncating the log prefix a snapshot subsumes) is
+// `truncate_log` below (ADR-052, driven by `CompactEveryNEvents<N>`); correctness never depends on it
+// (recovery reads snapshot + tail-from-through_seq), only RAM and file size do.
 #pragma once
 
 #include <array>
@@ -160,6 +160,76 @@ public:
         return cur;
     }
 
+    // ADR-052 compaction seam (see `CompactableStore`). Drops events <= through_seq from RAM AND from
+    // disk: the WAL is rewritten as {fence, latest snapshot, surviving events} into `<path>.compact`,
+    // fdatasync'd, then atomically renamed over the live file (same pattern as FileReminderStore).
+    // A crash at any point leaves either the old complete file or the new complete file.
+    [[nodiscard]] result<void> truncate_log(ActorId id, FenceToken tok, SeqNo through_seq) {
+        std::lock_guard<std::mutex> g(mu_);
+        Entry& e = entry(id);
+        if (e.corrupt) return corrupt_error();
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();
+        if (!e.snapshot.has_value() || e.snapshot->through_seq < through_seq)
+            return fail(errc::internal, "truncate_log: no snapshot subsumes the requested prefix");
+        std::size_t n = 0;
+        while (n < e.log.size() && e.log[n].seq <= through_seq) ++n;
+        if (n == 0) return {};  // nothing to drop (idempotent)
+        std::vector<std::byte> out;
+        auto frame = [&out](const std::vector<std::byte>& body) {
+            put_u32(out, static_cast<std::uint32_t>(body.size()));
+            put_u32(out, crc32(std::span<const std::byte>(body)));
+            out.insert(out.end(), body.begin(), body.end());
+        };
+        {
+            std::vector<std::byte> b;
+            put_u8(b, kFence);
+            put_u64(b, e.owner.value);
+            frame(b);
+        }
+        {
+            std::vector<std::byte> b;
+            put_u8(b, kSnapshot);
+            put_u64(b, e.snapshot->fence.value);
+            put_u64(b, e.snapshot->through_seq);
+            put_blob(b, e.snapshot->record);
+            frame(b);
+        }
+        if (n < e.log.size()) {
+            std::vector<std::byte> b;
+            put_u8(b, kBatch);
+            put_u32(b, static_cast<std::uint32_t>(e.log.size() - n));
+            for (std::size_t i = n; i < e.log.size(); ++i) {
+                put_u64(b, e.log[i].seq);
+                put_blob(b, e.log[i].record);
+            }
+            frame(b);
+        }
+        // `last_seq` must survive a reopen even if every event was dropped: the snapshot's through_seq
+        // can be < last_seq only when events remain, and equals it otherwise (snapshot never ahead of
+        // the tail, and we only drop <= through_seq <= snapshot.through_seq).
+        const std::string path = path_for(id);
+        const std::string tmp = path + ".compact";
+        pal::file_t t = pal::file_open(tmp, pal::FileOpenMode::kWriteCreateTrunc);
+        if (t == pal::invalid_file) return fail(errc::internal, "FileStore: compact: open tmp failed");
+        const bool wrote = pal::file_pwrite(t, out.data(), out.size(), 0) ==
+                               static_cast<std::int64_t>(out.size()) &&
+                           pal::durable_flush(t);
+        pal::file_close(t);
+        if (!wrote || !pal::durable_rename(tmp, path)) {
+            (void)std::remove(tmp.c_str());
+            return fail(errc::internal, "FileStore: compact: rewrite failed (old log intact)");
+        }
+        pal::file_close(e.fd);
+        e.fd = pal::file_open(path, pal::FileOpenMode::kReadWriteCreate);
+        if (e.fd == pal::invalid_file) {
+            e.corrupt = true;  // cannot append anymore; surface rather than silently lose writes
+            return fail(errc::internal, "FileStore: compact: reopen failed");
+        }
+        e.write_off = out.size();
+        e.log.erase(e.log.begin(), e.log.begin() + static_cast<std::ptrdiff_t>(n));
+        return {};
+    }
+
     // --- Test/diagnostic introspection (not part of the Store seam) ---------------------------
     [[nodiscard]] FenceToken current_owner(ActorId id) {
         std::lock_guard<std::mutex> g(mu_);
@@ -272,6 +342,7 @@ private:
             s.through_seq = r.u64();
             s.record = r.blob();
             if (!r.ok || !r.done()) return false;
+            if (s.through_seq > e.last_seq) e.last_seq = s.through_seq;  // ADR-052: compacted log may hold no events
             e.snapshot = std::move(s);       // latest snapshot wins (later record overwrites)
         } else if (kind == kBatch) {
             const std::uint32_t count = r.u32();
@@ -405,5 +476,6 @@ private:
 };
 
 static_assert(Store<FileStore>, "FileStore must model the 012 Store seam");
+static_assert(CompactableStore<FileStore>, "FileStore supports ADR-052 truncate_log");
 
 }  // namespace quark

@@ -150,6 +150,25 @@ concept Store = requires(S& s, ActorId id, FenceToken tok, SeqNo seq,
     { s.read_log(id, seq) } -> std::same_as<result<EventCursor>>;
 };
 
+// ADR-052 (#24b) — OPTIONAL compaction seam, a refinement of `Store` (not part of the base concept so
+// existing/third-party adapters keep compiling). `truncate_log(id, tok, through_seq)` durably drops
+// every event with `seq <= through_seq`. Contract: fence-checked like a write; REFUSES
+// (errc::internal, no change) unless a snapshot with `through_seq >= through_seq` is already stored
+// (a truncation must never remove events no snapshot subsumes); idempotent. `last_seq` is unchanged.
+template <class S>
+concept CompactableStore = Store<S> && requires(S& s, ActorId id, FenceToken tok, SeqNo seq) {
+    { s.truncate_log(id, tok, seq) } -> std::same_as<result<void>>;
+};
+
+// 012 §Compaction (ADR-024 documented fixed-count fallback, implemented per ADR-052): snapshot +
+// truncate after `N` committed events past the last snapshot. A policy TAG consumed by
+// `EventLog::compact_if_due`; zero runtime cost for actors that do not use it.
+template <std::uint64_t N>
+struct CompactEveryNEvents {
+    static_assert(N > 0, "CompactEveryNEvents<N>: N must be > 0");
+    static constexpr std::uint64_t every = N;
+};
+
 // A token of 0 means "no fence": real tokens start at 1 (acquire_fence returns owner+1). A store
 // refuses every write carried under it, so a default-constructed / never-acquired token can never be
 // mistaken for a valid owner and silently write (review B5). acquire_fence itself now reports failure
@@ -259,6 +278,19 @@ public:
         for (const auto& ev : it->second.log)
             if (ev.seq >= from) cur.entries.push_back(ev);
         return cur;
+    }
+
+    // ADR-052 compaction seam (see `CompactableStore`).
+    [[nodiscard]] result<void> truncate_log(ActorId id, FenceToken tok, SeqNo through_seq) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto& e = table_[id];
+        if (is_unfenced(tok) || tok < e.owner) return fenced_error();
+        if (!e.snapshot.has_value() || e.snapshot->through_seq < through_seq)
+            return fail(errc::internal, "truncate_log: no snapshot subsumes the requested prefix");
+        std::size_t n = 0;
+        while (n < e.log.size() && e.log[n].seq <= through_seq) ++n;
+        e.log.erase(e.log.begin(), e.log.begin() + static_cast<std::ptrdiff_t>(n));
+        return {};
     }
 
     // --- Test/diagnostic introspection (not part of the Store seam) ---------------------------

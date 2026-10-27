@@ -432,6 +432,22 @@ public:
         return true;
     }
 
+    // --- ADR-052 diagnostics (any thread; relaxed, approximate under concurrency) -----------------
+    // Number of lazily-activated actors currently owned by the engine (resident, incl. evicted-but-
+    // not-yet-reclaimed) and number of live id_table entries. Both return to ~0 once idle actors are
+    // reclaimed (`EngineConfig::lazy_reclaim_grace_ms != 0`).
+    [[nodiscard]] std::size_t lazy_owned_size() const noexcept {
+        std::size_t n = 0;
+        for (std::uint32_t i = 0; i < cfg_.shard_count; ++i)
+            n += static_cast<std::size_t>(shards_[i].lazy_owned_count.load(std::memory_order_relaxed));
+        return n;
+    }
+    [[nodiscard]] std::size_t id_table_size() const noexcept {
+        std::size_t n = 0;
+        for (std::uint32_t i = 0; i < cfg_.shard_count; ++i) n += shards_[i].id_table.size();
+        return n;
+    }
+
     // --- Producer hot path (002 §Wakeup) ---------------------------------------------------
     // Enqueue a message on the actor's mailbox; if THIS caller drove Idle→Scheduled, carry the
     // activation onto its shard run-queue and wake EXACTLY ONE sleeping worker (never broadcast).
@@ -936,11 +952,17 @@ private:
     // `ActivationBroker` ever calls `insert` (a Sequential Activation — never two workers touching
     // the same shard's table at once). Readers are arbitrary producer threads calling `resolve()`
     // concurrently with an insert; `find` never locks, only acquire-ordered loads down an append-only
-    // chain (mirrors the ADR's own proven torn-read-free id-table shape, S4). Entries are never
-    // removed — permanent, matching the ADR's own documented residual risk (unbounded growth under
-    // huge-cardinality one-shot ids; no compaction seam here, out of scope).
+    // chain (mirrors the ADR's own proven torn-read-free id-table shape, S4). ADR-052 (#24b): entries
+    // can now be UNLINKED by the same single writer (`unlink`) — a reader already standing on the entry
+    // keeps a valid `next` (never cleared), and the entry's memory is released only after a grace period
+    // by the reclaim sweep, never at unlink time.
     class ShardIdTable {
     public:
+        struct Entry {
+            ActorId id;
+            Schedulable* sched;
+            std::atomic<Entry*> next;
+        };
         explicit ShardIdTable(std::size_t bucket_count = 1024) : buckets_(bucket_count) {
             for (auto& b : buckets_) b.store(nullptr, std::memory_order_relaxed);
         }
@@ -959,11 +981,34 @@ private:
 
         // Single-writer (this shard's broker only). Publishes with a release store — see `find`.
         void insert(ActorId id, Schedulable* s) {
-            auto* e = new Entry{id, s, nullptr};
-            const std::size_t b = bucket_of(id);
+            link(new Entry{id, s, nullptr});
+        }
+        // Re-publish a previously unlinked entry (ADR-052 rescue path). Single-writer.
+        void link(Entry* e) noexcept {
+            const std::size_t b = bucket_of(e->id);
             e->next.store(buckets_[b].load(std::memory_order_relaxed), std::memory_order_relaxed);
             buckets_[b].store(e, std::memory_order_release);  // the publish
+            count_.fetch_add(1, std::memory_order_relaxed);
         }
+        // Single-writer unlink (ADR-052). Returns the entry (NOT freed — see `destroy`), or null.
+        // `e->next` is left intact so a concurrent reader positioned on `e` still walks the chain.
+        Entry* unlink(ActorId id) noexcept {
+            std::atomic<Entry*>* link_from = &buckets_[bucket_of(id)];
+            for (Entry* e = link_from->load(std::memory_order_relaxed); e != nullptr;) {
+                Entry* next = e->next.load(std::memory_order_relaxed);
+                if (e->id == id) {
+                    link_from->store(next, std::memory_order_release);
+                    count_.fetch_sub(1, std::memory_order_relaxed);
+                    return e;
+                }
+                link_from = &e->next;
+                e = next;
+            }
+            return nullptr;
+        }
+        static void destroy(Entry* e) noexcept { delete e; }
+        // Diagnostic (any thread): number of linked entries.
+        [[nodiscard]] std::size_t size() const noexcept { return count_.load(std::memory_order_relaxed); }
 
         // Lock-free concurrent reader — no lock, no CAS, only acquire loads.
         [[nodiscard]] Schedulable* find(ActorId id) const noexcept {
@@ -975,11 +1020,7 @@ private:
         }
 
     private:
-        struct Entry {
-            ActorId id;
-            Schedulable* sched;
-            std::atomic<Entry*> next;
-        };
+        std::atomic<std::size_t> count_{0};
         [[nodiscard]] std::size_t bucket_of(ActorId id) const noexcept {
             return static_cast<std::size_t>(id.hash()) % buckets_.size();
         }
@@ -996,6 +1037,11 @@ private:
         DestroyFn destroy = nullptr;
         std::unique_ptr<Activation> act;
         std::unique_ptr<Schedulable> sched;  // per-shard Schedulable ownership — see build_schedulable
+        // ADR-052 reclaim bookkeeping — touched only by this shard's drain owner.
+        ActorId id{};                             // key of this actor's id_table entry
+        std::uint64_t due_tick = 0;               // wheel tick at/after which the next phase may run
+        ShardIdTable::Entry* unlinked = nullptr;  // non-null => phase A done (Retired, unlinked)
+        bool queued = false;                      // present in Shard::retire_q
 
         LazyOwned() = default;
         LazyOwned(void* a, DestroyFn d, std::unique_ptr<Activation> ac,
@@ -1008,7 +1054,8 @@ private:
         // destroys the old ones). Must explicitly null the source's `actor`/`destroy` to disarm it.
         LazyOwned(LazyOwned&& o) noexcept
             : actor(std::exchange(o.actor, nullptr)), destroy(std::exchange(o.destroy, nullptr)),
-              act(std::move(o.act)), sched(std::move(o.sched)) {}
+              act(std::move(o.act)), sched(std::move(o.sched)), id(o.id), due_tick(o.due_tick),
+              unlinked(std::exchange(o.unlinked, nullptr)), queued(o.queued) {}
         LazyOwned& operator=(LazyOwned&& o) noexcept {
             if (this != &o) {
                 if (destroy != nullptr && actor != nullptr) destroy(actor);
@@ -1016,12 +1063,17 @@ private:
                 destroy = std::exchange(o.destroy, nullptr);
                 act = std::move(o.act);
                 sched = std::move(o.sched);
+                id = o.id;
+                due_tick = o.due_tick;
+                unlinked = std::exchange(o.unlinked, nullptr);
+                queued = o.queued;
             }
             return *this;
         }
         LazyOwned(const LazyOwned&) = delete;
         LazyOwned& operator=(const LazyOwned&) = delete;
         ~LazyOwned() {
+            if (unlinked != nullptr) ShardIdTable::destroy(unlinked);
             if (destroy != nullptr && actor != nullptr) destroy(actor);
         }
     };
@@ -1106,7 +1158,11 @@ private:
         // shard's own broker (see `ShardIdTable`/`LazyOwned`); the `broker_*` triple is this shard's
         // permanent, engine-internal broker (constructed once, in `Engine`'s constructor).
         ShardIdTable id_table;
-        std::vector<LazyOwned> lazy_owned;
+        // ADR-052: keyed by Schedulable* so a reclaim is O(1) and never moves other entries (the old
+        // vector was append-only). Mutated only by this shard's drain owner (broker + reclaim sweep).
+        std::unordered_map<const Schedulable*, LazyOwned> lazy_owned;
+        std::atomic<std::uint64_t> lazy_owned_count{0};  // diagnostic mirror of lazy_owned.size()
+        std::vector<Schedulable*> retire_q;              // evicted lazy activations awaiting reclaim
         std::unique_ptr<Schedulable> broker_schedulable_owner;  // per-shard — NOT registry_ (see above)
         Schedulable* broker_schedulable = nullptr;              // == broker_schedulable_owner.get()
         std::unique_ptr<Activation> broker_activation;
@@ -1252,7 +1308,12 @@ private:
             Schedulable* raw = s.get();
             // Per-shard ONLY (bug (a) fix) — never registry_/an Engine-wide container; see
             // build_schedulable's comment for the concurrent-multi-shard use-after-free this replaced.
-            sh.lazy_owned.emplace_back(actor, m->destroy, std::move(act), std::move(s));
+            {
+                LazyOwned lo(actor, m->destroy, std::move(act), std::move(s));
+                lo.id = w.id;
+                sh.lazy_owned.emplace(raw, std::move(lo));
+            }
+            sh.lazy_owned_count.store(sh.lazy_owned.size(), std::memory_order_relaxed);
             owned = true;  // ownership now belongs to sh.lazy_owned's LazyOwned destructor
             sh.id_table.insert(w.id, raw);  // publish — BEFORE delivering `first` (bug (b) ordering)
             post(raw, w.first);  // deliver the ORIGINAL message through the ordinary, proven post() path
@@ -1544,6 +1605,61 @@ private:
             sh.wheel_last_tick_ns += tick_ns;
             sh.wheel.tick([this, &sh](detail::TimerEntry* e) { on_deactivate_fire(sh, e); });
         }
+        if (!sh.retire_q.empty()) reclaim_sweep(sh);  // ADR-052: off the drain path, per wheel visit
+    }
+
+    // ---- ADR-052 (#24b): reclaim of evicted lazy activations ------------------------------------
+    // Everything below runs ONLY on this shard's drain owner (same exclusivity as the wheel and the
+    // broker, the id_table's/lazy_owned's sole writers), so no new synchronization is introduced and
+    // nothing here is reachable from the dispatch drain loop except the cold `went_dormant` branch.
+    [[nodiscard]] std::uint64_t reclaim_grace_ticks() const noexcept {
+        return std::max<std::uint64_t>(1, cfg_.lazy_reclaim_grace_ms / cfg_.idle_tick_ms);
+    }
+    // A clean eviction just committed (Dormant, mailbox empty). Schedule the reclaim no earlier than
+    // (a) the activation's idle_ticks, so any stale Deactivate wheel entry holding its pointers has
+    // fired, plus (b) the grace period. Spawned (non-lazy) actors are not in lazy_owned — ignored.
+    void note_evicted(Shard& sh, Activation* act, Schedulable* s) noexcept {
+        const auto it = sh.lazy_owned.find(s);
+        if (it == sh.lazy_owned.end()) return;
+        LazyOwned& lo = it->second;
+        lo.due_tick = sh.wheel.now_ticks() + act->idle_ticks() + reclaim_grace_ticks();
+        if (lo.queued) return;
+        try {
+            sh.retire_q.push_back(s);
+            lo.queued = true;
+        } catch (...) {  // OOM: simply stay resident (never a correctness issue)
+        }
+    }
+    void reclaim_sweep(Shard& sh) noexcept {
+        const std::uint64_t now = sh.wheel.now_ticks();
+        std::size_t keep = 0;
+        for (std::size_t i = 0; i < sh.retire_q.size(); ++i) {
+            Schedulable* s = sh.retire_q[i];
+            LazyOwned& lo = sh.lazy_owned.find(s)->second;
+            if (now < lo.due_tick) { sh.retire_q[keep++] = s; continue; }
+            Activation* act = s->activation;
+            if (lo.unlinked == nullptr) {
+                // Phase A: seal Dormant -> Retired (loses cleanly to a racing readmit) and unlink.
+                if (!act->retire_from_dormant()) { lo.queued = false; continue; }  // re-admitted
+                lo.unlinked = sh.id_table.unlink(lo.id);
+                lo.due_tick = now + reclaim_grace_ticks();
+                sh.retire_q[keep++] = s;
+                continue;
+            }
+            // Phase B: a stale-pointer producer may have stranded a message while Retired — rescue it
+            // by re-linking and re-admitting; otherwise free everything.
+            if (act->mailbox().probe_has_work()) {
+                sh.id_table.link(lo.unlinked);
+                lo.unlinked = nullptr;
+                lo.queued = false;
+                if (act->readmit_from_retired()) schedule_and_wake(s);
+                continue;
+            }
+            ShardIdTable::destroy(std::exchange(lo.unlinked, nullptr));
+            sh.lazy_owned.erase(s);  // ~LazyOwned: destroys actor, Activation, Schedulable
+        }
+        sh.retire_q.resize(keep);
+        sh.lazy_owned_count.store(sh.lazy_owned.size(), std::memory_order_relaxed);
     }
 
     // ADR-028 Phase 2: arm a one-shot Deactivate entry for `act`, `idle_ticks()` wheel-ticks from now.
@@ -1686,8 +1802,10 @@ private:
                 // is the one cheap post-hoc check that tells the two apart: only a real Idle gets a
                 // fresh Deactivate token armed (011/ADR-028 Phase 2) — an evicted activation has
                 // nothing to arm until a future message reactivates it and it goes idle again.
-                if (!act->went_dormant() && act->idle_ticks() != 0) {
-                    arm_deactivate(shards_[sid], act, s);
+                if (!act->went_dormant()) {
+                    if (act->idle_ticks() != 0) arm_deactivate(shards_[sid], act, s);
+                } else if (cfg_.lazy_reclaim_grace_ms != 0) {
+                    note_evicted(shards_[sid], act, s);  // ADR-052: cold, once per clean eviction
                 }
                 return;  // released to Idle (or evicted to Dormant) — done
             }
