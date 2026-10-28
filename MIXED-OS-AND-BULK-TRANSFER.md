@@ -147,8 +147,33 @@ under SYN floods, and anything in 2.1 involving arm64 vs x86-64 layout.
   local-only, `distribution.hpp` ~l.191), positive control (same ABI => `WireMode::Tagless` on every
   frame, 0 fallback warnings), forced mismatch (alien tags => every frame `WireMode::Tagged`,
   warning fires, values decode correctly), clean `leave()`.
-* It does **not** prove: a real Windows<->Linux pair (different binaries, different `platform_abi_tag`
-  constants), mutual TLS with real certificates, SWIM on a real 3-node mixed cluster, or Linux/arm64.
+* It does **not** prove: mutual TLS with real certificates, SWIM on a real 3-node mixed cluster, or
+  Linux/arm64. (A real Windows<->Linux pair IS now exercised, see "Real cross-OS run" below.)
+
+#### Real cross-OS run (2026-10-28, issue #17)
+
+`tests/netem/mixed_os_node.cpp` is the same protocol as the test above with ONE node per process and the
+genuine `pal::platform_abi_tag` (nothing forced); `tests/netem/run_mixed_os.sh` drives it (built, not a
+CTest target: it needs two hosts). Run: seed on Linux/x86-64 (g++ 15.2, Release), joiner on
+Windows/x86-64 (clang++ 22, Release), the joiner reaching the seed's loopback listener through `ssh -L`.
+
+| Pair | local / peer abi_tag | inbound frames | Result |
+|---|---|---|---|
+| Windows <-> Windows (control) | 0x78866457 / 0x78866457 | tagless 100, tagged 0 | PASS |
+| Linux <-> Linux (control) | 0x7886644C / 0x7886644C | tagless 100, tagged 0 | PASS |
+| **Windows <-> Linux** | 0x78866457 / 0x7886644C | tagless 0, **tagged 100** | **PASS** (join via `SeedListDiscovery`, SWIM Alive both ways, 50 Req/Resp each way with the right sums, clean leave -> Left) |
+
+Finding: the same `Responder`/`Collector` actors declared in an ANONYMOUS namespace got different actor
+type keys on the two OSes (GCC spells it `{anonymous}`, Clang `(anonymous namespace)`), so every remote
+`tell` was received (tagged, as expected) but never dispatched (`req_handled=0`). Message keys (`Req`,
+`Resp`, Described fingerprints) matched. Moving the actors to a named namespace fixed it. This is the
+already-recorded cross-toolchain name-normalisation gap (`OpenQuestions.md`, `canonical_type_name`); it
+is now reproduced on a real mixed pair. MSVC (`cl`) will additionally differ for EVERY actor because
+`__FUNCSIG__` keeps the `struct`/`class` elaborator (recorded, not re-run here: this host builds Windows
+with clang++). A mixed cluster must therefore build every node with the same compiler family, or the
+normalisation must be implemented first (it changes durable actor keys, so it needs its own ADR).
+Still NOT covered: Linux/arm64, mTLS with real certificates (mock handshake), and a CI job: GitHub-hosted
+runners are not mutually routable, so the cross-host run stays a manual/self-hosted step.
 * CI: `.github/workflows/ci.yml` runs the test on every existing leg (it is auto-globbed) and adds a
   `mixed-os-conformance` job documented there as the cross-runner follow-up (see the workflow comment).
   **No GitHub CI was executed to produce this document.**

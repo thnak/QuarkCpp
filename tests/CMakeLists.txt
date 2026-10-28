@@ -343,6 +343,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_compile_definitions(swim_chaos_node PRIVATE QUARK_ALLOW_INSECURE)  # F1: dev plaintext
 endif()
 
+# Issue #17: one-node-per-process mixed-OS conformance node (tests/netem/mixed_os_node.cpp), driven by
+# tests/netem/run_mixed_os.sh across two hosts. Built on every OS, NOT registered with CTest (needs two hosts).
+add_executable(mixed_os_node netem/mixed_os_node.cpp)
+target_include_directories(mixed_os_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(mixed_os_node PRIVATE quark::quark quark_warnings Threads::Threads)
+
 # F1 negative control: built WITHOUT QUARK_ALLOW_INSECURE. A bare plaintext TcpTransport must
 # refuse start(); the explicit dev setter and a SecureTransport-wrapped inner must be allowed.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/security_plaintext_transport_refusal_control.cpp")

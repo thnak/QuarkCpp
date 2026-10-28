@@ -184,6 +184,14 @@ public:
 
     ~Engine() { stop(); }
 
+    // ADR-060 (#4): build the send-side descriptor pool for a `LocalRouter`, sized from the frozen
+    // config (`pool_capacity` per shard, `pool_partitions` independent free-lists). COLD, call once
+    // before constructing the router; the caller owns the pool and must keep it alive past the router.
+    [[nodiscard]] std::unique_ptr<detail::MessagePool> make_send_pool() const {
+        return std::make_unique<detail::MessagePool>(
+            static_cast<std::size_t>(cfg_.pool_capacity) * cfg_.shard_count, cfg_.pool_partitions);
+    }
+
     // Convenience ctor (worker + shard count, defaults for the rest).
     Engine(std::uint32_t worker_count, std::uint32_t shard_count)
         : Engine(EngineConfig{worker_count, shard_count, 1024, 64}) {}

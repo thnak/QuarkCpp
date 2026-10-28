@@ -73,6 +73,12 @@ struct EngineConfig {
     // This bounds how long a producer may sit between resolve() and post() before it risks a
     // use-after-free — see ADR-052 caveats; choose >> the longest producer stall you tolerate.
     std::uint32_t lazy_reclaim_grace_ms = 0;
+    // ADR-060 (#4): partition count for the send pool built by `Engine::make_send_pool()`. 1 (default)
+    // = one shared free-list, byte-for-byte today's behavior. >1 spreads producer-side acquire
+    // contention across independent partitions (producer thread -> partition by lane id). Measured on a
+    // quiet Linux Xeon, 8 producers -> 1 consumer: 1.05 -> 9.3 M msg/s (ADR-060). Set it to roughly
+    // the number of concurrent sender threads; more partitions only cost memory, never correctness.
+    std::uint32_t pool_partitions = 1;
     // 009 §"Build-time budget gate" / ADR-022: worst-case metrics grid/arena footprint ceiling. A
     // caller computes the exact footprint via `sizeof()` (metrics_cardinality.hpp's
     // `TypeMetricsGrid<Spec>::footprint_bytes` / `InstanceMetricsArena<Spec>::footprint_bytes`) and
@@ -212,6 +218,7 @@ public:
     ConfigBuilder& bands(std::uint32_t k) noexcept { cfg_.band_count = k; return *this; }
     ConfigBuilder& max_types(std::uint32_t n) noexcept { cfg_.max_types = n; return *this; }
     ConfigBuilder& pool_capacity(std::uint32_t n) noexcept { cfg_.pool_capacity = n; return *this; }
+    ConfigBuilder& pool_partitions(std::uint32_t n) noexcept { cfg_.pool_partitions = n; return *this; }
     ConfigBuilder& numa(Numa v) noexcept { cfg_.numa = v; return *this; }
     ConfigBuilder& validation(Validation v) noexcept { cfg_.validation = v; return *this; }
     ConfigBuilder& security_mode(SecurityMode v) noexcept { cfg_.security_mode = v; return *this; }
