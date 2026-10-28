@@ -474,6 +474,20 @@ private:
 // and inbound frame handling, which run on the driving thread); view()/epoch() publish an immutable
 // snapshot under a mutex so a cross-thread reader (placement per-send) is UAF-free and TSan-clean,
 // exactly as InProcessMembership does.
+//
+// THREADING: the driving thread is the thread that delivers this node's inbound frames. tick() and
+// on_frame()/inbound control handling share that one thread, and nothing else may call tick() while
+// frames can be delivered. Two supported ways to drive it:
+//   - Threaded transport (net::TcpTransport): marshal the tick onto the transport's I/O thread with
+//     `transport.post([&swim] { swim.tick(); })`. post() is the same queue on_receive() callbacks run
+//     on, so tick() and on_frame() are serialised by construction. This is the idiom used by
+//     samples/19_tcp_cluster_dynamic_join and samples/20_swim_membership_stability.
+//   - Synchronous in-process/loopback transport (the single-threaded test doubles): call tick()
+//     directly from the one thread that drives the transport.
+// Calling tick() from another thread while a threaded transport delivers frames is a DATA RACE: the
+// SWIM tables are unsynchronised by design. TSan flagged exactly this in
+// tests/tcp_relay_congestion_flow_test.cpp before that test adopted post(). Do not add a mutex around
+// tick() as a workaround; route it through post() instead.
 // ============================================================================================
 class SwimMembership final : public Membership {
 public:

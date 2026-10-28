@@ -8,8 +8,6 @@
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
-#include <functional>
-#include <mutex>
 #include <thread>
 
 #include "quark/core/cluster.hpp"
@@ -26,25 +24,6 @@ void check(bool c, const char* what, bool& ok) {
     }
 }
 
-// SwimMembership is single-driver by contract (cluster.hpp): its inbound frames and tick() must not
-// overlap. A real TCP transport delivers frames on its I/O thread, so this test serialises them with
-// tick() through one mutex (TSan caught the unserialised version: on_frame vs tick on node B).
-struct SerialisedTcp : Transport {  // TcpTransport is final: forward to it
-    explicit SerialisedTcp(net::TcpTransport& inner) : inner_(inner) {}
-    std::mutex drive_mu;
-    void send(NodeId to, MessageFrame f) override { inner_.send(to, std::move(f)); }
-    void on_receive(std::function<void(MessageFrame)> cb) override {
-        inner_.on_receive([this, cb = std::move(cb)](MessageFrame f) {
-            std::lock_guard<std::mutex> g(drive_mu);
-            cb(std::move(f));
-        });
-    }
-    [[nodiscard]] bool admit_send(NodeId peer) noexcept override { return inner_.admit_send(peer); }
-    void mark_congested(NodeId peer, std::int64_t ns) noexcept override { inner_.mark_congested(peer, ns); }
-
-private:
-    net::TcpTransport& inner_;
-};
 }  // namespace
 
 int main() {
@@ -53,7 +32,6 @@ int main() {
     const NodeId A{1}, R{2}, B{3};
 
     net::TcpTransport tr(R, pal::ipv4_loopback, 0), ta(A, pal::ipv4_loopback, 0), tb(B, pal::ipv4_loopback, 0);
-    SerialisedTcp tb_serial(tb);
     tr.on_receive([](MessageFrame) {});
     tr.set_relay_forwarding([&](NodeId, NodeId) { return true; });
 
@@ -64,7 +42,7 @@ int main() {
     cfg.congestion_low_watermark = 50;
     cfg.congestion_window_ns = 800'000'000;   // 0.8s TTL
     cfg.congestion_refresh_ns = 5'000'000'000;  // no re-broadcast inside the test window
-    SwimMembership swimA(A, ta, cfg), swimB(B, tb_serial, cfg);
+    SwimMembership swimA(A, ta, cfg), swimB(B, tb, cfg);
     (void)swimA.admit(B, cluster);
     (void)swimB.admit(A, cluster);
     std::atomic<std::uint64_t> b_resident{200};  // above the high watermark
@@ -82,10 +60,11 @@ int main() {
     check(ta.admit_send(B), "before any signal A admits sends to B", ok);
     bool throttled = wait_until(
         [&] {
-            {
-                std::lock_guard<std::mutex> g(tb_serial.drive_mu);
-                swimB.tick();
-            }  // fires the edge-triggered Congested broadcast (B past the watermark)
+            // Drive B's SWIM on its own transport's I/O thread (the same thread that delivers B's
+            // inbound frames), so tick() and on_frame() never overlap. The tick fires the edge-triggered
+            // Congested broadcast (B past the watermark). post() is async: sleep so ticks are not flooded.
+            tb.post([&] { swimB.tick(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             for (int i = 0; i < 200; ++i)
                 if (!ta.admit_send(B)) return true;  // the bucket drained ⇒ A's gate is Shedding
             return false;
