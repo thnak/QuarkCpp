@@ -51,7 +51,7 @@ that is **identical on every node and every restart** (`type_key`), while dispat
 tables want a **dense, small** index for O(1) array lookup (`type_index`). The
 identity is **explicit and platform-independent** (**ADR-062**). An **actor** declares
 `static constexpr std::string_view quark_type_name = "app.billing.Ledger"` — REQUIRED, a compile
-error if absent — and its `type_key` is `FNV-1a(name)` folded, in protocol order, with the 016
+error if absent or if it breaks the charset/length rule (1..128 ASCII letters, digits, `.`, `_`, `-`; no leading/trailing `.`, no `..`) — and its `type_key` is `FNV-1a(name)` folded, in protocol order, with the 016
 fingerprints of its **Described** messages only. No compiler-derived spelling (`__PRETTY_FUNCTION__`,
 `__FUNCSIG__`) ever enters an actor key, so the key is identical on GCC, Clang and MSVC, on every OS
 and architecture, and survives renaming or moving the C++ type. Non-Described messages are

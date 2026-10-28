@@ -63,5 +63,9 @@ name there would be a second mechanism), and a name on local-only non-Described 
 - Documentation snippets in README, 005, CONVENTIONS, wiki and samples/README were updated, and the actor
   snippets in RFCs 001, 004, 007, 012, 017, 024, 025 (and their wiki mirrors) were swept to declare a name.
   008's "canonical normalization" open question is resolved by this ADR.
-- Names are not validated for charset/length beyond non-empty; uniqueness is enforced by the startup scan, not
-  at compile time (a compile-time cross-TU check is impossible without a registry).
+- Name rules are validated at compile time for every actor (`detail::valid_actor_type_name`, checked in
+  `raw_type_key`, message cites ADR-062): 1..128 characters, ASCII letters, digits, `.`, `_` and `-` only, must
+  not start or end with `.`, and must not contain `..`. Any other byte (space, `/`, `!`, non-ASCII) is rejected.
+  Covered by `tests/metadata_typekey_test.cpp` (static_asserts) and the configure-time gate in `tests/CMakeLists.txt`
+  (unnamed actor and `"bad name!"` actor both rejected with the ADR-062 diagnostic). Uniqueness is enforced by the
+  startup scan, not at compile time (a compile-time cross-TU check is impossible without a registry).

@@ -5,7 +5,9 @@
 //      record header (016) and the 008 identity are the same number (the promised unification).
 //   4. PROTOCOL FOLD: an actor's key folds its protocol, so two actors that differ only by protocol
 //      get distinct keys.
+#include <array>
 #include <cstdio>
+#include <string_view>
 #include <unordered_set>
 
 #include "quark/core/actor.hpp"
@@ -144,3 +146,32 @@ int main() {
     std::printf("metadata_typekey_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
+
+// ADR-062 actor type-name rules (compile-time): 1..128 chars of [A-Za-z0-9._-], no leading/trailing '.', no "..".
+static_assert(detail::valid_actor_type_name("app.billing.Ledger"), "ADR-062: dotted name is valid");
+static_assert(detail::valid_actor_type_name("quark.test.engine_send_pool_partitions_test.Counter"),
+              "ADR-062: in-tree test name is valid");
+static_assert(detail::valid_actor_type_name("quark.sample.01_hello-counter.Counter"), "ADR-062: '-' and '_' are valid");
+static_assert(detail::valid_actor_type_name("A"), "ADR-062: single character is valid");
+// Exact-length boundary inputs (128 valid, 129 invalid), generated at compile time.
+template <std::size_t N>
+constexpr std::array<char, N> repeat_a() {
+    std::array<char, N> a{};
+    for (auto& c : a) c = 'a';
+    return a;
+}
+constexpr auto kLen128 = repeat_a<128>();
+constexpr auto kLen129 = repeat_a<129>();
+static_assert(detail::valid_actor_type_name(std::string_view{kLen128.data(), kLen128.size()}),
+              "ADR-062: 128 characters is valid (boundary)");
+static_assert(!detail::valid_actor_type_name(""), "ADR-062: empty is rejected");
+static_assert(!detail::valid_actor_type_name(std::string_view{kLen129.data(), kLen129.size()}),
+              "ADR-062: 129 characters is rejected (boundary)");
+static_assert(!detail::valid_actor_type_name("app billing.Ledger"), "ADR-062: space is rejected");
+static_assert(!detail::valid_actor_type_name("app/billing/Ledger"), "ADR-062: '/' is rejected");
+static_assert(!detail::valid_actor_type_name("app!"), "ADR-062: '!' is rejected");
+static_assert(!detail::valid_actor_type_name(".app.Ledger"), "ADR-062: leading '.' is rejected");
+static_assert(!detail::valid_actor_type_name("app.Ledger."), "ADR-062: trailing '.' is rejected");
+static_assert(!detail::valid_actor_type_name("a..b"), "ADR-062: \"..\" is rejected");
+static_assert(!detail::valid_actor_type_name("caf\xC3\xA9.Ledger"), "ADR-062: non-ASCII byte is rejected");
+static_assert(!detail::valid_actor_type_name("app.\xFF"), "ADR-062: high-bit byte is rejected");

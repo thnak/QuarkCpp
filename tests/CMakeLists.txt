@@ -379,6 +379,11 @@ try_compile(QUARK_ACTOR_WITHOUT_NAME_COMPILES
   SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/compile_fail/actor_name.cpp"
   ${_quark_cf_common}
   OUTPUT_VARIABLE _quark_cf_missing_out)
+try_compile(QUARK_ACTOR_BAD_NAME_COMPILES
+  "${CMAKE_BINARY_DIR}/cf_actor_name_bad"
+  SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/compile_fail/actor_name.cpp"
+  COMPILE_DEFINITIONS -DBAD_NAME ${_quark_cf_common}
+  OUTPUT_VARIABLE _quark_cf_bad_out)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_quark_cf_saved_type}")
 if(NOT QUARK_ACTOR_NAME_CONTROL_COMPILES)
   message(FATAL_ERROR "Quark ADR-062 gate: the positive control (actor WITH quark_type_name) failed to compile:\n${_quark_cf_control_out}")
@@ -389,4 +394,10 @@ endif()
 if(NOT _quark_cf_missing_out MATCHES "ADR-062")
   message(FATAL_ERROR "Quark ADR-062 gate: the no-name actor failed for the wrong reason (no ADR-062 diagnostic):\n${_quark_cf_missing_out}")
 endif()
-message(STATUS "Quark: ADR-062 gate OK (named actor compiles, unnamed actor rejected with the ADR-062 diagnostic)")
+if(QUARK_ACTOR_BAD_NAME_COMPILES)
+  message(FATAL_ERROR "Quark ADR-062 gate: an actor with an invalid quark_type_name (\"bad name!\") compiled; the charset/length rules must be enforced.")
+endif()
+if(NOT _quark_cf_bad_out MATCHES "ADR-062")
+  message(FATAL_ERROR "Quark ADR-062 gate: the bad-name actor failed for the wrong reason (no ADR-062 diagnostic):\n${_quark_cf_bad_out}")
+endif()
+message(STATUS "Quark: ADR-062 gate OK (named actor compiles; unnamed and invalid-name actors rejected with the ADR-062 diagnostic)")

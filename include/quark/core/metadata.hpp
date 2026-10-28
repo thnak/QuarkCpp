@@ -195,6 +195,21 @@ concept has_quark_type_name = requires {
     { A::quark_type_name } -> std::convertible_to<std::string_view>;
 };
 
+// ADR-062 name rules, checked at compile time for every actor: 1..128 characters, ASCII letters, digits,
+// '.', '_' and '-' only; must not start or end with '.', and must not contain "..". Any other byte
+// (space, '/', '!', non-ASCII) is rejected. Pure function so it is unit-testable (tests/metadata_typekey_test.cpp).
+[[nodiscard]] constexpr bool valid_actor_type_name(std::string_view s) noexcept {
+    if (s.empty() || s.size() > 128) return false;
+    if (s.front() == '.' || s.back() == '.') return false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        if (!alnum && c != '.' && c != '_' && c != '-') return false;
+        if (c == '.' && i + 1 < s.size() && s[i + 1] == '.') return false;
+    }
+    return true;
+}
+
 // A name usable in a key/label: the pinned name for anything that declares one (actor or not), else the
 // compiler's raw spelling (display only — never fed to an actor key).
 template <class T>
@@ -232,7 +247,12 @@ template <class T>
                       "every actor must declare `static constexpr std::string_view quark_type_name = \"...\";` "
                       "(ADR-062): its identity is an explicit, platform-independent name, never a "
                       "compiler-derived one. Pick a stable, unique, dotted name, e.g. \"app.billing.Ledger\".");
-        static_assert(!std::string_view{T::quark_type_name}.empty(), "quark_type_name must not be empty");
+        if constexpr (has_quark_type_name<T>) {
+            static_assert(valid_actor_type_name(std::string_view{T::quark_type_name}),
+                          "quark_type_name violates ADR-062: it must be 1..128 characters of ASCII letters, digits, "
+                          "'.', '_' or '-' only, must not start or end with '.', and must not contain \"..\" "
+                          "(e.g. \"app.billing.Ledger\")");
+        }
         if constexpr (requires { typename T::protocol; }) {
             return fold_protocol<T>(static_cast<typename T::protocol*>(nullptr));
         } else {
