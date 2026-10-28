@@ -7,6 +7,7 @@
 g++-14=14.2.0-4ubuntu2~24.04.1
 cmake=3.28.3-1build7
 ninja-build=1.11.1-2
+ccache=4.9.1-1
 gdb=15.1-1ubuntu1~24.04.1
 # apt.llvm.org llvm-toolchain-noble-22 (the hash-pinned installer only adds the repo; these are
 # installed exactly after it):

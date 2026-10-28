@@ -72,6 +72,9 @@ jobs:
       - name: Install toolchain (versions recorded in the SBOM)
         run: bash ci/install-deps.sh --with-clang
 
+      - name: Cache-prune planner self-test
+        run: python3 -I ci/prune_caches.py --self-test
+
       - name: Audit pinned inputs + negative self-test
         env:
           QUARK_VERIFY_INSTALLED: '1'  # prove the installed toolchain equals the exact apt lock
@@ -168,9 +171,14 @@ jobs:
         # majors and the apt allowlist live in ci/pins.env + ci/apt-packages.txt (audited above).
         run: bash ci/install-deps.sh ${{ startsWith(matrix.config.cxx, 'clang') && '--with-clang' || '' }}
 
+      - name: ccache restore
+        uses: ./.github/actions/ccache-restore
+        with:
+          scope: ${{ matrix.config.name }}-${{ matrix.arch }}
+
       - name: Configure
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} \
             ${SAN:+-DQUARK_SANITIZE="$SAN"}
@@ -179,6 +187,13 @@ jobs:
 
       - name: Build
         run: cmake --build build -j ${{ matrix.config.build_jobs }}
+
+      - name: ccache cleanup + save
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/ccache-save
+        with:
+          scope: ${{ matrix.config.name }}-${{ matrix.arch }}
+          save: ${{ github.event_name == 'push' && 'true' || 'false' }}
 
       # DIAGNOSTIC (temporary): arm64 gcc/clang-release hung indefinitely on
       # topology_fifo_under_relay_test — ASan/TSan on the same arch complete it fine (slowly),
@@ -398,13 +413,25 @@ jobs:
       - name: Install toolchain
         run: bash ci/install-deps.sh
 
+      - name: ccache restore
+        uses: ./.github/actions/ccache-restore
+        with:
+          scope: perf-gate-x86_64
+
       - name: Configure (gcc Release + bench gate)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
 
       - name: Build benches + run 023 gate
         # The custom target builds every *_bench then runs ci_bench_gate.sh: exit non-zero ONLY on a
         # Hard-budget [MISS]; Goal regressions are printed as warnings and keep the job green.
         run: cmake --build build --target bench-gate -j 2
+
+      - name: ccache cleanup + save
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/ccache-save
+        with:
+          scope: perf-gate-x86_64
+          save: ${{ github.event_name == 'push' && 'true' || 'false' }}
 
   perf-gate-arm64:
     name: perf-gate (023 budgets, arm64, informational)
@@ -425,11 +452,23 @@ jobs:
       - name: Install toolchain
         run: bash ci/install-deps.sh
 
+      - name: ccache restore
+        uses: ./.github/actions/ccache-restore
+        with:
+          scope: perf-gate-arm64
+
       - name: Configure (gcc Release + bench gate)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DQUARK_BENCH_CI_GATE=ON
 
       - name: Build benches + run 023 gate (informational)
         run: cmake --build build --target bench-gate -j 2
+
+      - name: ccache cleanup + save
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/ccache-save
+        with:
+          scope: perf-gate-arm64
+          save: ${{ github.event_name == 'push' && 'true' || 'false' }}
 
   # Issue #17 — named mixed-ABI conformance gate. tests/mixed_abi_cluster_conformance_test.cpp starts two
   # Quark nodes over real loopback TCP in ONE process, forces differing ABI tags (the simulation of a

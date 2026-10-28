@@ -110,7 +110,7 @@ PY
         ver="${line#*=}"
         [[ "$ver" == *"*"* ]] && fail "ci/apt-packages.txt: wildcard version for '$pkg'"
         case "$pkg" in
-            "g++-${GCC_MAJOR}"|cmake|ninja-build|gdb|"clang-${CLANG_MAJOR}"|\
+            "g++-${GCC_MAJOR}"|cmake|ninja-build|ccache|gdb|"clang-${CLANG_MAJOR}"|\
             "libc++-${CLANG_MAJOR}-dev"|"libc++abi-${CLANG_MAJOR}-dev"|\
             "libclang-rt-${CLANG_MAJOR}-dev"|\
             git|curl|ca-certificates|python3|gh|wget|gnupg|lsb-release|\
@@ -118,7 +118,7 @@ PY
             *) fail "ci/apt-packages.txt: unlisted package '$pkg'" ;;
         esac
     done < "$root/ci/apt-packages.txt"
-    for pkg in "g++-${GCC_MAJOR}" cmake ninja-build gdb "clang-${CLANG_MAJOR}" \
+    for pkg in "g++-${GCC_MAJOR}" cmake ninja-build ccache gdb "clang-${CLANG_MAJOR}" \
                "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev" \
                "libclang-rt-${CLANG_MAJOR}-dev" \
                git curl ca-certificates python3 gh wget gnupg lsb-release \

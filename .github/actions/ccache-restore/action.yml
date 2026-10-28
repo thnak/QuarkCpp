@@ -1,0 +1,59 @@
+# Restore the ccache compiler cache for a Linux CI leg and export the ccache environment.
+# Pair with ./.github/actions/ccache-save (mandatory cleanup + save). Requires ccache to be installed
+# already (ci/install-deps.sh installs the locked version), so call this AFTER "Install toolchain".
+#
+# Validity model (a cache hit can never change what a build produces):
+#   * ccache keys every object on the preprocessed source + compiler CONTENT hash + flags
+#     (CCACHE_COMPILERCHECK=content), so a restored entry is only ever used when it is exact.
+#   * the actions/cache key adds a toolchain fingerprint (ci/pins.env, ci/apt-packages.txt, the
+#     Dockerfile) so a toolchain bump starts a fresh cache instead of inheriting stale objects; the
+#     scope-only restore-key still lets the very first run after a bump reuse what is still valid.
+#   * bump CACHE_VERSION below to invalidate every cache at once (e.g. after a ccache config change).
+name: ccache-restore
+description: Restore the ccache directory and export the ccache environment
+inputs:
+  scope:
+    description: Cache scope, e.g. "gcc-release-x86_64" (one cache per CI leg)
+    required: true
+  max-size:
+    description: ccache size cap for this scope
+    required: false
+    default: 400M
+runs:
+  using: composite
+  steps:
+    - name: Configure ccache
+      shell: bash
+      run: |
+        command -v ccache >/dev/null || { echo "::error::ccache is not installed (ci/install-deps.sh)"; exit 1; }
+        mkdir -p "$GITHUB_WORKSPACE/.ccache"
+        {
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+          echo "CCACHE_MAXSIZE=${{ inputs.max-size }}"
+          echo "CCACHE_COMPILERCHECK=content"
+          echo "CCACHE_COMPRESS=1"
+          echo "CCACHE_COMPRESSLEVEL=6"
+        } >> "$GITHUB_ENV"
+
+    - name: Restore ccache
+      id: restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: .ccache
+        key: ccache-v1-${{ inputs.scope }}-${{ hashFiles('ci/pins.env', 'ci/apt-packages.txt', 'ci/Dockerfile') }}-${{ github.sha }}
+        restore-keys: |
+          ccache-v1-${{ inputs.scope }}-${{ hashFiles('ci/pins.env', 'ci/apt-packages.txt', 'ci/Dockerfile') }}-
+          ccache-v1-${{ inputs.scope }}-
+
+    - name: Report cache restore
+      shell: bash
+      run: |
+        ccache --zero-stats >/dev/null
+        {
+          echo "### ccache restore (${{ inputs.scope }})"
+          if [ -z "${{ steps.restore.outputs.cache-matched-key }}" ]; then echo "- cold cache (no key matched)"
+          elif [ "${{ steps.restore.outputs.cache-hit }}" = "true" ]; then echo "- exact key hit: ${{ steps.restore.outputs.cache-matched-key }}"
+          else echo "- restored from older key: ${{ steps.restore.outputs.cache-matched-key }}"; fi
+          echo "- size on disk: $(du -sh "$GITHUB_WORKSPACE/.ccache" | cut -f1)"
+        } >> "$GITHUB_STEP_SUMMARY"

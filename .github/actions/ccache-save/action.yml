@@ -1,0 +1,42 @@
+# Mandatory cleanup + (optional) save of the ccache directory. Run it with `if: ${{ !cancelled() }}` so a
+# failed build still contributes the objects it compiled. The cleanup runs on EVERY leg, saved or not:
+#   1. print hit/miss statistics to the job summary (a falling hit rate is the signal the cache is stale);
+#   2. evict entries not used in 7 days (outdated objects never ride along in the saved archive);
+#   3. enforce the CCACHE_MAXSIZE cap (ccache --cleanup);
+#   4. only then save. The save happens on pushes to the default branch only, so pull requests restore
+#      from the default branch's cache but never write their own (they cannot fill the 10 GB quota).
+# GitHub-side pruning (superseded keys, closed PRs, quota) is ./.github/workflows/cache-cleanup.yml.
+name: ccache-save
+description: Report, evict and save the ccache directory
+inputs:
+  scope:
+    description: Same scope as the matching ccache-restore step
+    required: true
+  save:
+    description: '"true" to upload the cache (default-branch pushes); anything else only cleans up'
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: ccache statistics, evict outdated entries, enforce size cap
+      shell: bash
+      run: |
+        command -v ccache >/dev/null || exit 0
+        {
+          echo "### ccache (${{ inputs.scope }})"
+          echo '```'
+          ccache --show-stats
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        ccache --evict-older-than 7d
+        ccache --cleanup
+        echo "ccache after cleanup:"; ccache --show-stats
+        du -sh "$GITHUB_WORKSPACE/.ccache"
+
+    - name: Save ccache
+      if: ${{ inputs.save == 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: .ccache
+        key: ccache-v1-${{ inputs.scope }}-${{ hashFiles('ci/pins.env', 'ci/apt-packages.txt', 'ci/Dockerfile') }}-${{ github.sha }}

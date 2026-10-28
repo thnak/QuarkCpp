@@ -1,0 +1,36 @@
+name: cache-cleanup
+
+# Removes outdated GitHub Actions caches (ccache-* keys only): caches of closed PRs / deleted branches,
+# stale (>7d idle), superseded (older than the newest 2 per ref+scope) and anything over the 8 GiB quota.
+# Rules and self-test: ci/prune_caches.py. Each ccache-save step also trims the cache *contents* before saving.
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the plan without deleting
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-cleanup
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Prune caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+        run: python3 -I ci/prune_caches.py $DRY
