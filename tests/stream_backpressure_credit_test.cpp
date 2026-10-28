@@ -96,7 +96,10 @@ int main() {
     check(torn == 0, "0 torn frames", ok);
     check(inversions == 0, "FIFO preserved under stall/un-stall", ok);
     check(max_occupancy.load() <= kCap, "occupancy pinned at/under the credit window (bounded memory)", ok);
-    check(max_occupancy.load() >= kCap, "occupancy actually reached capacity (producer outran consumer)", ok);
+    // The consumer SAMPLES occupancy between batches, so it can miss the instant the ring is exactly full
+    // (Windows/ARM64 CI saw 255/256 with stalls=3). "Outran" = it filled most of the window; the stall
+    // count and the exact credit invariant above are the precise assertions.
+    check(max_occupancy.load() >= kCap - kCap / 8, "occupancy reached ~capacity (producer outran consumer)", ok);
     check(ch.stall_events() > 0, "the producer STALLED on credit depletion (real backpressure, not shedding)", ok);
     check(producer_done.load(), "the producer UN-STALLED and completed (credit-return rendezvous woke it)", ok);
     check(credit_ok, "credit == window - (head - tail), exactly (derived, race-free by construction)", ok);
