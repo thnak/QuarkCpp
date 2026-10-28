@@ -46,7 +46,7 @@
 using namespace quark;
 using namespace quark::test;
 
-namespace mixed_os {  // NAMED (not anonymous): canonical_type_name spells anon namespaces per-compiler, see #17 finding
+namespace {  // ANONYMOUS on purpose: ADR-061 normalises the per-compiler spelling, so this must still dispatch cross-OS
 
 void put_u64(std::vector<std::byte>& out, std::uint64_t v) {
     for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::byte>((v >> (b * 8)) & 0xFF));
@@ -257,8 +257,7 @@ struct MixedNode {
     }
 };
 
-}  // namespace mixed_os
-using namespace mixed_os;
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3 || (std::strcmp(argv[1], "a") != 0 && std::strcmp(argv[1], "b") != 0)) {

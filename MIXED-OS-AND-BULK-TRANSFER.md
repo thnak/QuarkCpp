@@ -163,15 +163,17 @@ Windows/x86-64 (clang++ 22, Release), the joiner reaching the seed's loopback li
 | Linux <-> Linux (control) | 0x7886644C / 0x7886644C | tagless 100, tagged 0 | PASS |
 | **Windows <-> Linux** | 0x78866457 / 0x7886644C | tagless 0, **tagged 100** | **PASS** (join via `SeedListDiscovery`, SWIM Alive both ways, 50 Req/Resp each way with the right sums, clean leave -> Left) |
 
-Finding: the same `Responder`/`Collector` actors declared in an ANONYMOUS namespace got different actor
-type keys on the two OSes (GCC spells it `{anonymous}`, Clang `(anonymous namespace)`), so every remote
-`tell` was received (tagged, as expected) but never dispatched (`req_handled=0`). Message keys (`Req`,
-`Resp`, Described fingerprints) matched. Moving the actors to a named namespace fixed it. This is the
-already-recorded cross-toolchain name-normalisation gap (`OpenQuestions.md`, `canonical_type_name`); it
-is now reproduced on a real mixed pair. MSVC (`cl`) will additionally differ for EVERY actor because
-`__FUNCSIG__` keeps the `struct`/`class` elaborator (recorded, not re-run here: this host builds Windows
-with clang++). A mixed cluster must therefore build every node with the same compiler family, or the
-normalisation must be implemented first (it changes durable actor keys, so it needs its own ADR).
+Finding (fixed by ADR-061): the same `Responder`/`Collector` actors declared in an ANONYMOUS namespace got
+different actor type keys on the two OSes (GCC spells it `{anonymous}`, Clang `(anonymous namespace)`), so
+every remote `tell` was received (tagged, as expected) but never dispatched (`req_handled=0`). Message keys
+(`Req`, `Resp`, Described fingerprints) matched throughout. ADR-061 normalises the per-compiler spelling
+(MSVC `struct `/`class ` elaborators, the three anonymous-namespace spellings, comma spacing) before hashing
+and adds `quark_type_name` for an explicit, rename-stable identity. Re-run with the actors back in the
+anonymous namespace: Windows/clang <-> Linux/g++ PASS (`req_handled=50`), and real `cl.exe` 14.51 computes
+the same keys as Clang and GCC in `metadata_typekey_conformance_test`. **No same-compiler-family workaround
+is needed any more**; types persisted by `cl.exe` or in a GCC anonymous namespace before ADR-061 have new
+keys (accepted pre-1.0 break; pin with `quark_type_name`). A live `cl.exe` <-> g++ *cluster* run was not
+done (this host's `mixed_os_node` is built with clang++); only the key derivation was verified on `cl.exe`.
 Still NOT covered: Linux/arm64, mTLS with real certificates (mock handshake), and a CI job: GitHub-hosted
 runners are not mutually routable, so the cross-host run stays a manual/self-hosted step.
 * CI: `.github/workflows/ci.yml` runs the test on every existing leg (it is auto-globbed) and adds a

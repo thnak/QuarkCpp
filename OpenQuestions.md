@@ -498,6 +498,16 @@ These affect multiple subsystems; resolving one constrains several specs.
      different FNV-1a folds. Left as recorded-not-asserted (Tier 3); pinning a golden would
      hard-fail at least two of the three toolchains.
 
+   **Resolved 2026-10-28 by [ADR-061](decisions/ADR-061-actor-type-key-normalisation.md).** Actor/name-derived
+   keys are now NORMALISED before hashing (MSVC `struct `/`class ` elaborators dropped, the GCC/MSVC
+   anonymous-namespace spellings mapped to Clang's, template-argument comma spacing fixed) and a type may pin
+   `static constexpr std::string_view quark_type_name`. **Correction to the Tier 2 finding above:** the
+   "GCC and Clang diverge pairwise on user type names" result was the *anonymous-namespace* effect (the test
+   fixture lives in one), not a general name divergence — a named-namespace type already matched on GCC and
+   Clang. After ADR-061 the fixtures produce ONE key on Clang 22/21, g++ 15.2 and real `cl.exe` 14.51, and a
+   real Windows<->Linux pair dispatches (`tests/netem/run_mixed_os.sh`). Still open: builtin spellings
+   (Tier 3) and inline std namespaces — use `quark_type_name`.
+
    All three legs are now real, measured data — not projected from "GCC probably matches
    Clang" reasoning. Closing Tier 3 means normalizing the spellings (strip the MSVC elaborator,
    canonicalize builtin names) or mandating an explicit per-type key; then Tier 3 promotes to

@@ -43,6 +43,25 @@ struct GammaActor : Actor<GammaActor, Sequential> {
     void handle(const Pong&) {}
 };
 
+// ADR-061 (E5): `quark_type_name` pins an actor's identity to a string, so two actors that pin the SAME
+// name AND share a protocol have one key — the startup collision scan must reject the second.
+struct PinnedOne : Actor<PinnedOne, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    using protocol = Protocol<Ping>;
+    void handle(const Ping&) {}
+};
+struct PinnedTwo : Actor<PinnedTwo, Sequential> {  // different C++ name, same pinned name + protocol
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    using protocol = Protocol<Ping>;
+    void handle(const Ping&) {}
+};
+struct PinnedWide : Actor<PinnedWide, Sequential> {  // same pinned name, wider protocol => distinct
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    using protocol = Protocol<Ping, Pong>;
+    void handle(const Ping&) {}
+    void handle(const Pong&) {}
+};
+
 void check(bool c, const char* what, bool& ok) {
     if (!c) {
         std::fprintf(stderr, "  CHECK FAILED: %s\n", what);
@@ -85,6 +104,23 @@ int main() {
     // 4) PROTOCOL FOLD — AlphaActor(<Ping>) and GammaActor(<Ping,Pong>) differ by protocol only.
     check(type_key_of<AlphaActor>() != type_key_of<GammaActor>(),
           "actors differing by protocol get distinct keys (fold)", ok);
+
+    // 5) ADR-061 quark_type_name override: key is the pinned name folded with the protocol — C++ name
+    // independent — and the startup collision scan still trips on two actors that pin the same identity.
+    check(type_key_of<PinnedOne>() == type_key_of<PinnedTwo>(),
+          "quark_type_name: same pinned name + protocol => same key regardless of C++ name", ok);
+    check(type_key_of<PinnedOne>() != type_key_of<PinnedWide>(),
+          "quark_type_name: same pinned name, different protocol => distinct (fold)", ok);
+    {
+        TypeRegistry reg(Validation::Strict);
+        result<std::uint16_t> a = reg.register_metadata(compile_actor_metadata<PinnedOne>(), "PinnedOne",
+                                                        [] { return result<void>{}; });
+        result<std::uint16_t> b = reg.register_metadata(compile_actor_metadata<PinnedTwo>(), "PinnedTwo",
+                                                        [] { return result<void>{}; });
+        check(a.has_value(), "quark_type_name: first pinned actor registers", ok);
+        check(!b.has_value() && b.error().code == errc::validation,
+              "quark_type_name: second actor pinning the same identity is rejected at startup (Strict)", ok);
+    }
 
     std::printf("metadata_typekey_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;

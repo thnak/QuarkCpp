@@ -13,11 +13,12 @@
 //     (so two actors with the same protocol but different names stay distinct, and the described-
 //     message part of the fold is toolchain-independent);
 //   * any other type → the canonical-type-name FNV-1a hash (008's stated derivation).
-// The name normalization across GCC/Clang/MSVC is the standing 008 open question (a mixed-toolchain
-// cluster needs a conformance test or an explicit per-type key); within one toolchain it is stable.
+// ADR-061: the name is NORMALISED across GCC/Clang/MSVC before hashing (see `normalize_type_name`), and
+// `static constexpr std::string_view quark_type_name` pins an identity explicitly (verbatim, rename-stable).
 #pragma once
 
 #include <cstddef>
+#include <concepts>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -58,8 +59,8 @@ namespace detail {
 }
 
 // The compiler's function-name string, sliced to just the `T = …` payload — a canonical type name
-// without a reflection library (008 §Dependencies). Stable within one toolchain; cross-toolchain
-// normalization is the documented open question. Only the BYTES are folded (never a pointer stored),
+// without a reflection library (008 §Dependencies). RAW compiler spelling: feed it through
+// `normalize_type_name` (ADR-061) before hashing. Only the BYTES are folded (never a pointer stored),
 // so this is safe in a constant expression.
 template <class T>
 [[nodiscard]] constexpr std::string_view canonical_type_name() noexcept {
@@ -105,6 +106,74 @@ template <class T>
 #endif
 }
 
+// ADR-061: cross-toolchain NORMALISATION of a canonical type name, streamed byte-by-byte into `emit`.
+// Target spelling is GCC/Clang's, so every name those two already agree on emits IDENTICAL bytes (their
+// existing keys do not change); only the spellings below are rewritten:
+//   * MSVC elaborators `struct ` / `class ` / `enum ` / `union ` at a token start (also inside template
+//     arguments) are dropped;
+//   * anonymous namespaces — GCC `{anonymous}`, MSVC `` `anonymous namespace' `` / `` `anonymous-namespace' ``
+//     — become Clang's `(anonymous namespace)`;
+//   * a `,` not already followed by a space gets one (MSVC prints `Foo<int,int>`, GCC/Clang `Foo<int, int>`).
+// Not normalised (non-goals, use `quark_type_name`): builtin spellings, inline std namespaces.
+template <class Emit>
+constexpr void normalize_type_name(std::string_view s, Emit&& emit) noexcept {
+    constexpr std::string_view kAnon = "(anonymous namespace)";
+    const auto at = [&](std::size_t i, std::string_view lit) { return s.substr(i, lit.size()) == lit; };
+    const auto boundary = [&](std::size_t i) {
+        if (i == 0) return true;
+        const char p = s[i - 1];
+        return p == '<' || p == ',' || p == ' ' || p == '(' || p == ':' || p == '*' || p == '&';
+    };
+    for (std::size_t i = 0; i < s.size();) {
+        if (boundary(i)) {
+            bool skipped = false;
+            for (std::string_view kw : {std::string_view{"struct "}, std::string_view{"class "},
+                                        std::string_view{"enum "}, std::string_view{"union "}}) {
+                if (at(i, kw)) {
+                    i += kw.size();
+                    skipped = true;
+                    break;
+                }
+            }
+            if (skipped) continue;
+        }
+        if (at(i, "{anonymous}")) {
+            for (char c : kAnon) emit(c);
+            i += std::string_view{"{anonymous}"}.size();
+        } else if (at(i, "`anonymous")) {  // MSVC: `anonymous namespace' / `anonymous-namespace'
+            std::size_t j = i;
+            while (j < s.size() && s[j] != '\'') ++j;
+            for (char c : kAnon) emit(c);
+            i = j < s.size() ? j + 1 : j;
+        } else if (s[i] == ',') {
+            emit(',');
+            if (i + 1 >= s.size() || s[i + 1] != ' ') emit(' ');
+            ++i;
+        } else {
+            emit(s[i]);
+            ++i;
+        }
+    }
+}
+
+// The name part of a name-derived key (ADR-061). A type may pin its identity with
+// `static constexpr std::string_view quark_type_name = "...";` — hashed VERBATIM, nothing compiler-
+// derived, so it is identical on every toolchain and stable across renames / namespace moves.
+// Otherwise the normalised canonical name above.
+template <class T>
+[[nodiscard]] constexpr std::uint64_t type_name_hash() noexcept {
+    if constexpr (requires { { T::quark_type_name } -> std::convertible_to<std::string_view>; }) {
+        return fnv1a(std::string_view{T::quark_type_name});
+    } else {
+        std::uint64_t h = 1469598103934665603ULL;  // FNV offset basis (same stream as fnv1a)
+        normalize_type_name(canonical_type_name<T>(), [&h](char c) {
+            h ^= static_cast<std::uint64_t>(static_cast<std::uint8_t>(c));
+            h *= 1099511628211ULL;
+        });
+        return h;
+    }
+}
+
 // The key of a single (non-actor) type: a Described type folds to its 016 fingerprint (toolchain-
 // independent, and identical to the durable/wire key); anything else to its canonical-name hash.
 template <class T>
@@ -112,7 +181,7 @@ template <class T>
     if constexpr (Described<T>) {
         return fingerprint_v<T>;
     } else {
-        return fnv1a(canonical_type_name<T>());
+        return type_name_hash<T>();
     }
 }
 
@@ -137,7 +206,7 @@ template <class A, class... Ms>
     static_assert(protocol_keys_distinct<Ms...>(),
                   "two message types in this Protocol share one type key (same layout): add a "
                   "distinct `static constexpr std::uint64_t quark_type_salt` to one (#18, 016)");
-    std::uint64_t h = fnv1a(canonical_type_name<A>());
+    std::uint64_t h = type_name_hash<A>();  // ADR-061: normalised name or quark_type_name
     ((h = hash_combine(h, single_type_key<Ms>())), ...);
     return h;
 }
@@ -149,7 +218,7 @@ template <class T>
     } else if constexpr (Described<T>) {
         return fingerprint_v<T>;  // matches the 016 durable/wire fingerprint exactly
     } else {
-        return fnv1a(canonical_type_name<T>());
+        return type_name_hash<T>();
     }
 }
 

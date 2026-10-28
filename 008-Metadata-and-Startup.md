@@ -50,7 +50,17 @@ Two ids because the requirements conflict: distribution and persistence need an 
 that is **identical on every node and every restart** (`type_key`), while dispatch
 tables want a **dense, small** index for O(1) array lookup (`type_index`). The
 canonical name is derived from a `constexpr` view of the compiler's function-name
-string, normalized to strip compiler-specific decoration.
+string, normalized to strip compiler-specific decoration (**ADR-061**): MSVC's
+`struct `/`class `/`enum `/`union ` elaborators are dropped, the GCC (`{anonymous}`) and MSVC
+(`` `anonymous namespace' ``) spellings of an anonymous namespace become Clang's
+`(anonymous namespace)`, and a `,` in a template argument list is followed by exactly one space.
+The target is GCC/Clang's spelling, so names those two already agree on keep their keys. An actor
+(or any non-Described type) may instead pin its identity with
+`static constexpr std::string_view quark_type_name = "..."`: hashed **verbatim**, identical on every
+toolchain and stable across renames and namespace moves — recommended for anything persisted or that
+crosses a toolchain boundary. Not normalised (use `quark_type_name`): builtin spellings
+(`unsigned long` is not one type across LP64/LLP64) and inline standard namespaces
+(`std::__cxx11::`, `std::__1::`).
 
 Collision handling: `type_key` collisions are detected during Validation (two
 distinct registered types hashing equal) and are a **Strict-mode startup failure**.

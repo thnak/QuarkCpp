@@ -25,6 +25,8 @@
 // (GCC/Clang only — MSVC's divergence is the expected finding, not a bug to golden away).
 #include <cstdio>
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 #include "quark/core/describe.hpp"
 #include "quark/core/metadata.hpp"
@@ -73,30 +75,52 @@ void check(bool c, const char* what, bool& ok) {
 
 }  // namespace
 
+// ADR-061 fixtures live OUTSIDE the anonymous namespace so the named-namespace case is distinct from
+// the anonymous `ConformanceTag` above (GCC `{anonymous}` / Clang `(anonymous namespace)` / MSVC
+// `anonymous namespace'` spell the latter three ways).
+namespace conformance_named {
+struct NamedTag {
+    int unused = 0;
+};
+template <class A, class B>
+struct NamedPair {
+    A a{};
+    B b{};
+};
+struct Pinned {  // quark_type_name: hashed verbatim, identical on every toolchain, rename-stable
+    static constexpr std::string_view quark_type_name = "quark.conformance.Pinned";
+    int unused = 0;
+};
+struct PinnedRenamed {  // a DIFFERENT C++ name with the SAME pinned identity => same key
+    static constexpr std::string_view quark_type_name = "quark.conformance.Pinned";
+    int unused = 0;
+};
+}  // namespace conformance_named
+
+namespace {
+// Normalise a literal spelling to a std::string (compiler-independent: exercises the three spellings
+// directly, so this runs the same on every toolchain, not only on the one that prints that spelling).
+std::string norm(std::string_view s) {
+    std::string out;
+    detail::normalize_type_name(s, [&out](char c) { out.push_back(c); });
+    return out;
+}
+}  // namespace
+
 // --- Golden constants ---------------------------------------------------------------------
 // F17 changed the layout-aware fold; the old 0x60eb/0x54f5 values predate it. Re-measured on the
 // pinned toolchains: GCC 14, Clang 20 and real MSVC 14.44 all compute the same Tier-1 values.
 inline constexpr std::uint64_t kTier1Golden = 0x27756b6f126e43f2ULL;
 inline constexpr std::uint64_t kTier1SwappedGolden = 0xec12c83ceaf59f3cULL;
 
-// Tier 2 golden, measured on Clang (Windows box) — the branch metadata.hpp's canonical_type_name()
-// takes whenever __clang__ is defined, INCLUDING Windows Clang, which also defines _MSC_VER for
-// MSVC-ABI compatibility. `#if !defined(_MSC_VER)` (as OpenQuestions.md originally proposed) is
-// therefore the WRONG guard here — it would wrongly exclude a real Clang build on Windows. The
-// guard below mirrors metadata.hpp's actual dispatch order (__clang__ / __GNUC__ checked BEFORE
-// _MSC_VER).
-inline constexpr std::uint64_t kTier2GoldenClang = 0xba4a66eb2b3e6ff3ULL;
-// Real GCC golden — measured directly (g++ 15.2.0, WSL/Linux). CORRECTED: this was originally
-// assumed to share Clang's golden (both use __PRETTY_FUNCTION__-based name slicing in
-// canonical_type_name()), but real GCC diverges from real Clang here too, not just from MSVC —
-// the two compilers' __PRETTY_FUNCTION__ output for the identical type is NOT byte-identical
-// (a different name string folds to a different FNV-1a key). This was caught by ThreadSanitizer
-// CI running this test for the first time on GCC and failing it, exactly the drift-detection this
-// test exists for.
-inline constexpr std::uint64_t kTier2GoldenGcc = 0xc1a54de107d9d89fULL;
-// Real MSVC (cl.exe, __clang__ NOT defined) golden — measured directly, confirms the predicted
-// elaborator divergence (`struct ns::Point` vs `ns::Point`) is real, not merely plausible.
-inline constexpr std::uint64_t kTier2GoldenRealMsvc = 0x2d4c989423ddf201ULL;
+// ADR-061 Tier 2 goldens: ONE value for ALL toolchains (the point of the ADR). `kTier2Golden` is the
+// anonymous-namespace fixture and is byte-for-byte the pre-ADR-061 CLANG value (0xba4a66eb2b3e6ff3):
+// normalisation targets Clang/GCC's spelling, so a Clang key does not move (E2). GCC's and MSVC's
+// pre-ADR-061 values (0xc1a54de107d9d89f / 0x2d4c989423ddf201) are retired.
+inline constexpr std::uint64_t kTier2Golden = 0xba4a66eb2b3e6ff3ULL;
+inline constexpr std::uint64_t kTier2NamedGolden = 0x4202adf0189cbfa1ULL;
+inline constexpr std::uint64_t kTier2PairGolden = 0x28f38acdf8c467cbULL;
+inline constexpr std::uint64_t kTier2PinnedGolden = 0x1a4e0103acebb260ULL;
 
 int main() {
     bool ok = true;
@@ -104,7 +128,11 @@ int main() {
     const std::uint64_t tier1_key = fingerprint_v<ConformancePoint>;
     const std::uint64_t tier1_swapped_key = fingerprint_v<ConformancePointFieldsSwapped>;
     const std::uint64_t tier2_key = type_key_of<ConformanceTag>().value;
+    const std::uint64_t named_key = type_key_of<conformance_named::NamedTag>().value;
+    const std::uint64_t pair_key = type_key_of<conformance_named::NamedPair<int, double>>().value;
+    const std::uint64_t pinned_key = type_key_of<conformance_named::Pinned>().value;
     const std::uint64_t tier3_key = type_key_of<ConformanceWrap<std::size_t>>().value;
+
 
     // --- Tier 1: F17 layout-aware golden (GCC/Clang/MSVC agree). ------------------------------
     check(type_key_of<ConformancePoint>().value == fingerprint_v<ConformancePoint>,
@@ -118,37 +146,33 @@ int main() {
           "Tier 1 negative control: swapping which field carries which tag MUST move the "
           "fingerprint (016 field-order invariant) — proves the golden above is non-vacuous", ok);
 
-    // --- Tier 2: one golden PER COMPILER — Clang, GCC, and MSVC all diverge from each other
-    // (confirmed; GCC vs Clang was originally assumed to match since both use
-    // __PRETTY_FUNCTION__-based slicing, but real measurement disproved that — see the golden
-    // constants' comments above). This mirrors metadata.hpp's OWN dispatch priority
-    // (__clang__ checked before __GNUC__ before _MSC_VER), not a naive _MSC_VER check.
-#if defined(__clang__)
-    check(tier2_key == kTier2GoldenClang,
-          "Tier 2 golden (Clang name-derived key) drifted", ok);
-    check(tier2_key != kTier2GoldenGcc,
-          "Tier 2 CONFIRMED divergence: Clang's __PRETTY_FUNCTION__ slice yields a different "
-          "name-derived key than GCC's for the identical type",
-          ok);
-#elif defined(__GNUC__)
-    check(tier2_key == kTier2GoldenGcc,
-          "Tier 2 golden (GCC name-derived key) drifted", ok);
-    check(tier2_key != kTier2GoldenClang,
-          "Tier 2 CONFIRMED divergence: GCC's __PRETTY_FUNCTION__ slice yields a different "
-          "name-derived key than Clang's for the identical type — if this ever matches, one of "
-          "the two toolchains' canonical_type_name() slicing changed and this pairing may be "
-          "closeable",
-          ok);
-#elif defined(_MSC_VER)
-    check(tier2_key == kTier2GoldenRealMsvc,
-          "Tier 2 golden (real MSVC name-derived key) drifted", ok);
-    check(tier2_key != kTier2GoldenClang && tier2_key != kTier2GoldenGcc,
-          "Tier 2 CONFIRMED divergence: real MSVC's __FUNCSIG__ elaborator (`struct ns::T` vs "
-          "`ns::T`) yields a different name-derived key than Clang/GCC for the identical type — "
-          "if this ever matches, MSVC's canonical_type_name() slicing changed and Tier 2 may be "
-          "closeable",
-          ok);
-#endif
+    // --- Tier 2 (ADR-061): ONE golden on every toolchain. -----------------------------------------
+    check(tier2_key == kTier2Golden, "Tier 2 golden (anonymous-namespace fixture) drifted or differs on this toolchain", ok);
+    check(named_key == kTier2NamedGolden, "Tier 2 golden (named-namespace fixture) drifted or differs on this toolchain", ok);
+    check(pair_key == kTier2PairGolden, "Tier 2 golden (two-argument template) drifted or differs on this toolchain", ok);
+    check(pinned_key == kTier2PinnedGolden, "Tier 2 golden (quark_type_name) drifted or differs on this toolchain", ok);
+    check(pinned_key == type_key_of<conformance_named::PinnedRenamed>().value,
+          "quark_type_name: same pinned name => same key regardless of the C++ name (rename-stable)", ok);
+    check(pinned_key != named_key, "quark_type_name: negative control, pinned key differs from a name-derived one", ok);
+
+    // --- Normaliser, compiler-independent: every compiler's spelling of one type => one string. ----
+    check(norm("ns::Foo") == "ns::Foo", "normalise: GCC/Clang names are untouched (their keys do not move)", ok);
+    check(norm("struct ns::Foo") == "ns::Foo", "normalise: MSVC `struct ` elaborator dropped", ok);
+    check(norm("class ns::Foo") == "ns::Foo" && norm("enum ns::E") == "ns::E" && norm("union ns::U") == "ns::U",
+          "normalise: class/enum/union elaborators dropped", ok);
+    check(norm("ns::W<struct ns::A,class ns::B>") == "ns::W<ns::A, ns::B>",
+          "normalise: elaborators inside template args dropped and `,` gets one space (MSVC spelling)", ok);
+    check(norm("ns::W<ns::A, ns::B>") == "ns::W<ns::A, ns::B>", "normalise: GCC/Clang template spelling untouched", ok);
+    check(norm("{anonymous}::X") == "(anonymous namespace)::X", "normalise: GCC anonymous namespace", ok);
+    check(norm("(anonymous namespace)::X") == "(anonymous namespace)::X", "normalise: Clang anonymous namespace untouched", ok);
+    check(norm("`anonymous namespace'::X") == "(anonymous namespace)::X", "normalise: MSVC anonymous namespace", ok);
+    check(norm("`anonymous-namespace'::X") == "(anonymous namespace)::X", "normalise: MSVC anonymous-namespace variant", ok);
+    check(norm("mystruct ns::Foo") == "mystruct ns::Foo" && norm("ns::classy") == "ns::classy",
+          "normalise: a keyword is only dropped at a token start, never inside an identifier", ok);
+    check(norm("struct `anonymous namespace'::X") == "(anonymous namespace)::X",
+          "normalise: MSVC spelling of an anonymous-namespace type collapses to Clang's", ok);
+    static_assert(detail::type_name_hash<conformance_named::NamedTag>() == type_key_of<conformance_named::NamedTag>().value,
+                  "the normalised name hash is a constant expression and is the key of a non-actor, non-Described type");
 
     // --- Tier 3: determinism only — never asserted equal across toolchains. -----------------
     check(tier3_key == type_key_of<ConformanceWrap<std::size_t>>().value,
@@ -175,6 +199,12 @@ int main() {
                  static_cast<unsigned long long>(tier1_swapped_key));
     std::printf("  Tier 2 (name-derived, ConformanceTag)                    = 0x%016llx\n",
                  static_cast<unsigned long long>(tier2_key));
+    std::printf("  Tier 2 (named, NamedTag)                                = 0x%016llx\n",
+                 static_cast<unsigned long long>(named_key));
+    std::printf("  Tier 2 (named, NamedPair<int,double>)                   = 0x%016llx\n",
+                 static_cast<unsigned long long>(pair_key));
+    std::printf("  Tier 2 (quark_type_name, Pinned)                        = 0x%016llx\n",
+                 static_cast<unsigned long long>(pinned_key));
     std::printf("  Tier 3 (builtin-spelling, Wrap<size_t>)                  = 0x%016llx\n",
                  static_cast<unsigned long long>(tier3_key));
 
