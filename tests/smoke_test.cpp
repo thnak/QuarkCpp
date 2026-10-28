@@ -30,8 +30,8 @@ int main() {
     const quark::result<int> err = quark::fail(quark::errc::not_found, "actor");
     if (!(!err && err.error().code == quark::errc::not_found)) ok = false;
 
-    // pal — barrier is callable, clock is monotonic
-    quark::pal::store_load_barrier();
+    // pal — spin hint is callable, clock is monotonic
+    quark::pal::cpu_relax();
     const auto t0 = quark::pal::now();
     const auto t1 = quark::pal::now();
     if (!(t1 >= t0)) ok = false;

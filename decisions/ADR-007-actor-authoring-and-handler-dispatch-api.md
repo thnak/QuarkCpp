@@ -315,3 +315,18 @@ baked thunk vs (c) a hand-written switch. Both D1 and D2 keep exactly one indire
 D2's ~10 ns sync-tell p50 edge holds *and* its BTB churn does not regress p999 under mixed fan-in
 while D1's ask advantage is deemed less load-bearing, the tell-latency case for D2 strengthens.
 Absent that result, D1's complete-hot-path superiority and zero-disproven record decide it.
+
+## Addendum (2026-10-28) — thunk reports the async frame through an out-parameter
+
+The thunk signature changed from `DispatchOutcome thunk(self, desc, ctx)` (a 16-byte
+`{HandlerKind, coroutine_handle<>}`) to `void thunk(self, desc, ctx, coroutine_handle<>& frame)`,
+with two thunk templates chosen per slot at compile time (`dispatch_thunk<A,M>()`): a SYNC thunk
+is the handler call and nothing else (leaves `frame` null); an ASYNC thunk stores its started frame
+(never null). The dispatch is unchanged — still ONE `.rodata` indexed indirect call, no
+RTTI/virtual, sync-vs-async still selected at compile time by the handler's return type. Why: (1) `HandlerKind` was redundant
+with `frame != nullptr`; (2) under the Windows x64 ABI the 16-byte result was returned through a
+hidden memory pointer the callee wrote on every sync message; (3) a handler that never returns
+(always throws — a legitimate poison-message actor) left a dead trailing `return {Sync, {}}` in its
+instantiation, which MSVC reports as C4702 inside this library header at `/W4` for user code. The
+sync thunk now has no trailing statement to be dead. Benches (`activation_bench`, `sched_bench`,
+clang 22 / Windows x64) unchanged within run noise.

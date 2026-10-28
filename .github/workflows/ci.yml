@@ -7,7 +7,7 @@
 #               The arm64 leg is what several TODO(arm64) comments in the core (mailbox.hpp,
 #               engine.hpp, stream_channel.hpp, stream_activation.hpp, reply_stream.hpp,
 #               hot_cell.hpp) are waiting on: TSan-on-arm64 is the weak-memory re-gate for the
-#               `store_load_barrier()` Dekker close-outs those specs flag as x86-TSO-proven only.
+#               `seq_cst` Dekker close-outs (ADR-066) those specs flag as x86-TSO-proven only.
 #               GitHub's Linux arm64 hosted runners (`ubuntu-24.04-arm`) are free for public repos
 #               (GA since 2025-08) — no self-hosted runner or QEMU emulation needed.
 #  * test-windows: the Windows/x86-64 PAL backend (pal/windows_x86_64/) correctness leg, on the

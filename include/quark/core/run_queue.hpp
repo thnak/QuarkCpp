@@ -62,10 +62,14 @@ public:
     ActivationMpsc(ActivationMpsc&&) = delete;
     ActivationMpsc& operator=(ActivationMpsc&&) = delete;
 
-    // Producer (many threads): wait-free push. One acq_rel exchange + one release link store — a
-    // full StoreLoad barrier on x86-TSO, so the engine's subsequent Dekker load needs no extra
-    // fence there (producer-side elision, ADR-004/015).
-    QUARK_ALWAYS_INLINE void enqueue(Schedulable* s) noexcept { link_push(s); }
+    // Producer (many threads): wait-free push. One seq_cst exchange + one release link store. The
+    // exchange is the producer's Dekker store half for BOTH engine rendezvous (run-queue wake and
+    // drain-owner close-out, ADR-066): seq_cst puts it in S with the engine's seq_cst idle_mask_ load
+    // and the workers' seq_cst has_work() probes, so no fence follows it on any ISA. Same instruction
+    // as acq_rel on x86-64 (`xchg`) and AArch64 (`swpal` / LL-SC loop).
+    QUARK_ALWAYS_INLINE void enqueue(Schedulable* s) noexcept {
+        link_push(s, std::memory_order_seq_cst);
+    }
 
     // Consumer (exactly one worker at a time): pop one activation with plain head_ loads.
     [[nodiscard]] RunResult try_pop() noexcept {
@@ -91,7 +95,7 @@ public:
         Schedulable* tail = tail_.load(std::memory_order_acquire);
         if (front != tail) return {nullptr, RunStatus::Busy};
 
-        link_push(&stub_);  // re-arm the stub (occupancy-1 boundary only)
+        link_push(&stub_, std::memory_order_acq_rel);  // re-arm the stub (occupancy-1 only)
         next = front->rq_next.load(std::memory_order_acquire);
         if (next != nullptr) {
             head_ = next;
@@ -113,14 +117,17 @@ public:
     // try_pop(). `tail_ != &stub_` is a complete emptiness test: the consumer re-arms the stub
     // (tail_ = &stub_) exactly when it drains the last node, so tail_ points off the stub iff a
     // producer has published work (linked or mid-publish — both mean "do not park").
+    // seq_cst (ADR-066): the Dekker LOAD half of both callers (drain-owner close-out, park rescan).
     [[nodiscard]] bool has_work() const noexcept {
-        return tail_.load(std::memory_order_acquire) != &stub_;
+        return tail_.load(std::memory_order_seq_cst) != &stub_;
     }
 
 private:
-    QUARK_ALWAYS_INLINE void link_push(Schedulable* s) noexcept {
+    // `order` is a constant at both always-inlined call sites: seq_cst for producers, acq_rel for the
+    // consumer's stub re-arm (not a Dekker half).
+    QUARK_ALWAYS_INLINE void link_push(Schedulable* s, std::memory_order order) noexcept {
         s->rq_next.store(nullptr, std::memory_order_relaxed);
-        Schedulable* prev = tail_.exchange(s, std::memory_order_acq_rel);
+        Schedulable* prev = tail_.exchange(s, order);
         prev->rq_next.store(s, std::memory_order_release);
     }
 

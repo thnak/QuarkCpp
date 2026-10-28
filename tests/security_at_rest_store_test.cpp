@@ -258,6 +258,21 @@ int main() {
         const auto ob = open_at_rest(cipher, ctx, std::span<const std::byte>(b));
         check(oa && *oa == snap_bytes && ob && *ob == snap_bytes, "both seals round-trip", ok);
 
+        // Byte-exact framing: the record is [nonce, 8 B little-endian] || Aead::seal(nonce, aad,
+        // plaintext) — i.e. the fixed-buffer `seal_into` construction in seal_at_rest emits exactly
+        // what the growable-vector `seal` path did, under the same context AAD.
+        {
+            std::uint64_t n = 0;
+            for (std::size_t i = 0; i < kAtRestNonceBytes; ++i)
+                n |= static_cast<std::uint64_t>(static_cast<unsigned char>(a[i])) << (i * 8);
+            const auto aad = at_rest_aad(ctx);
+            std::vector<std::byte> ref;
+            cipher.seal(n, std::span<const std::byte>(aad), std::span<const std::byte>(snap_bytes), ref);
+            check(ref.size() + kAtRestNonceBytes == a.size() &&
+                      std::equal(ref.begin(), ref.end(), a.begin() + kAtRestNonceBytes),
+                  "sealed body is byte-identical to Aead::seal under the same nonce + AAD", ok);
+        }
+
         auto forged = a;
         forged[0] = static_cast<std::byte>(static_cast<unsigned char>(forged[0]) ^ 0x01);
         check(!open_at_rest(cipher, ctx, std::span<const std::byte>(forged)).has_value(),

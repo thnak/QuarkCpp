@@ -78,22 +78,27 @@ concept InProtocol = A::protocol::template contains<M>;
 template <class A, class M>
 concept Handles = InProtocol<A, M> && has_handler<A, M>;
 
-// --- Dispatch result + the type-erased thunk / table --------------------------------------
-enum class HandlerKind : std::uint8_t { Sync, Async };
-
-struct DispatchOutcome {
-    HandlerKind kind = HandlerKind::Sync;
-    std::coroutine_handle<> frame{};  // valid iff kind == Async (may already be .done())
-};
-
-// One indexed indirect call target. NOT `noexcept` (007/ADR-009): a throwing SYNC handler — and a
-// coroutine-frame allocation failure while starting an ASYNC handler — must PROPAGATE out of the
-// thunk to the handler-boundary guard in `Activation::drain_step`, which catches it (Itanium
-// zero-cost on the no-throw path — nothing added to the success path, ADR-009 F1/F2), fails any
-// pending `ask` reply, and applies the supervision decision. An async handler's own body throw is
-// captured by its coroutine promise (`task<>::unhandled_exception`) and surfaced via
-// `async_frame_faulted`; it does not propagate here. See task.hpp / activation.hpp.
-using Thunk = DispatchOutcome (*)(void* self, Descriptor* d, const MessageContext& ctx);
+// --- The type-erased thunk / table ---------------------------------------------------------
+//
+// One indexed indirect call target. Its ONLY output is the started async frame, via `frame`:
+//   * SYNC handler  — runs to completion inside the call and leaves `frame` untouched. The caller
+//     passes a null handle, so "still null after the call" IS "it was sync". The sync thunk body is
+//     the handler call and nothing else: no result to build after it, so a handler that never
+//     returns (always throws, e.g. a poison-message actor) leaves no dead trailing code in the
+//     instantiation (MSVC C4702 at /W4 used to fire inside this header for such user handlers).
+//   * ASYNC handler — stores the started frame (never null; may already be `.done()`).
+// The former `{HandlerKind, frame}` result carried the kind redundantly — an async frame is never
+// null — and, at 16 bytes, was returned through a hidden memory pointer under the Windows x64 ABI.
+//
+// NOT `noexcept` (007/ADR-009): a throwing SYNC handler — and a coroutine-frame allocation failure
+// while starting an ASYNC handler — must PROPAGATE out of the thunk to the handler-boundary guard in
+// `Activation::drain_step`, which catches it (Itanium zero-cost on the no-throw path — nothing added
+// to the success path, ADR-009 F1/F2), fails any pending `ask` reply, and applies the supervision
+// decision. On such a throw `frame` is left null (an async frame is only stored once it exists). An
+// async handler's own body throw is captured by its coroutine promise (`task<>::unhandled_exception`)
+// and surfaced via `async_frame_faulted`; it does not propagate here. See task.hpp / activation.hpp.
+using Thunk = void (*)(void* self, Descriptor* d, const MessageContext& ctx,
+                       std::coroutine_handle<>& frame);
 
 // A plain function-pointer array (0 vtable, .rodata) + its size — carried by value (ptr + size).
 struct DispatchTable {
@@ -101,21 +106,33 @@ struct DispatchTable {
     std::size_t size = 0;
 };
 
-// The per-(A,M) thunk: static_cast the erased self/payload (type-sound, no RTTI — ADR-007 S2),
-// select sync vs async at compile time, and for async START the frame and report suspend-vs-done.
+// The per-(A,M) thunks: static_cast the erased self/payload (type-sound, no RTTI — ADR-007 S2).
+// Two distinct thunk templates, one chosen per slot at compile time by `dispatch_thunk<A,M>()`:
+//   * sync  — run the handler to completion inline on the lane; never touches `frame` (so the
+//             parameter is unnamed: a sync thunk has no async output by construction);
+//   * async — START the frame and hand it back via `frame`.
 template <class A, class M>
-DispatchOutcome dispatch_thunk(void* self, Descriptor* d, const MessageContext& ctx) {
-    A& actor = *static_cast<A*>(self);
-    const M& msg = *static_cast<const M*>(d->payload);
+void sync_dispatch_thunk(void* self, Descriptor* d, const MessageContext& ctx,
+                         std::coroutine_handle<>& /*frame: stays null*/) {
+    invoke_handle(*static_cast<A*>(self), *static_cast<const M*>(d->payload), ctx);
+}
+
+template <class A, class M>
+void async_dispatch_thunk(void* self, Descriptor* d, const MessageContext& ctx,
+                          std::coroutine_handle<>& frame) {
+    task<> t = invoke_handle(*static_cast<A*>(self), *static_cast<const M*>(d->payload), ctx);
+    frame = t.detach();  // 015 seam: executor now owns the frame
+    frame.resume();      // start; runs to first co_await or to final_suspend
+}
+
+// Sync vs async is selected here, at compile time, by the handler's return type.
+template <class A, class M>
+[[nodiscard]] constexpr Thunk dispatch_thunk() noexcept {
     if constexpr (sync_handler<A, M>) {
-        invoke_handle(actor, msg, ctx);  // run to completion inline on the worker lane
-        return {HandlerKind::Sync, {}};
+        return &sync_dispatch_thunk<A, M>;
     } else {
         static_assert(async_handler<A, M>, "handle() must return void (sync) or quark::task<> (async)");
-        task<> t = invoke_handle(actor, msg, ctx);
-        std::coroutine_handle<> h = t.detach();  // 015 seam: executor now owns the frame
-        h.resume();                              // start; runs to first co_await or to final_suspend
-        return {HandlerKind::Async, h};
+        return &async_dispatch_thunk<A, M>;
     }
 }
 
@@ -124,7 +141,7 @@ template <class A, class Proto>
 struct thunk_table_of;
 template <class A, class... Ms>
 struct thunk_table_of<A, Protocol<Ms...>> {
-    static constexpr std::array<Thunk, sizeof...(Ms)> value{&dispatch_thunk<A, Ms>...};
+    static constexpr std::array<Thunk, sizeof...(Ms)> value{dispatch_thunk<A, Ms>()...};
 };
 
 // --- Send-site slot stamping (ADR-007) ----------------------------------------------------

@@ -79,6 +79,14 @@ public:
     QUARK_ALWAYS_INLINE void store_relaxed(std::uint64_t x) noexcept {
         v_.store(x, std::memory_order_relaxed);
     }
+    // seq_cst load / store — ONLY for the Dekker halves of the arm / un-stall rendezvous (ADR-066),
+    // never per frame. Still load + store only: the type keeps its no-RMW guarantee.
+    [[nodiscard]] QUARK_ALWAYS_INLINE std::uint64_t seq_cst() const noexcept {
+        return v_.load(std::memory_order_seq_cst);
+    }
+    QUARK_ALWAYS_INLINE void store_seq_cst(std::uint64_t x) noexcept {
+        v_.store(x, std::memory_order_seq_cst);
+    }
 
 private:
     std::atomic<std::uint64_t> v_{0};
@@ -155,10 +163,11 @@ public:
 
     // Blocking, lossless push: on credit depletion, arm the reverse-Dekker stall edge and WAIT on the
     // credit-return wake (024 §Producer un-stall). Never sheds. Off the hot path (only under sustained
-    // overproduce). The producer half of the reverse Dekker: arm `stalled_`, seq_cst fence, capture the
-    // credit generation AFTER arming, re-check credit; if still depleted, sleep on the generation —
-    // paired with the consumer's `poll_unstall` (advance tail, fence, observe `stalled_`, bump+notify),
-    // so a stalled producer is never left asleep against available credit (no lost wakeup).
+    // overproduce). The producer half of the reverse Dekker: arm `stalled_` (seq_cst store), re-check
+    // credit (seq_cst tail load); if still depleted, sleep on the generation captured BEFORE arming —
+    // paired with the consumer's `poll_unstall` (seq_cst tail publish, seq_cst `stalled_` test-and-
+    // clear, bump+notify), so a stalled producer is never left asleep against available credit (no
+    // lost wakeup). ADR-066: seq_cst operations on both halves, no standalone fence.
     void push_blocking(const F& frame) noexcept {
         for (;;) {
             if (try_push(frame)) return;
@@ -173,9 +182,8 @@ public:
             // slept on that already-bumped value with `stalled_` clear, so no future poll_unstall
             // re-signalled it (empirically: asleep in wait, stalled_==false, gen frozen, full credit).
             const std::uint32_t g = credit_gen_.load(std::memory_order_acquire);  // capture BEFORE arming
-            stalled_.store(true, std::memory_order_release);           // arm the un-stall edge
-            std::atomic_thread_fence(std::memory_order_seq_cst);       // StoreLoad (producer Dekker half)
-            if (credit_available() > 0) {                              // credit raced back in
+            stalled_.store(true, std::memory_order_seq_cst);  // arm (producer Dekker store half)
+            if (credit_available_seq_cst() > 0) {  // credit raced back in (Dekker load half)
                 stalled_.store(false, std::memory_order_relaxed);
                 continue;
             }
@@ -201,13 +209,12 @@ public:
             if (try_push(frame)) return true;
             stalls_.fetch_add(1, std::memory_order_relaxed);
             const std::uint32_t g = credit_gen_.load(std::memory_order_acquire);  // capture BEFORE arming
-            stalled_.store(true, std::memory_order_release);
-            std::atomic_thread_fence(std::memory_order_seq_cst);  // StoreLoad (producer Dekker half)
+            stalled_.store(true, std::memory_order_seq_cst);  // arm (producer Dekker store half)
             if (!keep_going.load(std::memory_order_acquire)) {
                 stalled_.store(false, std::memory_order_relaxed);
                 return false;
             }
-            if (credit_available() > 0) {
+            if (credit_available_seq_cst() > 0) {  // Dekker load half vs poll_unstall
                 stalled_.store(false, std::memory_order_relaxed);
                 continue;
             }
@@ -221,8 +228,16 @@ public:
     // credit-return — a departure clears `keep_going` (caller's flag) but that alone does not touch
     // this channel's futex word, so a producer already asleep in credit_gen_.wait() would never notice.
     // Off the hot path (called O(departures), never per frame).
+    //
+    // No StoreLoad fence (ADR-066 — the former leading seq_cst fence ordered nothing this protocol
+    // reads): the departure side performs no load after clearing `keep_going` except this acq_rel
+    // `credit_gen_` RMW, and the producer captured its wait generation `g` BEFORE re-checking
+    // `keep_going`. So either (a) `g` predates this bump — then `wait(g)` either sees the new value or
+    // is woken by the notify_all below — or (b) `g` read this bump (or a later one in its release
+    // sequence) — then the acq_rel RMW synchronizes-with that acquire load, the caller's prior
+    // `keep_going` clear happens-before the producer's re-check, and the producer returns false
+    // without sleeping. No lost wakeup in either case.
     void notify_departure() noexcept {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
         stalled_.store(false, std::memory_order_relaxed);
         credit_gen_.fetch_add(1, std::memory_order_acq_rel);
         credit_gen_.notify_all();
@@ -238,6 +253,17 @@ public:
     // Credit the producer may still consume (window - resident-owed).
     [[nodiscard]] QUARK_ALWAYS_INLINE std::uint64_t credit_available() const noexcept {
         return capacity_ - (head_.acquire() - tail_.acquire());
+    }
+    // Dekker-probe variants (ADR-066), used ONLY right after a seq_cst arm/disarm store, never per
+    // frame: the cross-thread cursor is read seq_cst so the probe is in S after that store. A plain
+    // `mov` on x86-64; the same `ldar` as acquire on baseline AArch64.
+    //   occupancy_seq_cst()        — consumer close-out (stream_activation); reads producer's `head`.
+    //   credit_available_seq_cst() — producer stall re-check (push_blocking*); reads consumer's `tail`.
+    [[nodiscard]] QUARK_ALWAYS_INLINE std::uint64_t occupancy_seq_cst() const noexcept {
+        return head_.seq_cst() - disp_.relaxed();
+    }
+    [[nodiscard]] QUARK_ALWAYS_INLINE std::uint64_t credit_available_seq_cst() const noexcept {
+        return capacity_ - (head_.relaxed() - tail_.seq_cst());  // head_: the producer's own cursor
     }
 
     // Peek the next frame to dispatch (at `disp`) WITHOUT advancing — valid iff occupancy() > 0.
@@ -271,14 +297,22 @@ public:
 
     // ---- Producer un-stall (024 §Producer un-stall — reverse Dekker rendezvous) --------------------
     // Called by the drainer at a BATCH boundary (never per frame): if a credit-starved producer armed
-    // `stalled_`, the seq_cst fence + the notify wake it on the next credit-return under edge-triggered
+    // `stalled_`, the Dekker below + the notify wake it on the next credit-return under edge-triggered
     // readiness, so a stalled producer never sleeps forever against available credit. Off the per-frame
-    // path — the RMW/fence here is O(batches), not O(frames).
+    // path — the seq_cst ops here are O(batches), not O(frames).
     void poll_unstall() noexcept {
-        std::atomic_thread_fence(std::memory_order_seq_cst);  // consumer half of the reverse Dekker
+        // Consumer half of the reverse Dekker (ADR-066), as seq_cst OPERATIONS instead of a standalone
+        // fence: (1) re-publish the current credit cursor with a seq_cst STORE — the per-frame
+        // advance_tail() stays a plain release store, so this one store per batch is what puts the
+        // consumer's credit return into S — then (2) the seq_cst test-and-clear of `stalled_`. Paired
+        // with the producer's seq_cst arm store + seq_cst `tail` re-check (push_blocking*): if our
+        // exchange misses the arm, the producer's re-check is after our tail store in S and sees the
+        // credit. The cursor stays store-only (single writer; no RMW on `tail`). On x86-64 this is
+        // `xchg` + `xchg` where it was fence + `xchg`; on AArch64 `stlr` + `swpal` instead of `dmb ish`.
+        tail_.store_seq_cst(tail_.relaxed());
         // Test-and-clear the stall edge (exchange is an RMW, but at a BATCH boundary — O(stalls), NOT
         // per frame). On the disarm edge, bump the generation + wake the sleeping producer.
-        if (QUARK_UNLIKELY(stalled_.exchange(false, std::memory_order_acq_rel))) {
+        if (QUARK_UNLIKELY(stalled_.exchange(false, std::memory_order_seq_cst))) {
             credit_gen_.fetch_add(1, std::memory_order_acq_rel);
             credit_gen_.notify_all();
         }

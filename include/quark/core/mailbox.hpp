@@ -2,7 +2,7 @@
 //
 // The queue node *is* the pooled Descriptor (its first member is the intrusive link), so
 // enqueue/dequeue move one Descriptor* with no side allocation. Many producers enqueue
-// wait-free with one `tail_.exchange(acq_rel)` + one link store; a SINGLE consumer drains a
+// wait-free with one `tail_.exchange(seq_cst)` + one link store; a SINGLE consumer drains a
 // consumer-private `head_` with plain loads (0 cross-core RMW on the steady drain path, 023).
 //
 // This layer owns the QUEUE PRIMITIVE + the Descriptor gen_state only. It does NOT own the
@@ -52,11 +52,17 @@ public:
 
     // --- Producer side (many threads) -----------------------------------------------------
     // Wait-free, allocation-free, ABA-free by construction (never compares an address).
-    // Compiles to `1 lock xchg + 2 stores` on x86 (ADR-004 F1). The exchange is **acq_rel, not
-    // release**: the acquire half orders the predecessor's node-init before the successor's link
-    // store (publication ordering) so the queue is correct on weakly-ordered ISAs too (ADR-003).
-    // On x86-TSO the xchg is already a full barrier, so acq_rel is free here.
-    QUARK_ALWAYS_INLINE void enqueue(Descriptor* d) noexcept { link_push(d); }
+    // Compiles to `1 lock xchg + 2 stores` on x86 (ADR-004 F1). The exchange is **at least acq_rel,
+    // never release**: the acquire half orders the predecessor's node-init before the successor's
+    // link store (publication ordering) so the queue is correct on weakly-ordered ISAs too (ADR-003).
+    // The PRODUCER's exchange is seq_cst (ADR-066): it is also the store half of the producer side of
+    // the close-out Dekker rendezvous, so it must sit in the single total order S with the consumer's
+    // seq_cst relinquish store + probe. Identical instruction to acq_rel on x86-64 (`xchg`) and AArch64
+    // (`swpal` / `ldaxr`+`stlxr`) — and it is what lets the producer-side StoreLoad fence go entirely
+    // (formerly elided on x86 only and a real `dmb ish` per enqueue on AArch64).
+    QUARK_ALWAYS_INLINE void enqueue(Descriptor* d) noexcept {
+        link_push(d, std::memory_order_seq_cst);
+    }
 
     // --- Consumer side (exactly one worker at a time — the single-executor invariant) ------
     // Pops one descriptor with plain loads on the consumer-private `head_`. Steady-state pops do
@@ -94,7 +100,7 @@ public:
 
         // Re-arm the stub so the queue is never truly empty (Vyukov invariant). This is the ONE
         // consumer-side exchange (occupancy-1 boundary only). Then front->next -> &stub_.
-        link_push(&stub_);
+        link_push(&stub_, std::memory_order_acq_rel);  // consumer re-arm: not a Dekker half
         next = front->link.next.load(std::memory_order_acquire);
         if (next != nullptr) {
             head_ = next;
@@ -106,32 +112,17 @@ public:
     // --- Close-out seam for 002 (the exec-state wakeup + seq_cst Dekker rendezvous) --------
     //
     // The mailbox does NOT own exec_state; 002 does. The full release close-out (002 §Release
-    // close-out) is:
+    // close-out) is a Dekker StoreLoad rendezvous spelled as seq_cst OPERATIONS (ADR-066):
     //
-    //   consumer:  exec_state.store(Idle, release);  <consumer_close_out_fence()>;  probe_has_work()
-    //   producer:  enqueue(d);                       <producer_close_out_fence()>;  exec_state.load(acquire)
+    //   consumer:  exec_state.store(Idle, seq_cst);    probe_has_work()  [tail_.load(seq_cst)]
+    //   producer:  enqueue(d)  [tail_.exchange(seq_cst)];  exec_state CAS (seq_cst success+failure)
     //
-    // Both fences are the seq_cst StoreLoad half of a Dekker rendezvous — the one reordering
-    // x86-TSO permits (a store buffered past a later load to a different address). Proven 0/300k
-    // lost with the fence, >0 without (ADR-004 C3). The two halves are provided as seams so the
-    // caller cannot forget the fence; exec_state itself stays with the actor (001/002).
-
-    // Consumer half: issue the StoreLoad fence AFTER storing exec_state=Idle, then probe. Always
-    // emits a real barrier (the exec_state release-store is a plain store, not an RMW).
-    QUARK_ALWAYS_INLINE static void consumer_close_out_fence() noexcept {
-        quark::pal::store_load_barrier();
-    }
-
-    // Producer half: the StoreLoad fence BEFORE loading exec_state after enqueue().
-    // ELIDED on x86-TSO — enqueue()'s `tail_.exchange(acq_rel)` is itself a full StoreLoad
-    // barrier there, so this is zero instructions (ADR-004). A real barrier is retained off x86.
-    QUARK_ALWAYS_INLINE static void producer_close_out_fence() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
-        // elided — the acq_rel exchange already fenced StoreLoad on x86-TSO.
-#else
-        quark::pal::store_load_barrier();  // TODO(arm64): re-gate the close-out under weak memory
-#endif
-    }
+    // All four operations are in the single total order S, so "the consumer's probe misses the
+    // enqueue AND the producer's CAS misses the relinquish" is impossible (C++20 [atomics.order]) —
+    // the property ADR-004 C3 proved with the former store + standalone-fence + load form (0/300k
+    // lost with the StoreLoad ordering, >0 without). Unlike a standalone fence, every edge here is an
+    // atomic operation ThreadSanitizer models. The store half lives on the exec-state cell
+    // (ExecStateCell::release_to_idle_sc / park_sc / retire_to_dormant); the load half is below.
 
     // Read-only work probe used by the consumer's close-out (step 2 of the seq_cst Dekker). Does NOT
     // dequeue and does NOT touch the consumer-private head_ — the caller must re-acquire ownership
@@ -150,15 +141,20 @@ public:
         // had already released Running, so it raced the NEXT owner lane's try_dequeue write of head_
         // (TSan-proven under scheduling stress). Reading only the atomic tail_ removes that race and
         // preserves the lost-wakeup Dekker guarantee (ADR-004 C3; proven by sched_no_lost_wakeup).
-        return tail_.load(std::memory_order_acquire) != &stub_;
+        //
+        // seq_cst (ADR-066): this is the LOAD half of the consumer's side of the Dekker — it must be
+        // in S after the caller's seq_cst relinquish store. A plain `mov` on x86-64 and the same
+        // `ldar` an acquire load uses on baseline AArch64.
+        return tail_.load(std::memory_order_seq_cst) != &stub_;
     }
 
 private:
-    // The shared publish operation: one unconditional acq_rel exchange + one release link store.
-    // Used by enqueue() and by the consumer-side stub re-arm.
-    QUARK_ALWAYS_INLINE void link_push(Descriptor* d) noexcept {
+    // The shared publish operation: one unconditional exchange + one release link store. Used by
+    // enqueue() (seq_cst — a Dekker half) and by the consumer-side stub re-arm (acq_rel). `order` is
+    // always a constant at both always-inlined call sites.
+    QUARK_ALWAYS_INLINE void link_push(Descriptor* d, std::memory_order order) noexcept {
         d->link.next.store(nullptr, std::memory_order_relaxed);
-        Descriptor* prev = tail_.exchange(d, std::memory_order_acq_rel);
+        Descriptor* prev = tail_.exchange(d, order);
         prev->link.next.store(d, std::memory_order_release);
     }
 

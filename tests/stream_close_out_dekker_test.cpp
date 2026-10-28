@@ -1,11 +1,13 @@
 // Tests 024-Streaming §Arming/wakeup — the stream close-out rides the SAME seq_cst Dekker StoreLoad
 // rendezvous as the mailbox (002/ADR-004): the consumer's `release-to-idle + disarm` store and its
-// occupancy re-probe must be separated by a seq_cst fence, or a producer arm that races the close-out
-// window is LOST (a stranded frame). This is the ADR-014 CONTROL-6 (inherited, load-bearing): an
-// isolating Dekker litmus over a BOUNDED trial count.
-//   * positive (fence present): lost == 0.
-//   * -DQUARK_STREAM_NO_FENCE  : the StoreLoad fence is removed -> x86-TSO reorders store-past-load and
-//     both sides miss -> lost > 0 (the fence's necessity, proven, not assumed).
+// occupancy re-probe must be StoreLoad-ordered, or a producer arm that races the close-out window is
+// LOST (a stranded frame). ADR-066 spells that ordering as a seq_cst disarm STORE + seq_cst occupancy
+// LOAD (against the producer's seq_cst arm exchange) instead of a standalone seq_cst fence; this
+// litmus mirrors it. This is the ADR-014 CONTROL-6 (inherited, load-bearing): an isolating Dekker
+// litmus over a BOUNDED trial count.
+//   * positive (seq_cst store/load): lost == 0.
+//   * -DQUARK_STREAM_NO_FENCE  : the StoreLoad ordering is removed (same pair, relaxed) -> x86-TSO
+//     reorders store-past-load and both sides miss -> lost > 0 (its necessity, proven, not assumed).
 // Two threads (machine safe). Deterministic control flow; no wall clock.
 #include <atomic>
 #include <cinttypes>
@@ -33,6 +35,16 @@ namespace {
 constexpr std::uint64_t kTrials = 500'000;
 #else
 constexpr std::uint64_t kTrials = 50'000'000;
+#endif
+
+// The racing pair's orders: the real close-out's seq_cst store + seq_cst probe (ADR-066), or - the
+// control - the same pair with the StoreLoad ordering removed.
+#if defined(QUARK_STREAM_NO_FENCE)
+constexpr std::memory_order kStoreOrder = std::memory_order_relaxed;
+constexpr std::memory_order kLoadOrder = std::memory_order_relaxed;
+#else
+constexpr std::memory_order kStoreOrder = std::memory_order_seq_cst;
+constexpr std::memory_order kLoadOrder = std::memory_order_seq_cst;
 #endif
 
 // The two close-out flags, each on its own cache line (isolate the StoreLoad — like armed_ vs the ring
@@ -79,24 +91,19 @@ int main() {
 
             int other;
             if (who == 0) {
-                ax.v.store(1, std::memory_order_relaxed);   // "disarm / release-to-idle" store
-#if !defined(QUARK_STREAM_NO_FENCE)
-                std::atomic_thread_fence(std::memory_order_seq_cst);  // the load-bearing close-out fence
-#endif
-                other = ay.v.load(std::memory_order_relaxed);         // "occupancy / arm" re-probe
+                ax.v.store(1, kStoreOrder);     // "disarm / release-to-idle" seq_cst store
+                other = ay.v.load(kLoadOrder);  // "occupancy / arm" seq_cst re-probe
                 t0_saw.store(other, std::memory_order_relaxed);
             } else {
-                ay.v.store(1, std::memory_order_relaxed);
-#if !defined(QUARK_STREAM_NO_FENCE)
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-#endif
-                other = ax.v.load(std::memory_order_relaxed);
+                ay.v.store(1, kStoreOrder);
+                other = ax.v.load(kLoadOrder);
                 t1_saw.store(other, std::memory_order_relaxed);
             }
 
             barrier(sense);  // both observations recorded
             // Dekker guarantee: at least one thread must observe the other's store. If BOTH read 0 the
-            // wakeup is LOST — impossible WITH the fence, reachable WITHOUT it on x86-TSO. Thread 0 tallies.
+            // wakeup is LOST — impossible WITH seq_cst, reachable WITHOUT it on x86-TSO. Thread 0
+            // tallies.
             if (who == 0 && t0_saw.load(std::memory_order_relaxed) == 0 &&
                 t1_saw.load(std::memory_order_relaxed) == 0) {
                 lost.fetch_add(1, std::memory_order_relaxed);
@@ -112,11 +119,11 @@ int main() {
     const std::uint64_t l = lost.load();
     bool ok;
     if (no_fence) {
-        ok = (l > 0);  // the control MUST strand at least once — proving the fence load-bearing
+        ok = (l > 0);  // the control MUST strand at least once — proving the ordering load-bearing
         std::printf("stream_close_out_dekker_test [CONTROL no-fence]: %s  (trials=%" PRIu64
                     " lost=%" PRIu64 ")\n", ok ? "FIRED" : "NOT-FIRED", kTrials, l);
     } else {
-        ok = (l == 0);  // WITH the fence: never a lost wakeup
+        ok = (l == 0);  // WITH seq_cst: never a lost wakeup
         std::printf("stream_close_out_dekker_test: %s  (trials=%" PRIu64 " lost=%" PRIu64 ")\n",
                     ok ? "OK" : "FAIL", kTrials, l);
     }

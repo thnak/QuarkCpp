@@ -58,15 +58,16 @@ does not execute, it just ensures the actor is (re)scheduled.
      every run).
   2. **Wakeup rendezvous** with producers — the release-ownership `store(exec_state)`
      followed by a `load(tail_)`, racing a producer's `exchange(tail_)` then
-     `load(exec_state)`. This is a **Dekker StoreLoad**, closed by a **`seq_cst`
-     fence between the store and the load on each side** — the symmetric
-     `store(release) · fence(seq_cst) · load(acquire)` form (002 §close-out; ADR-004).
-     Plain release/acquire leaks wakeups here; the producer keeps its cheap `acq_rel`
-     exchange (no per-enqueue `seq_cst`). The dramatic ~48% loss needs *both* sides
-     downgraded; with the `acq_rel` exchange retained the residual x86 leak is small
-     (~0.05–0.09%) but nonzero, so the fence is load-bearing.
+     `load(exec_state)`. This is a **Dekker StoreLoad**, closed by making the store
+     and the load **`seq_cst` on each side** — the symmetric
+     `store(seq_cst) · load(seq_cst)` form (002 §close-out; ADR-004 proved the
+     ordering, ADR-066 replaced its standalone fence with `seq_cst` operations, which
+     TSan models). Plain release/acquire leaks wakeups here. The producer's `seq_cst`
+     exchange is the same instruction as `acq_rel` on x86-64 and AArch64. The dramatic
+     ~48% loss needs *both* sides downgraded; with the exchange retained the residual
+     x86 leak is small (~0.05–0.09%) but nonzero, so the ordering is load-bearing.
 
-  Both the relaxed-CAS `head_` guard and the no-fence Dekker guard (calibrated
+  Both the relaxed-CAS `head_` guard and the no-StoreLoad Dekker guard (calibrated
   `lost == 0` vs `lost > 0`) are permanent CI regression tests.
 
 **Reconfirmed, no contract change (ADR-029, r7 judgment, S2).** The mailbox

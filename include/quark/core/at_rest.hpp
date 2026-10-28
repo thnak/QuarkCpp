@@ -19,6 +19,7 @@
 // adapter ONLY when configured — a plaintext-at-rest store links zero crypto.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -59,10 +60,13 @@ private:
 
 // The at-rest AAD: {fence, seq}. Both are integrity-relevant (012/017) and MUST be covered by the tag
 // so neither can be swapped onto other ciphertext. Deterministic little-endian encoding.
-[[nodiscard]] inline std::vector<std::byte> at_rest_aad(FenceToken fence, SeqNo seq) {
-    std::vector<std::byte> aad;
-    for (int b = 0; b < 8; ++b) aad.push_back(static_cast<std::byte>((fence.value >> (b * 8)) & 0xFF));
-    for (int b = 0; b < 8; ++b) aad.push_back(static_cast<std::byte>((seq >> (b * 8)) & 0xFF));
+// Fixed 16 bytes, built on the stack (only ever handed to the Aead as a span).
+[[nodiscard]] inline std::array<std::byte, 16> at_rest_aad(FenceToken fence, SeqNo seq) noexcept {
+    std::array<std::byte, 16> aad{};
+    for (std::size_t b = 0; b < 8; ++b) {
+        aad[b] = static_cast<std::byte>((fence.value >> (b * 8)) & 0xFF);
+        aad[8 + b] = static_cast<std::byte>((seq >> (b * 8)) & 0xFF);
+    }
     return aad;
 }
 
@@ -77,7 +81,7 @@ private:
 // bound into the tag via the AAD. `cipher` is the data-key AEAD from the Keyring.
 [[nodiscard]] inline std::vector<std::byte> seal_at_rest(const Aead& cipher, FenceToken fence, SeqNo seq,
                                                          std::span<const std::byte> canonical) {
-    std::vector<std::byte> aad = at_rest_aad(fence, seq);
+    const auto aad = at_rest_aad(fence, seq);
     std::vector<std::byte> out;
     cipher.seal(at_rest_nonce(fence, seq), std::span<const std::byte>(aad), canonical, out);
     return out;
@@ -90,7 +94,7 @@ private:
 [[nodiscard]] inline result<std::vector<std::byte>> open_at_rest(const Aead& cipher, FenceToken fence,
                                                                  SeqNo seq,
                                                                  std::span<const std::byte> sealed) {
-    std::vector<std::byte> aad = at_rest_aad(fence, seq);
+    const auto aad = at_rest_aad(fence, seq);
     std::vector<std::byte> out;
     if (!cipher.open(at_rest_nonce(fence, seq), std::span<const std::byte>(aad), sealed, out))
         return fail(errc::serialization,
@@ -114,10 +118,16 @@ struct AtRestContext {
     FenceToken fence{};  // snapshot only; events are position-bound by actor+seq
 };
 
-[[nodiscard]] inline std::vector<std::byte> at_rest_aad(const AtRestContext& ctx) {
-    std::vector<std::byte> aad;
-    const auto put = [&aad](std::uint64_t v) {
-        for (int b = 0; b < 8; ++b) aad.push_back(static_cast<std::byte>((v >> (b * 8)) & 0xFF));
+// Fixed-size: five little-endian u64 fields {actor.type, actor.key, kind, seq, fence}. Built on the
+// stack — the AAD is only ever passed to the Aead as a span, so it never needs a heap buffer.
+inline constexpr std::size_t kAtRestAadBytes = 5 * 8;
+
+[[nodiscard]] inline std::array<std::byte, kAtRestAadBytes> at_rest_aad(
+    const AtRestContext& ctx) noexcept {
+    std::array<std::byte, kAtRestAadBytes> aad{};
+    std::size_t at = 0;
+    const auto put = [&aad, &at](std::uint64_t v) noexcept {
+        for (int b = 0; b < 8; ++b) aad[at++] = static_cast<std::byte>((v >> (b * 8)) & 0xFF);
     };
     put(ctx.actor.type.value);
     put(ctx.actor.key);
@@ -142,15 +152,24 @@ inline constexpr std::size_t kAtRestNonceBytes = 8;
     return (static_cast<std::uint64_t>(rd()) << 32) ^ static_cast<std::uint64_t>(rd());
 }
 
+// The sealed size is known exactly up front — [nonce:8][ciphertext:|canonical|][tag:tag_size()] — so
+// the record is built in ONE exactly-sized allocation: the nonce prefix is written in place and the
+// AEAD seals straight into the remainder through the fixed-buffer `seal_into` (aead.hpp), the same
+// algorithm/framing as `seal`. No reserve-then-grow, no second (AAD) heap buffer.
 [[nodiscard]] inline std::vector<std::byte> seal_at_rest(const Aead& cipher, const AtRestContext& ctx,
                                                          std::span<const std::byte> canonical) {
-    const std::vector<std::byte> aad = at_rest_aad(ctx);
+    const auto aad = at_rest_aad(ctx);
     const std::uint64_t nonce = fresh_at_rest_nonce();
-    std::vector<std::byte> out;
-    out.reserve(kAtRestNonceBytes + canonical.size() + cipher.tag_size());
+    std::vector<std::byte> out(kAtRestNonceBytes + canonical.size() + cipher.tag_size());
     for (std::size_t b = 0; b < kAtRestNonceBytes; ++b)
-        out.push_back(static_cast<std::byte>((nonce >> (b * 8)) & 0xFF));
-    cipher.seal(nonce, std::span<const std::byte>(aad), canonical, out);  // appends after the prefix
+        out[b] = static_cast<std::byte>((nonce >> (b * 8)) & 0xFF);
+    const std::size_t sealed =
+        cipher.seal_into(nonce, std::span<const std::byte>(aad), canonical,
+                         std::span<std::byte>(out).subspan(kAtRestNonceBytes));
+    // `sealed` is |canonical| + tag_size() on success. A backend that fails closed returns 0 (e.g. the
+    // mbedTLS adapter on an internal GCM error): trim to the prefix so the record is unopenable
+    // (open_at_rest rejects it as too short for a tag) instead of carrying zeroed "ciphertext".
+    out.resize(kAtRestNonceBytes + sealed);
     return out;
 }
 
@@ -162,7 +181,7 @@ inline constexpr std::size_t kAtRestNonceBytes = 8;
     std::uint64_t nonce = 0;
     for (std::size_t b = 0; b < kAtRestNonceBytes; ++b)
         nonce |= static_cast<std::uint64_t>(static_cast<unsigned char>(sealed[b])) << (b * 8);
-    const std::vector<std::byte> aad = at_rest_aad(ctx);
+    const auto aad = at_rest_aad(ctx);
     std::vector<std::byte> out;
     if (!cipher.open(nonce, std::span<const std::byte>(aad), sealed.subspan(kAtRestNonceBytes), out))
         return fail(errc::serialization,

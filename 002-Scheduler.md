@@ -43,18 +43,21 @@ until the next unrelated wakeup.
 Releasing ownership on an apparent `Empty` is a **read-only** protocol — the
 consumer must not mutate the queue while it is racing a producer:
 
-The rendezvous is spelled as a **symmetric store + `seq_cst` fence + load on both
-sides** — the canonical, ISA-independent Dekker form (ADR-004):
+The rendezvous is spelled as **`seq_cst` operations on both sides** — a `seq_cst`
+store (or RMW) followed by a `seq_cst` load, the ISA-independent Dekker form that the
+C++ memory model alone makes correct (ADR-066; it replaced ADR-004's store + standalone
+`seq_cst` fence + load, which ThreadSanitizer cannot model and which cost a `dmb ish`
+per side on AArch64):
 
 ```
-consumer:  exec_state.store(Idle, release);  atomic_thread_fence(seq_cst);  tail_.load(acquire);
-producer:  tail_.exchange(desc, acq_rel);    atomic_thread_fence(seq_cst);  exec_state.load(acquire);
+consumer:  exec_state.store(Idle, seq_cst);   tail_.load(seq_cst);
+producer:  tail_.exchange(desc, seq_cst);     exec_state.CAS(Idle → Scheduled, seq_cst, seq_cst);
 ```
 
-1. `exec_state.store(Idle, release)` then `fence(seq_cst)` — the release publishes
-   the consumer-private `head_` for the next worker (001); the fence is the
-   consumer's half of the wakeup rendezvous.
-2. **Read-only** `tail_.load(acquire)` probe (no dequeue, no `head_` write).
+1. `exec_state.store(Idle, seq_cst)` — still a release, so it publishes the
+   consumer-private `head_` for the next worker (001); being `seq_cst` it is also the
+   consumer's half of the wakeup rendezvous (x86-64: one `xchg`; AArch64: `stlr`).
+2. **Read-only** `tail_.load(seq_cst)` probe (no dequeue, no `head_` write).
 3. If the probe shows work (or `Busy`), **re-acquire** via
    `CAS(Idle → Running, acquire)` **before touching `head_` again**, and resume
    draining. If the CAS loses, another worker already owns the actor — done.
@@ -64,16 +67,18 @@ producer:  tail_.exchange(desc, acq_rel);    atomic_thread_fence(seq_cst);  exec
 > (the single-writer handoff, S1-proven). But the store-then-load-of-`tail_`, racing
 > a producer's `exchange(tail_)`-then-load-of-`exec_state`, is a **Dekker StoreLoad
 > rendezvous** — the one reordering x86-TSO permits (a store buffered past a later
-> load to a different address). Plain release/acquire does **not** fence StoreLoad, so
-> a wakeup can leak; the **`seq_cst` fence between the store and the load on each
-> side** closes it (executed control: **0 / 300,000** lost with the fence). The
-> producer keeps its cheap `acq_rel` exchange — no per-enqueue `seq_cst` cost.
+> load to a different address). Plain release/acquire does **not** order StoreLoad, so
+> a wakeup can leak; making the store and the load **`seq_cst` on each side** closes it
+> (executed control: **0 / 300,000** lost with the ADR-004 fence form; **0 / 50M** with the
+> ADR-066 `seq_cst`-operation form, whose relaxed control loses ~150k / 50M). The
+> producer's exchange costs nothing extra for being `seq_cst`: it is the same
+> instruction as `acq_rel` on x86-64 and AArch64.
 > **Magnitude note (ADR-004 correction):** the dramatic ~48% loss only occurs if
-> *both* sides are downgraded; with the producer's `acq_rel` exchange retained the
-> residual x86 leak is ~0.05–0.09%. So calibrate the CI guard to **`lost == 0` vs
-> `lost > 0`**, not to a 48% threshold — the fence is load-bearing regardless of the
-> small magnitude. Keep it a permanent regression guard, alongside the relaxed-CAS
-> `head_` guard (001).
+> *both* sides are downgraded; with the producer's exchange retained the residual x86
+> leak is ~0.05–0.09%. So calibrate the CI guard to **`lost == 0` vs `lost > 0`**, not
+> to a 48% threshold — the StoreLoad ordering is load-bearing regardless of the small
+> magnitude. Keep it a permanent regression guard, alongside the relaxed-CAS `head_`
+> guard (001).
 
 > **Never reintroduce the mutating variant.** An earlier close-out that ran a
 > *mutating* `try_dequeue` inside the `Empty → release` recheck window silently
@@ -211,12 +216,13 @@ enqueue drives `Idle → Scheduled` (waking one worker), and the worker relinqui
 via `Running → Idle` only through the read-only close-out above. Any code path that
 wires wakeup or deschedule to mailbox emptiness reintroduces lost wakeups. The
 protocol is only race-free when the close-out rendezvous carries the **`seq_cst`
-fence** (see the close-out note): ADR-002's original 20M-race test passed because it
-did not isolate the Dekker StoreLoad window; ADR-003 built the isolating control and
-ADR-004 refined the magnitude — with the producer's `acq_rel` exchange retained the
-x86 leak is small (~0.05–0.09%) but nonzero, so the fence is load-bearing and the CI
+StoreLoad ordering** (see the close-out note): ADR-002's original 20M-race test passed
+because it did not isolate the Dekker StoreLoad window; ADR-003 built the isolating
+control and ADR-004 refined the magnitude — with the producer's exchange retained the
+x86 leak is small (~0.05–0.09%) but nonzero, so the ordering is load-bearing and the CI
 guard is `lost == 0` vs `lost > 0`. See
-[ADR-004](decisions/ADR-004-mailbox-mpsc-hot-path-r4.md).
+[ADR-004](decisions/ADR-004-mailbox-mpsc-hot-path-r4.md) and, for the current
+`seq_cst`-operation spelling, [ADR-066](decisions/ADR-066-dekker-rendezvous-as-seq-cst-operations.md).
 
 ### Idle backoff before park (ADR-035)
 
@@ -225,12 +231,12 @@ means every producer that lands a message on an already-parked worker pays a rea
 (futex / `WaitOnAddress`) synchronously inside its own `tell()` call — measured on one host at
 31.0%/15.8%/4.4% of sends at 1/2/4 producers for a fast-draining single-shard workload. Before
 committing to `park()`, a worker runs a **bounded, read-only pre-park spin**
-(`EngineConfig::pre_park_spin_limit`, default 256): re-probe `any_work()` (a plain acquire load,
-the same probe `park()`'s own rescan already uses) between bounded `cpu_relax()` pauses; a hit
+(`EngineConfig::pre_park_spin_limit`, default 256): re-probe `any_work()` (a read-only `seq_cst`
+load — a plain `mov` on x86-64 — the same probe `park()`'s own rescan already uses) between bounded `cpu_relax()` pauses; a hit
 re-enters the ordinary scan path, a full miss falls through to `park()` completely unmodified. The
 spin **never writes the idle bitmask** — a producer's targeted wake only fires a syscall when a
 worker's idle bit is set, so a message landing during the spin is picked up by the spin's own probe
-instead, and `park()`'s announce/fence/rescan Dekker rendezvous (the sole source of the
+instead, and `park()`'s announce/rescan Dekker rendezvous (the sole source of the
 no-lost-wakeup guarantee above) is reached in exactly the state it would have been in without the
 spin. `pre_park_spin_limit = 0` disables it (a predictable branch is the only added cost). Measured
 (one host, `decisions/ADR-035-worker-park-wake-backoff-policy.md`): the wake-syscall ratio dropped
@@ -438,15 +444,17 @@ completing thread re-admits on itself), a blocking/fiber leaf completes on a **c
 `Parked → Scheduled` CAS. That CAS carries the **same `seq_cst` Dekker rendezvous** as the
 close-out, but it is a **distinct StoreLoad pair** (carrier-vs-consumer, not
 producer-vs-consumer) and so needs its **own** isolating CI control — a 3-party litmus in
-which dropping the carrier-side fence must leak a wakeup. Resume of the stackful form is
+which dropping the carrier-side StoreLoad ordering must leak a wakeup. Resume of the stackful form is
 **origin-worker-pinned** (015): a foreign frame may hold thread-affine state (a pthread
 mutex owner, `errno`/TLS), so cross-worker resume is UB.
 
-> **Platform note (ADR-015).** The producer's half of the close-out fence is **elided to
-> zero instructions on x86** (TSO makes the `acq_rel` exchange a full StoreLoad barrier),
-> but this is x86-only — a real `dmb ish` is retained on ARM64 behind the PAL
-> `store_load_barrier()` (019). The `Parked`/resume release-acquire handshake, like the
-> whole close-out, is TSO-proven only and carries a deferred ARM64 weak-memory re-gate.
+> **Platform note (ADR-015, ADR-066).** No rendezvous uses a standalone fence: each half
+> is a `seq_cst` store/RMW followed by a `seq_cst` load, correct by the C++ model on every
+> ISA (x86-64 lowers it to `xchg`/locked RMW + `mov`; AArch64 to `stlr`/`swpal` + `ldar`,
+> with no `dmb`). The former x86-only producer-side fence elision and the ARM64 `dmb ish`
+> behind the PAL's `store_load_barrier()` are gone with it. The `Parked`/resume handshake,
+> like the whole close-out, is litmus-proven on x86 and run on arm64 CI; a tool-checked
+> (herd7/GenMC) ARM64 weak-memory re-gate is still deferred.
 
 ## Fairness
 

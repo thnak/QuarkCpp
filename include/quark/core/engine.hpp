@@ -6,8 +6,8 @@
 // start()/stop(). Workers are transient lanes, never owners: any worker may drain any shard, and
 // stealing = winning a shard's cold drain-owner CAS (ADR-010 §Work stealing).
 //
-// The three load-bearing rendezvous (all seq_cst StoreLoad Dekker pairs, x86-elided on the
-// producer half — ADR-004/010/015):
+// The three load-bearing rendezvous (all StoreLoad Dekker pairs — ADR-004/010/015 — spelled as
+// seq_cst atomic OPERATIONS on both halves, no standalone fence, ADR-066):
 //   1. MAILBOX close-out (per actor) — driven inside Activation (post/close_out); orthogonal here.
 //   2. RUN-QUEUE wake (producer enqueues an activation ↔ a worker parks) — the {run-queue tail,
 //      idle_mask} Dekker below: a producer never fails to wake a worker that is going to sleep.
@@ -650,7 +650,7 @@ public:
         return shard_pow2_ ? static_cast<std::uint32_t>(h & shard_mask_)
                            : static_cast<std::uint32_t>(h % cfg_.shard_count);
     }
-    // True iff any shard run-queue currently holds work (acquire probe — never mutates).
+    // True iff any shard run-queue currently holds work (seq_cst probe — never mutates; ADR-066).
     [[nodiscard]] bool any_work() const noexcept {
         for (std::uint32_t sh = 0; sh < cfg_.shard_count; ++sh)
             if (shards_[sh].run_queue.has_work()) return true;
@@ -1357,19 +1357,12 @@ private:
         return shard % cfg_.worker_count;
     }
 
-    // Producer half of the run-queue wake Dekker — order the run-queue enqueue before the idle_mask
-    // load. ELIDED on x86-TSO (the enqueue's acq_rel exchange is a full StoreLoad barrier there).
-    QUARK_ALWAYS_INLINE static void producer_wake_fence() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
-        // elided
-#else
-        pal::store_load_barrier();  // TODO(arm64): re-gate the run-queue Dekker under weak memory
-#endif
-    }
-
+    // Producer half of the run-queue wake Dekker (ADR-066): the run-queue enqueue is a seq_cst
+    // exchange and wake_one()'s idle_mask_ load is seq_cst, so both are in S against the worker's
+    // seq_cst announce-idle fetch_or + seq_cst rescan in park() — no standalone fence on any ISA
+    // (formerly elided on x86 only and a real `dmb ish` per wake on AArch64).
     QUARK_ALWAYS_INLINE void schedule_and_wake(Schedulable* s) noexcept {
         shards_[s->shard].run_queue.enqueue(s);  // carry the activation onto the shard run-queue
-        producer_wake_fence();                    // Dekker: enqueue happens-before the idle_mask load
         if (wake_one()) {
             // 009: producer-side, possibly concurrent (many producers can post to the same shard) —
             // the genuinely-atomic path, not the drain-owner-exclusive inc(). Counted only when a
@@ -1382,7 +1375,9 @@ private:
     // worker is busy and will re-scan on finishing its session (the park() Dekker rescan guarantees
     // it observes this enqueue), so no wakeup is lost. Returns true iff a worker was actually woken.
     bool wake_one() noexcept {
-        std::uint32_t m = idle_mask_.load(std::memory_order_acquire);
+        // seq_cst: the LOAD half of the producer side of the wake Dekker (ADR-066). Plain `mov` on
+        // x86-64; the same `ldar` an acquire load uses on baseline AArch64.
+        std::uint32_t m = idle_mask_.load(std::memory_order_seq_cst);
         while (m != 0) {
             const std::uint32_t id = static_cast<std::uint32_t>(std::countr_zero(m));
             const std::uint32_t bit = 1u << id;
@@ -1428,7 +1423,7 @@ private:
     // still-busy for the whole spin and takes the existing zero-syscall "every worker busy" path,
     // so a message landing here is picked up by this function's own any_work() probe instead of a
     // futex/WaitOnAddress wake. If the bounded budget is exhausted, park() runs completely
-    // unmodified — its Dekker rendezvous (announce idle → seq_cst fence → rescan) is the sole
+    // unmodified — its Dekker rendezvous (seq_cst announce idle → seq_cst rescan) is the sole
     // source of the no-lost-wakeup guarantee regardless of how many probes ran first.
     QUARK_ALWAYS_INLINE bool pre_park_spin() noexcept {
         for (std::uint32_t i = 0; i < cfg_.pre_park_spin_limit; ++i) {
@@ -1480,8 +1475,8 @@ private:
                                                     std::memory_order_relaxed))
             return;  // a real worker (or a concurrent backstop pass) owns this shard right now — skip
         advance_wheel(sh);
-        sh.drain_owner.store(kNoOwner, std::memory_order_release);
-        pal::store_load_barrier();  // consumer half of the SAME drain-owner Dekker try_drain_shard uses
+        // seq_cst store: the SAME drain-owner Dekker store half try_drain_shard uses (ADR-066).
+        sh.drain_owner.store(kNoOwner, std::memory_order_seq_cst);
     }
 
     // Win the shard's drain-owner CAS (single-consumer arbitration; a cold per-session edge — this
@@ -1504,8 +1499,9 @@ private:
             advance_wheel(sh);  // 011/ADR-028 Phase 2: opportunistic per-shard idle-eviction tick
 
             // Close out the drain session — the {drain_owner, run-queue tail} Dekker vs producers.
-            sh.drain_owner.store(kNoOwner, std::memory_order_release);
-            pal::store_load_barrier();  // consumer half of the drain-owner Dekker (always a barrier)
+            // seq_cst store + the seq_cst run_queue.has_work() probe below = the consumer half of the
+            // drain-owner Dekker (ADR-066; formerly release store + standalone StoreLoad fence).
+            sh.drain_owner.store(kNoOwner, std::memory_order_seq_cst);
             // ADR-038: also clear a pending request HERE, not only inside `cooperative_evict()` — a
             // request posted into the narrow window between `drain_run_queue`'s last checkpoint and
             // this close-out would otherwise be orphaned (a contender's ack-spin would time out even
@@ -1788,8 +1784,8 @@ private:
     // documented structures are never touched by two threads at once in any interleaving.
     void cooperative_evict(Shard& sh) noexcept {
         const std::uint32_t g = sh.evict_.evict_request.load(std::memory_order_acquire);
-        sh.drain_owner.store(kNoOwner, std::memory_order_release);
-        pal::store_load_barrier();  // same Dekker fence try_drain_shard's ordinary close-out uses
+        // seq_cst: the same drain-owner Dekker store try_drain_shard's ordinary close-out uses (ADR-066).
+        sh.drain_owner.store(kNoOwner, std::memory_order_seq_cst);
         sh.evict_.evict_request.store(0, std::memory_order_release);  // durable protocol: owner clears
         sh.evict_.evict_ack.store(g, std::memory_order_release);
     }
@@ -1883,17 +1879,19 @@ private:
     }
 
     // Deschedule this worker until a targeted wake. The {idle_mask, run-queue tail} Dekker (announce
-    // idle → seq_cst barrier → rescan) is what makes a wakeup impossible to lose: either a producer's
-    // wake_one() observes our idle bit, or our rescan observes its enqueue.
+    // idle → rescan, both seq_cst — ADR-066) is what makes a wakeup impossible to lose: either a
+    // producer's wake_one() observes our idle bit, or our rescan observes its enqueue.
     void park(std::uint32_t wid) noexcept {
         Worker& self = workers_[wid];
         const std::uint32_t seq = self.wake_seq.load(std::memory_order_acquire);
-        idle_mask_.fetch_or(1u << wid, std::memory_order_acq_rel);  // announce idle
+        // Announce idle with a seq_cst RMW: the worker's Dekker store half. It was already a locked
+        // RMW (a full barrier on x86), so the former standalone fence after it was a second barrier.
+        idle_mask_.fetch_or(1u << wid, std::memory_order_seq_cst);
 #if defined(QUARK_SCHED_BROKEN_WAKEUP)
-        // CONTROL (no-lost-wakeup teeth): skip the Dekker barrier + rescan. A producer that enqueues
-        // between our full-scan and our sleep is then never observed → the activation is STRANDED.
+        // CONTROL (no-lost-wakeup teeth): skip the rescan. A producer that enqueues between our
+        // full-scan and our sleep is then never observed → the activation is STRANDED.
 #else
-        pal::store_load_barrier();  // worker half of the wake Dekker (announce-idle store ↔ tail load)
+        // The worker's Dekker load half: any_work() probes every run-queue tail with seq_cst loads.
         if (any_work() || stopping_.load(std::memory_order_acquire)) {
             idle_mask_.fetch_and(~(1u << wid), std::memory_order_acq_rel);  // retract — go run it
             return;

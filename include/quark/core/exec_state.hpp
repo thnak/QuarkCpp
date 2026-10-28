@@ -6,7 +6,8 @@
 // The transitions are the load-bearing memory edges (001 §Mailbox, ADR-002/003/004): the SAME
 // atomic carries two obligations with different orders — the consumer-private `head_` handoff
 // (release on relinquish, acquire on claim), and the Dekker StoreLoad wakeup rendezvous with
-// producers (the seq_cst fence lives in the mailbox close-out seam; see Activation::close_out).
+// producers. ADR-066: the rendezvous is spelled as seq_cst OPERATIONS on both sides (the `_sc`
+// relinquish stores below + the producer's seq_cst wake CAS), not as a standalone fence.
 //
 // `Parked` (ADR-015) is a SEALED state that FAILS every admission CAS — while an actor is parked
 // on an in-flight async/blocking/fiber call no worker may claim it; single-executor is preserved
@@ -44,12 +45,14 @@ public:
     // (002 targeted wakeup — the wake callback itself is a 002 seam). From Running the current
     // drain (or its close-out probe) will observe the message; from Scheduled it is already
     // pending; from Parked the completion re-admit will drain it — all return false (no wake).
-    // This CAS is the producer's "load exec_state" half of the Dekker rendezvous; the caller must
-    // have issued the producer-side StoreLoad fence after enqueue (elided on x86-TSO).
+    // This CAS is the producer's "load exec_state" half of the Dekker rendezvous (ADR-066): seq_cst on
+    // BOTH the success and the failure path, so the value it reads — including a failed read of
+    // Running/Dormant/Parked — is ordered in S after the caller's seq_cst enqueue exchange. Same
+    // instruction as acq_rel on x86-64 (`lock cmpxchg`) and AArch64 (`casal` / LL-SC loop).
     [[nodiscard]] bool notify_enqueued() noexcept {
         ExecState expected = ExecState::Idle;
         return s_.compare_exchange_strong(expected, ExecState::Scheduled,
-                                          std::memory_order_acq_rel, std::memory_order_acquire);
+                                          std::memory_order_seq_cst, std::memory_order_seq_cst);
     }
 
     // --- Worker acquire edges (acquire the head_ handoff published by the prior release) ----
@@ -91,26 +94,39 @@ public:
     void yield_to_scheduled() noexcept { s_.store(ExecState::Scheduled, std::memory_order_release); }
     // Running → Parked (ADR-015): seals the actor while an async/blocking/fiber leaf is in flight.
     void park() noexcept { s_.store(ExecState::Parked, std::memory_order_release); }
-    // Running → Dormant (ADR-028 Phase 1): tentatively seals the actor for eviction. Paired with the
-    // SAME seq_cst close-out fence + probe as every other relinquish edge (see Activation::close_out)
-    // before the caller commits to actually freeing the actor instance.
-    void retire_to_dormant() noexcept { s_.store(ExecState::Dormant, std::memory_order_release); }
+
+    // --- Dekker close-out relinquish edges (002 §Release close-out; ADR-066) ----------------
+    // The STORE half of the close-out StoreLoad rendezvous: a seq_cst store, followed by the caller's
+    // seq_cst work probe. Both sit in the single total order S, as do the producer's seq_cst enqueue
+    // exchange and wake CAS, so "consumer misses the message AND producer misses the relinquish" is
+    // forbidden by the language model itself (C++20 [atomics.order]) — no standalone fence, which
+    // ThreadSanitizer cannot model. A seq_cst store is still a release, so the head_ handoff above is
+    // unchanged. Lowering: x86-64 `xchg` (the one locked instruction the former `mov` + fence pair
+    // already paid); AArch64 a bare `stlr`, ordered before the probe's `ldar` (the `dmb ish` is gone).
+    void release_to_idle_sc() noexcept { s_.store(ExecState::Idle, std::memory_order_seq_cst); }
+    void park_sc() noexcept { s_.store(ExecState::Parked, std::memory_order_seq_cst); }
+    // Running → Dormant (ADR-028 Phase 1): tentatively seals the actor for eviction. Its ONLY use is
+    // the deactivate close-out, so it is always the seq_cst Dekker store (same as release_to_idle_sc),
+    // followed by the same seq_cst probe before the caller commits to freeing the actor instance.
+    void retire_to_dormant() noexcept { s_.store(ExecState::Dormant, std::memory_order_seq_cst); }
 
     // --- 015 re-admit: Parked → Scheduled. The completion is a structurally new third-party
     // waker (carrier → actor); it carries the same seq_cst Dekker rendezvous as the close-out but
     // is a DISTINCT StoreLoad pair (002 §Blocking/fiber adapter completion). true ⇒ should wake.
+    // seq_cst on both paths for the same reason as notify_enqueued (ADR-066) — same instructions.
     [[nodiscard]] bool readmit_from_parked() noexcept {
         ExecState expected = ExecState::Parked;
         return s_.compare_exchange_strong(expected, ExecState::Scheduled,
-                                          std::memory_order_acq_rel, std::memory_order_acquire);
+                                          std::memory_order_seq_cst, std::memory_order_seq_cst);
     }
     // ADR-028 Phase 4 seam (unused until the broker lands): Dormant → Scheduled, the edge a future
     // reactivation path uses to re-admit an evicted activation once its actor storage is rebuilt.
     // Same shape as readmit_from_parked() — a structurally new third-party waker (broker → actor).
+    // Also the producer's Dormant fallback in Activation::wake_after_enqueue (a Dekker load half).
     [[nodiscard]] bool readmit_from_dormant() noexcept {
         ExecState expected = ExecState::Dormant;
         return s_.compare_exchange_strong(expected, ExecState::Scheduled,
-                                          std::memory_order_acq_rel, std::memory_order_acquire);
+                                          std::memory_order_seq_cst, std::memory_order_seq_cst);
     }
 
     // ADR-052: Dormant -> Retired (sweep, drain-owner only). CAS so a racing readmit wins cleanly.

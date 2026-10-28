@@ -8,14 +8,15 @@ with the ADR that proved it), then the code — never silently diverge.
 ## Target & scope
 
 - **Primary target: Linux / x86-64.** This is the reference platform: the 023 perf budgets are
-  pinned to it, and it's where x86-TSO-specific fast paths (producer-fence elision, the Dekker
-  litmus controls) are proven.
+  pinned to it, and it's where the x86-TSO store-buffer litmus controls for the Dekker rendezvous are proven
+  (ADR-066 removed the old x86-only producer-fence elision: every StoreLoad pair is now a
+  `seq_cst` store/RMW + `seq_cst` load, no standalone fence).
 - **Linux / arm64 is CI-verified, not yet spec-Accepted.** GitHub-hosted arm64 runners run the
   full correctness matrix (gcc/clang Release, ASan+UBSan, TSan — same 211-test suite as x86-64)
   on real AArch64 hardware on every push/PR (`.github/workflows/ci.yml`). That's real, repeatable
   evidence the engine builds and runs race-free on arm64 — but it is empirical CI coverage, not
   the formal weak-memory-model proof (herd7/GenMC) the `TODO(arm64)` markers still call for on the
-  seams proven only on x86-TSO (the `seq_cst` Dekker close-out, producer-fence elision, fiber
+  seams proven only on x86-TSO (the `seq_cst` Dekker close-out, fiber
   handshakes, big-endian serialization), and the 023 perf budgets are not re-baselined for it. Do
   not promote a spec's gate to "Accepted (arm64)" off CI-green alone.
 - **Cross-platform by construction otherwise.** All OS/arch specifics live behind the **PAL**

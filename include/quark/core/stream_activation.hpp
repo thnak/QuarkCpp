@@ -8,8 +8,8 @@
 //   * the scheduling rides the Accepted 002/015 `ExecStateCell` (exec_state.hpp) — Idle -> Scheduled
 //     -> Running -> Parked, `notify_enqueued`, `try_acquire`, `park`, `readmit_from_parked`,
 //     `reacquire_from_idle` — the SAME class the Engine drains actors with;
-//   * the wakeup + relinquish ride the mailbox `seq_cst` Dekker close-out fences
-//     (`Mailbox::consumer_close_out_fence` / `producer_close_out_fence`) VERBATIM.
+//   * the wakeup + relinquish ride the SAME `seq_cst` Dekker close-out shape as the mailbox
+//     (ADR-066: seq_cst disarm store + seq_cst occupancy probe ↔ seq_cst arm exchange).
 // The ordinary Vyukov mailbox + the discrete tell/ask hot path are BYTE-FOR-BYTE UNCHANGED (this is
 // a separate, additively-included header; no core file is edited). A non-streaming actor constructs
 // no StreamChannel/StreamActivation at all (024 §zero-cost-when-unused).
@@ -32,8 +32,10 @@
 //   * BlockingHandler / stackful `quark::fiber<>` C4 multiplexing  ->  ADR-015 (the transferred-not-
 //     parked re-admission is what IS implemented here; the stackful multiplexing is the seam);
 //   * `system.open_stream<F>(actor_id, transport_ep)` addressing/transport binding  ->  006/010.
-//   * ARM64 weak-memory re-gate of the `armed.exchange`-as-Dekker-arm + the close-out fences  ->
-//     deferred (x86-TSO proven only). TODO(arm64): re-gate under weak memory (herd7/GenMC).
+//   * ARM64 weak-memory re-gate of the `armed.exchange`-as-Dekker-arm + the seq_cst close-out
+//     store/probe (ADR-066)  ->  deferred (x86-TSO litmus-proven only; the producer's per-frame
+//     release `head` store before the arm exchange is a hardware ordering, not a C++-model one).
+//     TODO(arm64): re-gate under weak memory (herd7/GenMC).
 #pragma once
 
 #include <atomic>
@@ -45,7 +47,6 @@
 #include "quark/core/config.hpp"
 #include "quark/core/error.hpp"
 #include "quark/core/exec_state.hpp"
-#include "quark/core/mailbox.hpp"          // the seq_cst Dekker close-out fences (reused verbatim)
 #include "quark/core/stream_channel.hpp"
 
 namespace quark {
@@ -266,12 +267,20 @@ public:
                                                         // a worker that acquires in the close-out window is
                                                         // never (falsely) counted as a 2nd concurrent executor
         exec_.release_to_idle();                        // Running -> Idle (publishes disp/tail state)
-        armed_.store(false, std::memory_order_release); // disarm: a plain release store — the consumer
-                                                        // NEVER exchanges `armed_` (ADR-005: producer-only arm-RMW)
+        // Disarm, then re-probe occupancy: the consumer half of the arm Dekker (ADR-066). The disarm is
+        // a seq_cst STORE and the probe a seq_cst load — both in S against the producer's seq_cst
+        // `armed_.exchange` — replacing the former release store + standalone StoreLoad fence. Still
+        // never an `armed_` RMW at the C++ level (ADR-005: producer-only arm-RMW); x86-64 lowers the
+        // seq_cst store to `xchg`, the one locked instruction the fence it replaces already cost, and
+        // it runs once per empty-transition, never per frame.
 #ifndef QUARK_STREAM_NO_FENCE
-        Mailbox::consumer_close_out_fence();            // seq_cst StoreLoad (consumer half of the Dekker)
+        armed_.store(false, std::memory_order_seq_cst);
+        const std::uint64_t occ = ch_.occupancy_seq_cst();
+#else
+        armed_.store(false, std::memory_order_release);  // CONTROL: StoreLoad ordering removed
+        const std::uint64_t occ = ch_.occupancy();
 #endif
-        if (ch_.occupancy() > 0) {                      // work raced in during the close-out window
+        if (occ > 0) {                                  // work raced in during the close-out window
             if (exec_.reacquire_from_idle()) {          // Idle -> Running: we win, keep draining
                 running_enter();                         // re-entered the drain region
                 armed_.store(true, std::memory_order_release);  // we are the active readiness again
@@ -309,7 +318,7 @@ public:
         proc.on_resume(ch_.slot_at(parked_idx_), parked_idx_);      // carrier resumes it too
         ch_.advance_tail();
         running_leave();
-        if (armed_.exchange(true, std::memory_order_acq_rel) == false)
+        if (armed_.exchange(true, std::memory_order_seq_cst) == false)
             enter_run_queue();                                      // re-enqueue -> membership can exceed 1
         const bool wake = exec_.readmit_from_parked();
         if (wake) enter_run_queue();
@@ -357,9 +366,11 @@ private:
 
     // The ring's empty->nonempty ARM-EDGE: post the reusable readiness exactly once per disarmed->armed
     // transition. `armed_.exchange(true)` is the single cross-core RMW of the design + the producer's
-    // StoreLoad Dekker arm on x86 (lock xchg is a full barrier); fires per arm-edge, NEVER per frame.
+    // StoreLoad Dekker arm; seq_cst (ADR-066) so it is in S with the consumer's seq_cst disarm store +
+    // occupancy probe (same `xchg` / `swpal` instruction as acq_rel). Fires per arm-edge, never per
+    // frame.
     void arm_edge() noexcept {
-        if (armed_.exchange(true, std::memory_order_acq_rel) == false) {
+        if (armed_.exchange(true, std::memory_order_seq_cst) == false) {
             if (exec_.notify_enqueued())  // Idle->Scheduled: the reusable descriptor enters the run-queue
                 enter_run_queue();        // instrumentation: membership 0->1 (max must be 1)
         }

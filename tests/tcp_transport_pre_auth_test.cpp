@@ -35,7 +35,10 @@ void check(bool c, const char* what, bool& ok) {
 }
 
 constexpr std::uint64_t kAny = pal::ipv4(0, 0, 0, 0);
+#if defined(__linux__)
+// Second loopback source address — only the Linux-only raw-socket section below binds from it.
 constexpr std::uint64_t kLoop2 = pal::ipv4(127, 0, 0, 2);
+#endif
 
 std::vector<std::byte> hello_bytes(NodeId node) {
     std::vector<std::byte> h;

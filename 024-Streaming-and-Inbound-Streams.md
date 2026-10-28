@@ -287,9 +287,12 @@ load and collapse to low latency when idle.
   turbo-off rig; ratios, 0-RMW and 0-alloc gates are host-independent and pass, but
   absolute latency percentiles must re-run on the 023 Zen4/SPR core before the 024
   Hard-latency budget is stamped.
-- **Weak-memory (AArch64) — INCONCLUSIVE.** The `armed.exchange`-as-Dekker-arm relies
+- **Weak-memory (AArch64) — INCONCLUSIVE.** The `armed.exchange`-as-Dekker-arm relied
   on x86 `lock xchg` being a full StoreLoad barrier; on ARM it needs an explicit
-  `seq_cst` fence or `seq_cst` exchange. Deferred with the rest of ARM (no hardware);
+  `seq_cst` fence or `seq_cst` exchange. Since ADR-066 it is a `seq_cst` exchange paired
+  with a `seq_cst` disarm store + `seq_cst` occupancy probe (no standalone fence); the
+  producer's per-frame `head` store stays a plain `release` store, so its ordering before
+  the arm exchange is still an x86-TSO / ARMv8 hardware property, not a C++-model one.
   herd7/GenMC litmus-checked before any ARM claim (OpenQuestions).
 - **Zero-copy suspend head-of-line blocking** (only under `ZeroCopyRetained`): a
   suspended handler pins its referenced RX buffer, so on a shared provided-buffer pool

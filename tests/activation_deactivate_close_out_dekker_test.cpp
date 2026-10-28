@@ -1,17 +1,20 @@
 // Tests ADR-028 Phase 1 §close_out_retire — the Deactivate close-out rides the SAME seq_cst Dekker
 // StoreLoad rendezvous as every other Activation close-out (002/ADR-004, and 024's stream close-out,
-// tests/stream_close_out_dekker_test.cpp): the consumer's `retire_to_dormant (release store)` and its
-// mailbox-occupancy re-probe must be separated by a seq_cst fence, or a producer message that races
-// the close-out window is LOST — the eviction would commit while a message sits unseen in the
-// mailbox (ADR-028's "[Deactivate, M] abort-eviction never loses M" claim, S2).
-//   * positive (fence present): lost == 0 — the race ALWAYS resolves to "abort eviction, dispatch M"
-//     or "producer's own notify_enqueued edge already sees the retire", never "both sides miss".
-//   * -DQUARK_ACTIVATION_DEACTIVATE_NO_FENCE : the StoreLoad fence is removed -> x86-TSO reorders
-//     store-past-load and both sides can miss -> lost > 0 (the fence's necessity, proven, not assumed).
+// tests/stream_close_out_dekker_test.cpp): the consumer's `retire_to_dormant` store and its
+// mailbox-occupancy re-probe must be StoreLoad-ordered against the producer's enqueue + exec-state
+// read, or a producer message that races the close-out window is LOST — the eviction would commit
+// while a message sits unseen in the mailbox (ADR-028's "[Deactivate, M] abort-eviction never loses
+// M" claim, S2). ADR-066 spells that ordering as seq_cst OPERATIONS on both sides (a seq_cst store,
+// then a seq_cst load) instead of a release store + standalone seq_cst fence; this litmus mirrors it.
+//   * positive (seq_cst store/load): lost == 0 — the race ALWAYS resolves to "abort eviction,
+//     dispatch M" or "producer's own notify_enqueued edge already sees the retire", never "both miss".
+//   * -DQUARK_ACTIVATION_DEACTIVATE_NO_FENCE : the StoreLoad ordering is removed (the same store/load
+//     pair downgraded to relaxed) -> x86-TSO reorders store-past-load and both sides can miss ->
+//     lost > 0 (the ordering's necessity, proven, not assumed).
 //
-// This is the repo's own established isolating-Dekker-litmus methodology (per the
-// design-debate-prove-args memory: TSan does not model a standalone std::atomic_thread_fence, so this
-// class of claim is proven this way, matching stream_close_out_dekker_test.cpp, not via TSan directly).
+// This is the repo's own established isolating-Dekker-litmus methodology, matching
+// stream_close_out_dekker_test.cpp. (With the seq_cst-operation spelling, TSan now also models every
+// edge of the real rendezvous; this litmus remains the hardware store-buffer-reorder proof.)
 // Two threads (machine safe). Deterministic control flow; no wall clock.
 #include <atomic>
 #include <cinttypes>
@@ -32,6 +35,16 @@ namespace {
 constexpr std::uint64_t kTrials = 500'000;
 #else
 constexpr std::uint64_t kTrials = 50'000'000;
+#endif
+
+// The racing pair's orders: the real close-out's seq_cst store + seq_cst probe (ADR-066), or - the
+// control - the same pair with the StoreLoad ordering removed.
+#if defined(QUARK_ACTIVATION_DEACTIVATE_NO_FENCE)
+constexpr std::memory_order kStoreOrder = std::memory_order_relaxed;
+constexpr std::memory_order kLoadOrder = std::memory_order_relaxed;
+#else
+constexpr std::memory_order kStoreOrder = std::memory_order_seq_cst;
+constexpr std::memory_order kLoadOrder = std::memory_order_seq_cst;
 #endif
 
 // ax = the consumer's "retire_to_dormant" store; ay = the producer's "message enqueued" store. Each
@@ -78,20 +91,14 @@ int main() {
 
             int other;
             if (who == 0) {
-                // "consumer": close_out_retire()'s retire_to_dormant() release store.
-                ax.v.store(1, std::memory_order_relaxed);
-#if !defined(QUARK_ACTIVATION_DEACTIVATE_NO_FENCE)
-                std::atomic_thread_fence(std::memory_order_seq_cst);  // the load-bearing close-out fence
-#endif
-                other = ay.v.load(std::memory_order_relaxed);  // probe_has_work() re-probe
+                // "consumer": close_out_retire()'s retire_to_dormant() seq_cst store.
+                ax.v.store(1, kStoreOrder);
+                other = ay.v.load(kLoadOrder);  // probe_has_work() seq_cst re-probe
                 consumer_saw.store(other, std::memory_order_relaxed);
             } else {
-                // "producer": a message's mailbox enqueue + producer close-out fence + notify.
-                ay.v.store(1, std::memory_order_relaxed);
-#if !defined(QUARK_ACTIVATION_DEACTIVATE_NO_FENCE)
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-#endif
-                other = ax.v.load(std::memory_order_relaxed);  // "did the retire already commit?" read
+                // "producer": a message's seq_cst mailbox enqueue + seq_cst exec-state CAS read.
+                ay.v.store(1, kStoreOrder);
+                other = ax.v.load(kLoadOrder);  // "did the retire already commit?" read
                 producer_saw.store(other, std::memory_order_relaxed);
             }
 
@@ -99,8 +106,8 @@ int main() {
             // Dekker guarantee: at least one side must observe the other's store — either the
             // consumer's probe sees the message (aborts eviction, dispatches M) or the producer's
             // read sees the retire is in flight (its own notify_enqueued edge is what wakes a future
-            // reactivation path, per ADR-028 Phase 4 — not exercised here, only the fence itself is).
-            // If BOTH read 0, the message is LOST under a real eviction: impossible WITH the fence,
+            // reactivation path, per ADR-028 Phase 4 — not exercised here, only the ordering is).
+            // If BOTH read 0, the message is LOST under a real eviction: impossible WITH seq_cst,
             // reachable WITHOUT it on x86-TSO. Thread 0 tallies.
             if (who == 0 && consumer_saw.load(std::memory_order_relaxed) == 0 &&
                 producer_saw.load(std::memory_order_relaxed) == 0) {
@@ -117,11 +124,11 @@ int main() {
     const std::uint64_t l = lost.load();
     bool ok;
     if (no_fence) {
-        ok = (l > 0);  // the control MUST strand at least once — proving the fence load-bearing
+        ok = (l > 0);  // the control MUST strand at least once — proving the ordering load-bearing
         std::printf("activation_deactivate_close_out_dekker_test [CONTROL no-fence]: %s  (trials=%"
                     PRIu64 " lost=%" PRIu64 ")\n", ok ? "FIRED" : "NOT-FIRED", kTrials, l);
     } else {
-        ok = (l == 0);  // WITH the fence: never a lost message across the [Deactivate, M] race
+        ok = (l == 0);  // WITH seq_cst: never a lost message across the [Deactivate, M] race
         std::printf("activation_deactivate_close_out_dekker_test: %s  (trials=%" PRIu64
                     " lost=%" PRIu64 ")\n", ok ? "OK" : "FAIL", kTrials, l);
     }

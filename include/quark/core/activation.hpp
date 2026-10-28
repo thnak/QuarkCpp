@@ -461,8 +461,7 @@ public:
             }
         }
         g.enqueued.fetch_add(1, std::memory_order_relaxed);  // producer-side depth++
-        mailbox_.enqueue(d);
-        Mailbox::producer_close_out_fence();
+        mailbox_.enqueue(d);  // seq_cst exchange: the producer's Dekker store half (ADR-066)
         if (metrics_) metrics_->mailbox_enqueued.inc_atomic();  // producer-side, possibly concurrent
         const bool wake = wake_after_enqueue();  // ADR-028 Phase 2: Idle/Dormant->Scheduled (see below)
         if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle/Dormant->Scheduled edge (009)
@@ -484,8 +483,7 @@ public:
     // a message the caller's OWN guard already decided to admit).
     QUARK_ALWAYS_INLINE bool post_governed_unconditional(Descriptor* d) noexcept {
         if (gov_) gov_->enqueued.fetch_add(1, std::memory_order_relaxed);
-        mailbox_.enqueue(d);
-        Mailbox::producer_close_out_fence();
+        mailbox_.enqueue(d);  // seq_cst exchange: the producer's Dekker store half (ADR-066)
         if (metrics_) metrics_->mailbox_enqueued.inc_atomic();
         const bool wake = wake_after_enqueue();
         if (metrics_ && wake) metrics_->activations.inc_atomic();
@@ -510,10 +508,10 @@ public:
     // ADR-028 Phase 2: the wake-edge CAS, extended with the Dormant→Scheduled fallback. The Idle CAS
     // already fails cleanly (returns false, no side effect) when the state is anything else, so
     // trying it first costs the ordinary Idle producer NOTHING extra — the Dormant check/CAS below
-    // only runs on that (cold) miss. This is NOT a new fence: the SAME producer_close_out_fence()
-    // StoreLoad above already orders the enqueue before both CAS attempts, so an evicted activation
-    // that races a real message in is re-admitted exactly like the close-out abort race is aborted —
-    // reusing the Phase 1 Dekker rendezvous, never re-deriving it.
+    // only runs on that (cold) miss. This is NOT a new ordering: the seq_cst enqueue exchange and the
+    // seq_cst CAS (success AND failure, ADR-066) already order the enqueue before both CAS attempts in
+    // S, so an evicted activation that races a real message in is re-admitted exactly like the
+    // close-out abort race is aborted — reusing the Phase 1 Dekker rendezvous, never re-deriving it.
     QUARK_ALWAYS_INLINE bool wake_after_enqueue() noexcept {
         bool wake = exec_.notify_enqueued();
         if (!wake && QUARK_UNLIKELY(exec_.state() == ExecState::Dormant))
@@ -522,15 +520,15 @@ public:
     }
 
     QUARK_ALWAYS_INLINE bool post(Descriptor* d) noexcept {
-        mailbox_.enqueue(d);
-        Mailbox::producer_close_out_fence();  // elided on x86-TSO (the tail_.exchange fenced it)
+        mailbox_.enqueue(d);  // seq_cst exchange: the producer's Dekker store half (ADR-066)
         if (metrics_) metrics_->mailbox_enqueued.inc_atomic();  // producer-side, possibly concurrent
         const bool wake = wake_after_enqueue();
         if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle/Dormant->Scheduled edge (009)
         return wake;
     }
+    // For a caller that enqueued through mailbox().enqueue() directly (already the seq_cst Dekker
+    // store half) and now drives the wake edge.
     QUARK_ALWAYS_INLINE bool notify_enqueued() noexcept {
-        Mailbox::producer_close_out_fence();
         const bool wake = wake_after_enqueue();
         if (metrics_ && wake) metrics_->activations.inc_atomic();  // Idle/Dormant->Scheduled edge (009)
         return wake;
@@ -627,11 +625,11 @@ public:
             // proven by objdump + bench, ADR-009 F1/F2). A SYNC throw (and a coroutine-frame alloc
             // failure starting an async handler) unwinds cleanly to here; the fault is turned into a
             // VALUE (failed reply / dead-letter) and the supervision decision is applied.
-            DispatchOutcome o;
+            std::coroutine_handle<> async_frame{};  // stays null iff the handler was sync
 #ifndef QUARK_SUPERVISION_NO_GUARD
             try {
                 detail::AmbientContextScope amb(current_ctx_);  // #12: tell/ask from handler inherits
-                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+                table_.thunks[slot_from(*d)](self_, d, current_ctx_, async_frame);
             } catch (const ResourceFailure& rf) {
                 on_fault_sequential(d, FailureSource::Resource, rf.err);
                 continue;
@@ -644,27 +642,28 @@ public:
             // control benchmark uses only non-throwing handlers, isolating the guard's success cost.
             {
                 detail::AmbientContextScope amb(current_ctx_);
-                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+                table_.thunks[slot_from(*d)](self_, d, current_ctx_, async_frame);
             }
 #endif
 
-            if (o.kind == HandlerKind::Sync) {
+            if (!async_frame) {
                 d->complete();
                 reclaim_(d);
                 if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
 
-            if (o.frame.done()) {
+            if (async_frame.done()) {
                 // Async handler completed inline. It may have completed WITH an exception (surfaced
                 // at final_suspend, 007) — probe the promise and route it through the guard.
-                if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {
-                    auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
-                    o.frame.destroy();
+                if (QUARK_UNLIKELY(async_frame_faulted(async_frame))) {
+                    auto [fault_src, fault_err] =
+                        classify_fault(async_frame_fault_ptr(async_frame));
+                    async_frame.destroy();
                     on_fault_sequential(d, fault_src, fault_err);
                     continue;
                 }
-                o.frame.destroy();
+                async_frame.destroy();
                 d->complete();
                 reclaim_(d);
                 if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
@@ -675,7 +674,7 @@ public:
             // gates its read of these two fields behind an acquire-confirmed observation of `Parked`
             // (see complete_parked()'s "Lost-wakeup / UB fix" comment) — that release/acquire pairing
             // is the ONLY synchronization this handoff needs; do not reorder these three statements.
-            parked_frame_ = o.frame;
+            parked_frame_ = async_frame;
             parked_desc_ = d;
 #ifdef QUARK_ACTIVATION_PARK_NO_GATE
             quark_activation_park_race_test_hook();  // CONTROL-only widen — see declaration above
@@ -701,8 +700,8 @@ public:
     // ---- Close-out seam (002): DrainedEmpty → relinquish via the seq_cst Dekker rendezvous ----
     [[nodiscard]] bool close_out() noexcept {
         if (QUARK_UNLIKELY(retire_requested_)) return close_out_retire();
-        exec_.release_to_idle();
-        Mailbox::consumer_close_out_fence();
+        // seq_cst store + the seq_cst probe below = the consumer half of the Dekker (ADR-066).
+        exec_.release_to_idle_sc();
         if (!mailbox_.probe_has_work()) return false;
         return exec_.reacquire_from_idle();
     }
@@ -717,9 +716,9 @@ public:
     QUARK_COLD bool close_out_retire() noexcept {
         retire_requested_ = false;
         // ADR-028 Phase 8: on_deactivate() + the persistence flush run HERE, strictly BEFORE
-        // retire_to_dormant()'s release-store below — while this worker still unambiguously holds
-        // Running. This ordering is load-bearing, not stylistic: once that store + the Dekker fence
-        // below have passed, a concurrent producer can hand a DIFFERENT worker ownership of this
+        // retire_to_dormant()'s seq_cst store below — while this worker still unambiguously holds
+        // Running. This ordering is load-bearing, not stylistic: once that Dekker store has
+        // passed, a concurrent producer can hand a DIFFERENT worker ownership of this
         // SAME activation (the proven abort-eviction path) — touching `self_` after that point would
         // be a genuine second-executor race that doesn't exist anywhere else in this file. Accepted
         // trade-off: on the rare abort-eviction race, the hook/flush may fire once on an attempt that
@@ -747,8 +746,7 @@ public:
             (void)deactivate_flush_.fn(self_, deactivate_flush_.store, deactivate_flush_.id,
                                        deactivate_flush_.fence);
 #endif
-        exec_.retire_to_dormant();            // Running -> Dormant (release)
-        Mailbox::consumer_close_out_fence();  // SAME seq_cst StoreLoad as every other close-out
+        exec_.retire_to_dormant();  // Running -> Dormant: the SAME seq_cst Dekker store
         if (!mailbox_.probe_has_work()) return false;        // clean evict
         if (exec_.reacquire_from_dormant()) return true;     // aborted: a message raced in, keep draining
         return false;  // lost the race to a reactivation path (Phase 4 seam; unreachable in this pass)
@@ -765,7 +763,7 @@ public:
     // A carrier may legitimately be entered here BEFORE drain_step's suspend tail has actually run
     // `exec_.park()` — e.g. an ask()-style awaiter commits to suspending (its own win-arbitration
     // already resolved) before control unwinds back into drain_step's loop body and the three plain
-    // statements `parked_frame_ = o.frame; parked_desc_ = d; exec_.park();` execute. Reading
+    // statements `parked_frame_ = async_frame; parked_desc_ = d; exec_.park();` execute. Reading
     // `parked_frame_`/`parked_desc_` before that happened is a data race (UB) on plain, non-atomic
     // members; worse, it makes the `readmit_from_parked()` CAS below run against a still-`Running`
     // state, fail silently with no retry, and then get permanently overwritten by drain_step's own
@@ -897,7 +895,11 @@ public:
             rc_->suspended.pop_front();
             rc_->ready.push_back(f);
         }
-        Mailbox::producer_close_out_fence();     // pair the lane's Parked close-out (Dekker)
+        // No StoreLoad fence needed here (ADR-066): the lane's Parked close-out reads `ready` under
+        // the SAME mutex. Either our critical section precedes the lane's (the lane sees the push and
+        // reacquires), or the lane's precedes ours — then its park_sc() store happens-before this CAS
+        // via the mutex hand-off, so the CAS observes Parked and re-admits. The mutex totally orders
+        // the two critical sections; that is the rendezvous.
         return exec_.readmit_from_parked();      // Parked→Scheduled; true ⇒ wake exactly one worker
     }
 
@@ -934,8 +936,9 @@ public:
         if (rc_->seal.load(std::memory_order_acquire) != SealState::Draining) return false;
         const std::int64_t dl = rc_->drain_deadline_ns.load(std::memory_order_acquire);
         if (dl == 0 || now_ns < dl) return false;
-        rc_->lane_actions.fetch_or(ReCore::kEscalateCancel, std::memory_order_acq_rel);
-        Mailbox::producer_close_out_fence();     // pair the lane's Parked close-out (Dekker)
+        // seq_cst RMW + seq_cst re-admit CAS (ADR-066): both in S, replacing the former standalone
+        // StoreLoad fence between them (same `lock or` / `ldsetal` instruction as acq_rel).
+        rc_->lane_actions.fetch_or(ReCore::kEscalateCancel, std::memory_order_seq_cst);
         return exec_.readmit_from_parked();      // Parked→Scheduled; wakes a stuck-Parked lane
     }
 
@@ -963,8 +966,8 @@ public:
     void request_stop() noexcept {
         stop_src_.request_stop();
         if (rc_) {
-            rc_->lane_actions.fetch_or(ReCore::kStopAll, std::memory_order_acq_rel);
-            Mailbox::producer_close_out_fence();
+            // seq_cst RMW + seq_cst re-admit CAS, no standalone fence between them (ADR-066).
+            rc_->lane_actions.fetch_or(ReCore::kStopAll, std::memory_order_seq_cst);
             (void)exec_.readmit_from_parked();  // best-effort wake if Parked; else lane self-observes
         }
     }
@@ -1250,11 +1253,11 @@ private:
             current_ctx_.principal = resolve_principal(d, claim_flags);  // ADR-044 C1r/S2r
             tbytes.add(d->payload_size);  // ADR-054: per-type message bytes (flushed once per call)
 
-            DispatchOutcome o;
+            std::coroutine_handle<> async_frame{};  // stays null iff the handler was sync
 #ifndef QUARK_SUPERVISION_NO_GUARD
             try {
                 detail::AmbientContextScope amb(current_ctx_);  // #12: tell/ask from handler inherits
-                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+                table_.thunks[slot_from(*d)](self_, d, current_ctx_, async_frame);
             } catch (const ResourceFailure& rf) {
                 on_fault_sequential(d, FailureSource::Resource, rf.err);
                 continue;
@@ -1265,24 +1268,25 @@ private:
 #else
             {
                 detail::AmbientContextScope amb(current_ctx_);
-                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+                table_.thunks[slot_from(*d)](self_, d, current_ctx_, async_frame);
             }
 #endif
 
-            if (o.kind == HandlerKind::Sync) {
+            if (!async_frame) {
                 d->complete();
                 reclaim_(d);
                 if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
                 continue;
             }
-            if (o.frame.done()) {
-                if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {
-                    auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
-                    o.frame.destroy();
+            if (async_frame.done()) {
+                if (QUARK_UNLIKELY(async_frame_faulted(async_frame))) {
+                    auto [fault_src, fault_err] =
+                        classify_fault(async_frame_fault_ptr(async_frame));
+                    async_frame.destroy();
                     on_fault_sequential(d, fault_src, fault_err);
                     continue;
                 }
-                o.frame.destroy();
+                async_frame.destroy();
                 d->complete();
                 reclaim_(d);
                 if (metrics_) metrics_->messages_processed.inc();  // drain-owner-exclusive
@@ -1290,7 +1294,7 @@ private:
             }
             // Same handoff shape/fix as the Sequential drain_step() suspend tail above — see
             // complete_parked()'s "Lost-wakeup / UB fix" comment; do not reorder these three lines.
-            parked_frame_ = o.frame;
+            parked_frame_ = async_frame;
             parked_desc_ = d;
 #ifdef QUARK_ACTIVATION_PARK_NO_GATE
             quark_activation_park_race_test_hook();  // CONTROL-only widen — see declaration above
@@ -1334,11 +1338,11 @@ private:
                 return DrainOutcome::DrainedEmpty;  // quiescent + no work ⇒ close_out to Idle
 
             // In-flight frames remain (or the gate is sealed / at cap). Park and let carriers
-            // re-admit. Dekker close-out for the ready hand-off (mirrors the mailbox close-out):
-            // store Parked, seq_cst fence, then re-probe — so a carrier push that races the park is
-            // never lost.
-            exec_.park();
-            Mailbox::consumer_close_out_fence();
+            // re-admit. Dekker close-out (mirrors the mailbox close-out, ADR-066): seq_cst store of
+            // Parked, then re-probe — the mailbox probe is the seq_cst load half against producers;
+            // `has_pending_ready()` reads under the carriers' mutex, which orders it against
+            // complete_one() by itself — so neither a racing post nor a carrier push is lost.
+            exec_.park_sc();
             const bool admittable = c.seal.load(std::memory_order_acquire) == SealState::Open &&
                                     c.live.size() < c.cap && mailbox_.probe_has_work();
             if (has_pending_ready() || admittable) {
@@ -1385,11 +1389,11 @@ private:
         rc_->resuming_frame = f;
         rc_->resuming_suspended = false;
         // Handler-boundary guard (reentrant): a sync throw / frame-alloc failure unwinds to here.
-        DispatchOutcome o;
+        std::coroutine_handle<> async_frame{};  // stays null iff the handler was sync
 #ifndef QUARK_SUPERVISION_NO_GUARD
         try {
             detail::AmbientContextScope amb(f->ctx);  // #12: tell/ask from this frame inherits its ctx
-            o = table_.thunks[slot_from(*d)](self_, d, f->ctx);
+            table_.thunks[slot_from(*d)](self_, d, f->ctx, async_frame);
         } catch (const ResourceFailure& rf) {
             rc_->resuming_frame = nullptr;
             on_fault_reentrant(f, FailureSource::Resource, rf.err);
@@ -1402,19 +1406,19 @@ private:
 #else
         {
             detail::AmbientContextScope amb(f->ctx);
-            o = table_.thunks[slot_from(*d)](self_, d, f->ctx);
+            table_.thunks[slot_from(*d)](self_, d, f->ctx, async_frame);
         }
 #endif
         rc_->resuming_frame = nullptr;
 
-        if (o.kind == HandlerKind::Sync) {
+        if (!async_frame) {
             complete_and_remove(f);  // sync ran to completion inline on the lane
             return;
         }
-        f->h = o.frame;
-        if (o.frame.done()) {
-            if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {  // async completed with a throw (007)
-                auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
+        f->h = async_frame;
+        if (async_frame.done()) {
+            if (QUARK_UNLIKELY(async_frame_faulted(async_frame))) {  // async completed with a throw
+                auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(async_frame));
                 on_fault_reentrant(f, fault_src, fault_err);
                 return;
             }
@@ -1702,12 +1706,12 @@ private:
             // relaxed gen_state flags re-read is the correct (and only) way to recover the same word.
             current_ctx_.principal =
                 resolve_principal(d, GenState::flags_of(d->gen_state.load(std::memory_order_relaxed)));
-            DispatchOutcome o;
+            std::coroutine_handle<> async_frame{};  // stays null iff the handler was sync
             bool retry_faulted = false;
 #ifndef QUARK_SUPERVISION_NO_GUARD
             try {
                 detail::AmbientContextScope amb(current_ctx_);
-                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+                table_.thunks[slot_from(*d)](self_, d, current_ctx_, async_frame);
             } catch (const ResourceFailure& rf) {
                 retry_faulted = true;
                 last_error = rf.err;
@@ -1718,32 +1722,33 @@ private:
 #else
             {
                 detail::AmbientContextScope amb(current_ctx_);
-                o = table_.thunks[slot_from(*d)](self_, d, current_ctx_);
+                table_.thunks[slot_from(*d)](self_, d, current_ctx_, async_frame);
             }
 #endif
             if (!retry_faulted) {
-                if (o.kind == HandlerKind::Sync) {
+                if (!async_frame) {
                     d->complete();
                     reclaim_(d);
                     if (metrics_) metrics_->messages_processed.inc();
                     return;  // retry succeeded
                 }
-                if (o.frame.done()) {
-                    if (QUARK_UNLIKELY(async_frame_faulted(o.frame))) {
-                        auto [fault_src, fault_err] = classify_fault(async_frame_fault_ptr(o.frame));
+                if (async_frame.done()) {
+                    if (QUARK_UNLIKELY(async_frame_faulted(async_frame))) {
+                        auto [fault_src, fault_err] =
+                            classify_fault(async_frame_fault_ptr(async_frame));
                         (void)fault_src;
-                        o.frame.destroy();
+                        async_frame.destroy();
                         retry_faulted = true;
                         last_error = fault_err;
                     } else {
-                        o.frame.destroy();
+                        async_frame.destroy();
                         d->complete();
                         reclaim_(d);
                         if (metrics_) metrics_->messages_processed.inc();
                         return;  // retry succeeded (async, completed inline — no real suspension)
                     }
                 } else {
-                    o.frame.destroy();  // abandon: genuine suspension is out of scope (see banner)
+                    async_frame.destroy();  // abandon: genuine suspension is out of scope (banner)
                     retry_faulted = true;
                     last_error = error{errc::internal, "retry_async_unsupported"};
                 }

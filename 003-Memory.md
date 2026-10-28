@@ -285,12 +285,14 @@ Two distinct ordering claims in the exec-state close-out path were previously
 bundled together; ADR-031 separated them and proved only one; ADR-032 closed
 the other:
 
-- **The seq_cst Dekker fence in `Mailbox::producer_close_out_fence` /
-  `consumer_close_out_fence` is proven load-bearing.** Removing it reproduces
-  a real lost-wakeup: 0 lost/50M messages fenced vs. 366k–618k lost/50M
-  unfenced (ADR-031 F5, reconfirmed ADR-032: 0/50M fenced vs 441,292–576,097
-  lost/50M unfenced). This fence stays in the shipped design and is not a
-  candidate for removal or relaxation.
+- **The seq_cst Dekker StoreLoad ordering of the close-out is proven
+  load-bearing.** Removing it (then the fences in `Mailbox::producer_close_out_fence` /
+  `consumer_close_out_fence`) reproduces a real lost-wakeup: 0 lost/50M messages
+  fenced vs. 366k–618k lost/50M unfenced (ADR-031 F5, reconfirmed ADR-032: 0/50M
+  fenced vs 441,292–576,097 lost/50M unfenced). The ordering stays in the shipped
+  design and is not a candidate for relaxation; since ADR-066 it is spelled as
+  `seq_cst` operations (seq_cst relinquish store + seq_cst `tail_` probe ↔ seq_cst
+  enqueue exchange + seq_cst exec-state CAS) instead of standalone fences.
 - **`ExecStateCell`'s own release/acquire ordering is now independently
   proven load-bearing (ADR-032 F4-revised), closing the question ADR-031
   left open.** ADR-031's mutant test was inconclusive because it ran the
