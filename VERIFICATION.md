@@ -23,7 +23,7 @@ which can hang or power off if a build/run saturates all cores. Never use `-j$(n
 |---|---|---|
 | **Release** (gcc) | `build` | **211 / 211 passed**, 0 failed |
 | **ThreadSanitizer** (gcc) | `build-tsan` | **194 / 194 passed**, 0 failed — no data races (the TSan config's documented exclusions; `tcp_transport_control_priority_test` passed this run) |
-| **ASan + UBSan** (gcc) | `build-asan` | **13 / 13 passed** on the changed transport/SWIM/security slice this cycle — full-suite ASan was last run at 209/210, the one miss being the pre-existing `topic_no_quiesce_control` weakness below |
+| **ASan + UBSan** (gcc 15.2, Linux) | `build-asan` | **Full suite, 2026-10-28 (ADR-062 + #10/#21 commits): 238 / 242 on first run, 2 real heap-use-after-free found and fixed (`FanOut` member teardown order; `delivery_at_least_once_test` re-entering `pump()` from its sink) — both re-run clean (commit `7d331fc`). The other 2 misses are the firing controls `activation_park_race_control` and `topic_no_quiesce_control`, which did not reproduce their race on this host (timing-dependent; untouched by these changes). The full suite was not re-run after the fixes, only the two tests. |
 | **SWIM chaos** (not CTest) | `tests/netem/run_swim_chaos.sh build` | **5 / 5** scenarios end all-alive (form, isolate, asym, split, flaky) |
 
 Release is the full gate — it is the only config where every allocation-counting probe and every
