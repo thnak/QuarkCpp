@@ -610,19 +610,36 @@ public:
     }
     // Re-send up to `window` oldest unacked frames (0 = all) via
     // `sink(const ReliableFrame&, const std::string& body) -> void`. A lossy sink simply drops; the
-    // next pump retries. The sink must NOT call on_ack()/enqueue() on this sender (it mutates the
-    // deque being iterated); collect acks and apply them after pump() returns.
+    // next pump retries. Returns the number of frames sent.
+    // RE-ENTRANCY (#27): the sink MAY call enqueue() on this sender (frames are located by seq at each
+    // step, never by a saved iterator, so push_back is safe) and MAY call on_ack() (the ack is DEFERRED:
+    // recorded, and applied once the outermost pump() returns, so the `body` reference handed to the
+    // sink stays valid for the whole sink call).
     template <class Sink>
     std::size_t pump(Sink&& sink, std::size_t window = 0) {
+        if (pending_.empty()) return 0;
+        const bool outermost = !in_pump_;
+        in_pump_ = true;
+        PumpScope scope{*this, outermost};  // clears in_pump_ + applies deferred ack on every exit path
         std::size_t n = 0;
-        for (const Item& it : pending_) {
-            if (window != 0 && n == window) break;
-            sink(ReliableFrame{sender_, it.seq, pending_.front().seq}, it.body);
+        std::uint64_t cursor = pending_.front().seq;
+        while (window == 0 || n != window) {
+            const auto it = std::lower_bound(pending_.begin(), pending_.end(), cursor,
+                                             [](const Item& item, std::uint64_t s) { return item.seq < s; });
+            if (it == pending_.end()) break;
+            const std::uint64_t seq = it->seq;
+            cursor = seq + 1;
+            sink(ReliableFrame{sender_, seq, pending_.front().seq}, it->body);
             ++n;
         }
         return n;
     }
     void on_ack(std::uint64_t cumulative) {
+        if (in_pump_) {  // inside a pump(): defer, so the in-flight body reference stays valid
+            deferred_ack_ = std::max(deferred_ack_, cumulative);
+            has_deferred_ack_ = true;
+            return;
+        }
         while (!pending_.empty() && pending_.front().seq <= cumulative) pending_.pop_front();
     }
     [[nodiscard]] std::size_t pending() const noexcept { return pending_.size(); }
@@ -633,9 +650,26 @@ private:
         std::uint64_t seq;
         std::string body;
     };
+    // Scope guard for pump(): only the OUTERMOST pump clears in_pump_ and flushes the deferred ack
+    // (a nested pump from inside a sink must not apply acks while the outer sink call is in flight).
+    struct PumpScope {
+        ReliableSender& s;
+        bool outermost;
+        ~PumpScope() {
+            if (!outermost) return;
+            s.in_pump_ = false;
+            if (s.has_deferred_ack_) {
+                s.has_deferred_ack_ = false;
+                s.on_ack(s.deferred_ack_);
+            }
+        }
+    };
     std::uint64_t sender_;
     std::uint64_t next_ = 1;
     std::deque<Item> pending_;
+    bool in_pump_ = false;
+    std::uint64_t deferred_ack_ = 0;
+    bool has_deferred_ack_ = false;
 };
 
 class ReliableReceiver {
