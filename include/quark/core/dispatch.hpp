@@ -109,14 +109,7 @@ DispatchOutcome dispatch_thunk(void* self, Descriptor* d, const MessageContext& 
     const M& msg = *static_cast<const M*>(d->payload);
     if constexpr (sync_handler<A, M>) {
         invoke_handle(actor, msg, ctx);  // run to completion inline on the worker lane
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4702)  // handlers that always throw make the return unreachable (dead-letter path)
-#endif
         return {HandlerKind::Sync, {}};
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
     } else {
         static_assert(async_handler<A, M>, "handle() must return void (sync) or quark::task<> (async)");
         task<> t = invoke_handle(actor, msg, ctx);

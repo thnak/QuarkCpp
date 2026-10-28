@@ -26,7 +26,6 @@ struct Fast {
 };
 
 struct Handler : Actor<Handler, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sched_readmit_test.Handler";
     using protocol = Protocol<Slow, Fast>;
     std::atomic<int> slow_ran{0};
     std::atomic<int> fast_ran{0};

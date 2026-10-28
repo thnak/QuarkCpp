@@ -23,7 +23,7 @@ struct Pong {};
 
 // Terminal actor: records the trace/deadline its inbound message carried.
 struct Sink : Actor<Sink, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.messaging_ambient_propagation_test.Sink";
+    static constexpr std::string_view quark_type_name = "quark.test.messaging_ambient_propagation_test.Sink";
     using protocol = Protocol<Pong>;
     std::atomic<std::uint64_t> got_trace{0};
     std::atomic<std::int64_t> got_deadline{0};
@@ -38,7 +38,7 @@ struct Sink : Actor<Sink, Sequential> {
 // Relay: on Ping it tells Sink a Pong — the outbound tell must inherit the Relay handler's ambient
 // context (which itself was inherited from the message that triggered the Relay).
 struct Relay : Actor<Relay, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.messaging_ambient_propagation_test.Relay";
+    static constexpr std::string_view quark_type_name = "quark.test.messaging_ambient_propagation_test.Relay";
     using protocol = Protocol<Ping>;
     ActorRef<Sink>* sink = nullptr;
     void handle(const Ping&) { sink->tell(Pong{}); }

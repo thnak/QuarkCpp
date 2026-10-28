@@ -29,7 +29,6 @@ struct Msg {
 };
 
 struct Hop : Actor<Hop, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.tracing_test.Hop";
     using protocol = Protocol<Msg>;
     SpanRing<64>* ring = nullptr;
     std::uint64_t observed = 0;

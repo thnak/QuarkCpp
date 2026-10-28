@@ -18,7 +18,7 @@ struct GetSquare {
 };
 
 struct Squarer : Actor<Squarer, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_engine_test.Squarer";
+    static constexpr std::string_view quark_type_name = "quark.test.ask_engine_test.Squarer";
     using protocol = Protocol<Ask<GetSquare, int>>;
     void handle(const Ask<GetSquare, int>& m) noexcept { m.respond(m.query.x * m.query.x); }
 };

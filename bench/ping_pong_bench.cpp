@@ -38,7 +38,7 @@ struct PingActor;
 struct PongActor;
 
 struct PingActor : Actor<PingActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.ping_pong_bench.PingActor";
+    static constexpr std::string_view quark_type_name = "quark.bench.ping_pong_bench.PingActor";
     using protocol = Protocol<Ball>;
     ActorRef<PongActor>* pong = nullptr;
     std::vector<double>* rtt_ns = nullptr;
@@ -53,7 +53,7 @@ struct PingActor : Actor<PingActor, Sequential> {
 };
 
 struct PongActor : Actor<PongActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.ping_pong_bench.PongActor";
+    static constexpr std::string_view quark_type_name = "quark.bench.ping_pong_bench.PongActor";
     using protocol = Protocol<Ball>;
     ActorRef<PingActor>* ping = nullptr;
     void handle(const Ball& b) noexcept { ping->tell(b); }  // bounce straight back, same lap

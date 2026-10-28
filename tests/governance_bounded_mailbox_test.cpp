@@ -28,7 +28,6 @@ struct Item {
 };
 
 struct Sink : Actor<Sink, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.governance_bounded_mailbox_test.Sink";
     using protocol = Protocol<Item>;
     std::vector<std::uint64_t> processed;
     void handle(const Item& m) { processed.push_back(m.id); }

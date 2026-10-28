@@ -61,7 +61,7 @@ void print_stats(const char* label, const Stats& s) {
 // ---- Ping actor (fire-and-forget, counts messages) -----------------------
 
 struct PingActor : Actor<PingActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.quark_mpsc_sharded_bench.PingActor";
+    static constexpr std::string_view quark_type_name = "quark.bench.quark_mpsc_sharded_bench.PingActor";
     using protocol = Protocol<int>;
 
     void handle(const int&) noexcept { /* just receive — mirrors quark_bench.cpp's throughput

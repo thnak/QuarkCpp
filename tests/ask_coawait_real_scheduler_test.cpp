@@ -56,7 +56,7 @@ struct Query {
 };
 
 struct Answerer : Actor<Answerer, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_coawait_real_scheduler_test.Answerer";
+    static constexpr std::string_view quark_type_name = "quark.test.ask_coawait_real_scheduler_test.Answerer";
     using protocol = Protocol<Ask<Query, int>>;
     void handle(const Ask<Query, int>& m) noexcept { m.respond(m.query.tag * 2 + 1); }
 };
@@ -71,7 +71,7 @@ constexpr int kAsksPerAsker = 25;
 // injection (Engine::spawn<A>() default-constructs A). Every Asker reads the SAME pool of Answerer
 // refs and the SAME shared counters; each Asker's own identity travels in the Trigger message itself.
 struct Asker : Actor<Asker, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_coawait_real_scheduler_test.Asker";
+    static constexpr std::string_view quark_type_name = "quark.test.ask_coawait_real_scheduler_test.Asker";
     using protocol = Protocol<Trigger>;
     static inline std::vector<ActorRef<Answerer>>* g_responders = nullptr;
     static inline std::atomic<int>* g_completed = nullptr;

@@ -26,7 +26,6 @@ struct Ping {
 };
 
 struct Sink : Actor<Sink, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sched_no_lost_wakeup_test.Sink";
     using protocol = Protocol<Ping>;
     std::atomic<std::uint64_t>* dispatched = nullptr;
     void handle(const Ping&) noexcept { dispatched->fetch_add(1, std::memory_order_release); }

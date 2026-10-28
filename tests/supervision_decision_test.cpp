@@ -24,7 +24,6 @@ struct Bump {};
 struct Boom {};
 
 struct Counter : Actor<Counter, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_decision_test.Counter";
     using protocol = Protocol<Bump, Boom>;
     int n = 0;
     void handle(const Bump&) noexcept { ++n; }

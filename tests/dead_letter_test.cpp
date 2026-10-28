@@ -29,7 +29,6 @@ struct Poison {
 // A handler that always faults — every message routes to dead-letter (007 -> 009 sink). NOT
 // noexcept: the throw propagates to the Activation handler-boundary guard, which dead-letters it.
 struct Poisoner : Actor<Poisoner, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.dead_letter_test.Poisoner";
     using protocol = Protocol<Poison>;
     void handle(const Poison&) { throw std::runtime_error("boom"); }
 };

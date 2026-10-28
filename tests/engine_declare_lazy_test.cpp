@@ -18,13 +18,13 @@ namespace {
 struct Ping {};
 
 struct Worker : Actor<Worker, Sequential, Priority<0>, DrainBudget<32>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_declare_lazy_test.Worker";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_declare_lazy_test.Worker";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
 
 struct Other : Actor<Other, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_declare_lazy_test.Other";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_declare_lazy_test.Other";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
@@ -37,7 +37,7 @@ struct DbConn {
 // provided resource, so declare_lazy's optional WireCheck closure has the same fail-fast seam
 // spawn<A>() already has.
 struct NeedsDb : Actor<NeedsDb, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_declare_lazy_test.NeedsDb";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_declare_lazy_test.NeedsDb";
     using protocol = Protocol<Ping>;
     Cached<DbConn> db_;
     [[nodiscard]] result<void> wire(const ResourceScope& s) { return wire_resources(s, db_); }

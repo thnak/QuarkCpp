@@ -31,7 +31,6 @@ int g_succeed_on_attempt = 0;  // 0 == never succeeds
 
 struct RetryActor : Actor<RetryActor, Sequential, OnFailure<Restart>,
                           OnRestartAsk<Retry<3, IdempotencyKey<RetryKey>>>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_restart_retry_test.RetryActor";
     using protocol = Protocol<Flaky>;
     int n = 0;
     void handle(const Flaky&) {
@@ -46,7 +45,6 @@ void reset_retry_actor(void* self, void*) noexcept { static_cast<RetryActor*>(se
 // bounded by the actor's OWN restart budget, not just the Retry<N> count.
 struct BudgetedRetryActor : Actor<BudgetedRetryActor, Sequential, OnFailure<Restart, MaxRestarts<1>>,
                                   OnRestartAsk<Retry<3, IdempotencyKey<RetryKey>>>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_restart_retry_test.BudgetedRetryActor";
     using protocol = Protocol<Flaky>;
     void handle(const Flaky&) {
         ++g_attempts;

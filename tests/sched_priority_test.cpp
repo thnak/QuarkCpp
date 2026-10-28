@@ -32,7 +32,6 @@ struct Job {
 };
 
 struct Band : Actor<Band, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sched_priority_test.Band";
     using protocol = Protocol<Job>;
     bool low = false;
     std::atomic<std::uint64_t>* order = nullptr;

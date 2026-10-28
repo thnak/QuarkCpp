@@ -15,12 +15,12 @@ using namespace quark;
 namespace {
 
 struct A : Actor<A, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.actor_ref_identity_test.A";
+    static constexpr std::string_view quark_type_name = "quark.test.actor_ref_identity_test.A";
     using protocol = Protocol<int>;
     void handle(const int&) noexcept {}
 };
 struct B : Actor<B, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.actor_ref_identity_test.B";
+    static constexpr std::string_view quark_type_name = "quark.test.actor_ref_identity_test.B";
     using protocol = Protocol<int>;
     void handle(const int&) noexcept {}
 };

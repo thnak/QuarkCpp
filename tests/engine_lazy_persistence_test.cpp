@@ -36,7 +36,7 @@ struct CounterState {
 QUARK_SERIALIZE(CounterState, (1, n))
 
 struct PersistedCounter : Actor<PersistedCounter, Sequential, Persistent<Snapshot>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.PersistedCounter";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.PersistedCounter";
     using protocol = Protocol<Ping>;
     using PersistState = CounterState;
 
@@ -141,7 +141,7 @@ struct CountedMsg2 {
     ~CountedMsg2() { destructed.fetch_add(1, std::memory_order_release); }
 };
 struct NeedsFenceStore : Actor<NeedsFenceStore, Sequential, Persistent<Snapshot>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.NeedsFenceStore";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.NeedsFenceStore";
     using protocol = Protocol<CountedMsg2>;
     using PersistState = CounterState;
     static inline std::atomic<int> handled{0};
@@ -150,7 +150,7 @@ struct NeedsFenceStore : Actor<NeedsFenceStore, Sequential, Persistent<Snapshot>
     void handle(const CountedMsg2&) noexcept { handled.fetch_add(1, std::memory_order_relaxed); }
 };
 struct OrderedPersisted : Actor<OrderedPersisted, Sequential, Persistent<Snapshot>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.OrderedPersisted";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.OrderedPersisted";
     using protocol = Protocol<Ping>;
     using PersistState = CounterState;
     static inline std::atomic<int> handled{0};
@@ -166,7 +166,7 @@ struct CountedMsg {
     ~CountedMsg() { destructed.fetch_add(1, std::memory_order_release); }
 };
 struct NeedsFailingStore : Actor<NeedsFailingStore, Sequential, Persistent<Snapshot>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.NeedsFailingStore";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.NeedsFailingStore";
     using protocol = Protocol<CountedMsg>;
     using PersistState = CounterState;
     [[nodiscard]] CounterState snapshot_state() const { return CounterState{}; }
@@ -176,7 +176,7 @@ struct NeedsFailingStore : Actor<NeedsFailingStore, Sequential, Persistent<Snaps
 
 // --- S3 concurrency pin: N threads race the SAME cold Persistent<Snapshot> id ------------------
 struct RacePersisted : Actor<RacePersisted, Sequential, Persistent<Snapshot>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.RacePersisted";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_persistence_test.RacePersisted";
     using protocol = Protocol<Ping>;
     using PersistState = CounterState;
     static inline std::atomic<int> recover_calls{0};

@@ -210,12 +210,14 @@ void run_scenario(std::uint64_t seed, Stats& st) {
 int main() {
     std::uint64_t n = 10000;
 #if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4996)  // std::getenv: portable, std-only; single read before any threads
-#endif
+    char* e = nullptr;
+    std::size_t e_len = 0;
+    if (_dupenv_s(&e, &e_len, "QUARK_LEASE_SCENARIOS") == 0 && e) {
+        n = std::strtoull(e, nullptr, 10);
+        std::free(e);
+    }
+#else
     if (const char* e = std::getenv("QUARK_LEASE_SCENARIOS")) n = std::strtoull(e, nullptr, 10);
-#if defined(_MSC_VER)
-#pragma warning(pop)
 #endif
     Stats st;
     const auto t0 = std::chrono::steady_clock::now();

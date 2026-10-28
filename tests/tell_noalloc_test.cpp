@@ -82,7 +82,7 @@ struct Ping {
 };
 
 struct Sink : Actor<Sink, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.tell_noalloc_test.Sink";
+    static constexpr std::string_view quark_type_name = "quark.test.tell_noalloc_test.Sink";
     using protocol = Protocol<Ping>;
     std::atomic<long> sum{0};
     std::atomic<int> count{0};

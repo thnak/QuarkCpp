@@ -23,7 +23,6 @@ struct Restart {
 };
 
 struct Account : Actor<Account, MaxConcurrency<8>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.quiescence_cancel_test.Account";
     using protocol = Protocol<Sibling, Restart>;
     Activation* lane = nullptr;
 

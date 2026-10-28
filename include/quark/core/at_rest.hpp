@@ -148,10 +148,8 @@ inline constexpr std::size_t kAtRestNonceBytes = 8;
     const std::uint64_t nonce = fresh_at_rest_nonce();
     std::vector<std::byte> out;
     out.reserve(kAtRestNonceBytes + canonical.size() + cipher.tag_size());
-    // resize + index (not push_back): GCC 14 emits a false -Wfree-nonheap-object on reserve+push_back here.
-    out.resize(kAtRestNonceBytes);
     for (std::size_t b = 0; b < kAtRestNonceBytes; ++b)
-        out[b] = static_cast<std::byte>((nonce >> (b * 8)) & 0xFF);
+        out.push_back(static_cast<std::byte>((nonce >> (b * 8)) & 0xFF));
     cipher.seal(nonce, std::span<const std::byte>(aad), canonical, out);  // appends after the prefix
     return out;
 }

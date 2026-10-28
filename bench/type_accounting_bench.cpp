@@ -26,7 +26,7 @@ struct Tick {
 };
 std::atomic<std::uint64_t> g_handled{0};
 struct Sink : Actor<Sink, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.type_accounting_bench.Sink";
+    static constexpr std::string_view quark_type_name = "quark.bench.type_accounting_bench.Sink";
     using protocol = Protocol<Tick>;
     void handle(const Tick& t) noexcept {
         sum += t.v;

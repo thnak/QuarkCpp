@@ -22,7 +22,7 @@ struct Compute {
 };
 
 struct Server : Actor<Server, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_concurrent_partitioned_test.Server";
+    static constexpr std::string_view quark_type_name = "quark.test.ask_concurrent_partitioned_test.Server";
     using protocol = Protocol<Ask<Compute, long long>>;
     // A pure per-request transform: the reply is uniquely determined by the request token, so any
     // cross-caller misroute is detectable by the caller comparing against its own expected value.

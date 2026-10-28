@@ -53,7 +53,6 @@ struct Config1 {
 };
 
 struct DirectActor : Actor<DirectActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.activation_restart_resource_rewire_test.DirectActor";
     using protocol = Protocol<Bump, Boom>;
     int n = 0;
     Cached<Config1> cfg_;
@@ -85,7 +84,7 @@ struct Config2 {
     int value = 0;
 };
 struct SpawnedRestart : Actor<SpawnedRestart, Sequential, OnFailure<Restart>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.activation_restart_resource_rewire_test.SpawnedRestart";
+    static constexpr std::string_view quark_type_name = "quark.test.activation_restart_resource_rewire_test.SpawnedRestart";
     using protocol = Protocol<Bump, Boom>;
     static inline std::atomic<int> constructions{0};
     static inline std::atomic<bool> last_resolved{false};
@@ -107,7 +106,7 @@ struct Config3 {
     int value = 0;
 };
 struct LazyRestart : Actor<LazyRestart, Sequential, OnFailure<Restart>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.activation_restart_resource_rewire_test.LazyRestart";
+    static constexpr std::string_view quark_type_name = "quark.test.activation_restart_resource_rewire_test.LazyRestart";
     using protocol = Protocol<Bump, Boom>;
     static inline std::atomic<int> constructions{0};
     static inline std::atomic<bool> last_resolved{false};

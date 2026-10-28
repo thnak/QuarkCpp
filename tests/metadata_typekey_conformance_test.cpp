@@ -88,11 +88,11 @@ struct NamedPair {
     B b{};
 };
 struct Pinned {  // quark_type_name: hashed verbatim, identical on every toolchain, rename-stable
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.conformance.Pinned";
+    static constexpr std::string_view quark_type_name = "quark.conformance.Pinned";
     int unused = 0;
 };
 struct PinnedRenamed {  // a DIFFERENT C++ name with the SAME pinned identity => same key
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.conformance.Pinned";
+    static constexpr std::string_view quark_type_name = "quark.conformance.Pinned";
     int unused = 0;
 };
 }  // namespace conformance_named
@@ -103,7 +103,7 @@ struct PinnedRenamed {  // a DIFFERENT C++ name with the SAME pinned identity =>
 // cases that used to diverge per toolchain.
 namespace {
 struct AnonActor : Actor<AnonActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.conformance.AnonActor";
+    static constexpr std::string_view quark_type_name = "quark.conformance.AnonActor";
     using protocol = Protocol<ConformancePoint, std::size_t>;
     void handle(const ConformancePoint&) {}
     void handle(const std::size_t&) {}
@@ -111,12 +111,12 @@ struct AnonActor : Actor<AnonActor, Sequential> {
 }  // namespace
 namespace conformance_named {
 struct NamedActor : Actor<NamedActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.conformance.NamedActor";
+    static constexpr std::string_view quark_type_name = "quark.conformance.NamedActor";
     using protocol = Protocol<ConformancePoint>;
     void handle(const ConformancePoint&) {}
 };
 struct NoProtocolActor : Actor<NoProtocolActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.conformance.NoProtocolActor";
+    static constexpr std::string_view quark_type_name = "quark.conformance.NoProtocolActor";
 };
 }  // namespace conformance_named
 

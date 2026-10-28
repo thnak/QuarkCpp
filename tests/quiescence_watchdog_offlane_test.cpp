@@ -33,7 +33,6 @@ struct DrainMsg {
 };
 
 struct Service : Actor<Service, MaxConcurrency<8>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.quiescence_watchdog_offlane_test.Service";
     using protocol = Protocol<Stuck, DrainMsg>;
     Activation* lane = nullptr;
     std::atomic<int> unwound{0};

@@ -31,18 +31,18 @@ struct Segment {
 };
 
 struct AlphaActor : Actor<AlphaActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.AlphaActor";
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.AlphaActor";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
 struct BetaActor : Actor<BetaActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.BetaActor";
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.BetaActor";
     using protocol = Protocol<Pong>;
     void handle(const Pong&) {}
 };
 // Same *name shape* as AlphaActor but a different protocol — must get a distinct key (fold).
 struct GammaActor : Actor<GammaActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.GammaActor";
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.GammaActor";
     using protocol = Protocol<Ping, Pong>;
     void handle(const Ping&) {}
     void handle(const Pong&) {}
@@ -51,19 +51,19 @@ struct GammaActor : Actor<GammaActor, Sequential> {
 // ADR-061 (E5): `quark_type_name` pins an actor's identity to a string, so two actors that pin the SAME
 // name AND share a protocol have one key — the startup collision scan must reject the second.
 struct PinnedOne : Actor<PinnedOne, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
 struct PinnedTwo : Actor<PinnedTwo, Sequential> {  // different C++ name, same pinned name + protocol
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
 // Same pinned name, wider protocol of NON-Described messages: local-only, never on the wire or in a
 // durable record, so it does NOT enter the key (ADR-062) — identity is the declared name.
 struct PinnedWide : Actor<PinnedWide, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
     using protocol = Protocol<Ping, Pong>;
     void handle(const Ping&) {}
     void handle(const Pong&) {}
@@ -73,7 +73,7 @@ struct Wide {  // a DESCRIBED message: its 016 fingerprint folds into the actor 
 };
 QUARK_SERIALIZE(Wide, (1, v))
 struct PinnedDescribed : Actor<PinnedDescribed, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
     using protocol = Protocol<Ping, Wide>;
     void handle(const Ping&) {}
     void handle(const Wide&) {}

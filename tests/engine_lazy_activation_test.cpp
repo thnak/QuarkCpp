@@ -28,7 +28,7 @@ struct Ping {
 
 // A plain lazily-activated actor with no resources — the common case.
 struct LazyWorker : Actor<LazyWorker, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.LazyWorker";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.LazyWorker";
     using protocol = Protocol<Ping>;
     static inline std::atomic<int> constructions{0};
     static inline std::atomic<int> handled{0};
@@ -40,7 +40,7 @@ struct LazyWorker : Actor<LazyWorker, Sequential> {
 // the existing Phase 1/2 idle-eviction/reactivation machinery with ZERO further broker involvement
 // (Engine::activate() only ever fires once per ActorId, on its true first touch).
 struct LazySleepy : Actor<LazySleepy, Sequential, IdleTimeout<20>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.LazySleepy";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.LazySleepy";
     using protocol = Protocol<Ping>;
     static inline std::atomic<int> handled{0};
     void handle(const Ping& p) noexcept { handled.fetch_add(p.n, std::memory_order_release); }
@@ -52,7 +52,7 @@ struct DbConn {
     int fd = 42;
 };
 struct NeedsDbLazy : Actor<NeedsDbLazy, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.NeedsDbLazy";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.NeedsDbLazy";
     using protocol = Protocol<Ping>;
     Cached<DbConn> db_;
     static inline std::atomic<int> seen_fd{-1};
@@ -71,7 +71,7 @@ struct CountedMsg {
     ~CountedMsg() { destructed.fetch_add(1, std::memory_order_release); }
 };
 struct NeverDeclared : Actor<NeverDeclared, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.NeverDeclared";
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_test.NeverDeclared";
     using protocol = Protocol<CountedMsg>;
     void handle(const CountedMsg&) noexcept {}
 };

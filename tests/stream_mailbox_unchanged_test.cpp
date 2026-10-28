@@ -27,7 +27,6 @@ struct Ping {
 
 // A plain non-streaming Sequential actor.
 struct Echo : Actor<Echo, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.stream_mailbox_unchanged_test.Echo";
     using protocol = Protocol<Ping>;
     std::uint64_t sum = 0;
     std::uint64_t count = 0;

@@ -21,7 +21,6 @@ struct Report {
 };
 
 struct Order : Actor<Order, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.exec_dispatch_test.Order";
     using protocol = Protocol<Ship, Query, Report>;
 
     int ships = 0;

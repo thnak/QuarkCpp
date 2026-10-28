@@ -47,20 +47,7 @@ QUARK_SERIALIZE(PodShift, (1, id), (5, extra_before), (2, qty), (3, flags), (4, 
 int main() {
     // The gate's premise: the two schemas hash DISTINCTLY, so negotiate() would refuse tagless
     // and fall back to tagged. If the fingerprints collided the control would be vacuous.
-    const std::uint64_t fp_w = fingerprint_v<Pod>;
-    const std::uint64_t fp_r = fingerprint_v<PodShift>;
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4127)  // deliberate runtime check of a compile-time fingerprint
-#endif
-    if (fp_w == fp_r) {
-        std::fprintf(stderr, "VACUOUS: fingerprints collide (%016llx) — control cannot fire\n",
-                     static_cast<unsigned long long>(fp_w));
-        return 1;
-    }
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
+    static_assert(fingerprint_v<Pod> != fingerprint_v<PodShift>, "VACUOUS: fingerprints collide — control cannot fire");
 
     Pod w{0x0102030405060708ULL, 0xaabbccddU, 0x11223344U, 2.5};
     const std::size_t wrote = tagless_size(w);  // 24
@@ -91,9 +78,9 @@ int main() {
 
     std::printf("serialize_fingerprint_mismatch_control_test: %s\n",
                 (qty_corrupt || flags_corrupt) ? "OK (corruption detected)" : "FAIL (no defect)");
-    std::printf("  fp(writer Pod)     = %016llx\n", static_cast<unsigned long long>(fp_w));
+    std::printf("  fp(writer Pod)     = %016llx\n", static_cast<unsigned long long>(fingerprint_v<Pod>));
     std::printf("  fp(reader PodShift)= %016llx  (distinct -> negotiation would reject)\n",
-                static_cast<unsigned long long>(fp_r));
+                static_cast<unsigned long long>(fingerprint_v<PodShift>));
     std::printf("  writer qty = %08x   reader qty = %08x   (wrong: %s)\n", w.qty, r.qty,
                 qty_corrupt ? "yes" : "no");
     std::printf("  id preserved by prefix overlap = %s (bytes written=%zu)\n",

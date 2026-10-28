@@ -42,7 +42,6 @@ struct SessionSource {
 
 // FailMessage (default): a failed acquire throws ResourceFailure via acquire_or_throw().
 struct FailMsgActor : Actor<FailMsgActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_resource_failure_test.FailMsgActor";
     using protocol = Protocol<Query, Boom>;
     PerMessage<Session> session_;
     int handled = 0;
@@ -57,7 +56,6 @@ struct FailMsgActor : Actor<FailMsgActor, Sequential> {
 
 // Degrade: a failed acquire is handled by the actor itself — no 007 fault.
 struct DegradeActor : Actor<DegradeActor, Sequential, OnResourceFailure<Degrade>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_resource_failure_test.DegradeActor";
     using protocol = Protocol<Query>;
     PerMessage<Session> session_;
     int handled = 0;

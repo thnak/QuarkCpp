@@ -86,7 +86,7 @@ void print_stats(const char* label, const Stats& s) {
 // safe even though tell() and ask() arrive concurrently from different threads — the same
 // pattern as tests/authoring_e2e_test.cpp's Counter actor (Add mutates, Ask<GetTotal,int> reads).
 struct PingActor : Actor<PingActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.quark_stress_bench.PingActor";
+    static constexpr std::string_view quark_type_name = "quark.bench.quark_stress_bench.PingActor";
     using protocol = Protocol<int, Ask<int, std::uint64_t>>;
     std::uint64_t count = 0;
 

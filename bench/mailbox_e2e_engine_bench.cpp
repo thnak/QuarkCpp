@@ -37,7 +37,7 @@ namespace {
 struct Ping { std::uint64_t v; };
 
 struct Echo : Actor<Echo, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.mailbox_e2e_engine_bench.Echo";
+    static constexpr std::string_view quark_type_name = "quark.bench.mailbox_e2e_engine_bench.Echo";
     using protocol = Protocol<Ping>;
     std::atomic<std::uint64_t>* seen = nullptr;
     void handle(const Ping&) noexcept { seen->fetch_add(1, std::memory_order_release); }

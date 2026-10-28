@@ -32,7 +32,7 @@ struct GetCount {};
 
 // Default supervision = Restart with an unbounded budget (007), so it re-activates across faults.
 struct Counter : Actor<Counter, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metadata_restart_reconstruct_test.Counter";
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_restart_reconstruct_test.Counter";
     using protocol = Protocol<Bump, Ask<GetCount, int>>;
     int count = 0;
     void handle(const Bump& b) {

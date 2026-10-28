@@ -34,7 +34,7 @@ struct Ping {};
 // A perfectly ordinary, already-registered-at-build actor: proves the frozen record's pointer/index
 // survives a LATER failed declare_lazy<Bad> untouched.
 struct Warm : Actor<Warm, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.Warm";
+    static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.Warm";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
@@ -50,7 +50,7 @@ struct UnknownStore {
 };
 
 struct GoodActor : Actor<GoodActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.GoodActor";
+    static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.GoodActor";
     using protocol = Protocol<Ping>;
     Cached<KnownPool> pool_;
     [[nodiscard]] result<void> wire(const ResourceScope& s) { return wire_resources(s, pool_); }
@@ -60,7 +60,7 @@ struct GoodActor : Actor<GoodActor, Sequential> {
 // References a Node-scoped resource type that was never registered at first build() — the
 // closed-world violation this test exists to catch.
 struct BadActor : Actor<BadActor, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.BadActor";
+    static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.BadActor";
     using protocol = Protocol<Ping>;
     Cached<UnknownStore> store_;
     [[nodiscard]] result<void> wire(const ResourceScope& s) { return wire_resources(s, store_); }
@@ -70,7 +70,7 @@ struct BadActor : Actor<BadActor, Sequential> {
 KnownPool make_known_pool() { return KnownPool{7}; }
 
 struct Trailing : Actor<Trailing, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.Trailing";
+    static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_closed_world_test.Trailing";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };

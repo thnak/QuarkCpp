@@ -27,7 +27,7 @@ namespace {
 
 struct Boom {};
 struct AlwaysBoom : Actor<AlwaysBoom, Sequential, OnFailure<Restart, MaxRestarts<2, Within<100>>>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sim_virtual_clock_window_test.AlwaysBoom";
+    static constexpr std::string_view quark_type_name = "quark.test.sim_virtual_clock_window_test.AlwaysBoom";
     using protocol = Protocol<Boom>;
     void handle(const Boom&) { throw std::runtime_error("boom"); }
 };

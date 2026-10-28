@@ -20,7 +20,6 @@ struct Job {
 };
 
 struct Pipe : Actor<Pipe, MaxConcurrency<3>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.reentrancy_maxconcurrency_test.Pipe";
     using protocol = Protocol<Job>;
     Activation* lane = nullptr;
     int started = 0;    // synchronous prologue count (lane-exclusive)

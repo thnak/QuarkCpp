@@ -21,7 +21,7 @@ struct Req {
 };
 
 struct Flaky : Actor<Flaky, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_reply_before_teardown_test.Flaky";
+    static constexpr std::string_view quark_type_name = "quark.test.ask_reply_before_teardown_test.Flaky";
     using protocol = Protocol<Ask<Req, int>>;
     void handle(const Ask<Req, int>& m) noexcept {
         if (m.query.answer) m.respond(m.query.x);

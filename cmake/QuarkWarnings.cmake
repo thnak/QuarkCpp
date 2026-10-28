@@ -38,11 +38,5 @@ else()
     target_compile_options(quark_warnings INTERFACE
       -fsanitize=${_quark_san} -fno-omit-frame-pointer -g)
     target_link_options(quark_warnings INTERFACE -fsanitize=${_quark_san})
-    # GCC TSan does not model std::atomic_thread_fence and warns at every inlined fence ("-Wtsan", ~2300x/run).
-    # The fences are load-bearing (store-load barrier, ADR-002/003 Dekker pairs) and stay; TSan simply cannot
-    # see them, which tests/ already accounts for (VERIFICATION.md TSan exclusions). Silence only that diagnostic.
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND QUARK_SANITIZE MATCHES "thread")
-      target_compile_options(quark_warnings INTERFACE -Wno-tsan)
-    endif()
   endif()
 endif()

@@ -133,7 +133,7 @@ bool section_b_single_thread_fifo() {
 struct Seq { int producer; int seq; };
 
 struct Collector : Actor<Collector, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.mailbox_dims_smoke_test.Collector";
+    static constexpr std::string_view quark_type_name = "quark.test.mailbox_dims_smoke_test.Collector";
     using protocol = Protocol<Seq>;
     std::atomic<int> count{0};
     std::vector<int> last_seq = std::vector<int>(4, -1);  // per-producer last seen seq

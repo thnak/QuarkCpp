@@ -36,7 +36,6 @@ struct Job {
 };
 
 struct Sink : Actor<Sink, Sequential> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sched_work_stealing_test.Sink";
     using protocol = Protocol<Job>;
     std::atomic<std::uint64_t>* by_worker = nullptr;  // [kWorkers] dispatch counts
     std::atomic<std::uint64_t>* total = nullptr;

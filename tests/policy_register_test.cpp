@@ -28,7 +28,7 @@ struct Job {
 
 // High-priority, small explicit budget.
 struct Hi : Actor<Hi, Priority<0>, DrainBudget<32>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_register_test.Hi";
+    static constexpr std::string_view quark_type_name = "quark.test.policy_register_test.Hi";
     using protocol = Protocol<Job>;
     std::atomic<std::uint64_t>* order = nullptr;
     std::atomic<std::uint64_t>* sum = nullptr;
@@ -42,7 +42,7 @@ struct Hi : Actor<Hi, Priority<0>, DrainBudget<32>> {
 
 // Low-priority, no explicit budget ⇒ inherits the engine default.
 struct Lo : Actor<Lo, Priority<1>> {
-    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_register_test.Lo";
+    static constexpr std::string_view quark_type_name = "quark.test.policy_register_test.Lo";
     using protocol = Protocol<Job>;
     std::atomic<std::uint64_t>* order = nullptr;
     std::atomic<std::uint64_t>* sum = nullptr;
