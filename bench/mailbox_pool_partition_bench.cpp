@@ -4,7 +4,7 @@
 //
 // Corrected finding: the earlier 6-8x gain was measured with an UNDER-SIZED pool (cap 4096). When the
 // producers outrun the consumer the backlog exceeds 4096 cells, the free list grows by heap allocation
-// WHILE HOLDING the partition mutex, and at 1 partition that serialises every producer behind malloc.
+// (before ADR-065 WHILE HOLDING the partition mutex, serialising producers behind malloc; now outside it).
 // Pre-sized, the throughput gain of partitioning is only about 1.0-2.5x on the Linux Xeon of ADR-063 (and
 // can be absent on other platforms, e.g. a 4-core Windows box); the tell() p99 latency gain is
 // still large (4-35x on Linux). This bench therefore runs every config in two modes:
@@ -213,7 +213,7 @@ int main(int argc, char** argv) {
 
     std::printf(
         "\n[info] The undersized pool (cap 4096) inflates the num_partitions=1 baseline: the free list grows by "
-        "heap allocation under the partition mutex (see heap_allocs). Pre-sized, the throughput gain from "
+        "heap allocation (see heap_allocs; outside the partition mutex since ADR-065). Pre-sized, the throughput gain from "
         "partitioning is much smaller on Linux (about 1.0-2.5x throughput, tell() p99 down 4-35x; ADR-063). "
         "Results are platform-dependent: a Windows run showed no throughput gain pre-sized, only a lower p99. "
         "Compare the presized rows' p99 and heap_allocs, not just M msg/s.\n");
