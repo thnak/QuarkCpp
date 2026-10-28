@@ -1,6 +1,6 @@
 # ADR-060 — Send-pool partitions as an engine config policy (#4, follow-up (a) of ADR-057)
 
-Status: Accepted (opt-in; default unchanged). Evidence: `tests/engine_send_pool_partitions_test.cpp`
+Status: Accepted. The default is superseded by ADR-063 (auto); the 8x headline below was measured with an under-sized pool — see ADR-063. Evidence: `tests/engine_send_pool_partitions_test.cpp`
 (exactly-once at 1/2/8 partitions; passes on MSVC Release, and on Linux under TSan and ASan+UBSan),
 `bench/mailbox_pool_partition_bench.cpp`, `bench/mailbox_producer_sweep_bench.cpp`.
 

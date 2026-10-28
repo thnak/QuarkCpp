@@ -57,12 +57,27 @@ bool run(std::uint32_t partitions, unsigned producers, std::uint64_t per_produce
 
 int main() {
     bool ok = true;
-    ok &= EngineConfig{}.pool_partitions == 1;  // default unchanged
+    ok &= EngineConfig{}.pool_partitions == 0;  // default = auto (ADR-063)
+    {  // the auto rule (hw_threads injected so the result does not depend on this machine)
+        EngineConfig c{};
+        ok &= resolve_pool_partitions(c, 1) == 1;     // 1 hw thread: nothing to spread
+        ok &= resolve_pool_partitions(c, 2) == 2;
+        ok &= resolve_pool_partitions(c, 3) == 4;     // power of two, never odd
+        ok &= resolve_pool_partitions(c, 28) == 4;    // default 4096 cells caps it at 4 x 1024
+        c.shard_count = 4;                            // 16384 cells -> up to 16 partitions
+        ok &= resolve_pool_partitions(c, 28) == 16;
+        ok &= resolve_pool_partitions(c, 64) == 16;   // hard cap
+        c.pool_capacity = 1024;                       // 4096 cells total -> 4
+        ok &= resolve_pool_partitions(c, 28) == 4;
+        c.pool_partitions = 3;                        // explicit value is verbatim
+        ok &= resolve_pool_partitions(c, 28) == 3;
+        if (!ok) std::fprintf(stderr, "  resolve_pool_partitions rules failed\n");
+    }
     {
         auto cfg = ConfigBuilder{}.pool_partitions(4).build();
         ok &= cfg.has_value() && cfg->pool_partitions == 4;
     }
-    for (std::uint32_t p : {1u, 2u, 8u}) ok &= run(p, 4, 50'000);
+    for (std::uint32_t p : {0u, 1u, 2u, 8u}) ok &= run(p, 4, 50'000);  // 0 = auto default
     std::printf("engine_send_pool_partitions_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

@@ -504,9 +504,10 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-057](decisions/ADR-057-mailbox-many-producer-contention-measurement.md) | Mailbox many-producer contention measurement (003, #4) | No collapse reproduced on a 6-core Windows box; no code change; Linux re-measure recommended. |
 | [ADR-058](decisions/ADR-058-lease-leader-election-fencing.md) | Leases and leader election over Store fencing (028, #22) | `LeaseArbiter`/`LeaseHolder`; 10⁴ seeded simulations, safety invariants hold. |
 | [ADR-059](decisions/ADR-059-windows-arm64-pal-and-iocp-reactor.md) | Windows/ARM64 PAL + opt-in IOCP reactor (019, #13) | ARM64 cross-compiles (unrun); AFD-poll IOCP reactor opt-in via `QUARK_WIN_IOCP`. |
-| [ADR-060](decisions/ADR-060-send-pool-partitions-policy.md) | Send-pool partitions as an engine policy (003, #4) | `EngineConfig::pool_partitions`; 1→8 producers 1.05→9.3 M msg/s on a quiet Linux Xeon. Default unchanged. |
+| [ADR-060](decisions/ADR-060-send-pool-partitions-policy.md) | Send-pool partitions as an engine policy (003, #4) | `EngineConfig::pool_partitions`; 1→8 producers 1.05→9.3 M msg/s on a quiet Linux Xeon. Default superseded by ADR-063 (auto). |
 | [ADR-061](decisions/ADR-061-actor-type-key-normalisation.md) | Cross-toolchain actor type-key normalisation + `quark_type_name` (008, #17) | GCC/Clang/`cl.exe` now emit one key per type; real Windows↔Linux pair dispatches. Durable break for `cl.exe` / GCC-anonymous types. |
 | [ADR-062](decisions/ADR-062-required-actor-type-name.md) | Required explicit actor `quark_type_name` — one cross-platform identity mechanism (008) | Compile error without it; key = name + Described fingerprints; no compiler spelling in any actor key. Durable break. |
+| [ADR-063](decisions/ADR-063-auto-send-pool-partitions.md) | Send-pool partitions default to AUTO (003, #4) | `pool_partitions = 0` resolves to a power of two <= 16 from hw threads, >= 1024 cells each; p99 `tell` 25-57 us -> ~5 us at 8-16 producers, mean 1.0-3.4x. |
 
 </details>
 

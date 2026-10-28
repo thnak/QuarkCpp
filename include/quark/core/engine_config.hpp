@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <string_view>
+#include <thread>
 
 #include "quark/core/error.hpp"
 #include "quark/core/hot_cell.hpp"
@@ -73,12 +74,12 @@ struct EngineConfig {
     // This bounds how long a producer may sit between resolve() and post() before it risks a
     // use-after-free — see ADR-052 caveats; choose >> the longest producer stall you tolerate.
     std::uint32_t lazy_reclaim_grace_ms = 0;
-    // ADR-060 (#4): partition count for the send pool built by `Engine::make_send_pool()`. 1 (default)
-    // = one shared free-list, byte-for-byte today's behavior. >1 spreads producer-side acquire
-    // contention across independent partitions (producer thread -> partition by lane id). Measured on a
-    // quiet Linux Xeon, 8 producers -> 1 consumer: 1.05 -> 9.3 M msg/s (ADR-060). Set it to roughly
-    // the number of concurrent sender threads; more partitions only cost memory, never correctness.
-    std::uint32_t pool_partitions = 1;
+    // ADR-060/063 (#4): partition count for the send pool built by `Engine::make_send_pool()`.
+    // 0 (DEFAULT) = AUTO, resolved by `resolve_pool_partitions()`: a power of two from the hardware
+    // thread count, capped at 16, keeping >= 1024 cells per partition. 1 = one shared free-list (the
+    // pre-ADR-060 behavior). N>1 = exactly N independent free-lists (producer thread -> partition by
+    // lane id). More partitions than concurrent senders only costs memory; see ADR-063 for the sweep.
+    std::uint32_t pool_partitions = 0;
     // 009 §"Build-time budget gate" / ADR-022: worst-case metrics grid/arena footprint ceiling. A
     // caller computes the exact footprint via `sizeof()` (metrics_cardinality.hpp's
     // `TypeMetricsGrid<Spec>::footprint_bytes` / `InstanceMetricsArena<Spec>::footprint_bytes`) and
@@ -191,6 +192,26 @@ struct EngineConfig {
         };
     }
 };
+
+// ADR-063 (#4): the send-pool partition count the engine actually uses. An explicit `pool_partitions`
+// (>= 1) is honoured verbatim. 0 = AUTO: the largest power of two <= 16 that is >= the hardware thread
+// count (the max concurrent producers the box can run), then limited so every partition keeps at least
+// `kMinCellsPerPartition` cells of the total capacity (an over-split pool makes a hot producer exhaust
+// its own partition and cold-allocate while siblings sit idle — measured, ADR-063). Powers of two only:
+// an odd count spreads consecutive thread lane ids unevenly (measured P=4,N=3 slower than N=2).
+// `hardware_concurrency` is read ONLY to size this index space — it creates no threads, so the
+// "never hardware_concurrency for worker_count" machine-safety rule is untouched.
+inline constexpr std::uint32_t kMinCellsPerPartition = 1024;
+inline constexpr std::uint32_t kMaxAutoPoolPartitions = 16;
+[[nodiscard]] inline std::uint32_t resolve_pool_partitions(const EngineConfig& c,
+                                                           unsigned hw_threads = std::thread::hardware_concurrency()) noexcept {
+    if (c.pool_partitions != 0) return c.pool_partitions;
+    std::uint32_t n = 1;
+    while (n < hw_threads && n < kMaxAutoPoolPartitions) n <<= 1;
+    const std::uint64_t cells = static_cast<std::uint64_t>(c.pool_capacity) * (c.shard_count == 0 ? 1 : c.shard_count);
+    while (n > 1 && cells / n < kMinCellsPerPartition) n >>= 1;
+    return n;
+}
 
 // Startup Validation (008/013), fail-fast → `errc::validation`. Checks structural ranges AND that the
 // seeded Live read-set packs (delegates to `validate_operational` so ceilings can never drift). On
