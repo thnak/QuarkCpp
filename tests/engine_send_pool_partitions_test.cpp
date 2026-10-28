@@ -18,6 +18,7 @@ namespace {
 std::atomic<std::uint64_t> g_handled{0};
 
 struct Counter : Actor<Counter, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.engine_send_pool_partitions_test.Counter";
     using protocol = Protocol<int>;
     void handle(const int&) noexcept { g_handled.fetch_add(1, std::memory_order_relaxed); }
 };

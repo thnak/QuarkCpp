@@ -28,6 +28,7 @@ struct Seq {
 QUARK_SERIALIZE(Seq, (1, n));
 
 struct Logger : Actor<Logger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.tcp_distribution_integration_test.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> got;  // single drain lane (single-executor) — no lock needed
     std::atomic<int> count{0};

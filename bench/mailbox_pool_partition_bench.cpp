@@ -28,6 +28,7 @@ using namespace quark;
 namespace {
 
 struct PingActor : Actor<PingActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.bench.mailbox_pool_partition_bench.PingActor";
     using protocol = Protocol<int>;
     void handle(const int&) noexcept {}
 };

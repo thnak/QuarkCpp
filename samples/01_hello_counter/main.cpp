@@ -32,6 +32,7 @@ struct GetTotal {};
 // --- The actor. Policies in the CRTP base ARE the actor's metadata, read by the engine at compile
 // time (band, budget, reentrancy). `protocol` is the closed set of messages it dispatches. ---------
 struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    static constexpr std::string_view quark_type_name = "quark.sample.01_hello_counter.Counter";
     using protocol = Protocol<Add, Ask<GetTotal, int>>;
 
     void handle(const Add& a) noexcept { total_ += a.amount; }                 // tell: mutate state

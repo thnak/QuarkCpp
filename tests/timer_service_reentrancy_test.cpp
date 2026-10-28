@@ -60,6 +60,7 @@ struct Hooked {
 constexpr int kMaxId = 4096;
 
 struct Sink : Actor<Sink, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.timer_service_reentrancy_test.Sink";
     using protocol = Protocol<Hooked>;
     std::atomic<int> got[kMaxId]{};
     std::atomic<int> total{0};

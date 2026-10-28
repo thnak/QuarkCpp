@@ -24,6 +24,7 @@ struct DbConn {
 };
 
 struct NeedsDb : Actor<NeedsDb, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_validation_test.NeedsDb";
     using protocol = Protocol<Ping>;
     Cached<DbConn> db_;
     // The 004 explicit cold wire pass. Undeclared DbConn ⇒ errc::validation.
@@ -32,6 +33,7 @@ struct NeedsDb : Actor<NeedsDb, Sequential> {
 };
 
 struct Plain : Actor<Plain, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_validation_test.Plain";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };

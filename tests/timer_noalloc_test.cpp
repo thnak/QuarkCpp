@@ -85,6 +85,7 @@ struct Tick {
 // Atomic-only sink: its handler allocates nothing, so any allocation in the measured window is the
 // timer/tell path's, not the receiver's.
 struct Sink : Actor<Sink, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.timer_noalloc_test.Sink";
     using protocol = Protocol<Tick>;
     std::atomic<int> count{0};
     void handle(const Tick&) noexcept { count.fetch_add(1, std::memory_order_release); }

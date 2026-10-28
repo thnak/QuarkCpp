@@ -17,6 +17,7 @@ struct Ping {
 };
 
 struct Sink : Actor<Sink, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.exec_cancel_budget_test.Sink";
     using protocol = Protocol<Ping>;
     int handled = 0;
     void handle(const Ping& p) noexcept { handled += p.n; }

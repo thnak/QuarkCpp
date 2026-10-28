@@ -24,6 +24,7 @@ struct Ping {
 // 20ms IdleTimeout (same shape as engine_idle_timeout_eviction_test.cpp's Sleepy) plus an
 // on_deactivate() hook that increments a shared counter every time it fires.
 struct HookedSleepy : Actor<HookedSleepy, Sequential, IdleTimeout<20>> {
+    static constexpr std::string_view quark_type_name = "quark.test.activation_on_deactivate_hook_test.HookedSleepy";
     using protocol = Protocol<Ping>;
     std::atomic<int> handled{0};
     static inline std::atomic<int> deactivate_calls{0};

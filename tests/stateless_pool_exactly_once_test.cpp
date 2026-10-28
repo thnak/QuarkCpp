@@ -97,6 +97,7 @@ void bump_max(std::atomic<int>& m, int v) noexcept {
 }
 
 struct Worker : Actor<Worker, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.stateless_pool_exactly_once_test.Worker";
     using protocol = Protocol<Job>;
     Oracle* oracle = nullptr;
 

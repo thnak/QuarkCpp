@@ -56,6 +56,7 @@ QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable
 // sender, so FIFO can be checked per-(sender,receiver) pair even though all 4 senders' traffic
 // interleaves on the same actor. Single Sequential executor drains this actor, so no lock is needed.
 struct Logger : Actor<Logger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.17_tcp_cluster_mesh.Logger";
     using protocol = Protocol<Seq>;
     std::array<int, NUM_NODES> last_seen{};
     std::atomic<int> count{0};

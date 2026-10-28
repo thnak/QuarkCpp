@@ -35,6 +35,7 @@ struct Square {
 // Default supervision == Restart(assert-intact): the guard contains the throw and the actor keeps
 // serving. No supervision policy is spelled out here — this is the out-of-the-box behavior.
 struct Worker : Actor<Worker, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.02_supervised_worker.Worker";
     using protocol = Protocol<Work, Ask<Square, int>>;
 
     void handle(const Work& w) {

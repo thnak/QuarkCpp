@@ -28,7 +28,8 @@ struct Sibling {
 };
 struct CancelAll {};
 
-struct Job : Actor<Job, MaxConcurrency<8>> {  // reentrant: up to 8 frames in flight at once
+struct Job : Actor<Job, MaxConcurrency<8>> {
+    static constexpr std::string_view quark_type_name = "quark.sample.05_cooperative_cancellation.Job";  // reentrant: up to 8 frames in flight at once
     using protocol = Protocol<Sibling, CancelAll>;
     Activation* lane = nullptr;
 

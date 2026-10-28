@@ -43,24 +43,22 @@ Every actor type and every message type gets **two** ids, derived without RTTI:
 
 | Id | Type | Derivation | Used for |
 |---|---|---|---|
-| `type_key` | `uint64_t` | `constexpr` FNV-1a hash of a canonical type name | Stable across runs/binaries → wire (010) & storage (012) keys |
+| `type_key` | `uint64_t` | `constexpr` FNV-1a of the actor's REQUIRED `quark_type_name`, folded with its Described messages' 016 fingerprints (ADR-062) | Stable across runs/binaries → wire (010) & storage (012) keys |
 | `type_index` | `uint16_t` | Dense counter assigned at registration | Array indexing on the hot path |
 
 Two ids because the requirements conflict: distribution and persistence need an id
 that is **identical on every node and every restart** (`type_key`), while dispatch
 tables want a **dense, small** index for O(1) array lookup (`type_index`). The
-canonical name is derived from a `constexpr` view of the compiler's function-name
-string, normalized to strip compiler-specific decoration (**ADR-061**): MSVC's
-`struct `/`class `/`enum `/`union ` elaborators are dropped, the GCC (`{anonymous}`) and MSVC
-(`` `anonymous namespace' ``) spellings of an anonymous namespace become Clang's
-`(anonymous namespace)`, and a `,` in a template argument list is followed by exactly one space.
-The target is GCC/Clang's spelling, so names those two already agree on keep their keys. An actor
-(or any non-Described type) may instead pin its identity with
-`static constexpr std::string_view quark_type_name = "..."`: hashed **verbatim**, identical on every
-toolchain and stable across renames and namespace moves — recommended for anything persisted or that
-crosses a toolchain boundary. Not normalised (use `quark_type_name`): builtin spellings
-(`unsigned long` is not one type across LP64/LLP64) and inline standard namespaces
-(`std::__cxx11::`, `std::__1::`).
+identity is **explicit and platform-independent** (**ADR-062**). An **actor** declares
+`static constexpr std::string_view quark_type_name = "app.billing.Ledger"` — REQUIRED, a compile
+error if absent — and its `type_key` is `FNV-1a(name)` folded, in protocol order, with the 016
+fingerprints of its **Described** messages only. No compiler-derived spelling (`__PRETTY_FUNCTION__`,
+`__FUNCSIG__`) ever enters an actor key, so the key is identical on GCC, Clang and MSVC, on every OS
+and architecture, and survives renaming or moving the C++ type. Non-Described messages are
+local-only (never on the wire or in a durable record) and do not enter the key. A Described message
+type's key is its 016 fingerprint (name-free). Any other non-actor type (local-only, e.g. an
+authorizer's message key) uses the normalised compiler name of ADR-061, or its own
+`quark_type_name`; that key is process-local and must not be persisted or sent.
 
 Collision handling: `type_key` collisions are detected during Validation (two
 distinct registered types hashing equal) and are a **Strict-mode startup failure**.

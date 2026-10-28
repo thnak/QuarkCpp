@@ -34,6 +34,7 @@ struct CounterState {
 QUARK_SERIALIZE(CounterState, (1, n))
 
 struct PersistedCounter : Actor<PersistedCounter, Sequential, Persistent<Snapshot>> {
+    static constexpr std::string_view quark_type_name = "quark.test.engine_passivate_persistence_test.PersistedCounter";
     using protocol = Protocol<Bump>;
     using PersistState = CounterState;
 
@@ -70,6 +71,7 @@ static_assert(Store<FailingSaveStore>, "FailingSaveStore must model the 012 Stor
 // A Persistent<Snapshot> actor spawned WITHOUT a store (spawn<A>(), not declare_lazy<A>(store,...))
 // -- proves the flush is simply inactive, never a crash, for the documented eager-spawn limitation.
 struct SpawnedPersistent : Actor<SpawnedPersistent, Sequential, Persistent<Snapshot>> {
+    static constexpr std::string_view quark_type_name = "quark.test.engine_passivate_persistence_test.SpawnedPersistent";
     using protocol = Protocol<Bump>;
     using PersistState = CounterState;
     std::uint64_t n = 0;

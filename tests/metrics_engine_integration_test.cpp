@@ -37,6 +37,7 @@ struct Tick {};
 struct GetSeen {};
 
 struct Sink : Actor<Sink, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metrics_engine_integration_test.Sink";
     using protocol = Protocol<Tick, Ask<GetSeen, std::uint64_t>>;
     void handle(const Tick&) noexcept { ++seen; }
     void handle(const Ask<GetSeen, std::uint64_t>& m) noexcept { m.respond(seen); }
@@ -48,6 +49,7 @@ struct Boom {};
 struct GetCount {};
 
 struct Faulty : Actor<Faulty, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metrics_engine_integration_test.Faulty";
     using protocol = Protocol<Boom, Ask<GetCount, int>>;
     void handle(const Boom&) { ++count; throw std::runtime_error("boom"); }
     void handle(const Ask<GetCount, int>& m) noexcept { m.respond(count); }

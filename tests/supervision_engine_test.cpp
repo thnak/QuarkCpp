@@ -26,7 +26,8 @@ struct Q {
     bool boom;
 };
 
-struct Svc : Actor<Svc, Sequential> {  // default supervision = Restart (assert-intact)
+struct Svc : Actor<Svc, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.supervision_engine_test.Svc";  // default supervision = Restart (assert-intact)
     using protocol = Protocol<Ping, Ask<Q, int>>;
 
     void handle(const Ping& p) {

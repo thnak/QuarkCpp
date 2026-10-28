@@ -29,6 +29,7 @@ struct Tick {
 };
 
 struct Counter : Actor<Counter, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.exec_single_executor_test.Counter";
     using protocol = Protocol<Tick>;
 
     // Concurrency witness (atomic): must never observe > 1 executor in the handler at once.

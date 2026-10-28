@@ -65,6 +65,10 @@ bench/                  hot-path microbenchmarks (percentiles, spec 023 budgets)
 - **Types** `PascalCase`, **functions/members/variables** `snake_case`, **macros** `QUARK_UPPER`
   (matches the spec code samples, e.g. `class Order : public Actor<Order, Sequential>`,
   `quark::task<> handle(const Query&)`, `QUARK_SERIALIZE(Order, (1, id), ...)`).
+- **Every actor declares `static constexpr std::string_view quark_type_name = "<stable.dotted.name>";`**
+  (ADR-062; a missing name is a compile error). It is the one cross-platform identity mechanism: no
+  compiler-derived spelling may ever enter an actor's key. Names are unique per program (the startup
+  collision scan rejects duplicates) and are a durable contract: never reuse or change one casually.
 - **Every source file names the spec(s)/ADR(s) it implements in a top comment**, e.g.
   `// Implements 003-Memory §Mailbox — Vyukov MPSC; ADR-002/003/004 hot path.`
 - Header guards: `#pragma once`.

@@ -32,6 +32,7 @@ struct Count {};
 
 // Counts how many timer fires it has received; answers the count on demand.
 struct Alarm : Actor<Alarm, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.04_scheduled_timer.Alarm";
     using protocol = Protocol<Tick, Ask<Count, int>>;
 
     void handle(const Tick&) noexcept { ++fires_; }

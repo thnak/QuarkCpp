@@ -4,7 +4,7 @@
 // a region-pinned service needs a node in the right zone. In Quark that is expressed by the actor's
 // PLACEMENT POLICY, declared right in its CRTP policy list:
 //
-//     struct GpuWorker : Actor<GpuWorker, Sequential, Placement<HashById, Require<Gpu>>> { ... };
+//     struct GpuWorker : Actor<GpuWorker, Sequential, Placement<HashById, Require<Gpu>>> { static constexpr std::string_view quark_type_name = "app.GpuWorker"; ... };
 //
 // Nodes advertise STATIC, typed capabilities at startup — boolean Flags ("gpu"), string Labels
 // ("zone"="eu-west-1"), numeric Scalars ("weight"=capacity). Placement is then a PURE FUNCTION of
@@ -44,6 +44,7 @@ struct Decode {
 // THE capability actor: it declares that it must be placed on a GPU node (Require<Gpu>) and, among
 // those, prefers the eu-west-1 zone (Prefer<ZoneEU>). A plain Sequential handler otherwise.
 struct GpuWorker : Actor<GpuWorker, Sequential, Placement<HashById, Require<Gpu>, Prefer<ZoneEU>>> {
+    static constexpr std::string_view quark_type_name = "quark.sample.12_capability_actor.GpuWorker";
     using protocol = Protocol<Decode>;
     void handle(const Decode&) noexcept { /* ... decode on the GPU ... */ }
 };
@@ -51,6 +52,7 @@ struct GpuWorker : Actor<GpuWorker, Sequential, Placement<HashById, Require<Gpu>
 // A worker that requires a capability NO node advertises — to show the graceful empty-eligible error.
 using Fpga = HasFlag<"fpga">;
 struct FpgaWorker : Actor<FpgaWorker, Sequential, Placement<HashById, Require<Fpga>>> {
+    static constexpr std::string_view quark_type_name = "quark.sample.12_capability_actor.FpgaWorker";
     using protocol = Protocol<Decode>;
     void handle(const Decode&) noexcept {}
 };

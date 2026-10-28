@@ -41,6 +41,7 @@ struct Item {
     std::uint64_t id;
 };
 struct Sink : Actor<Sink, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.governance_zero_cost_test.Sink";
     using protocol = Protocol<Item>;
     std::uint64_t sum = 0;
     void handle(const Item& m) { sum += m.id; }

@@ -30,6 +30,7 @@ struct Ping {
 // KeepAlive (no IdleTimeout declared) -- the automatic wheel never touches this actor at all; any
 // retirement observed here can ONLY have come from an explicit .passivate() call.
 struct KeptAlive : Actor<KeptAlive, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.engine_passivate_test.KeptAlive";
     using protocol = Protocol<Ping>;
     std::atomic<int> handled{0};
     void handle(const Ping& p) noexcept { handled.fetch_add(p.n, std::memory_order_release); }

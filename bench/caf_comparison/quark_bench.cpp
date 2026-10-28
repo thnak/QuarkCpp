@@ -76,6 +76,7 @@ void warmup_for(double seconds, F&& op) {
 // ---- Ping actor (fire-and-forget) --------------------------------------
 
 struct PingActor : Actor<PingActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.bench.quark_bench.PingActor";
     using protocol = Protocol<int>;
     void handle(const int&) noexcept { /* just receive */ }
 };
@@ -83,6 +84,7 @@ struct PingActor : Actor<PingActor, Sequential> {
 // ---- Echo actor (responds to requests) ---------------------------------
 
 struct EchoActor : Actor<EchoActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.bench.quark_bench.EchoActor";
     using protocol = Protocol<Ask<int, int>>;
     void handle(const Ask<int, int>& m) noexcept {
         m.respond(m.query);

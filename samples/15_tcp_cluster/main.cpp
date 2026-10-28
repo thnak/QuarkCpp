@@ -43,6 +43,7 @@ struct Seq {
 QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable (016)
 
 struct Logger : Actor<Logger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.15_tcp_cluster.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> got;             // single drain lane (single executor) — no lock needed
     std::atomic<int> count{0};

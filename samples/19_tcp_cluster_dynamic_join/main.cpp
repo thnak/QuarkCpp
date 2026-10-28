@@ -73,6 +73,7 @@ QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable
 // `last_seen[src-1]` tracks the last in-order sequence number received FROM that sender, so FIFO can
 // be checked per-(sender,receiver) pair. Single Sequential executor drains this actor, so no lock needed.
 struct Logger : Actor<Logger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.19_tcp_cluster_dynamic_join.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> last_seen;  // sized to final_n by main(), filled with -1
     std::atomic<int> count{0};

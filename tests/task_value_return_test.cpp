@@ -75,6 +75,7 @@ struct Query {
 };
 
 struct Answerer : Actor<Answerer, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.task_value_return_test.Answerer";
     using protocol = Protocol<Ask<Query, int>>;
     void handle(const Ask<Query, int>& m) noexcept { m.respond(m.query.tag * 2 + 1); }
 };
@@ -96,6 +97,7 @@ struct Trigger {
 constexpr int kAsksPerAsker = 25;
 
 struct Asker : Actor<Asker, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.task_value_return_test.Asker";
     using protocol = Protocol<Trigger>;
     static inline std::vector<ActorRef<Answerer>>* g_responders = nullptr;
     static inline std::atomic<int>* g_completed = nullptr;

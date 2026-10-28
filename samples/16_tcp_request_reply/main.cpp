@@ -53,6 +53,7 @@ QUARK_SERIALIZE(Pong, (1, n))
 
 // Lives on node 1. Collects the replies that came back across the cluster.
 struct Collector : Actor<Collector, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.16_tcp_request_reply.Collector";
     using protocol = Protocol<Pong>;
     std::vector<int> got;
     std::atomic<int> count{0};
@@ -65,6 +66,7 @@ struct Collector : Actor<Collector, Sequential> {
 // Lives on node 2. On each Ping, sends a Pong straight back to the Collector on node 1 — addressed by
 // key through node 2's own DistributedRouter, which sees it is remote and routes it over TCP.
 struct Ponger : Actor<Ponger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.16_tcp_request_reply.Ponger";
     using protocol = Protocol<Ping>;
     DistributedRouter* home = nullptr;  // wired after construction; the path back to node 1
     std::uint64_t collector_key = 0;

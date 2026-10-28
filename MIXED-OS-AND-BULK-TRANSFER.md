@@ -171,7 +171,8 @@ every remote `tell` was received (tagged, as expected) but never dispatched (`re
 and adds `quark_type_name` for an explicit, rename-stable identity. Re-run with the actors back in the
 anonymous namespace: Windows/clang <-> Linux/g++ PASS (`req_handled=50`), and real `cl.exe` 14.51 computes
 the same keys as Clang and GCC in `metadata_typekey_conformance_test`. **No same-compiler-family workaround
-is needed any more**; types persisted by `cl.exe` or in a GCC anonymous namespace before ADR-061 have new
+is needed any more** (ADR-062 then removed compiler spelling from actor keys entirely: every actor now pins an explicit
+`quark_type_name`, and this run still passes with those keys); types persisted by `cl.exe` or in a GCC anonymous namespace before ADR-061 have new
 keys (accepted pre-1.0 break; pin with `quark_type_name`). A live `cl.exe` <-> g++ *cluster* run was not
 done (this host's `mixed_os_node` is built with clang++); only the key derivation was verified on `cl.exe`.
 Still NOT covered: Linux/arm64, mTLS with real certificates (mock handshake), and a CI job: GitHub-hosted

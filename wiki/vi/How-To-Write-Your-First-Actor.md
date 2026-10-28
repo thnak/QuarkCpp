@@ -22,6 +22,9 @@ struct GetTotal {};
 
 // Actor Counter duy trì trạng thái tổng tích lũy
 struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    // BẮT BUỘC (ADR-062): tên định danh tường minh, độc lập nền tảng; không suy ra từ tên C++.
+    //
+    static constexpr std::string_view quark_type_name = "app.Counter";
     using protocol = Protocol<Add, Ask<GetTotal, int>>;
 
     // Handler cho tin nhắn Add (tell)

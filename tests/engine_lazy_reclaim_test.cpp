@@ -20,6 +20,7 @@ struct Ping {
     int n = 1;
 };
 struct Ephemeral : Actor<Ephemeral, Sequential, IdleTimeout<5>> {
+    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_reclaim_test.Ephemeral";
     using protocol = Protocol<Ping>;
     static inline std::atomic<std::uint64_t> constructions{0};
     static inline std::atomic<std::uint64_t> destructions{0};

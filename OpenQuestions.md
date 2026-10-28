@@ -508,6 +508,11 @@ These affect multiple subsystems; resolving one constrains several specs.
    real Windows<->Linux pair dispatches (`tests/netem/run_mixed_os.sh`). Still open: builtin spellings
    (Tier 3) and inline std namespaces — use `quark_type_name`.
 
+   **Superseded the same day by [ADR-062](decisions/ADR-062-required-actor-type-name.md):** actors now REQUIRE an
+   explicit `quark_type_name` and their key contains no compiler-derived string at all (name + Described
+   fingerprints), so the Tier 3 divergence can no longer reach an actor key. ADR-061's normaliser remains only
+   for non-actor, local-only types.
+
    All three legs are now real, measured data — not projected from "GCC probably matches
    Clang" reasoning. Closing Tier 3 means normalizing the spellings (strip the MSVC elaborator,
    canonicalize builtin names) or mandating an explicit per-type key; then Tier 3 promotes to

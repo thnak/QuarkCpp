@@ -1,6 +1,6 @@
 # ADR-061 — Cross-toolchain actor type-key normalisation (#17 finding; 008 open question 1)
 
-Status: **Accepted** (2026-10-28; owner accepted the pre-1.0 durable key break and a large refactor).
+Status: **Accepted, actor part SUPERSEDED by [ADR-062](ADR-062-required-actor-type-name.md)** (2026-10-28; owner accepted the pre-1.0 durable key break and a large refactor).
 Implemented in `include/quark/core/metadata.hpp` (`normalize_type_name`, `type_name_hash`); evidence in
 section 9. Governs spec 008 §Type identity, 016, 010.
 
@@ -143,3 +143,7 @@ MSVC `0x2d4c989423ddf201`.
   versions is unverified (rules also accept `` `anonymous-namespace' ``).
 - Durable break: persisted `ActorId`s / event-log headers for `cl.exe` and GCC-anonymous-namespace types
   from before this change no longer match. Use `quark_type_name` to pin an identity going forward.
+
+> **Update (ADR-062):** actors no longer use the normalised compiler name at all; `quark_type_name` is
+> required on every actor. The normaliser in this ADR now applies only to non-actor, non-Described, local-only
+> types (e.g. an authorizer's message key).

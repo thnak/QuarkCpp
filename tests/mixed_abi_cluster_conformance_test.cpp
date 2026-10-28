@@ -199,6 +199,7 @@ QUARK_SERIALIZE(Resp, (1, n));
 constexpr std::uint64_t kResponderKey = 7, kCollectorKey = 9;
 
 struct Collector : Actor<Collector, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.mixed_abi_cluster_conformance_test.Collector";
     using protocol = Protocol<Resp>;
     std::atomic<int> count{0};
     std::atomic<long long> sum{0};
@@ -209,6 +210,7 @@ struct Collector : Actor<Collector, Sequential> {
 };
 
 struct Responder : Actor<Responder, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.mixed_abi_cluster_conformance_test.Responder";
     using protocol = Protocol<Req>;
     DistributedRouter* dist = nullptr;
     void handle(const Req& q) noexcept {

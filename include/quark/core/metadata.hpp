@@ -185,19 +185,33 @@ template <class T>
     }
 }
 
-// Fold an actor's protocol message set into its type key (008 §Type identity: "for actors, fold the
-// protocol/handler set"). Seeded with the actor's own canonical-name hash so same-protocol actors
-// stay distinct; each message key is order-sensitively combined so a reordered protocol differs.
-// #18: two distinct Described messages of ONE protocol with equal keys would share a wire/durable
-// identity (remote dispatch to the wrong handler). Reject at compile time; the fix is a distinct
-// `static constexpr std::uint64_t quark_type_salt` on one of them (016).
+// ADR-062 / 008 §Type identity: an ACTOR's identity is the explicit `static constexpr std::string_view
+// quark_type_name`, REQUIRED on every actor — ONE mechanism on every platform, no compiler-derived
+// spelling anywhere in the key. The actor's protocol is folded in order-sensitively, but only through
+// its DESCRIBED messages (#18: their 016 fingerprints are layout-based and portable; two Described
+// messages of one protocol with equal keys are rejected at compile time, add a distinct `quark_type_salt`).
+template <class A>
+concept has_quark_type_name = requires {
+    { A::quark_type_name } -> std::convertible_to<std::string_view>;
+};
+
+// A name usable in a key/label: the pinned name for anything that declares one (actor or not), else the
+// compiler's raw spelling (display only — never fed to an actor key).
+template <class T>
+[[nodiscard]] constexpr std::string_view type_label() noexcept {
+    if constexpr (has_quark_type_name<T>) return std::string_view{T::quark_type_name};
+    else return canonical_type_name<T>();
+}
+
+// Two DESCRIBED messages of one protocol must have distinct keys; non-Described ones are not compared.
 template <class... Ms>
 [[nodiscard]] constexpr bool protocol_keys_distinct() noexcept {
     constexpr std::size_t n = sizeof...(Ms);
-    const std::uint64_t keys[n + 1] = {single_type_key<Ms>()..., 0};
+    const bool described[n + 1] = {Described<Ms>..., false};
+    const std::uint64_t keys[n + 1] = {(Described<Ms> ? single_type_key<Ms>() : 0)..., 0};
     for (std::size_t i = 0; i < n; ++i)
         for (std::size_t j = i + 1; j < n; ++j)
-            if (keys[i] == keys[j]) return false;
+            if (described[i] && described[j] && keys[i] == keys[j]) return false;
     return true;
 }
 
@@ -206,15 +220,24 @@ template <class A, class... Ms>
     static_assert(protocol_keys_distinct<Ms...>(),
                   "two message types in this Protocol share one type key (same layout): add a "
                   "distinct `static constexpr std::uint64_t quark_type_salt` to one (#18, 016)");
-    std::uint64_t h = type_name_hash<A>();  // ADR-061: normalised name or quark_type_name
-    ((h = hash_combine(h, single_type_key<Ms>())), ...);
+    std::uint64_t h = fnv1a(std::string_view{A::quark_type_name});
+    ((h = Described<Ms> ? hash_combine(h, single_type_key<Ms>()) : h), ...);
     return h;
 }
 
 template <class T>
 [[nodiscard]] constexpr std::uint64_t raw_type_key() noexcept {
-    if constexpr (is_actor<T> && requires { typename T::protocol; }) {
-        return fold_protocol<T>(static_cast<typename T::protocol*>(nullptr));
+    if constexpr (is_actor<T>) {
+        static_assert(has_quark_type_name<T>,
+                      "every actor must declare `static constexpr std::string_view quark_type_name = \"...\";` "
+                      "(ADR-062): its identity is an explicit, platform-independent name, never a "
+                      "compiler-derived one. Pick a stable, unique, dotted name, e.g. \"app.billing.Ledger\".");
+        static_assert(!std::string_view{T::quark_type_name}.empty(), "quark_type_name must not be empty");
+        if constexpr (requires { typename T::protocol; }) {
+            return fold_protocol<T>(static_cast<typename T::protocol*>(nullptr));
+        } else {
+            return fnv1a(std::string_view{T::quark_type_name});
+        }
     } else if constexpr (Described<T>) {
         return fingerprint_v<T>;  // matches the 016 durable/wire fingerprint exactly
     } else {
@@ -553,7 +576,7 @@ public:
     [[nodiscard]] result<std::uint16_t> register_type(WireCheck&& check,
                                                       const ResourceScope* scope = nullptr,
                                                       ReclaimSink reclaim = {}) {
-        return register_metadata(compile_actor_metadata<A>(), detail::canonical_type_name<A>(),
+        return register_metadata(compile_actor_metadata<A>(), detail::type_label<A>(),
                                  std::forward<WireCheck>(check), scope, reclaim);
     }
     template <class A>
@@ -577,7 +600,7 @@ public:
         m.flush = make_flush_fn<A, S>();              // ADR-028 Phase 8
         m.fence_acquire = make_fence_acquire_fn<S>();  // ADR-028 Phase 8
         m.store = static_cast<void*>(&store);
-        return register_metadata(std::move(m), detail::canonical_type_name<A>(),
+        return register_metadata(std::move(m), detail::type_label<A>(),
                                  [] { return result<void>{}; }, scope, reclaim);
     }
 

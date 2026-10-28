@@ -27,6 +27,7 @@ struct GetTotal {};
 //   * `using protocol` enumerates the dispatched message set (a tell + an ask envelope).
 //   * ordinary member `handle` overloads (sync tell; ask via the reply-carrying envelope).
 struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    static constexpr std::string_view quark_type_name = "quark.test.authoring_e2e_test.Counter";
     using protocol = Protocol<Add, Ask<GetTotal, int>>;
 
     void handle(const Add& a) noexcept { total_ += a.amount; }

@@ -32,6 +32,7 @@ struct Tick {
 };
 
 struct Counter : Actor<Counter, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.bench.supervision_bench.Counter";
     using protocol = Protocol<Tick>;
     std::uint64_t sum = 0;
     void handle(const Tick& t) noexcept { sum += t.x; }  // trivial, never throws

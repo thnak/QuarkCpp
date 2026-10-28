@@ -78,6 +78,7 @@ struct CommitAwaiter {
 };
 
 struct Handler : Actor<Handler, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.activation_park_race_test.Handler";
     using protocol = Protocol<Ping>;
     std::atomic<bool> handoff_ready{false};
     std::atomic<int> completed{0};

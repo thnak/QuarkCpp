@@ -50,6 +50,7 @@ struct Seq {
 QUARK_SERIALIZE(Seq, (1, n))
 
 struct Logger : Actor<Logger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.22_tcp_secure_transport.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> got;
     std::atomic<int> count{0};

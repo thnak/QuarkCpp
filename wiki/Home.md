@@ -104,6 +104,9 @@ struct GetTotal {};
 
 // Policies in the CRTP base ARE the actor's metadata (band, budget, reentrancy).
 struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    // REQUIRED (ADR-062): the actor's explicit, platform-independent identity. Never derived from
+    // the C++ name, so it is the same on every compiler/OS and survives renames.
+    static constexpr std::string_view quark_type_name = "app.Counter";
     using protocol = Protocol<Add, Ask<GetTotal, int>>;
 
     void handle(const Add& a) noexcept { total_ += a.amount; }

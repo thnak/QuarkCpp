@@ -29,6 +29,7 @@ struct Job {
 };
 
 struct Task : Actor<Task, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.sched_fairness_budget_test.Task";
     using protocol = Protocol<Job>;
     bool competitor = false;
     std::atomic<std::uint64_t>* order = nullptr;       // global dispatch order counter

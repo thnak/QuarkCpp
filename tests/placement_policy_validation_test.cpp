@@ -22,6 +22,7 @@ using SameZone = HasLabel<"zone", "eu-west-1">;
 
 // ---- Zero-cost baseline: a plain Sequential actor, no placement/pool policies. -----------------
 struct Plain : Actor<Plain, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.Plain";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
@@ -29,31 +30,37 @@ struct Plain : Actor<Plain, Sequential> {
 // ---- Constrained + weighted stateful actor (the spec's GpuDecoder shape). ----------------------
 struct GpuDecoder
     : Actor<GpuDecoder, Sequential, Placement<HashById, Require<Gpu>, Prefer<SameZone>, Weighted>> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.GpuDecoder";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 // ---- Stateless pool actor. ---------------------------------------------------------------------
 struct Validator : Actor<Validator, Stateless<8>> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.Validator";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 struct WideValidator : Actor<WideValidator, Stateless<4, ClusterWide, Require<Gpu>>> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.WideValidator";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 // ---- The three CONFLICTS (defined only to read their rule predicates — never validated/registered). --
 struct BadStatelessExplicit : Actor<BadStatelessExplicit, Stateless<4>, Placement<Explicit>> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.BadStatelessExplicit";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 struct BadStatelessPersist
     : Actor<BadStatelessPersist, Stateless<4>, Persistent<EventSourced, PersistMode::Sync>> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.BadStatelessPersist";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 struct BadEmptyRequire : Actor<BadEmptyRequire, Placement<HashById, Require<>>> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_policy_validation_test.BadEmptyRequire";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };

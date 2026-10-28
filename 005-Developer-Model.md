@@ -16,6 +16,7 @@ class Order : public quark::Actor<Order,
                   DrainBudget<64>>          // scheduling policy
 {
 public:
+    static constexpr std::string_view quark_type_name = "shop.Order";  // REQUIRED (ADR-062)
     using protocol = quark::Protocol<Ship, Query>;  // the dispatched message set
 
     void          handle(const Ship&  s);   // sync handler

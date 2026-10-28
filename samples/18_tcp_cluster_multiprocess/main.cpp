@@ -63,6 +63,7 @@ QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable
 // be checked per-(sender,receiver) pair even with every OTHER process's traffic interleaved on this
 // Logger. Single Sequential executor drains this actor, so no lock is needed.
 struct Logger : Actor<Logger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.18_tcp_cluster_multiprocess.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> last_seen;  // sized to num_nodes by main(), filled with -1
     std::atomic<int> count{0};

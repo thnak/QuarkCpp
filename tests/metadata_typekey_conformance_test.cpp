@@ -97,6 +97,29 @@ struct PinnedRenamed {  // a DIFFERENT C++ name with the SAME pinned identity =>
 };
 }  // namespace conformance_named
 
+// ADR-062 Tier 4 fixtures — ACTORS. Identity = the explicit quark_type_name + the Described protocol
+// messages; NO compiler spelling enters the key. The anonymous-namespace actor (GCC/Clang/MSVC spell that
+// three ways) and the actor whose protocol names `std::size_t` (a builtin spelled three ways) are the two
+// cases that used to diverge per toolchain.
+namespace {
+struct AnonActor : Actor<AnonActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.conformance.AnonActor";
+    using protocol = Protocol<ConformancePoint, std::size_t>;
+    void handle(const ConformancePoint&) {}
+    void handle(const std::size_t&) {}
+};
+}  // namespace
+namespace conformance_named {
+struct NamedActor : Actor<NamedActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.conformance.NamedActor";
+    using protocol = Protocol<ConformancePoint>;
+    void handle(const ConformancePoint&) {}
+};
+struct NoProtocolActor : Actor<NoProtocolActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.conformance.NoProtocolActor";
+};
+}  // namespace conformance_named
+
 namespace {
 // Normalise a literal spelling to a std::string (compiler-independent: exercises the three spellings
 // directly, so this runs the same on every toolchain, not only on the one that prints that spelling).
@@ -121,6 +144,10 @@ inline constexpr std::uint64_t kTier2Golden = 0xba4a66eb2b3e6ff3ULL;
 inline constexpr std::uint64_t kTier2NamedGolden = 0x4202adf0189cbfa1ULL;
 inline constexpr std::uint64_t kTier2PairGolden = 0x28f38acdf8c467cbULL;
 inline constexpr std::uint64_t kTier2PinnedGolden = 0x1a4e0103acebb260ULL;
+// ADR-062 Tier 4 goldens (actors): one value per fixture on EVERY toolchain.
+inline constexpr std::uint64_t kTier4AnonActorGolden = 0xb3d61babaac77327ULL;
+inline constexpr std::uint64_t kTier4NamedActorGolden = 0x32464213a5ce9f09ULL;
+inline constexpr std::uint64_t kTier4NoProtocolGolden = 0x92462dbdb69011eaULL;
 
 int main() {
     bool ok = true;
@@ -154,6 +181,18 @@ int main() {
     check(pinned_key == type_key_of<conformance_named::PinnedRenamed>().value,
           "quark_type_name: same pinned name => same key regardless of the C++ name (rename-stable)", ok);
     check(pinned_key != named_key, "quark_type_name: negative control, pinned key differs from a name-derived one", ok);
+
+    // --- Tier 4 (ADR-062): actor keys are the same on every toolchain, by construction. -----------
+    const std::uint64_t anon_actor = type_key_of<AnonActor>().value;
+    const std::uint64_t named_actor = type_key_of<conformance_named::NamedActor>().value;
+    const std::uint64_t noproto_actor = type_key_of<conformance_named::NoProtocolActor>().value;
+    check(anon_actor == kTier4AnonActorGolden, "Tier 4 golden (anonymous-namespace actor, size_t in protocol) differs on this toolchain", ok);
+    check(named_actor == kTier4NamedActorGolden, "Tier 4 golden (named actor) differs on this toolchain", ok);
+    check(noproto_actor == kTier4NoProtocolGolden, "Tier 4 golden (actor without a protocol) differs on this toolchain", ok);
+    check(noproto_actor == detail::fnv1a(conformance_named::NoProtocolActor::quark_type_name),
+          "Tier 4: an actor with no protocol is exactly the hash of its pinned name", ok);
+    check(type_key_of<AnonActor>() != type_key_of<conformance_named::NamedActor>(),
+          "Tier 4 negative control: different pinned names => different keys", ok);
 
     // --- Normaliser, compiler-independent: every compiler's spelling of one type => one string. ----
     check(norm("ns::Foo") == "ns::Foo", "normalise: GCC/Clang names are untouched (their keys do not move)", ok);
@@ -205,6 +244,12 @@ int main() {
                  static_cast<unsigned long long>(pair_key));
     std::printf("  Tier 2 (quark_type_name, Pinned)                        = 0x%016llx\n",
                  static_cast<unsigned long long>(pinned_key));
+    std::printf("  Tier 4 (actor, anon ns, size_t in protocol)             = 0x%016llx\n",
+                static_cast<unsigned long long>(type_key_of<AnonActor>().value));
+    std::printf("  Tier 4 (actor, named)                                   = 0x%016llx\n",
+                static_cast<unsigned long long>(type_key_of<conformance_named::NamedActor>().value));
+    std::printf("  Tier 4 (actor, no protocol)                             = 0x%016llx\n",
+                static_cast<unsigned long long>(type_key_of<conformance_named::NoProtocolActor>().value));
     std::printf("  Tier 3 (builtin-spelling, Wrap<size_t>)                  = 0x%016llx\n",
                  static_cast<unsigned long long>(tier3_key));
 

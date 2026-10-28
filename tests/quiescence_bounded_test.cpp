@@ -23,6 +23,7 @@ struct Drain {
 };
 
 struct Service : Actor<Service, MaxConcurrency<8>> {
+    static constexpr std::string_view quark_type_name = "quark.test.quiescence_bounded_test.Service";
     using protocol = Protocol<Stuck, Drain>;
     Activation* lane = nullptr;
 

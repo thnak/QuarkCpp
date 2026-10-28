@@ -30,10 +30,12 @@ struct Ping {};
 // The affinity target and the affine/anti-affine client — distinct actor types (distinct TypeKey), so
 // their HRW keys differ even for the same instance key; affinity co-locates by DESIGN, not by hash.
 struct Ledger : Actor<Ledger, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_affinity_test.Ledger";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 struct Cart : Actor<Cart, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.placement_affinity_test.Cart";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };

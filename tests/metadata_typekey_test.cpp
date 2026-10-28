@@ -29,15 +29,18 @@ struct Segment {
 };
 
 struct AlphaActor : Actor<AlphaActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.AlphaActor";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
 struct BetaActor : Actor<BetaActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.BetaActor";
     using protocol = Protocol<Pong>;
     void handle(const Pong&) {}
 };
 // Same *name shape* as AlphaActor but a different protocol — must get a distinct key (fold).
 struct GammaActor : Actor<GammaActor, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metadata_typekey_test.GammaActor";
     using protocol = Protocol<Ping, Pong>;
     void handle(const Ping&) {}
     void handle(const Pong&) {}
@@ -55,11 +58,23 @@ struct PinnedTwo : Actor<PinnedTwo, Sequential> {  // different C++ name, same p
     using protocol = Protocol<Ping>;
     void handle(const Ping&) {}
 };
-struct PinnedWide : Actor<PinnedWide, Sequential> {  // same pinned name, wider protocol => distinct
+// Same pinned name, wider protocol of NON-Described messages: local-only, never on the wire or in a
+// durable record, so it does NOT enter the key (ADR-062) — identity is the declared name.
+struct PinnedWide : Actor<PinnedWide, Sequential> {
     static constexpr std::string_view quark_type_name = "quark.test.Pinned";
     using protocol = Protocol<Ping, Pong>;
     void handle(const Ping&) {}
     void handle(const Pong&) {}
+};
+struct Wide {  // a DESCRIBED message: its 016 fingerprint folds into the actor key
+    int v = 0;
+};
+QUARK_SERIALIZE(Wide, (1, v))
+struct PinnedDescribed : Actor<PinnedDescribed, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.Pinned";
+    using protocol = Protocol<Ping, Wide>;
+    void handle(const Ping&) {}
+    void handle(const Wide&) {}
 };
 
 void check(bool c, const char* what, bool& ok) {
@@ -109,8 +124,12 @@ int main() {
     // independent — and the startup collision scan still trips on two actors that pin the same identity.
     check(type_key_of<PinnedOne>() == type_key_of<PinnedTwo>(),
           "quark_type_name: same pinned name + protocol => same key regardless of C++ name", ok);
-    check(type_key_of<PinnedOne>() != type_key_of<PinnedWide>(),
-          "quark_type_name: same pinned name, different protocol => distinct (fold)", ok);
+    check(type_key_of<PinnedOne>() == type_key_of<PinnedWide>(),
+          "quark_type_name: non-Described (local-only) messages do not enter the key", ok);
+    check(type_key_of<PinnedOne>() != type_key_of<PinnedDescribed>(),
+          "quark_type_name: a Described message in the protocol DOES fold into the key", ok);
+    check(type_key_of<PinnedOne>() != type_key_of<AlphaActor>(),
+          "different pinned names => different keys even with an identical protocol", ok);
     {
         TypeRegistry reg(Validation::Strict);
         result<std::uint16_t> a = reg.register_metadata(compile_actor_metadata<PinnedOne>(), "PinnedOne",

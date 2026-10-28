@@ -38,6 +38,9 @@ struct GetTotal {};
 
 ```cpp
 struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    // REQUIRED (ADR-062): the actor's explicit, platform-independent identity. Never derived from
+    // the C++ name, so it is the same on every compiler/OS and survives renames.
+    static constexpr std::string_view quark_type_name = "app.Counter";
     using protocol = Protocol<Add, Ask<GetTotal, int>>;
 
     void handle(const Add& a) noexcept { total_ += a.amount; }
@@ -53,6 +56,10 @@ private:
   `Sequential` (one message at a time, the default), `Priority<0>` (scheduling
   band), `DrainBudget<16>` (max messages drained before yielding the worker).
   An actor with no policies at all (`Actor<Counter>`) is valid and sequential.
+- `quark_type_name` is **required** on every actor (ADR-062). It is the actor's identity on the wire, in
+  durable records and in metrics labels, and it is the same on every compiler and OS because it is
+  never derived from the C++ name. Pick a stable, unique, dotted name (`"app.billing.Ledger"`);
+  renaming or moving the C++ type does not change it, changing the string does.
   Full policy catalog: [005-Developer-Model § Policy catalog](005-Developer-Model#policy-catalog).
 - `using protocol = Protocol<…>` is the **closed set** of messages this actor
   dispatches. Every type listed here needs a matching `handle` overload, and

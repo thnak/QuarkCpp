@@ -247,6 +247,9 @@ struct GetTotal {};
 
 // Policies in the CRTP base ARE the actor's metadata (band, budget, reentrancy).
 struct Counter : Actor<Counter, Sequential, Priority<0>, DrainBudget<16>> {
+    // REQUIRED (ADR-062): the actor's explicit, platform-independent identity. Never derived from
+    // the C++ name, so it is the same on every compiler/OS and survives renames.
+    static constexpr std::string_view quark_type_name = "app.Counter";
     using protocol = Protocol<Add, Ask<GetTotal, int>>;
 
     void handle(const Add& a) noexcept { total_ += a.amount; }
@@ -503,6 +506,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-059](decisions/ADR-059-windows-arm64-pal-and-iocp-reactor.md) | Windows/ARM64 PAL + opt-in IOCP reactor (019, #13) | ARM64 cross-compiles (unrun); AFD-poll IOCP reactor opt-in via `QUARK_WIN_IOCP`. |
 | [ADR-060](decisions/ADR-060-send-pool-partitions-policy.md) | Send-pool partitions as an engine policy (003, #4) | `EngineConfig::pool_partitions`; 1→8 producers 1.05→9.3 M msg/s on a quiet Linux Xeon. Default unchanged. |
 | [ADR-061](decisions/ADR-061-actor-type-key-normalisation.md) | Cross-toolchain actor type-key normalisation + `quark_type_name` (008, #17) | GCC/Clang/`cl.exe` now emit one key per type; real Windows↔Linux pair dispatches. Durable break for `cl.exe` / GCC-anonymous types. |
+| [ADR-062](decisions/ADR-062-required-actor-type-name.md) | Required explicit actor `quark_type_name` — one cross-platform identity mechanism (008) | Compile error without it; key = name + Described fingerprints; no compiler spelling in any actor key. Durable break. |
 
 </details>
 

@@ -28,16 +28,19 @@ using Spec = LatencyNsSpec;
 // ---- PerInstanceMetrics<N> policy surface: zero-cost-when-unused + extraction -------------------
 struct Ping {};
 struct Plain : Actor<Plain, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.metrics_cardinality_test.Plain";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 struct Opted : Actor<Opted, Sequential, PerInstanceMetrics<8>> {
+    static constexpr std::string_view quark_type_name = "quark.test.metrics_cardinality_test.Opted";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 // The rejected combination — defined only to read its rule PREDICATE (never validated/registered),
 // exactly the pattern placement_policy_validation_test.cpp uses for the 025 conflicts.
 struct BadPooledOpted : Actor<BadPooledOpted, Stateless<4>, PerInstanceMetrics<8>> {
+    static constexpr std::string_view quark_type_name = "quark.test.metrics_cardinality_test.BadPooledOpted";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };

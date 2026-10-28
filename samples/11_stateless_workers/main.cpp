@@ -29,6 +29,7 @@ struct Job {
 // A stateless worker: it owns no durable identity, just counts what it processed (scratch state, safe
 // because each activation is single-executor). It records each token so we can prove exactly-once.
 struct Worker : Actor<Worker, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.11_stateless_workers.Worker";
     using protocol = Protocol<Job>;
     std::uint64_t handled = 0;
     std::vector<std::uint64_t>* seen = nullptr;  // shared oracle (written only on this worker's lane)

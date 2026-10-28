@@ -57,6 +57,7 @@ smoke checks. To build just one: `cmake --build build --target 03_pipeline`.
 // 1. Declare an actor: CRTP base carries policies; `protocol` is the closed message set;
 //    one handle() overload per message.
 struct MyActor : quark::Actor<MyActor, quark::Sequential> {
+    static constexpr std::string_view quark_type_name = "app.MyActor";  // REQUIRED (ADR-062)
     using protocol = quark::Protocol<Msg, quark::Ask<Query, Reply>>;
     void handle(const Msg&) noexcept { /* mutate state */ }
     void handle(const quark::Ask<Query, Reply>& m) noexcept { m.respond(/* reply */); }

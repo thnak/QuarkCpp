@@ -359,3 +359,34 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/security_plaintext_transport_refusal_cont
   add_test(NAME security_plaintext_transport_refusal_control
            COMMAND security_plaintext_transport_refusal_control)
 endif()
+
+# ADR-062 gate: every actor MUST declare `static constexpr std::string_view quark_type_name`. Checked at
+# CONFIGURE time (no CTest target needed): the same source compiles WITH the name (positive control, so a
+# broken include path cannot fake a pass) and is REJECTED without it.
+set(_quark_cf_inc "${PROJECT_SOURCE_DIR}/include\;${PROJECT_SOURCE_DIR}")  # escaped ';': ONE flag, two dirs
+set(_quark_cf_common
+    CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON
+    CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${_quark_cf_inc}")
+set(_quark_cf_saved_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+try_compile(QUARK_ACTOR_NAME_CONTROL_COMPILES
+  "${CMAKE_BINARY_DIR}/cf_actor_name_control"
+  SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/compile_fail/actor_name.cpp"
+  COMPILE_DEFINITIONS -DWITH_NAME ${_quark_cf_common}
+  OUTPUT_VARIABLE _quark_cf_control_out)
+try_compile(QUARK_ACTOR_WITHOUT_NAME_COMPILES
+  "${CMAKE_BINARY_DIR}/cf_actor_name_missing"
+  SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/compile_fail/actor_name.cpp"
+  ${_quark_cf_common}
+  OUTPUT_VARIABLE _quark_cf_missing_out)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_quark_cf_saved_type}")
+if(NOT QUARK_ACTOR_NAME_CONTROL_COMPILES)
+  message(FATAL_ERROR "Quark ADR-062 gate: the positive control (actor WITH quark_type_name) failed to compile:\n${_quark_cf_control_out}")
+endif()
+if(QUARK_ACTOR_WITHOUT_NAME_COMPILES)
+  message(FATAL_ERROR "Quark ADR-062 gate: an actor WITHOUT quark_type_name compiled; the name must be required.")
+endif()
+if(NOT _quark_cf_missing_out MATCHES "ADR-062")
+  message(FATAL_ERROR "Quark ADR-062 gate: the no-name actor failed for the wrong reason (no ADR-062 diagnostic):\n${_quark_cf_missing_out}")
+endif()
+message(STATUS "Quark: ADR-062 gate OK (named actor compiles, unnamed actor rejected with the ADR-062 diagnostic)")

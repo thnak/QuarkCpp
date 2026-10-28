@@ -31,12 +31,14 @@ struct Reserve {
 struct Ship {};
 struct Tick {};
 
-struct Inventory : Actor<Inventory, Sequential> {  // capture target only (never instantiated)
+struct Inventory : Actor<Inventory, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.sim_testkit_test.Inventory";  // capture target only (never instantiated)
     using protocol = Protocol<Reserve>;
     void handle(const Reserve&) noexcept {}
 };
 
 struct Order : Actor<Order, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.sim_testkit_test.Order";
     using protocol = Protocol<Ask<Query, Confirm>, Ship, Tick>;
     ActorRef<Inventory> inv{};
     bool shipped = false;
@@ -57,6 +59,7 @@ struct Ball {
     int n = 0;
 };
 struct Player : Actor<Player, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.test.sim_testkit_test.Player";
     using protocol = Protocol<Ball>;
     ActorRef<Player> partner{};
     int hits = 0;

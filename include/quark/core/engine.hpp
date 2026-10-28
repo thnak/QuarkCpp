@@ -294,7 +294,7 @@ public:
                               std::max<std::uint64_t>(1, idle_ms / cfg_.idle_tick_ms));
 
         const ActorId id = actor_id_of<A>(key);
-        act->set_type_cell(type_cell_for(shard_of(id), type_key_of<A>(), detail::canonical_type_name<A>()));  // ADR-054
+        act->set_type_cell(type_cell_for(shard_of(id), type_key_of<A>(), detail::type_label<A>()));  // ADR-054
         register_activation(id, *act, static_cast<std::uint16_t>(priority_band_of<A>()),
                             drain_budget_of<A>(), idle_ticks);
         wire_escalation<A>(*act, id);  // 007 §Escalation: no-op if no matching supervisor is registered
@@ -331,7 +331,7 @@ public:
                       "declare_lazy<A>: Priority<P> exceeds the engine's PriorityBands<K> (P < K) — "
                       "ADR-010");
         auto r = type_registry_.register_type<A>(std::forward<WireCheck>(check), scope, reclaim);
-        if (r) (void)metrics_.assign_type_slot(type_key_of<A>(), detail::canonical_type_name<A>(), cfg_.max_types);  // ADR-054 (name for the label)
+        if (r) (void)metrics_.assign_type_slot(type_key_of<A>(), detail::type_label<A>(), cfg_.max_types);  // ADR-054 (name for the label)
         return r;
     }
     template <class A>
@@ -372,7 +372,7 @@ public:
                       "store-taking overload (ADR-028 Phase 5); use declare_lazy<A>(scope, reclaim) "
                       "otherwise");
         auto r = type_registry_.register_type<A>(store, scope, reclaim);
-        if (r) (void)metrics_.assign_type_slot(type_key_of<A>(), detail::canonical_type_name<A>(), cfg_.max_types);  // ADR-054
+        if (r) (void)metrics_.assign_type_slot(type_key_of<A>(), detail::type_label<A>(), cfg_.max_types);  // ADR-054
         return r;
     }
 
@@ -1134,6 +1134,8 @@ private:
     // try/catch converts any construct/wire/recover fault into a synchronous dead-letter, never an
     // escaping exception), so this policy is a regression guard, not a currently-exercised path.
     class ActivationBroker : public Actor<ActivationBroker, Sequential, OnFailure<Restart>> {
+    public:
+        static constexpr std::string_view quark_type_name = "quark.internal.engine.ActivationBroker";
     public:
         using protocol = Protocol<Wake>;
         ActivationBroker(Engine* eng, std::uint32_t shard_id) noexcept

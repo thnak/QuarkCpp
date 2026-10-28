@@ -34,6 +34,7 @@ struct Total {};   // ask: "what's the running sum?"
 
 // Terminal stage: accumulates deposits, answers the running total.
 struct Sink : Actor<Sink, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.03_pipeline.Sink";
     using protocol = Protocol<Deposit, Ask<Total, int>>;
 
     void handle(const Deposit& d) noexcept { sum_ += d.n; }
@@ -46,6 +47,7 @@ private:
 // Middle stage: doubles each value and forwards it downstream. `downstream` is set once, before the
 // engine starts; forwarding a `tell` from inside a handler is just another enqueue (MPSC-safe).
 struct Doubler : Actor<Doubler, Sequential> {
+    static constexpr std::string_view quark_type_name = "quark.sample.03_pipeline.Doubler";
     using protocol = Protocol<Ingest, Ask<Flush, int>>;
 
     ActorRef<Sink> downstream{};  // wired at bring-up
