@@ -508,6 +508,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-061](decisions/ADR-061-actor-type-key-normalisation.md) | Cross-toolchain actor type-key normalisation + `quark_type_name` (008, #17) | GCC/Clang/`cl.exe` now emit one key per type; real Windows↔Linux pair dispatches. Durable break for `cl.exe` / GCC-anonymous types. |
 | [ADR-062](decisions/ADR-062-required-actor-type-name.md) | Required explicit actor `quark_type_name` — one cross-platform identity mechanism (008) | Compile error without it; key = name + Described fingerprints; no compiler spelling in any actor key. Durable break. |
 | [ADR-063](decisions/ADR-063-auto-send-pool-partitions.md) | Send-pool partitions default to AUTO (003, #4) | `pool_partitions = 0` resolves to a power of two <= 16 from hw threads, >= 1024 cells each; p99 `tell` 25-57 us -> ~5 us at 8-16 producers, mean 1.0-3.4x. |
+| [ADR-064](decisions/ADR-064-hot-path-division-and-resolve-flat-map.md) | Counter-guided hot-path wins (003/006, #4) | `MessagePool` partition by mask (no `div` per acquire) + flat open-addressing `by_id_`; 1P->1C 4.9 -> 6.3 M msg/s; five other candidates measured and rejected. |
 
 </details>
 

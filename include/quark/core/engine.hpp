@@ -52,6 +52,7 @@
 #include "quark/core/run_queue.hpp"
 #include "quark/core/supervision.hpp"     // 007: supervision_of<A>() resolved at spawn
 #include "quark/core/timer_wheel.hpp"     // 011/ADR-028 Phase 2: the per-shard idle-eviction wheel
+#include "quark/detail/flat_actor_map.hpp"  // ADR-064: by_id_ (flat open-addressing, no per-tell div)
 #include "quark/detail/message_pool.hpp"  // ADR-028 Phase 4: broker_pool_ (Wake control descriptors)
 #include "quark/detail/parked_resume.hpp" // 015: ReplyCell's co_await re-admit ambient seam
 #include "pal/pal.hpp"
@@ -240,7 +241,7 @@ public:
         std::unique_ptr<Schedulable> s = build_schedulable(shard_of(id), act, band, budget, idle_ticks);
         Schedulable* raw = s.get();
         registry_.push_back(std::move(s));  // cold-only: safe, single-threaded before start()
-        by_id_[id] = raw;  // 006 addressing registry: ActorId → Schedulable (resolve() lookup)
+        by_id_.insert_or_assign(id, raw);  // 006 addressing registry: ActorId → Schedulable (resolve() lookup)
         return raw;
     }
 
@@ -389,8 +390,7 @@ public:
     // ActivationBroker publishes at runtime) — the documented, opt-in extra cost of a lazily-declared
     // (never eagerly `spawn`'d) actor: every lookup after its first pays one extra map miss, forever.
     [[nodiscard]] Schedulable* resolve(ActorId id) const noexcept {
-        const auto it = by_id_.find(id);
-        if (it != by_id_.end()) return it->second;
+        if (Schedulable* s = by_id_.find(id)) return s;
         return shards_[shard_of(id)].id_table.find(id);
     }
 
@@ -1940,7 +1940,7 @@ private:
     // has joined every worker (no lane can touch them during destruction).
     std::vector<std::shared_ptr<void>> owned_actors_;        // type-erased actor instances (008 factory)
     std::vector<std::unique_ptr<Activation>> owned_activations_;
-    std::unordered_map<ActorId, Schedulable*> by_id_;     // 006 addressing: ActorId → Schedulable
+    detail::FlatActorMap<Schedulable> by_id_;             // 006 addressing: ActorId → Schedulable (ADR-064)
     // 007 §Escalation (ADR-009 `Supervision<Node|PerType|Tree<…>>`) — see `wire_escalation<A>()`.
     // `escalation_bindings_` is a `std::deque`, NOT a `vector`: a binding's address is handed to
     // `Activation::set_escalation_sink` as `ctx` and must stay stable across later push_backs.

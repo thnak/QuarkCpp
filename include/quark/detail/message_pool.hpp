@@ -124,6 +124,10 @@ public:
     explicit MessagePool(std::size_t capacity, std::size_t num_partitions = 1)
         : num_partitions_(num_partitions == 0 ? 1 : num_partitions),
           partitions_(num_partitions_) {
+        // Perf (ADR-064): a power-of-two count selects the partition with a mask. `lane % N` compiled to a
+        // 64-bit `div` (~40 cycles on Broadwell) on EVERY acquire, even for N == 1.
+        lane_mask_ = (num_partitions_ & (num_partitions_ - 1)) == 0 ? static_cast<std::uint32_t>(num_partitions_ - 1)
+                                                                    : kNoMask;
         for (auto& p : partitions_) {
             p = std::make_shared<Partition>();
             p->self = p;
@@ -137,7 +141,7 @@ public:
     // partition's mutex-guarded free list only when the magazine is empty (ADR-037). Grows cold if
     // the partition is genuinely exhausted (pre-size to avoid it) — same cold-miss contract as before.
     [[nodiscard]] Slot acquire(void (*destroy)(void*) noexcept) noexcept {
-        Partition& p = *partitions_[pool_lane_id() % num_partitions_];
+        Partition& p = *partitions_[partition_index(pool_lane_id())];
         LocalCache& lc = local_cache_for(p);
         if (lc.count == 0) refill(lc, p);
         Descriptor* d = lc.cells[--lc.count];
@@ -316,7 +320,13 @@ private:
         }
     }
 
+    static constexpr std::uint32_t kNoMask = 0xFFFF'FFFFu;
+    [[nodiscard]] std::size_t partition_index(std::uint32_t lane) const noexcept {
+        return lane_mask_ != kNoMask ? (lane & lane_mask_) : (lane % num_partitions_);
+    }
+
     std::size_t num_partitions_;
+    std::uint32_t lane_mask_ = kNoMask;
     std::vector<std::shared_ptr<Partition>> partitions_;
 };
 
