@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -65,14 +66,16 @@ int main() {
         while (!all_acked() && rounds < 100000) {
             ++rounds;
             for (auto& s : senders) {
+                std::optional<std::uint64_t> ack;
                 s.pump([&](const ReliableFrame& f, const std::string&) {
                     ++total;
                     if (rng.drop()) { ++dropped; return; }
                     if (rx.accept(f) == ReliableReceiver::Verdict::Deliver) ++got[{f.sender, f.seq}];
                     ++total;
                     if (rng.drop()) { ++dropped; return; }  // ack lost
-                    s.on_ack(rx.ack_for(f.sender));
+                    ack = rx.ack_for(f.sender);  // applied after pump(): on_ack() must not re-enter pump()
                 }, /*window=*/8);
+                if (ack) { s.on_ack(*ack); ack.reset(); }
             }
         }
         check(all_acked(), "lossy: every sender fully acked", ok);

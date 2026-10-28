@@ -610,7 +610,8 @@ public:
     }
     // Re-send up to `window` oldest unacked frames (0 = all) via
     // `sink(const ReliableFrame&, const std::string& body) -> void`. A lossy sink simply drops; the
-    // next pump retries.
+    // next pump retries. The sink must NOT call on_ack()/enqueue() on this sender (it mutates the
+    // deque being iterated); collect acks and apply them after pump() returns.
     template <class Sink>
     std::size_t pump(Sink&& sink, std::size_t window = 0) {
         std::size_t n = 0;

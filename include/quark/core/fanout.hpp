@@ -313,6 +313,11 @@ public:
         return r;
     }
 
+    // Lane entries release their queued payloads into `pool_` when they die, so the membership
+    // snapshot must be dropped while `pool_` is still alive (it is declared after `snapshot_`, so the
+    // implicit member-order teardown would free the pool first -> heap-use-after-free, caught by ASan).
+    ~FanOut() { snapshot_.store(nullptr, std::memory_order_release); }
+
     [[nodiscard]] SharedPayloadPool<M>& pool() noexcept { return pool_; }
     [[nodiscard]] std::uint64_t in_flight() const noexcept { return in_flight_.load(std::memory_order_acquire); }
     [[nodiscard]] std::size_t lane_capacity() const noexcept { return lane_capacity_; }
