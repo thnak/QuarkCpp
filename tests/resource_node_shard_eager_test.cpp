@@ -70,7 +70,7 @@ ShardCache make_shard_cache(std::uint32_t sid) {
 
 struct Ping {};
 struct Consumer : Actor<Consumer, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_eager_test.Consumer";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.resource_node_shard_eager_test.Consumer";
     using protocol = Protocol<Ping>;
     static inline std::atomic<bool> last_pool_resolved{false};
     static inline std::atomic<ConnPool*> last_pool_ptr{nullptr};

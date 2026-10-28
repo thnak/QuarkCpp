@@ -19,7 +19,7 @@ struct Bump {};
 
 // ---- Transport-drop target: a plain counter ---------------------------------------------------
 struct Counter : Actor<Counter, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.sim_fault_injection_test.Counter";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sim_fault_injection_test.Counter";
     using protocol = Protocol<Bump>;
     int n = 0;
     void handle(const Bump&) noexcept { ++n; }
@@ -32,7 +32,7 @@ SimEngine* g_sim = nullptr;
 ActorId g_fid{};
 
 struct Faulty : Actor<Faulty, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.sim_fault_injection_test.Faulty";  // default supervision = Restart (007)
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sim_fault_injection_test.Faulty";  // default supervision = Restart (007)
     using protocol = Protocol<Bump>;
     int n = 0;
     void handle(const Bump&) {

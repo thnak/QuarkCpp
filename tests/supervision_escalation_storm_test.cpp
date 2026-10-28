@@ -52,13 +52,13 @@ bool wait_until(Pred&& pred, std::chrono::milliseconds timeout) {
 struct Boom {};
 
 struct Faulty : Actor<Faulty, Sequential, OnFailure<Escalate>> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_storm_test.Faulty";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_storm_test.Faulty";
     using protocol = Protocol<Boom>;
     void handle(const Boom&) { throw std::runtime_error("boom"); }
 };
 
 struct Watcher : Actor<Watcher, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_storm_test.Watcher";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_storm_test.Watcher";
     using protocol = Protocol<Escalated>;
     static inline std::atomic<int> received{0};
     void handle(const Escalated&) { received.fetch_add(1, std::memory_order_relaxed); }

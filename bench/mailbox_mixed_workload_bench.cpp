@@ -37,7 +37,7 @@ struct Large { std::uint64_t v; std::uint8_t pad[168]; };   // 176 B
 struct Query { std::uint64_t x; };
 
 struct MixedActor : Actor<MixedActor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.bench.mailbox_mixed_workload_bench.MixedActor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.mailbox_mixed_workload_bench.MixedActor";
     using protocol = Protocol<Small, Medium, Large, Ask<Query, std::uint64_t>>;
     std::atomic<std::uint64_t> small_count{0}, medium_count{0}, large_count{0};
 

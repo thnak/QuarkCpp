@@ -18,14 +18,14 @@ struct Ping {};
 
 // --- Plain actor: no Delivery<> at all → the free AtMostOnce default. ----------------------------
 struct Plain : Actor<Plain, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Plain";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Plain";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 // --- Explicit AtLeastOnce (idempotent-handler contract; no persistence required). ---------------
 struct BestEffort : Actor<BestEffort, Sequential, Delivery<DeliveryLevel::AtLeastOnce>> {
-    static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.BestEffort";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.BestEffort";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
@@ -33,7 +33,7 @@ struct BestEffort : Actor<BestEffort, Sequential, Delivery<DeliveryLevel::AtLeas
 // --- EffectivelyOnce over a Persistent<EventSourced> actor — the well-formed CP shape. -----------
 struct Order : Actor<Order, Sequential, Persistent<EventSourced, PersistMode::Sync>,
                      Delivery<DeliveryLevel::EffectivelyOnce>> {
-    static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Order";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Order";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
@@ -41,7 +41,7 @@ struct Order : Actor<Order, Sequential, Persistent<EventSourced, PersistMode::Sy
 // --- EffectivelyOnce over a Persistent<Snapshot> actor — also persistent, also well-formed. ------
 struct Wallet : Actor<Wallet, Sequential, Persistent<Snapshot, PersistMode::Sync>,
                       Delivery<DeliveryLevel::EffectivelyOnce>> {
-    static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Wallet";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Wallet";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
@@ -50,7 +50,7 @@ struct Wallet : Actor<Wallet, Sequential, Persistent<Snapshot, PersistMode::Sync
 //     validate_actor_policies<Bad> (that would hard-fail the build); instead we assert the
 //     constexpr predicate reports the violation — the same technique the 025 conflict tests use. ---
 struct Bad : Actor<Bad, Sequential, Delivery<DeliveryLevel::EffectivelyOnce>> {
-    static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Bad";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.delivery_policy_traits_test.Bad";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };

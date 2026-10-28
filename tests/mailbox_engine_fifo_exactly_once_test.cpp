@@ -42,7 +42,7 @@ constexpr int kTotal = static_cast<int>(kProducers) * kPerProducer;
 struct Tagged { int producer; int seq; };
 
 struct Collector : Actor<Collector, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.mailbox_engine_fifo_exactly_once_test.Collector";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.mailbox_engine_fifo_exactly_once_test.Collector";
     using protocol = Protocol<Tagged>;
 
     // Single-executor invariant (Sequential) => these are touched by exactly one drain lane at a

@@ -25,7 +25,7 @@ struct Job {
 };
 
 struct FaultWorker : Actor<FaultWorker, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.stateless_pool_fault_deadletter_test.FaultWorker";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.stateless_pool_fault_deadletter_test.FaultWorker";
     using protocol = Protocol<Job>;
     std::uint64_t handled = 0;
     void handle(const Job& j) {

@@ -122,8 +122,8 @@ int main() {
         for (std::uint64_t i = 0; i < K; ++i) (void)fo.publish(Ev{i});
         done.store(true, std::memory_order_release);
         cons.join();
-        std::printf("  stress: delivered=%llu gapped=%llu evicted=%llu\n", (unsigned long long)delivered,
-                    (unsigned long long)gapped, (unsigned long long)lane->evicted());
+        std::printf("  stress: delivered=%llu gapped=%llu evicted=%llu\n", static_cast<unsigned long long>(delivered),
+                    static_cast<unsigned long long>(gapped), static_cast<unsigned long long>(lane->evicted()));
         check(part_ok, "ranges contiguous, no overlap");
         check(delivered + gapped == K, "delivered + gapped == published (no silent loss)");
         check(gapped == lane->evicted(), "gap total == evicted counter");

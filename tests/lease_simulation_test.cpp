@@ -64,7 +64,7 @@ struct Stats {
 #define SIM_CHECK(cond, ...)                                                      \
     do {                                                                          \
         if (!(cond)) {                                                            \
-            std::printf("FAIL seed=%llu: %s  ", (unsigned long long)seed, #cond); \
+            std::printf("FAIL seed=%llu: %s  ", static_cast<unsigned long long>(seed), #cond); \
             std::printf(__VA_ARGS__);                                             \
             std::printf("\n");                                                    \
             ++st.fails;                                                           \
@@ -134,13 +134,13 @@ void run_scenario(std::uint64_t seed, Stats& st) {
                         const auto v = rp->term.value;
                         auto it = term_holder.find(v);
                         if (it == term_holder.end()) {
-                            SIM_CHECK(v > max_granted, "term %llu not above max %llu", (unsigned long long)v,
-                                      (unsigned long long)max_granted);
+                            SIM_CHECK(v > max_granted, "term %llu not above max %llu", static_cast<unsigned long long>(v),
+                                      static_cast<unsigned long long>(max_granted));
                             term_holder[v] = rp->to;
                             max_granted = v;
                             ++seen_terms;
                         } else {
-                            SIM_CHECK(it->second == rp->to, "term %llu issued to two holders", (unsigned long long)v);
+                            SIM_CHECK(it->second == rp->to, "term %llu issued to two holders", static_cast<unsigned long long>(v));
                         }
                     }
                     send(ARB, rp->to, {}, *rp, t);
@@ -166,15 +166,15 @@ void run_scenario(std::uint64_t seed, Stats& st) {
             const FenceToken owner = store.current_owner(key);
             const bool accepted = store.append(key, tok, seq, payload).has_value();
             SIM_CHECK(accepted == (tok.value >= owner.value), "store accept=%d tok=%llu owner=%llu", accepted,
-                      (unsigned long long)tok.value, (unsigned long long)owner.value);
+                      static_cast<unsigned long long>(tok.value), static_cast<unsigned long long>(owner.value));
             if (tok.value < max_granted) {
-                SIM_CHECK(!accepted, "deposed token %llu (< granted %llu) accepted", (unsigned long long)tok.value,
-                          (unsigned long long)max_granted);
+                SIM_CHECK(!accepted, "deposed token %llu (< granted %llu) accepted", static_cast<unsigned long long>(tok.value),
+                          static_cast<unsigned long long>(max_granted));
                 ++st.zombie_rejected;
             }
             if (accepted) {
-                SIM_CHECK(tok.value >= max_accepted, "S3: accepted %llu after %llu", (unsigned long long)tok.value,
-                          (unsigned long long)max_accepted);
+                SIM_CHECK(tok.value >= max_accepted, "S3: accepted %llu after %llu", static_cast<unsigned long long>(tok.value),
+                          static_cast<unsigned long long>(max_accepted));
                 max_accepted = tok.value;
                 ++st.writes_ok;
                 ++ok_here;
@@ -190,7 +190,7 @@ void run_scenario(std::uint64_t seed, Stats& st) {
         }
     }
     SIM_CHECK(store.last_seq(key) == ok_here, "S4: log seq %llu != accepted writes %llu",
-              (unsigned long long)store.last_seq(key), (unsigned long long)ok_here);
+              static_cast<unsigned long long>(store.last_seq(key)), static_cast<unsigned long long>(ok_here));
 
     unsigned believers = 0;
     for (Peer i = 0; i < N; ++i) believers += nodes[i].believes_leader(clk[i].at(H)) ? 1u : 0u;
@@ -209,7 +209,14 @@ void run_scenario(std::uint64_t seed, Stats& st) {
 
 int main() {
     std::uint64_t n = 10000;
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)  // std::getenv: portable, std-only; single read before any threads
+#endif
     if (const char* e = std::getenv("QUARK_LEASE_SCENARIOS")) n = std::strtoull(e, nullptr, 10);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     Stats st;
     const auto t0 = std::chrono::steady_clock::now();
     for (std::uint64_t seed = 1; seed <= n && st.fails == 0; ++seed) run_scenario(seed, st);

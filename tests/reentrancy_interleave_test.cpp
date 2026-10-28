@@ -30,7 +30,7 @@ struct Job {
 };
 
 struct Mixer : Actor<Mixer, MaxConcurrency<kCap>> {
-    static constexpr std::string_view quark_type_name = "quark.test.reentrancy_interleave_test.Mixer";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.reentrancy_interleave_test.Mixer";
     using protocol = Protocol<Job>;
     Activation* lane = nullptr;
 

@@ -30,7 +30,7 @@ struct Ping {
 // 20ms IdleTimeout — with a 1ms wheel tick (set below) this is 20 ticks, evicting promptly without
 // racing the test's own message delivery.
 struct Sleepy : Actor<Sleepy, Sequential, IdleTimeout<20>> {
-    static constexpr std::string_view quark_type_name = "quark.test.engine_idle_timeout_eviction_test.Sleepy";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_idle_timeout_eviction_test.Sleepy";
     using protocol = Protocol<Ping>;
     std::atomic<int> handled{0};
     void handle(const Ping& p) noexcept { handled.fetch_add(p.n, std::memory_order_release); }

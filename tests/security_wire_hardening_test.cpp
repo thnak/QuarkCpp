@@ -163,10 +163,12 @@ void swim_source_binding() {
 
     // (e) gossip-only membership is in the convergence view but NOT in the placement view.
     bool in_view = false;
-    for (NodeId n : swim.view().nodes())
+    const auto convergence_view = swim.view();  // by value: keep it alive for the span below
+    for (NodeId n : convergence_view.nodes())
         if (n.value == 4242) in_view = true;
     bool in_placement = false;
-    for (NodeId n : swim.placement_view().nodes())
+    const auto placement_before = swim.placement_view();
+    for (NodeId n : placement_before.nodes())
         if (n.value == 4242) in_placement = true;
     check(in_view, "unverified gossip member is in the convergence view");
     check(!in_placement, "unverified gossip member is excluded from placement");
@@ -182,7 +184,8 @@ void swim_source_binding() {
     ack.seq = 0;
     send_control(NodeId{4242}, NodeId{1}, ack);
     bool in_placement_after = false;
-    for (NodeId n : swim.placement_view().nodes())
+    const auto placement_after = swim.placement_view();
+    for (NodeId n : placement_after.nodes())
         if (n.value == 4242) in_placement_after = true;
     check(in_placement_after, "first-hand Ack verifies the member for placement");
 

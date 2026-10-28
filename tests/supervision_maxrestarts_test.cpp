@@ -23,7 +23,7 @@ namespace {
 struct Boom {};
 
 struct Poison : Actor<Poison, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_maxrestarts_test.Poison";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_maxrestarts_test.Poison";
     using protocol = Protocol<Boom>;
     void handle(const Boom&) { throw std::runtime_error("poison"); }
 };

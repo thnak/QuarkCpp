@@ -19,14 +19,14 @@ struct Tick {};
 
 struct Worker : Actor<Worker, Sequential, Priority<0>, DrainBudget<32>,
                       OnFailure<Restart, MaxRestarts<3>>> {
-    static constexpr std::string_view quark_type_name = "quark.test.metadata_registry_test.Worker";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metadata_registry_test.Worker";
     using protocol = Protocol<Tick>;
     int state = 41;  // non-default sentinel so "fresh" (== 41 via ctor) is observable
     void handle(const Tick&) { ++state; }
 };
 
 struct Other : Actor<Other, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.metadata_registry_test.Other";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metadata_registry_test.Other";
     using protocol = Protocol<Tick>;
     void handle(const Tick&) {}
 };

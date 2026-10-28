@@ -199,7 +199,7 @@ QUARK_SERIALIZE(Resp, (1, n));
 constexpr std::uint64_t kResponderKey = 7, kCollectorKey = 9;
 
 struct Collector : Actor<Collector, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.mixed_abi_cluster_conformance_test.Collector";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.mixed_abi_cluster_conformance_test.Collector";
     using protocol = Protocol<Resp>;
     std::atomic<int> count{0};
     std::atomic<long long> sum{0};
@@ -210,7 +210,7 @@ struct Collector : Actor<Collector, Sequential> {
 };
 
 struct Responder : Actor<Responder, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.mixed_abi_cluster_conformance_test.Responder";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.mixed_abi_cluster_conformance_test.Responder";
     using protocol = Protocol<Req>;
     DistributedRouter* dist = nullptr;
     void handle(const Req& q) noexcept {
@@ -346,9 +346,9 @@ int main() {
     check(joined, "join via SeedListDiscovery: SWIM membership converges Alive both ways", ok);
     if (!joined) {
         std::fprintf(stderr, "  diag: A sees B alive=%d, B sees A alive=%d, sessA=%d sessB=%d, A tcp rx/tx=%llu/%llu, B rx/tx=%llu/%llu\n",
-                     (int)alive(a, idB), (int)alive(b, idA), (int)a.secure.has_session(idB), (int)b.secure.has_session(idA),
-                     (unsigned long long)a.tcp.frames_received(), (unsigned long long)a.tcp.frames_sent(),
-                     (unsigned long long)b.tcp.frames_received(), (unsigned long long)b.tcp.frames_sent());
+                     static_cast<int>(alive(a, idB)), static_cast<int>(alive(b, idA)), static_cast<int>(a.secure.has_session(idB)), static_cast<int>(b.secure.has_session(idA)),
+                     static_cast<unsigned long long>(a.tcp.frames_received()), static_cast<unsigned long long>(a.tcp.frames_sent()),
+                     static_cast<unsigned long long>(b.tcp.frames_received()), static_cast<unsigned long long>(b.tcp.frames_sent()));
         a.eng.stop(); b.eng.stop(); a.tcp.stop(); b.tcp.stop();
         std::printf("mixed_abi_cluster_conformance_test: FAIL (join)\n");
         return 1;

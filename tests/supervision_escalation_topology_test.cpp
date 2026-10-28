@@ -45,21 +45,21 @@ struct Boom {};
 
 // Default topology (Supervision<Node>, implicit) — routes to the engine-wide default supervisor.
 struct NodeFaulty : Actor<NodeFaulty, Sequential, OnFailure<Escalate>> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.NodeFaulty";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.NodeFaulty";
     using protocol = Protocol<Boom>;
     void handle(const Boom&) { throw std::runtime_error("boom"); }
 };
 
 // Explicit Supervision<PerType> — routes to a supervisor registered for THIS type specifically.
 struct PerTypeFaulty : Actor<PerTypeFaulty, Sequential, OnFailure<Escalate>, Supervision<PerType>> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.PerTypeFaulty";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.PerTypeFaulty";
     using protocol = Protocol<Boom>;
     void handle(const Boom&) { throw std::runtime_error("boom"); }
 };
 
 // The Node-default supervisor.
 struct NodeWatcher : Actor<NodeWatcher, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.NodeWatcher";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.NodeWatcher";
     using protocol = Protocol<Escalated>;
     static inline std::atomic<int> received{0};
     static inline std::atomic<std::uint64_t> last_source_key{0};
@@ -71,7 +71,7 @@ struct NodeWatcher : Actor<NodeWatcher, Sequential> {
 
 // A DISTINCT PerType supervisor — proves PerType routes independently of the Node default.
 struct TypeWatcher : Actor<TypeWatcher, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.TypeWatcher";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_escalation_topology_test.TypeWatcher";
     using protocol = Protocol<Escalated>;
     static inline std::atomic<int> received{0};
     void handle(const Escalated&) { received.fetch_add(1, std::memory_order_relaxed); }

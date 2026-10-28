@@ -33,7 +33,7 @@ struct Seq {
 QUARK_SERIALIZE(Seq, (1, n));
 
 struct Logger : Actor<Logger, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.distribution_routing_test.Logger";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.distribution_routing_test.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> got;  // written only on the single drain lane (single-executor)
     std::atomic<int> count{0};

@@ -98,6 +98,6 @@ int main() {
             res[mode] = best;
         }
         std::printf("drain_every=%llu publish+pop ns/op: A-old-pop=%.2f A-gap-pop=%.2f A-raw(16B,derived)=%.2f B-raw(32B,stamped)=%.2f\n",
-                    (unsigned long long)drain_every, res[0], res[1], res[3], res[2]);
+                    static_cast<unsigned long long>(drain_every), res[0], res[1], res[3], res[2]);
     }
 }

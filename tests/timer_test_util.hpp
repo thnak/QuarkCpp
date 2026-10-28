@@ -27,7 +27,7 @@ struct Sentinel {};
 // A Sequential (single-executor) sink: `order` is written only on its one drain lane, so it is a
 // faithful witness of arrival order; `count` is the cross-thread progress signal the harness spins on.
 struct Counter : quark::Actor<Counter, quark::Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.timer_test_util.Counter";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.timer_test_util.Counter";
     using protocol = quark::Protocol<Fire, Sentinel>;
     std::vector<int> order;
     std::atomic<int> count{0};

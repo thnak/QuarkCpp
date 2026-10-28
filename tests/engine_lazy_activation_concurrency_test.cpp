@@ -27,7 +27,7 @@ struct Ping {};
 
 // S1: exactly-one-construction under N threads racing the SAME cold id.
 struct RaceActor : Actor<RaceActor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_concurrency_test.RaceActor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_concurrency_test.RaceActor";
     using protocol = Protocol<Ping>;
     static inline std::atomic<int> constructions{0};
     static inline std::atomic<long long> handled{0};
@@ -37,7 +37,7 @@ struct RaceActor : Actor<RaceActor, Sequential> {
 
 // bug-(a) pin: many distinct ids of this type, scattered across shards, activated concurrently.
 struct ScatterActor : Actor<ScatterActor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_concurrency_test.ScatterActor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_lazy_activation_concurrency_test.ScatterActor";
     using protocol = Protocol<Ping>;
     static inline std::atomic<long long> handled{0};
     void handle(const Ping&) noexcept { handled.fetch_add(1, std::memory_order_release); }

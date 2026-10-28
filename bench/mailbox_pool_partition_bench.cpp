@@ -63,7 +63,7 @@ constexpr std::uint64_t kSampleEvery = 128;  // time 1 in 128 tell() calls
 constexpr int kReps = 3;                     // runs per config; median throughput / allocs
 
 struct PingActor : Actor<PingActor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.bench.mailbox_pool_partition_bench.PingActor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.mailbox_pool_partition_bench.PingActor";
     using protocol = Protocol<int>;
     void handle(const int&) noexcept {}
 };

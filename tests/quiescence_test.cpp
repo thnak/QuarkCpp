@@ -26,7 +26,7 @@ struct Newcomer {
 };
 
 struct Store : Actor<Store, MaxConcurrency<8>> {
-    static constexpr std::string_view quark_type_name = "quark.test.quiescence_test.Store";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.quiescence_test.Store";
     using protocol = Protocol<Sibling, Snapshot, Newcomer>;
     Activation* lane = nullptr;
 

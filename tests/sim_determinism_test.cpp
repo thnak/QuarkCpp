@@ -25,7 +25,7 @@ struct Tok {
 // A relay: on each token, record its arrival, then forward a decremented token to the next relay in
 // the ring until the hop budget is spent. `log`/`me` are wired by the harness (no restart here).
 struct Relay : Actor<Relay, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.sim_determinism_test.Relay";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sim_determinism_test.Relay";
     using protocol = Protocol<Tok>;
     ActorRef<Relay> next{};
     std::vector<int>* log = nullptr;

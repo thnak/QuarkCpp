@@ -67,7 +67,7 @@ namespace {
 void pin_thread(std::thread& th, int cpu) {
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
+    CPU_SET(static_cast<std::size_t>(cpu), &set);
     pthread_setaffinity_np(th.native_handle(), sizeof(set), &set);
 }
 

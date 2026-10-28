@@ -28,7 +28,7 @@ struct Job {
     std::uint64_t id;
 };
 struct Worker : Actor<Worker, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.governance_deadline_shed_test.Worker";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.governance_deadline_shed_test.Worker";
     using protocol = Protocol<Job>;
     std::vector<std::uint64_t> ran;
     void handle(const Job& m) { ran.push_back(m.id); }

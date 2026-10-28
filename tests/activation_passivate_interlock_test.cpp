@@ -23,7 +23,7 @@ struct Ping {
 };
 
 struct Pinger : Actor<Pinger, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.activation_passivate_interlock_test.Pinger";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.activation_passivate_interlock_test.Pinger";
     using protocol = Protocol<Ping>;
     int pings = 0;
     void handle(const Ping& p) noexcept { pings += p.n; }

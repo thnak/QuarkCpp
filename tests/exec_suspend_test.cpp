@@ -20,7 +20,7 @@ struct Fast {
 };
 
 struct Worker : Actor<Worker, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.exec_suspend_test.Worker";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.exec_suspend_test.Worker";
     using protocol = Protocol<Slow, Fast>;
 
     int slow_ran = 0;   // incremented AFTER the co_await resumes

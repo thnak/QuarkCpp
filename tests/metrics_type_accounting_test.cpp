@@ -34,7 +34,7 @@ struct LightMsg {
 };
 
 struct BusyActor : Actor<BusyActor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.metrics_type_accounting_test.BusyActor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metrics_type_accounting_test.BusyActor";
     using protocol = Protocol<BusyMsg>;
     void handle(const BusyMsg&) noexcept {
         const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(200);
@@ -44,7 +44,7 @@ struct BusyActor : Actor<BusyActor, Sequential> {
     std::uint64_t n = 0;
 };
 struct LightActor : Actor<LightActor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.metrics_type_accounting_test.LightActor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.metrics_type_accounting_test.LightActor";
     using protocol = Protocol<LightMsg>;
     void handle(const LightMsg&) noexcept { ++n; }
     std::uint64_t n = 0;

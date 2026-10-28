@@ -34,7 +34,7 @@ struct CountedMsg {
 
 // Throws unconditionally from its default constructor — the fault this phase must survive.
 struct ThrowsOnConstruct : Actor<ThrowsOnConstruct, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.engine_broker_fault_safety_test.ThrowsOnConstruct";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_broker_fault_safety_test.ThrowsOnConstruct";
     using protocol = Protocol<CountedMsg>;
     static inline std::atomic<int> constructions{0};
     ThrowsOnConstruct() {
@@ -47,7 +47,7 @@ struct ThrowsOnConstruct : Actor<ThrowsOnConstruct, Sequential> {
 // A perfectly ordinary lazily-activated actor sharing the SAME (single-shard) broker — proves the
 // broker itself survives a sibling id's constructor fault, not just "the process didn't crash".
 struct Survivor : Actor<Survivor, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.engine_broker_fault_safety_test.Survivor";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.engine_broker_fault_safety_test.Survivor";
     using protocol = Protocol<Ping>;
     static inline std::atomic<int> handled{0};
     void handle(const Ping& p) noexcept { handled.fetch_add(p.n, std::memory_order_release); }

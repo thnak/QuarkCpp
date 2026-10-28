@@ -76,7 +76,7 @@ constexpr int kItemsPerStream = 8;
 constexpr std::uint64_t kMix = 2654435761u;
 
 struct Streamer : Actor<Streamer, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.ask_stream_coawait_real_scheduler_test.Streamer";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_stream_coawait_real_scheduler_test.Streamer";
     using protocol = Protocol<AskStream<Query, Row>>;
     void handle(const AskStream<Query, Row>& m) noexcept {
         auto producer = m.respond.accept();
@@ -138,7 +138,7 @@ private:
 
 // Shared, engine-wide config set up BEFORE start() -- mirrors ask_coawait_real_scheduler_test.cpp.
 struct Puller : Actor<Puller, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.ask_stream_coawait_real_scheduler_test.Puller";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.ask_stream_coawait_real_scheduler_test.Puller";
     using protocol = Protocol<Trigger>;
     static inline std::vector<ActorRef<Streamer>>* g_streamers = nullptr;
     static inline std::atomic<int>* g_mismatches = nullptr;

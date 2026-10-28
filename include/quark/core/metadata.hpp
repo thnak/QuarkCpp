@@ -92,11 +92,11 @@ template <class T>
     constexpr std::string_view fn = __FUNCSIG__;
     constexpr std::string_view lead = "canonical_type_name<";
     constexpr std::string_view tail = ">(void)";
-    const std::size_t at = fn.find(lead);
-    if (at == std::string_view::npos) return fn;
-    const std::size_t start = at + lead.size();
-    const std::size_t end = fn.rfind(tail);
-    if (end == std::string_view::npos || end < start) return fn;
+    constexpr std::size_t at = fn.find(lead);
+    if constexpr (at == std::string_view::npos) return fn;
+    constexpr std::size_t start = at + lead.size();
+    constexpr std::size_t end = fn.rfind(tail);
+    if constexpr (end == std::string_view::npos || end < start) return fn;
     return fn.substr(start, end - start);
 #else
     // No reflection-friendly compiler macro known here: T cannot be distinguished by name at all,

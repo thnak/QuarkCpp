@@ -32,7 +32,7 @@ struct Tick {
 };
 
 struct Counter : Actor<Counter, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.test.sched_single_executor_test.Counter";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.sched_single_executor_test.Counter";
     using protocol = Protocol<Tick>;
 
     std::atomic<int> live{0};

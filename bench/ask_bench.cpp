@@ -43,7 +43,7 @@ struct GetSquare {
 
 // A real ask-handling actor: it responds through the Ask<Q,R> envelope's pooled Responder (ADR-007).
 struct Squarer : Actor<Squarer, Sequential> {
-    static constexpr std::string_view quark_type_name = "quark.bench.ask_bench.Squarer";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.bench.ask_bench.Squarer";
     using protocol = Protocol<Ask<GetSquare, std::uint64_t>>;
     void handle(const Ask<GetSquare, std::uint64_t>& m) noexcept { m.respond(m.query.x * m.query.x); }
 };

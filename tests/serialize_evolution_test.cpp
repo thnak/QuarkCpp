@@ -67,10 +67,17 @@ int main() {
 
     // Fingerprints must differ (adding a field changes the schema — negotiation would reject
     // the tagless fast path across this boundary; the tagged path handles it).
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4127)  // deliberate runtime check of a compile-time fingerprint
+#endif
     if (fingerprint_v<EventV1> == fingerprint_v<EventV2>) {
         std::fprintf(stderr, "FAIL: V1 and V2 fingerprints collide\n");
         ++fails;
     }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     const bool pass = (fails == 0);
     std::printf("serialize_evolution_test: %s  (v1_fp=%016llx v2_fp=%016llx)\n",

@@ -49,11 +49,18 @@ int main() {
     // and fall back to tagged. If the fingerprints collided the control would be vacuous.
     const std::uint64_t fp_w = fingerprint_v<Pod>;
     const std::uint64_t fp_r = fingerprint_v<PodShift>;
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4127)  // deliberate runtime check of a compile-time fingerprint
+#endif
     if (fp_w == fp_r) {
         std::fprintf(stderr, "VACUOUS: fingerprints collide (%016llx) — control cannot fire\n",
                      static_cast<unsigned long long>(fp_w));
         return 1;
     }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     Pod w{0x0102030405060708ULL, 0xaabbccddU, 0x11223344U, 2.5};
     const std::size_t wrote = tagless_size(w);  // 24

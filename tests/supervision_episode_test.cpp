@@ -27,7 +27,7 @@ namespace {
 struct Work {};
 
 struct Worker : Actor<Worker, MaxConcurrency<4>> {
-    static constexpr std::string_view quark_type_name = "quark.test.supervision_episode_test.Worker";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.supervision_episode_test.Worker";
     using protocol = Protocol<Work>;
     Activation* lane = nullptr;
     bool boom = false;

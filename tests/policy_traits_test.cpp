@@ -18,34 +18,34 @@ struct Query {};
 
 // --- Bare actor: no policies at all. Fully valid, Sequential by construction. --------------------
 struct Bare : Actor<Bare> {
-    static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Bare";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Bare";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 // --- Explicit Sequential + scheduling policies. -------------------------------------------------
 struct Ordered : Actor<Ordered, Sequential, Priority<0>, DrainBudget<64>> {
-    static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Ordered";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Ordered";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 // --- Reentrant + a concurrency cap + a low band. Order of policies is irrelevant. ---------------
 struct Worker : Actor<Worker, DrainBudget<8>, Reentrant, MaxConcurrency<4>, Priority<2>> {
-    static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Worker";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Worker";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 // --- Lifecycle + placement surface (declared-only; extracted where cheap). ----------------------
 struct Sticky : Actor<Sticky, KeepAlive, Placement<HashById>> {
-    static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Sticky";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Sticky";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
 
 struct Ephemeral : Actor<Ephemeral, IdleTimeout<5000>> {
-    static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Ephemeral";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Ephemeral";
     using protocol = Protocol<Ping>;
     void handle(const Ping&) noexcept {}
 };
@@ -109,7 +109,7 @@ static_assert(validate_actor_policies<Sticky>());
 // A reentrant actor still keyed and dispatched normally — trait extraction is orthogonal to the
 // protocol, which enumerates Ask envelopes just the same.
 struct Service : Actor<Service, Reentrant, Priority<1>> {
-    static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Service";
+    [[maybe_unused]] static constexpr std::string_view quark_type_name = "quark.test.policy_traits_test.Service";
     using protocol = Protocol<Ask<Query, int>>;
     void handle(const Ask<Query, int>& m) noexcept { m.respond(1); }
 };
