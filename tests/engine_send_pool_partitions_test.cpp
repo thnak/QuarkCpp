@@ -25,8 +25,12 @@ struct Counter : Actor<Counter, Sequential> {
 
 bool run(std::uint32_t partitions, unsigned producers, std::uint64_t per_producer) {
     g_handled.store(0);
-    EngineConfig cfg{2, 2, 64, 1024};
-    cfg.pool_partitions = partitions;
+    // Built via ConfigBuilder, not `EngineConfig{2, 2, 64, 1024}`: MSVC /fsanitize=address mis-describes the
+    // frame for that aggregate init and reports a false stack-buffer-overflow (known compiler bug).
+    auto built = ConfigBuilder{}.workers(2).shards(2).default_drain_budget(64).busy_spin_limit(1024)
+                     .pool_partitions(partitions).build();
+    if (!built) return false;
+    const EngineConfig cfg = *built;
     Engine eng(cfg);
     auto pool = eng.make_send_pool();
     auto spawned = eng.spawn<Counter>(1, pool->sink());
