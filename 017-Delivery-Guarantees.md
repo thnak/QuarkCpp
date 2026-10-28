@@ -14,7 +14,7 @@ stress-tested here.
 class Payment : public quark::Actor<Payment,
                     Sequential,
                     Persistent<EventSourced, PersistMode::Sync>,
-                    Delivery<DeliveryLevel::EffectivelyOnce>> {};
+                    Delivery<DeliveryLevel::EffectivelyOnce>> { static constexpr std::string_view quark_type_name = "app.Payment"; };
 ```
 
 | Level | Guarantee | Cost | Requires |

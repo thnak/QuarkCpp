@@ -204,11 +204,9 @@ built-in function-name macro; no external reflection library.
 
 ## Open questions
 
-- Canonical type-name normalization across GCC/Clang/MSVC — **mandatory** for the
-  cross-platform target, since a mixed cluster (010) and shared durable logs (012,
-  016) require every toolchain to derive an identical `type_key` for the same type.
-  Needs a per-toolchain conformance test; if normalization proves unreliable, fall
-  back to a developer-assigned explicit `type_key` per type.
+- *(Canonical type-name normalization across GCC/Clang/MSVC: resolved by ADR-062 — every actor declares a
+  required `quark_type_name`; no compiler-derived spelling enters an actor key. Conformance-tested on Clang, GCC
+  and `cl.exe` in `tests/metadata_typekey_conformance_test.cpp`.)*
 - *(Hot-reload / dynamic registration after `build()`: resolved — a guarded
   `add_actor_type<T>()` with incremental Validation + release table swap, pre-sized to a
   `max_types` cap; see "Dynamic registration (guarded)" above, ADR-008.)*

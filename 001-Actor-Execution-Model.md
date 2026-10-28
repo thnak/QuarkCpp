@@ -154,6 +154,7 @@ runtime branch:
 
 ```cpp
 class Order : public Actor<Order, Sequential> {
+    static constexpr std::string_view quark_type_name = "app.Order";
 public:
     void        handle(const Ship&);          // sync  — drained inline
     quark::task<> handle(const Query& q);     // async — suspends the activation

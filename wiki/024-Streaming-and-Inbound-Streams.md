@@ -161,6 +161,7 @@ A stream reaches a handler as a **batch**, not a frame at a time:
 
 ```cpp
 class Ingest : public Actor<Ingest, Sequential> {
+    static constexpr std::string_view quark_type_name = "app.Ingest";
 public:
     // discrete control-plane messages, as always
     void handle(const Configure&);

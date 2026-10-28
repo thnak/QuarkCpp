@@ -92,6 +92,7 @@ compile time and materialized during metadata compilation (see `008`, TBD):
 
 ```cpp
 class Order : public Actor<Order, Sequential> {
+    static constexpr std::string_view quark_type_name = "app.Order";
     // Cached at activation:
     Cached<Logger>       log_;
     Cached<PgPool>       pool_;      // a connection-pool handle

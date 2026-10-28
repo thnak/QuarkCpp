@@ -43,14 +43,22 @@ Every actor type and every message type gets **two** ids, derived without RTTI:
 
 | Id | Type | Derivation | Used for |
 |---|---|---|---|
-| `type_key` | `uint64_t` | `constexpr` FNV-1a hash of a canonical type name | Stable across runs/binaries → wire (010) & storage (012) keys |
+| `type_key` | `uint64_t` | `constexpr` FNV-1a of the actor's REQUIRED `quark_type_name`, folded with its Described messages' 016 fingerprints (ADR-062) | Stable across runs/binaries → wire (010) & storage (012) keys |
 | `type_index` | `uint16_t` | Dense counter assigned at registration | Array indexing on the hot path |
 
 Two ids because the requirements conflict: distribution and persistence need an id
 that is **identical on every node and every restart** (`type_key`), while dispatch
 tables want a **dense, small** index for O(1) array lookup (`type_index`). The
-canonical name is derived from a `constexpr` view of the compiler's function-name
-string, normalized to strip compiler-specific decoration.
+identity is **explicit and platform-independent** (**ADR-062**). An **actor** declares
+`static constexpr std::string_view quark_type_name = "app.billing.Ledger"` — REQUIRED, a compile
+error if absent — and its `type_key` is `FNV-1a(name)` folded, in protocol order, with the 016
+fingerprints of its **Described** messages only. No compiler-derived spelling (`__PRETTY_FUNCTION__`,
+`__FUNCSIG__`) ever enters an actor key, so the key is identical on GCC, Clang and MSVC, on every OS
+and architecture, and survives renaming or moving the C++ type. Non-Described messages are
+local-only (never on the wire or in a durable record) and do not enter the key. A Described message
+type's key is its 016 fingerprint (name-free). Any other non-actor type (local-only, e.g. an
+authorizer's message key) uses the normalised compiler name of ADR-061, or its own
+`quark_type_name`; that key is process-local and must not be persisted or sent.
 
 Collision handling: `type_key` collisions are detected during Validation (two
 distinct registered types hashing equal) and are a **Strict-mode startup failure**.
@@ -196,11 +204,9 @@ built-in function-name macro; no external reflection library.
 
 ## Open questions
 
-- Canonical type-name normalization across GCC/Clang/MSVC — **mandatory** for the
-  cross-platform target, since a mixed cluster (010) and shared durable logs (012,
-  016) require every toolchain to derive an identical `type_key` for the same type.
-  Needs a per-toolchain conformance test; if normalization proves unreliable, fall
-  back to a developer-assigned explicit `type_key` per type.
+- *(Canonical type-name normalization across GCC/Clang/MSVC: resolved by ADR-062 — every actor declares a
+  required `quark_type_name`; no compiler-derived spelling enters an actor key. Conformance-tested on Clang, GCC
+  and `cl.exe` in `tests/metadata_typekey_conformance_test.cpp`.)*
 - *(Hot-reload / dynamic registration after `build()`: resolved — a guarded
   `add_actor_type<T>()` with incremental Validation + release table swap, pre-sized to a
   `max_types` cap; see "Dynamic registration (guarded)" above, ADR-008.)*

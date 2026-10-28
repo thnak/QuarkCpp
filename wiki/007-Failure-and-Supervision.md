@@ -70,7 +70,7 @@ Declared as a policy (`005`):
 ```cpp
 class Order : public quark::Actor<Order,
                   Sequential,
-                  OnFailure<Restart, MaxRestarts<3, Within<seconds<10>>>> {};
+                  OnFailure<Restart, MaxRestarts<3, Within<seconds<10>>>> { static constexpr std::string_view quark_type_name = "app.Order"; };
 ```
 
 ### `Resume` state rollback (ADR-009)

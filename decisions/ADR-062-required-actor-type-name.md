@@ -60,7 +60,8 @@ name there would be a second mechanism), and a name on local-only non-Described 
 - No TSan/ASan run for this change (constexpr, cold path); no Linux full-suite run (only the conformance
   test and `mixed_os_node` were built there); Linux/arm64 and macOS not exercised.
 - A live `cl.exe` <-> g++ *cluster* run was not done; key derivation on real `cl.exe` was.
-- Documentation snippets in README, 005, CONVENTIONS, wiki and samples/README were updated; spec snippets in the
-  other RFCs (001, 004, 007, 012, 017, 024, 025) still show actors without a name and should be swept.
+- Documentation snippets in README, 005, CONVENTIONS, wiki and samples/README were updated, and the actor
+  snippets in RFCs 001, 004, 007, 012, 017, 024, 025 (and their wiki mirrors) were swept to declare a name.
+  008's "canonical normalization" open question is resolved by this ADR.
 - Names are not validated for charset/length beyond non-empty; uniqueness is enforced by the startup scan, not
   at compile time (a compile-time cross-TU check is impossible without a registry).

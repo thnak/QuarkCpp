@@ -94,7 +94,8 @@ class GpuDecoder : public Actor<GpuDecoder,
         Placement<HashById,          // strategy (default)
                   Require<Gpu>,       // hard constraint
                   Prefer<SameZone>>>  // soft preference
-{ /* … */ };
+{
+    static constexpr std::string_view quark_type_name = "app.GpuDecoder"; /* … */ };
 ```
 
 ### Strategies
@@ -143,6 +144,7 @@ core invariants, so the relaxation is spelled out exactly.
 
 ```cpp
 class JsonValidator : public Actor<JsonValidator, Stateless<8>> {
+    static constexpr std::string_view quark_type_name = "app.JsonValidator";
     std::expected<Report, Error> handle(const Doc& d);   // no persistent state
 };
 ```

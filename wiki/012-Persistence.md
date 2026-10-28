@@ -13,11 +13,11 @@ seam.
 ```cpp
 class Account : public quark::Actor<Account,
                     Sequential,
-                    Persistent<Snapshot,  PersistMode::Sync>> {};
+                    Persistent<Snapshot,  PersistMode::Sync>> { static constexpr std::string_view quark_type_name = "app.Account"; };
 
 class Ledger  : public quark::Actor<Ledger,
                     Sequential,
-                    Persistent<EventSourced, PersistMode::Batched>> {};
+                    Persistent<EventSourced, PersistMode::Batched>> { static constexpr std::string_view quark_type_name = "app.Ledger"; };
 ```
 
 | Model | Stores | Recovery | Cost |
@@ -96,7 +96,7 @@ sequence number. Per-event appends need no quiescence; a consistent point-in-tim
 class Ledger : public quark::Actor<Ledger,
                    Sequential,
                    Persistent<EventSourced, PersistMode::Batched,
-                              /* Cadence = */ CompactEvery<30000>>> {};
+                              /* Cadence = */ CompactEvery<30000>>> { static constexpr std::string_view quark_type_name = "app.Ledger"; };
 ```
 
 `Cadence` is consulted **only** when `Model = EventSourced`; Snapshot-model and
