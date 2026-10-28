@@ -6,7 +6,7 @@ The runtime owns optimization; developers express only intent.
 [![CI](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux%20x86--64%20%7C%20arm64-lightgrey.svg)](CONVENTIONS.md#target--scope)
+[![Platform](https://img.shields.io/badge/platform-Linux%20x86--64%20%7C%20arm64%20%7C%20Windows-lightgrey.svg)](CONVENTIONS.md#target--scope)
 
 Quark gives you actors — units of state and sequential behavior addressed by id — with a
 zero-cost, header-first C++23 core ([`include/quark/`](include/quark)): a work-stealing
@@ -14,7 +14,7 @@ scheduler, hybrid sync/async handlers, point-to-point and streaming messaging, c
 distribution to 10³–10⁴ nodes, durable persistence, and failure supervision, all expressed
 through compile-time CRTP policies instead of runtime configuration.
 
-It's backed by a **211-test** correctness suite ([`tests/`](tests)) verified clean under
+It's backed by a **244-target CTest** correctness suite ([`tests/`](tests)) verified clean under
 ASan/UBSan/TSan, a benchmark harness ([`bench/`](bench)) that turns every hot-path performance
 claim into a pass/fail gate, and **22 runnable samples** ([`samples/`](samples)) from a single
 local actor to multi-node TCP clusters. Every subsystem is backed by a written design and, where
@@ -39,10 +39,14 @@ it's hot-path or safety-critical, by an executed proof — see
 
 Every subsystem — actors, scheduler, messaging, streaming, clustering, persistence,
 supervision, security — is **implemented and covered by the test suite**, and the whole engine
-is **verified clean under ASan, UBSan, and TSan** on every push. **Linux/x86-64 is the primary
+is **verified clean under ASan, UBSan, and TSan** on every push (on the Linux x86-64 and arm64 legs; Windows carries MSVC ASan only, informationally). **Linux/x86-64 is the primary
 supported and verified target today**; ARM64 already runs the full correctness matrix in CI on
-real hardware, and Windows/macOS are designed-for behind the existing Platform Abstraction Layer
-seam — extending support means filling in a PAL backend, not redesigning the engine.
+real hardware. **Windows/x86-64** has its own PAL backend and a CI correctness leg (MSVC Release
+blocks merges; MSVC ASan is informational; no TSan/UBSan equivalent exists there, and no perf gate).
+An opt-in IOCP reactor (`-DQUARK_WIN_IOCP=ON`, [ADR-059](decisions/ADR-059-windows-arm64-pal-and-iocp-reactor.md))
+is verified locally on Windows/x86-64, and Windows/ARM64 only cross-compiles so far; both of their CI legs
+are informational and have not run yet. macOS is designed-for behind the PAL seam — extending support means
+filling in a PAL backend, not redesigning the engine.
 
 For the candid version — the profile that is safe to run in production today, and every named gap
 that still blocks a platform-wide commitment — see [PRODUCTION-READINESS.md](PRODUCTION-READINESS.md).
@@ -154,7 +158,9 @@ that still blocks a platform-wide commitment — see [PRODUCTION-READINESS.md](P
 > count-based threshold was disqualified after being proven to reorder frames on recovery.
 > Relay-node discovery, health/failover, and trust boundary remain open (021).
 >
-> **Still Draft (2):** **019 (PAL)** and **023 (budgets)** are hardware-blocked — the PAL's
+> **Still Draft (3):** **019 (PAL)**, **023 (budgets)** and **028 (leases and leader election, simulation-first)**.
+> 028 is simulation-verified only ([ADR-058](decisions/ADR-058-lease-leader-election-fencing.md)), not yet exercised over a real transport/Store under faults.
+> 019 and 023 are hardware-blocked — the PAL's
 > whole point is the multi-OS/ARM64 backends, and 023's numbers are provisional pending a
 > Zen4/SPR reference re-baseline and the ARM64 ratio. *Accepted (x86-64)* means the design is
 > settled and backed on the current support target; ARM64 promotion of the mailbox's `seq_cst`
@@ -199,22 +205,25 @@ that still blocks a platform-wide commitment — see [PRODUCTION-READINESS.md](P
 
 ## Quick start
 
-Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 22.1**).
+Requires CMake ≥ 3.24 and a C++23 compiler (verified: **g++ 14.2**, **clang 22.1**, and MSVC on `windows-2022` in CI).
 
 ```bash
 # Build + run the full correctness gate (Release)
 cmake -S . -B build
-cmake --build build                          # default parallelism
+cmake --build build -j4                      # bounded; never -j$(nproc), see the note below
 ctest --test-dir build --output-on-failure   # run all tests
 
 # Sanitizers (the same suite, minus by-design exclusions)
-cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined"
-cmake -S . -B build-tsan -DQUARK_SANITIZE="thread"
+cmake -S . -B build-asan -DQUARK_SANITIZE="address;undefined" -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build-tsan -DQUARK_SANITIZE="thread" -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-tsan -j1                 # TSan compiles are memory-heavy: serial only
 
-# Benchmarks (default ON) and the runnable samples (default OFF)
+# Benchmarks (default ON): the 023 performance gate fails on a Hard-budget [MISS]
+cmake --build build --target bench-gate
+
+# Runnable samples (default OFF)
 cmake -S . -B build -DQUARK_BUILD_SAMPLES=ON
 ./build/samples/01_hello_counter    # prints OK / exit 0
-# (Removed duplicated obsolete sections)
 
 # Opt-in persistence backends (off by default; std-only core needs neither)
 cmake -S . -B build -DQUARK_WITH_SQLITE=ON -DQUARK_WITH_ROCKSDB=ON
@@ -355,7 +364,7 @@ into one number.
 | Every hot-path/safety claim backed by an executed proof (ADRs: real C++, ASan/UBSan/TSan, benchmarked) | A large existing ecosystem and production track record — mature, widely-deployed, battle-tested at scale |
 | Deterministic simulation testing (014) for fault injection without real time/threads | A mature reactive-streaming toolkit today — CAF ships a full Rx-style `caf::flow` (observables, `merge`/`zip_with`/`buffer`/`retry`/backpressure strategies); Quark's streaming (024) is a narrower, single-producer credit-ring (its outbound half, `ask_stream`, ADR-018, is **Accepted (x86-64)** as of 2026-08-04) |
 | A project still hardening its scheduler under oversubscription/contention — actively being investigated (ADR-038), not yet closed | A scheduler that already degrades gracefully past core count, today |
-| Linux/x86-64 and Linux/ARM64 both running the full correctness matrix on real hardware in CI (ARM64's weak-memory re-gate of the mailbox close-out still open; Windows/macOS designed-for behind the PAL, not yet shipped) | Broader OS/platform support that's already shipped and battle-tested |
+| Linux/x86-64 and Linux/ARM64 both running the full correctness matrix on real hardware in CI (ARM64's weak-memory re-gate of the mailbox close-out still open; Windows/x86-64 has a PAL backend and a merge-blocking MSVC Release leg; macOS designed-for behind the PAL) | Broader OS/platform support that's already shipped and battle-tested |
 
 If your workload is dominated by request/reply calls to individually-addressed actors and you can
 build on Linux/x86-64 today, Quark's numbers and its proof discipline are the more direct fit. If
@@ -370,13 +379,18 @@ include/quark/core/     header-first engine core (hot path lives in headers)
 include/quark/net/      default TCP transport + wire codec (010/019/021)
 include/quark/adapters/ opt-in persistence/reminder backends (SQLite, RocksDB)
 include/quark/detail/   internals (message pool, reply cell, hashing)
-pal/                    Platform Abstraction Layer — the single OS seam (019)
+pal/                    Platform Abstraction Layer — the single OS seam (019); linux_x86_64,
+                         windows_x86_64, windows_arm64 backends
 src/                    non-template translation units
-tests/                  211-test correctness gate (CTest)
+tests/                  244-test correctness gate (CTest)
 bench/                  benchmark harness — the 023 budget verdicts
 samples/                22 runnable programs over the public developer surface
 decisions/              ADRs — the design → red-team → prove → judge records
-NNN-*.md                the 27 RFC specification documents
+NNN-*.md                the 28 RFC specification documents
+ci/                     CI image, pinned toolchain versions (pins.env), SBOM/release scripts
+cmake/                  warning/sanitizer flags and build helpers
+web/, docs/             project site (Vite source in web/, built output in docs/ for GitHub Pages)
+wiki/                   per-spec wiki pages embedded by the site
 ```
 
 The core is **std-only C++23** and **header-first** — the hot path (mailbox, scheduler,
@@ -395,6 +409,13 @@ rationale behind an API or a guarantee:
 - **[VERIFICATION.md](VERIFICATION.md)** — correctness record (test counts, sanitizer deltas).
 - **[PERFORMANCE.md](PERFORMANCE.md)** — full benchmark report and reproduce steps.
 - **[OpenQuestions.md](OpenQuestions.md)** — remaining cross-cutting design questions.
+- **[PRODUCTION-READINESS.md](PRODUCTION-READINESS.md)** — what is safe to run today and every named gap.
+- **[SECURITY-FINDINGS.md](SECURITY-FINDINGS.md)** / **[SECURITY-TRACKING.md](SECURITY-TRACKING.md)** /
+  **[SUPPLY-CHAIN.md](SUPPLY-CHAIN.md)** / **[FUZZING.md](FUZZING.md)** — security review, tracking, SBOM/pins and fuzz harness.
+- **[MIXED-OS-AND-BULK-TRANSFER.md](MIXED-OS-AND-BULK-TRANSFER.md)** — mixed Linux/Windows clusters and bulk transfer findings.
+- **[TAIL-CONTENTION.md](TAIL-CONTENTION.md)** — scheduler/mailbox tail-latency contention notes.
+- **[PersistenceAdapters.md](PersistenceAdapters.md)** — `Store` backends (in-memory, file WAL, SQLite, RocksDB).
+- **[REVIEW-BACKLOG.md](REVIEW-BACKLOG.md)** / **[OPEN-ISSUES-PLAN.md](OPEN-ISSUES-PLAN.md)** — review backlog and open-issue plan.
 
 A few decisions are locked project-wide: **C++23** (no RTTI/reflection on the hot path), a
 **hybrid handler model** (sync by default, opt-in `quark::task<>` coroutines for async I/O),
@@ -405,7 +426,7 @@ today**, Windows/x86-64 with its own PAL backend, and macOS designed-for but not
 There is no .NET / managed-runtime vocabulary anywhere in the design — see the glossary below.
 
 <details>
-<summary><strong>Reading order — the 27 RFC specification documents</strong></summary>
+<summary><strong>Reading order — the 28 RFC specification documents</strong></summary>
 
 | # | Document | Covers | Maturity |
 |---|---|---|---|
@@ -493,10 +514,14 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-041](decisions/ADR-041-mailbox-mpsc-hot-path-r11-judgment.md) | Mailbox MPSC hot path (round 11) | Winner **unchanged** (11th round, incumbent's 11th survival). SegRing-LCRQ (purpose-built to fix three prior challengers' defects) disqualified — a *third*, previously-unseen UAF window surfaced during Prove on already-once-revised reclamation code, plus a livelock as submitted. ReversingTreiber/BR (7th defeat of this lineage) conceded fatal pre-Prove: 100% reversed dispatch order, p999 breaches the 50µs ceiling. Incumbent 11/12 proven CORRECT (1 INCONCLUSIVE — host-conditional latency reporting, not a falsified number). |
 | [ADR-042](decisions/ADR-042-ipv6-endpoint-locator-widening.md) | IPv6 support — PAL network seam + cluster `Endpoint` locator widening (010/019) | **Tagged-Union `IpAddr`** — `pal::IpAddr{family; 16-byte array}` becomes `Endpoint::addr`'s type directly (`Endpoint` grows 24B→32B); a converting `IpAddr(uint64_t)` ctor reproduces legacy IPv4 decoding exactly, so every existing call site recompiles with zero source edits; both PAL backends gain a family-branching `to_sockaddr()` codec; `dual_stack` opt-in (default off). 8/8 proven CORRECT, mailbox/dispatch hot path unaffected within noise. A competing always-128-bit/dual-stack-by-default design is **disqualified** — it silently breaks pure-IPv4 deployments on any host with IPv6 restricted at the kernel level. Residual: no `scope_id` yet; SWIM/gossip wire format not yet v6-extended. |
 | [ADR-044](decisions/ADR-044-principal-propagation-envelope-pool.md) | Principal propagation into handler `MessageContext` (020) | **Flag-Gated Envelope Pool** — wire-arrived, non-anonymous `Principal` routes through a second, wire-scale `EnvelopePool` (reusing ADR-037's Cell-first-member/fixed-offset idiom), gated by one previously-unused bit in the existing `gen_state` flags subfield; `Descriptor` itself stays untouched at its real, ten-times-proven 56-byte layout. Wired at all four real dispatch sites (plain/governed Sequential drain, Reentrant admit, 007 supervised-restart redelivery). A retrofit of ADR-007's `ctx_`-pointer-into-payload-arena mechanism is disqualified — its own control proved a same-node local forward silently drops the propagated principal. |
+| [ADR-045](decisions/ADR-045-swim-capability-gossip-piggyback.md) | SWIM disseminates `NodeCapabilities` (021/025) | **Accepted** — bounded piggyback on the existing gossip digest feeds a real, network-backed `CapabilityView`. |
+| [ADR-046](decisions/ADR-046-cross-node-mailbox-backpressure-signalling.md) | Cross-node mailbox backpressure signalling (010) | **Accepted (with residual risks)** — remote full/near-full mailbox signals the sender so it can stall or shed locally. |
+| [ADR-047](decisions/ADR-047-task-t-nested-value-returning-coroutine.md) | `task<T>`, value-returning nested coroutine (015) | **Accepted** — awaitable inner coroutine for non-void `T`. |
 | [ADR-048](decisions/ADR-048-relay-transport-fallback-policy.md) | RelayTransport: direct-vs-relay endpoint fallback threshold policy (010) | **`DirectThenRelay<TimeoutMs>`** — a wall-clock give-up threshold (one-shot `io_.post_after` timer armed at first `Connecting`) that redirects a peer's dial target from its own `Endpoint` to a designated relay node's, entirely within `TcpTransport` (no new `Transport` subclass; relay-side forwarding is a thin `on_receive()` hook, decorator-shaped like `SecureTransport`). 7/7 claims proven CORRECT, incl. two real integration bugs found and fixed against the actual source (`do_reconnect()` not wired to the relay resolver; a silent Linux/epoll `EEXIST` on fd cutover). A competing count-based threshold (`DirectThenRelay<MaxAttempts>`) is **disqualified** — proven to reorder 50–57% of in-flight frames on relay→direct recovery. A templated hybrid alternative also fully proved but lost on footprint (requires `TcpTransport<FallbackPolicy>` plus 4 call-site migrations). |
+| [ADR-049](decisions/ADR-049-swim-partition-heal-rejoin-async-relay.md) | SWIM partition-heal rejoin + async indirect-ping relay (021) | **Accepted and merged** (2026-10-22) — fixes the partition-heal collapse and the blocking relay. |
 | [ADR-050](decisions/ADR-050-message-type-key-salt-and-passivation-flush.md) | Message type-key salt; passivation-flush policy (008/016, #18/#24) | `quark_type_salt` folded into the fingerprint; internal durable records salted; compile-time distinct-key check per Protocol. Passivation flush failure stays count-and-retire. |
 | [ADR-051](decisions/ADR-051-at-least-once-retry-ack-delivered-marker.md) | AtLeastOnce retry+ack seam, outbox delivered marker, bounded dedup maps (017, #19) | Go-back-N `ReliableSender/Receiver`, durable `DeliveredRecord`. Engine wiring of `Delivery<AtLeastOnce>` not done. |
-| [ADR-052](decisions/ADR-052-lazy-reclaim-and-compact-every-n-events.md) | `CompactEveryNEvents<N>` + opt-in lazy-activation reclaim (012/028, #24) | Count-based compaction via `CompactableStore::truncate_log`; two-grace-period reclaim of idle lazy activations (off by default, not TSan-verified). |
+| [ADR-052](decisions/ADR-052-lazy-reclaim-and-compact-every-n-events.md) | `CompactEveryNEvents<N>` + opt-in lazy-activation reclaim (012, ADR-028, #24) | Count-based compaction via `CompactableStore::truncate_log`; two-grace-period reclaim of idle lazy activations (off by default, not TSan-verified). |
 | [ADR-053](decisions/ADR-053-membership-events-and-wire-version-window.md) | Membership events + health; N/N-1 wire-version window (010/021, #20/#21) | Joined/Suspect/Recovered/Dead/Left/VersionRefused events; accept ±1 version, distinct refusal reasons. |
 | [ADR-054](decisions/ADR-054-per-actor-type-busy-time-and-bytes.md) | Per-actor-type busy time and bytes (009, #25) | Per-shard flat cells, one clock pair per quantum; overhead ~1–3% median (<2% goal not demonstrated); `QUARK_NO_TYPE_ACCOUNTING` opt-out. |
 | [ADR-055](decisions/ADR-055-backup-restore-fencing-epoch.md) | `BackupableStore` snapshot/restore with fencing epoch (012, #23) | Consistent-cut image; restore floors every actor's token above the image; InMemory/FileStore only. |
@@ -509,6 +534,8 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-062](decisions/ADR-062-required-actor-type-name.md) | Required explicit actor `quark_type_name` — one cross-platform identity mechanism (008) | Compile error without it; key = name + Described fingerprints; no compiler spelling in any actor key. Durable break. |
 | [ADR-063](decisions/ADR-063-auto-send-pool-partitions.md) | Send-pool partitions default to AUTO (003, #4) | `pool_partitions = 0` resolves to a power of two <= 16 from hw threads, >= 1024 cells each; p99 `tell` 25-57 us -> ~5 us at 8-16 producers, mean 1.0-3.4x. |
 | [ADR-064](decisions/ADR-064-hot-path-division-and-resolve-flat-map.md) | Counter-guided hot-path wins (003/006, #4) | `MessagePool` partition by mask (no `div` per acquire) + flat open-addressing `by_id_`; 1P->1C 4.9 -> 6.3 M msg/s; five other candidates measured and rejected. |
+| [ADR-065](decisions/ADR-065-pool-per-pool-lanes-and-sibling-borrow.md) | `MessagePool` per-pool lanes + sibling-borrow before heap growth (003, #30/#31) | **Accepted** (2026-10-28) — no lane collisions across pools; growth no longer serialises producers behind malloc. |
+| [ADR-066](decisions/ADR-066-dekker-rendezvous-as-seq-cst-operations.md) | Dekker rendezvous as `seq_cst` operations, not standalone fences (001/002/003/015/024) | Every StoreLoad pair is now a `seq_cst` store/RMW + `seq_cst` load: TSan-modelled (GCC `-Wtsan` gone), `dmb ish` removed on AArch64, x86 one locked op for one; litmus 0/50M, relaxed control fires; benches flat. |
 
 </details>
 
@@ -534,7 +561,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 ## Dependency posture
 
 The engine **core is std-only** (C++23), with all OS-specific facilities behind a thin
-**Platform Abstraction Layer** (Linux/Windows/macOS backends — sockets + event loop, durable
+**Platform Abstraction Layer** (Linux and Windows backends; macOS designed-for — sockets + event loop, durable
 file flush, thread affinity/NUMA). Every subsystem that would otherwise pull a heavy dependency
 is expressed as a **seam** with a self-contained default, and heavier backends are optional
 adapters that are never linked into a minimal build:
@@ -556,13 +583,14 @@ Remaining cross-cutting design questions are tracked in [OpenQuestions.md](OpenQ
 
 ## Contributing
 
-Every change must follow the RFC specs (`001`–`027`) and the proven decisions
+Every change must follow the RFC specs (`001`–`028`) and the proven decisions
 (`decisions/ADR-*`) — when code and a spec disagree, the spec wins; if the spec is genuinely
 wrong, fix the spec first (RFC-style, backed by an ADR), then the code. Read
 **[CONVENTIONS.md](CONVENTIONS.md)** before opening a PR — it covers target/scope, language and
 dependency rules, and the hot-path rules that are tested, not trusted. CI (`.github/workflows/ci.yml`)
 runs the full correctness matrix (gcc/clang Release, ASan+UBSan, TSan) on both x86-64 and arm64
-— arm64 blocks merges on the same failures x86-64 does — and the 023 performance gate on every
+— arm64 blocks merges on the same failures x86-64 does — plus a Windows/MSVC leg (Release blocks,
+ASan is informational; the mixed-OS conformance leg also blocks, the IOCP and Windows/ARM64 legs are informational and unrun), and the 023 performance gate on every
 push and pull request (the arm64 perf gate is informational-only, `continue-on-error`, pending a
 real ARM64 reference re-baseline).
 
