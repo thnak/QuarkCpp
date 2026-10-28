@@ -106,6 +106,18 @@ inline thread_local void (*t_after_token_lock_hook)() = nullptr;
     return t_pool_lane_id;
 }
 
+// #31: each pool hands out its OWN dense lane numbers (0,1,2,... in first-touch order), so P threads
+// that touch a pool of N >= P partitions land on P DISTINCT partitions instead of colliding by luck
+// of the process-wide counter (shared with worker threads and every other pool). A pool's serial is
+// never reused, so a stale thread-local entry can never be mistaken for a later pool at the same
+// address. Direct-mapped, 8 entries: a hit is one compare; a miss is one relaxed fetch_add (cold).
+inline std::atomic<std::uint64_t> g_next_pool_serial{1};
+struct PoolLaneSlot {
+    std::uint64_t serial = 0;
+    std::uint32_t lane = 0;
+};
+inline thread_local PoolLaneSlot t_pool_lane_slots[8];
+
 class MessagePool {
 public:
     // Inline payload capacity per cell. Sized for the local send path (small messages + an ask
@@ -123,6 +135,7 @@ public:
     // producer-side contention across independent partitions (see the file banner).
     explicit MessagePool(std::size_t capacity, std::size_t num_partitions = 1)
         : num_partitions_(num_partitions == 0 ? 1 : num_partitions),
+          serial_(g_next_pool_serial.fetch_add(1, std::memory_order_relaxed)),
           partitions_(num_partitions_) {
         // Perf (ADR-064): a power-of-two count selects the partition with a mask. `lane % N` compiled to a
         // 64-bit `div` (~40 cycles on Broadwell) on EVERY acquire, even for N == 1.
@@ -141,9 +154,10 @@ public:
     // partition's mutex-guarded free list only when the magazine is empty (ADR-037). Grows cold if
     // the partition is genuinely exhausted (pre-size to avoid it) — same cold-miss contract as before.
     [[nodiscard]] Slot acquire(void (*destroy)(void*) noexcept) noexcept {
-        Partition& p = *partitions_[partition_index(pool_lane_id())];
+        const std::size_t pi = my_partition();
+        Partition& p = *partitions_[pi];
         LocalCache& lc = local_cache_for(p);
-        if (lc.count == 0) refill(lc, p);
+        if (lc.count == 0) refill(lc, p, pi);
         Descriptor* d = lc.cells[--lc.count];
         Cell* c = cell_of(d);
         c->destroy = destroy;
@@ -165,6 +179,18 @@ public:
         LocalCache& lc = local_cache_for(*p);
         if (lc.count == LocalCache::kCap) flush_partial(lc);
         lc.cells[lc.count++] = d;
+    }
+
+    // Cold, for tests/benches: the partition the CALLING thread acquires from, and the number of cells
+    // this pool has ever heap-allocated (sums every partition under its lock).
+    [[nodiscard]] std::size_t current_thread_partition() const noexcept { return my_partition(); }
+    [[nodiscard]] std::size_t total_cells() const {
+        std::size_t n = 0;
+        for (auto& p : partitions_) {
+            std::lock_guard<std::mutex> g(p->mu);
+            n += p->cells.size();
+        }
+        return n;
     }
 
     static void reclaim_thunk(Descriptor* d, void* self) noexcept {
@@ -230,6 +256,9 @@ private:
         static constexpr std::uint32_t kCap = 64;
         static constexpr std::uint32_t kRefillBatch = 32;
         static constexpr std::uint32_t kReturnBatch = 32;
+        // Cold heap growth per refill. 1 (== the old grow_one) measured best: larger batches (4/8/32) move the
+        // allocation cost into every acquire's p50 for no throughput gain (Linux, undersized pool sweep).
+        static constexpr std::uint32_t kGrowBatch = 1;
         Descriptor* cells[kCap];
     };
 
@@ -296,19 +325,50 @@ private:
         return lc;
     }
 
-    void refill(LocalCache& lc, Partition& p) {
-        std::lock_guard<std::mutex> g(p.mu);
+    // Move up to kRefillBatch free cells of `q` into the magazine. Caller holds q.mu.
+    static std::uint32_t take_locked(LocalCache& lc, Partition& q) noexcept {
         std::uint32_t n = 0;
-        while (n < LocalCache::kRefillBatch) {
-            if (p.free_head == nullptr) {
-                if (n > 0) break;
-                grow_one(p);
-            }
-            Descriptor* d = p.free_head;
-            p.free_head = d->link.next.load(std::memory_order_relaxed);
+        while (n < LocalCache::kRefillBatch && q.free_head != nullptr) {
+            Descriptor* d = q.free_head;
+            q.free_head = d->link.next.load(std::memory_order_relaxed);
             lc.cells[n++] = d;
         }
-        lc.count = n;
+        return n;
+    }
+
+    // #30: (1) own partition; (2) steal a batch from a sibling with try_lock (never blocks on, and never
+    // holds two partition locks); (3) only if the whole pool is out of cells, heap-grow a batch OUTSIDE
+    // every lock and register it under the own partition's lock. A stolen/grown cell keeps its `home`,
+    // so reclaim() still returns it to the partition that owns its storage.
+    void refill(LocalCache& lc, Partition& p, std::size_t pi) {
+        {
+            std::lock_guard<std::mutex> g(p.mu);
+            if (const std::uint32_t n = take_locked(lc, p)) {
+                lc.count = n;
+                return;
+            }
+        }
+        for (std::size_t k = 1; k < num_partitions_; ++k) {
+            Partition& q = *partitions_[(pi + k) % num_partitions_];
+            std::unique_lock<std::mutex> g(q.mu, std::try_to_lock);
+            if (!g.owns_lock()) continue;
+            if (const std::uint32_t n = take_locked(lc, q)) {
+                lc.count = n;
+                return;
+            }
+        }
+        std::vector<std::unique_ptr<Cell>> fresh;
+        fresh.reserve(LocalCache::kGrowBatch);
+        for (std::uint32_t i = 0; i < LocalCache::kGrowBatch; ++i) {
+            auto c = std::make_unique<Cell>();
+            c->destroy = nullptr;
+            c->home = &p;
+            lc.cells[i] = &c->desc;
+            fresh.push_back(std::move(c));
+        }
+        std::lock_guard<std::mutex> g(p.mu);
+        for (auto& c : fresh) p.cells.push_back(std::move(c));
+        lc.count = LocalCache::kGrowBatch;
     }
 
     static void flush_partial(LocalCache& lc) {
@@ -325,7 +385,18 @@ private:
         return lane_mask_ != kNoMask ? (lane & lane_mask_) : (lane % num_partitions_);
     }
 
+    [[nodiscard]] std::size_t my_partition() const noexcept {
+        PoolLaneSlot& sl = t_pool_lane_slots[serial_ & 7];
+        if (sl.serial != serial_) {
+            sl.serial = serial_;
+            sl.lane = next_lane_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return partition_index(sl.lane);
+    }
+
     std::size_t num_partitions_;
+    std::uint64_t serial_;
+    mutable std::atomic<std::uint32_t> next_lane_{0};
     std::uint32_t lane_mask_ = kNoMask;
     std::vector<std::shared_ptr<Partition>> partitions_;
 };
