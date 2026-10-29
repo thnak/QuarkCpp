@@ -85,8 +85,9 @@ parser refuses a client certificate rather than reading it as a member). The rol
 prefix, consumes both numeric fields exactly, and refuses a Subject with more than one CN — so
 client and member ids are disjoint by construction and a client can never hold a member's id.
 A client is authenticated exactly like a member but is **never** a member: its Control frames
-never reach SWIM, it is never a relay origin or destination, it never enters an admission
-allowlist, and it never appears in a membership view, gossip, or placement. Because the role is
+never reach SWIM, it never appears in a membership view, gossip, or placement, and the
+member-only relay admission (`NodeAuthority`) refuses it; relaying a device to its home node is
+an explicit per-pair opt-in through the relay predicate. Because the role is
 readable from the id before any handshake, a client is always the TLS client and a member never
 initiates a handshake or renegotiation toward a client (member↔member keeps NodeId ordering). A
 revoked client session is actively closed on the sweep tick. Startup is refused if a node's own

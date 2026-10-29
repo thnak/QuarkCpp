@@ -186,10 +186,13 @@ public:
     // Admission by cluster trust anchor: relay only when BOTH the origin and the destination are
     // admitted by `authority` (the same NodeAuthority SecureTransport/021 admission consults — an
     // AllowlistNodeAuthority populated from membership, or a CA-backed one). `authority` must outlive
-    // this transport; its answers must be safe to read from the I/O thread.
+    // this transport; its answers must be safe to read from the I/O thread. ADR-067 D3: this member-only
+    // form never relays for a CLIENT id on either end; relaying a device to its home node is an explicit
+    // per-pair decision made through the predicate overload above (which sees the client bit).
     void set_relay_forwarding(const NodeAuthority& authority) {
         set_relay_forwarding([&authority](NodeId origin, NodeId dest) {
-            return authority.admitted(origin) && authority.admitted(dest);
+            return !is_client_node(origin) && !is_client_node(dest) && authority.admitted(origin) &&
+                   authority.admitted(dest);
         });
     }
 

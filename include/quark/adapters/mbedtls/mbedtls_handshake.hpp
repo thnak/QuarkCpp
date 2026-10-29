@@ -281,12 +281,6 @@ private:
             failure_ = "peer certificate CN does not encode a valid quark identity";
             return false;
         }
-        // ADR-067 D3: client identities parse, but their enforcement (no SWIM, no relay, active close on
-        // revocation) has not landed yet — refuse them until it does, so no client session can exist early.
-        if (is_client_node(claimed_node)) {
-            failure_ = "client-role identity not admitted yet (ADR-067 D3 enforcement pending)";
-            return false;
-        }
         if (!(claimed_node == expected_peer_) || !(claimed_cluster == cluster_id_)) {
             failure_ = "peer certificate identity mismatch (NodeId/ClusterId)";
             return false;

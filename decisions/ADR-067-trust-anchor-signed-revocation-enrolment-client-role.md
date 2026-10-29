@@ -107,13 +107,28 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
   * *Handshake role:* `local_is_client(self, peer)` = `peer` is a client → we are TLS **server**; `self`
     is a client → we are TLS **client**; both members → `self < peer` (unchanged). Renegotiation follows
     the same rule, so a member never starts a handshake or renegotiation toward a client; it only answers.
-  * *Relay:* node-side forwarding refuses any frame whose origin or destination id has the client bit.
-  * *Admission:* `NodeAuthority`/allowlists see the bit; a client id never enters the member allowlist.
+  * *Relay:* the member-only form `set_relay_forwarding(const NodeAuthority&)` refuses any frame whose
+    origin or destination id has the client bit, whatever the authority answers. #37 requires a device
+    behind NAT to reach its home node through a relay, so that is an **explicit per-pair opt-in**
+    through the predicate form `set_relay_forwarding(fn(origin, dest))`, which sees the bit (e.g. admit
+    exactly `(client, its home)`). Frames stay sealed end to end; the relay holds no session.
+  * *Placement:* `admitted_nodes`/`place_admitted` never return a client id, whatever the authority
+    answers (defence in depth behind SWIM).
 * **Enforcement:** a client session's Control frames never reach SWIM (dropped and counted, never
   decoded); a client never enters any membership view, gossip, or `placement_view()`. Data frames and the
   existing `set_principal_policy` binding are unchanged.
-* **Revocation close:** a revoked client session is **actively closed** on the sweep tick (no SWIM to fall
-  through). The 020 invariant "close within one sweep tick" now holds for both roles.
+* **Revocation close:** a revoked client session is **erased and its connection actively closed** on the
+  sweep tick (no SWIM to fall through); a relayed client, which has no direct socket, is left holding
+  nothing. A client whose *initial* handshake fails (e.g. a revoked certificate on reconnect) is also
+  disconnected rather than left retrying on an open socket. The 020 invariant "close within one sweep
+  tick" now holds for both roles.
+* **Role rule, all pairs:** member↔client — the client dials and is the TLS client; same-role pairs —
+  the lower id. Both ends always compute complementary answers (two clients included).
+* **Operational notes:** (1) handshake admission (`set_handshake_admission*`) is consulted for clients
+  too — an admission allowlist derived from membership refuses every client, so admit clients by the
+  id bit (or a client roster) there; (2) a member replies to a *relayed* client only if it routes that
+  client via the relay too (`set_relay_via(client, {relay})`); (3) a client never runs
+  `SwimMembership` — it is the member side that keeps it out.
 * **Cost:** client NodeIds live in the upper half of the 64-bit space; the application allocator must set
   the bit (Quark refuses an `IssueRequest` result that does not match the ticket's role).
 
@@ -152,8 +167,9 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
 
 * **C1** A member that is not the anchor cannot cause a third party to be revoked.
 * **C2** A revocation signature can never be accepted as a certificate signature or vice versa.
-* **C3** A client certificate never yields a SWIM member, gossip entry, relay hop, placement target, or a
-  session under a member's NodeId — including on an un-upgraded node and via a forged Control frame.
+* **C3** A client certificate never yields a SWIM member, gossip entry, placement target, a session under
+  a member's NodeId, or a relay hop the application did not explicitly opt that pair into — including on
+  an un-upgraded node and via a forged Control frame.
 * **C4** A ticket authorises at most one certificate, of exactly its role and cluster, even under
   concurrent presentation, a wrong-HMAC attacker, and custodian failure; only the real anchor can redeem it.
 * **C5** No CA private-key material is reachable from Quark code in any accepted configuration.

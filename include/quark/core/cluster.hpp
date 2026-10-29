@@ -126,15 +126,19 @@ private:
 // this is the whole rule (real socket teardown is 019, there is no socket here to race).
 // ============================================================================================
 
-// The NodeId whose *initiated* connection survives between `a` and `b` (the lower id).
-[[nodiscard]] constexpr NodeId dial_winner(NodeId a, NodeId b) noexcept {
-    return a.value <= b.value ? a : b;
+// From `self`'s vantage: keep the connection I initiated to `peer` (true) or keep the one the peer
+// initiated to me (false)? Between a member and a CLIENT (ADR-067 D3) the client's dial survives — a
+// member never dials a client. Between two peers of the same role: true iff I am the lower id. Both
+// ends compute complementary answers in every case. `self != peer` by construction (no self-dial).
+[[nodiscard]] constexpr bool keep_local_dial(NodeId self, NodeId peer) noexcept {
+    if (is_client_node(self) != is_client_node(peer)) return is_client_node(self);
+    return self.value < peer.value;
 }
 
-// From `self`'s vantage: keep the connection I initiated to `peer` (true) or keep the one the peer
-// initiated to me (false)? True iff I am the lower id. `self != peer` by construction (no self-dial).
-[[nodiscard]] constexpr bool keep_local_dial(NodeId self, NodeId peer) noexcept {
-    return self.value < peer.value;
+// The NodeId whose *initiated* connection survives between `a` and `b` (same rule as keep_local_dial).
+[[nodiscard]] constexpr NodeId dial_winner(NodeId a, NodeId b) noexcept {
+    if (a == b) return a;
+    return keep_local_dial(a, b) ? a : b;
 }
 
 // ============================================================================================
@@ -676,6 +680,7 @@ public:
     // works (ADR-048). -----------------------------------------------------------------------------
     [[nodiscard]] bool admit(NodeId joiner, ClusterId presented) {
         if (presented != cfg_.cluster_id) return false;  // §1 reject: wrong cluster
+        if (is_client_node(joiner)) return false;         // ADR-067 D3: a client is never a member
         std::uint64_t inc = 0;
         if (auto it = members_.find(joiner.value); it != members_.end() && is_tomb(it->second.status))
             inc = it->second.incarnation + 1;
@@ -799,6 +804,10 @@ public:
     [[nodiscard]] bool is_known(NodeId n) const { return members_.contains(n.value); }
     [[nodiscard]] std::uint64_t control_sheds() const noexcept {
         return control_sheds_.load(std::memory_order_relaxed);
+    }
+    // ADR-067 D3: Control frames from a CLIENT identity, dropped undecoded (a client is never a member).
+    [[nodiscard]] std::uint64_t client_control_drops() const noexcept {
+        return client_control_drops_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -987,6 +996,10 @@ private:
         if (f.to != self_) return;  // a transport may hand us frames addressed elsewhere; never act on them
         if (f.kind != FrameKind::Control) {
             if (data_sink_) data_sink_(std::move(f));  // 010 data plane, untouched
+            return;
+        }
+        if (is_client_node(f.from)) {  // ADR-067 D3: a client never speaks SWIM; never decode its control
+            client_control_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (!online_) return;  // crashed node ignores control (stops acking)
@@ -1364,6 +1377,9 @@ private:
     //   * a Left is authoritative and is never refuted by its own node.
     void apply_update(NodeId node, std::uint64_t inc, MemberStatus st, Src src, std::int64_t now) {
         if (static_cast<std::uint8_t>(st) > static_cast<std::uint8_t>(MemberStatus::Left)) return;  // wire range
+        // ADR-067 D3: the single membership choke point refuses CLIENT ids however they are named
+        // (Join, gossip update, join snapshot, PingReq subject) — a client never becomes a member.
+        if (is_client_node(node)) return;
         if (node == self_) {
             if (self_left_ || st == MemberStatus::Left) return;  // a departure is never refuted
             if (st != MemberStatus::Alive && inc >= self_incarnation_) {
@@ -1789,6 +1805,7 @@ private:
     std::shared_ptr<const std::vector<NodeId>> verified_snapshot_;
     std::array<ControlBudget, 256> control_budgets_{};
     std::atomic<std::uint64_t> control_sheds_{0};
+    std::atomic<std::uint64_t> client_control_drops_{0};
     std::atomic<std::uint64_t> gossip_rejected_{0};
     std::uint64_t epoch_ = 0;
 };

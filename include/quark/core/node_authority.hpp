@@ -66,12 +66,13 @@ private:
 
 // Filter `view`'s live nodes to the ADMITTED subset (020 §1). Off the hot path — placement reads the
 // already-published view. The result preserves the view's ascending-NodeId order so HRW iteration and
-// any downstream `contains` stay stable.
+// any downstream `contains` stay stable. ADR-067 D3: a CLIENT id is never eligible, whatever the
+// authority answers (defence in depth — SWIM already keeps clients out of every view).
 inline void admitted_nodes(const MembershipView& view, const NodeAuthority& authority,
                            std::vector<NodeId>& out) {
     out.clear();
     for (NodeId n : view.nodes())
-        if (authority.admitted(n)) out.push_back(n);
+        if (!is_client_node(n) && authority.admitted(n)) out.push_back(n);
 }
 
 // Admission-gated placement (020 §1). Runs the HRW argmax over ONLY the admitted nodes, so an

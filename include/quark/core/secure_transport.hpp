@@ -196,9 +196,11 @@ public:
     // force-close the underlying TCP socket (S5 is satisfied because the session's own send()/deliver()
     // now drop unconditionally) — the peer's own SWIM keepalive traffic rides this same session, so it
     // silently stops passing keepalives and falls through SWIM's existing suspicion→dead→close cycle.
+    // A CLIENT peer (ADR-067 D3) has no SWIM cycle, so its connection is closed here via reset_hook_.
     void sweep_revocations(std::shared_ptr<const std::unordered_set<Fingerprint>> revoked) {
         revoked_snapshot_.store(revoked);
         if (!revoked || revoked->empty()) return;
+        std::vector<std::shared_ptr<PeerSession>> revoked_clients;
         // D1: inspect OUTSIDE map_mu_ — peer_fingerprint() takes a session-side lock.
         for (const auto& session : snapshot_sessions()) {
             if (session->revoked()) continue;
@@ -206,8 +208,24 @@ public:
                 session->revoke();
                 revocations_enforced_.fetch_add(1, std::memory_order_relaxed);
                 if (metrics_) metrics_->security_revocations_enforced.inc();
+                if (is_client_node(session->peer())) revoked_clients.push_back(session);
             }
         }
+        if (revoked_clients.empty()) return;
+        // ADR-067 D3: a client runs no SWIM, so no suspicion cycle will ever retire its session or close
+        // its socket. Erase the session (only if it is still the one we revoked — a fresh handshake may
+        // have replaced it), so a relayed client holds nothing and a later handshake starts clean, then
+        // close the direct connection if there is one. A re-handshake with the revoked certificate is
+        // refused at handshake time (the snapshot above), and that failure closes the socket again.
+        {
+            std::unique_lock<std::shared_mutex> g(map_mu_);
+            for (const auto& session : revoked_clients) {
+                const auto it = sessions_.find(session->peer().value);
+                if (it != sessions_.end() && it->second == session) sessions_.erase(it);
+            }
+        }
+        if (reset_hook_)
+            for (const auto& session : revoked_clients) reset_hook_(session->peer());
     }
 
     // Seal the payload and forward. AAD = {from,to,target,msg_type,lane,seq} so a frame replayed to
@@ -444,8 +462,12 @@ private:
     // --- ADR-040 Phase 3: mTLS handshake driving. Glare-free role assignment mirrors cluster.hpp's
     // keep_local_dial rule (both ends independently compute the same predicate from NodeId ordering —
     // no wire negotiation needed); reimplemented locally so this transport-layer file does not take a
-    // dependency on the higher-level cluster/membership header. ------------------------------------
+    // dependency on the higher-level cluster/membership header. ADR-067 D3: between a member and a
+    // CLIENT the client is always the TLS client and the member never initiates (or renegotiates);
+    // between two peers of the same role the lower id initiates. The role is the id's client bit, so
+    // both ends still agree without negotiation. -----------------------------------------------------
     [[nodiscard]] static bool local_is_client(NodeId self, NodeId peer) noexcept {
+        if (is_client_node(self) != is_client_node(peer)) return is_client_node(self);
         return self.value < peer.value;
     }
 
@@ -601,6 +623,10 @@ private:
                 }
                 renegotiations_failed_.fetch_add(1, std::memory_order_relaxed);
                 if (reset_hook_) reset_hook_(peer);
+            } else if (is_client_node(peer) && reset_hook_) {
+                // ADR-067 D3: an INITIAL handshake from a client failed (e.g. its certificate is
+                // revoked). Close the connection instead of leaving a client socket open to retry.
+                reset_hook_(peer);
             }
             return;
         }

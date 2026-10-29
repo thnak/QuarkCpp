@@ -209,6 +209,7 @@ int main() {
     const GeneratedCert leaf_ca_flag = make_leaf(rng, ca, ca_key, cluster.value, 2, {}, 1);
     const GeneratedCert leaf_client =
         make_leaf(rng, ca, ca_key, cluster.value, 0, "CN=quark-client:" + cl + ":" + std::to_string(client_id.value));
+    const GeneratedCert leaf_client_member_id = make_leaf(rng, ca, ca_key, cluster.value, 0, "CN=quark-client:" + cl + ":2");
     mbedtls_pk_free(&ca_key);
 
     auto id1 = std::make_shared<const TlsIdentity>(TlsIdentity{leaf1.cert_der, leaf1.key_der, {}});
@@ -332,8 +333,28 @@ int main() {
     };
     refused_for(leaf_trailing, n2, "CN does not encode", "ADR-067: trailing bytes after the node id are refused");
     refused_for(leaf_ca_flag, n2, "mbedtls_ssl_handshake", "ADR-067: a leaf claiming CA:TRUE is refused");
-    refused_for(leaf_client, client_id, "client-role identity not admitted",
-                "ADR-067: a client identity is refused until D3 enforcement lands");
+    refused_for(leaf_client_member_id, n2, "CN does not encode",
+                "ADR-067: a client CN carrying a MEMBER id is refused (disjoint id spaces)");
+
+    // --- ADR-067 D3 positive: a client identity (TLS client, as SecureTransport's role rule makes it)
+    // handshakes with member n2, and n2 learns the client id — bit set — from the certificate. -------
+    {
+        auto blob = std::make_shared<const TlsIdentity>(TlsIdentity{leaf_client.cert_der, leaf_client.key_der, {}});
+        IdentityMaterial client_identity(blob);
+        MbedtlsHandshakeEngineFactory factory;
+        auto client =
+            factory.create(true, client_id, n2, cluster, client_identity.snapshot(0), trust_store.snapshot(0), nullptr);
+        auto server =
+            factory.create(false, n2, client_id, cluster, identity2.snapshot(0), trust_store.snapshot(0), nullptr);
+        const DriveResult r = drive(*client, *server);
+        check(r.client_step == HandshakeEngine::Step::Done && r.server_step == HandshakeEngine::Step::Done,
+              "ADR-067: client identity <-> member handshake completes", ok);
+        if (r.server_step == HandshakeEngine::Step::Done) {
+            const HandshakeEngine::Result sr = server->take_result();
+            check(sr.peer_node_id == client_id && is_client_node(sr.peer_node_id),
+                  "ADR-067: member learns the client id (client bit set) from the certificate", ok);
+        }
+    }
 
     // --- ADR-067: exactly one CN. mbedTLS's Subject writer keeps one value per OID, so a two-CN
     // certificate cannot be generated here; drive detail::parse_cn_identity over a hand-linked Subject
