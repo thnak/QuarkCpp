@@ -106,9 +106,10 @@ asynchronous `IssueFn` callback.
   crypto runs off the transport I/O thread. Inside server-authenticated TLS the joiner requires a
   **member**-role server certificate chaining to the pinned CA with exactly the join code's cluster
   id and anchor NodeId; only then does it send `ticket_id`, a CSR and
-  `HMAC-SHA256(ticket_secret, CSR)`. The secret never travels.
+  `HMAC-SHA256(ticket_secret, "QUARK-ENROL-v1\0" ‖ ticket_id ‖ cluster_id ‖ CSR)`. The secret never
+  travels.
 - Check order: ticket valid and under its attempt limit → constant-time HMAC → CSR
-  proof-of-possession → consume → `IssueFn`. A wrong HMAC counts an attempt but does not consume
+  proof-of-possession → consume → `IssueFn`. Every presentation counts an attempt (reserved before any crypto); a wrong HMAC does not consume
   the ticket.
 - The anchor **never honours a requested name**: the CSR contributes only its public key and
   proof-of-possession. The application assigns the NodeId (with the client bit set for a client

@@ -155,7 +155,9 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
   hello** (no NodeId). Inside **server-authenticated TLS** the joiner requires the server leaf to chain to
   the pinned CA **and** to be a **member**-role cert (`quark:` prefix) for exactly the join code's
   `cluster_id` and anchor NodeId — a client cert or any other member cannot impersonate the anchor. Only
-  then does it send `ticket_id`, a CSR, and `HMAC-SHA256(ticket_secret, CSR)`; the secret never travels.
+  then does it send `ticket_id`, a CSR, and
+  `HMAC-SHA256(ticket_secret, "QUARK-ENROL-v1\0" ‖ ticket_id ‖ cluster_id ‖ CSR)` (domain-separated and bound
+  to the ticket and cluster); the secret never travels.
   The anchor replies with the certificate chain or a refusal code.
 * **Isolation and bounds (C6):** the enrolment socket leaves the member pending-inbound pool at the enrol
   hello and counts against a **separate, small `max_concurrent_enrolments` cap** (and a per-IP cap); an
@@ -163,15 +165,21 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
   run **off the transport I/O thread** (a bounded cold-path worker), so a flood of unauthenticated
   ECDHE never stalls member traffic (020's crypto-isolation invariant).
 * **Check order (fixed):** ticket exists, unexpired, under its attempt limit → constant-time HMAC verify →
-  CSR proof-of-possession → **consume** (atomic, single use) → `IssueFn`. A wrong HMAC or bad CSR counts
-  an attempt but **does not consume** the ticket; a consumed ticket stays consumed even if the custodian
-  then fails.
+  CSR proof-of-possession → **consume** (atomic, single use) → `IssueFn`. Every presentation
+  reserves an attempt before any crypto (so concurrent guesses cannot overshoot the limit); a wrong HMAC or
+  bad CSR **does not consume** the ticket; a used ticket is refused before any crypto; an anchor at its
+  in-flight cap refuses before any crypto and refunds the attempt; a consumed ticket stays consumed even
+  if the custodian then fails, and can no longer be withdrawn (revoke the issued identity instead).
 * **The anchor never honours a requested name.** The CSR contributes only its public key and
-  proof-of-possession. The application assigns the NodeId (it owns the roster) through `IssueRequest`;
-  the role and cluster come from the ticket; Quark verifies the result (D1, D3).
+  proof-of-possession. The application assigns the NodeId (it owns the roster) and returns it with
+  the certificate (`Issued::node`); the custodian is never shown the CSR; the role and cluster come from
+  the ticket; Quark verifies the result (D1, D3).
 * **Tickets:** created by the application (`issue_ticket(role, ttl)`), held in memory on the anchor,
   short TTL, per-ticket attempt limit, per-IP rate limit. An anchor restart loses outstanding tickets —
   fail closed; the operator re-issues a join code. Durable tickets are a non-goal.
+* **Wire refusals are collapsed** (`wire_status`): unknown, used, exhausted and bad-MAC tickets share one
+  code, so a prober learns nothing about which ticket ids exist; rate-limit and capacity refusals say
+  'retry later'; issuance failures share another code. The detailed reason goes to the audit record.
 * **Audit:** every attempt, accepted or refused, emits an audit record (ticket id, source address,
   assigned NodeId if any, role, refusal reason).
 * Re-issue / rotation of an enrolled identity reuses ADR-040 rotation; enrolment only covers first issue.
@@ -245,7 +253,12 @@ binding. Found and folded in:
   1.4 KB) caps what a node attaches. Successive frames walk the held set round-robin, so every record is gossiped
   however large the set. A malformed section fails the frame, like any malformed field.
   The application still owns `prune_expired` scheduling and the rotation re-sign step.
-* **D4 enrolment — not started.**
+* **D4 enrolment — in progress.** D4a done: `enrollment.hpp` (`Enrollment` state machine, verify-only
+  `EnrolCrypto` seam, `format_quark_cn`) with `enrollment_test` (single use under races, attempt reservation,
+  MAC-before-CSR, role-bit and exact-certificate checks, rate/in-flight/timeout bounds, at-most-once
+  completion, exactly-once replies including on destruction, audit per attempt, collapsed wire codes).
+  Next: D4b mbedTLS `EnrolCrypto` + joiner-side CSR/MAC + the C5 startup
+  check; D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning).
 
 ## Not decided here
 

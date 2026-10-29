@@ -12,6 +12,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -84,6 +85,16 @@ namespace detail {
     cluster = ClusterId{cluster_val};
     node = NodeId{node_val};
     return true;
+}
+
+// The one canonical CN for (cluster, node): the role prefix follows the NodeId's client bit. The inverse
+// of parse_quark_cn — enrolment (ADR-067 D4) requires an issued certificate's CN to equal it byte for byte.
+[[nodiscard]] inline std::string format_quark_cn(ClusterId cluster, NodeId node) {
+    std::string cn(is_client_node(node) ? kClientCnPrefix : kMemberCnPrefix);
+    cn += std::to_string(cluster.value);
+    cn += ':';
+    cn += std::to_string(node.value);
+    return cn;
 }
 
 }  // namespace quark
