@@ -51,8 +51,11 @@ Found during design: `parse_cn_identity` (`mbedtls_handshake.hpp:99-116`) does n
 * **Custodian contract** (stated, not enforceable by Quark): the custodian signs *typed requests* — a
   revocation record or a TBSCertificate it builds/inspects itself — over **raw bytes**, never a
   caller-supplied digest. A custodian that signs arbitrary digests voids D2's domain separation.
-* **C5 made structural:** startup is refused if the node's own `IdentityMaterial` public key equals any
-  trusted-root public key (the "CA cert as node cert" shortcut would put the CA key in-process).
+* **C5 made structural:** a node refuses to run with CA key material: an own private key or certificate
+  key equal to any trusted-root public key (current or overlap-window previous; the "CA cert as node cert"
+  shortcut would put the CA key in-process), or a CA-capable own certificate (CA:TRUE, keyCertSign or
+  cRLSign: an issuing intermediate's key, one level down). Enforced in the handshake engine's setup for
+  every handshake, and as a startup check.
 
 ### D2 — Signed revocation record (Quark-defined, not CRL/OCSP)
 
@@ -235,8 +238,10 @@ binding. Found and folded in:
   survives) / requested name ignored; concurrent same-ticket presentation yields one issuance; joiner
   aborts against a client-role or wrong-id server cert before sending `ticket_id`; returned cert with
   CA:TRUE refused; enrol flood leaves member reconnects within bound; audit record per attempt.
-* `enrollment_no_key_test` — C5: links a stub `IssueFn`; asserts it is the only signing path; startup
-  refused when own identity key equals a root key.
+* C5 (realised in `mbedtls_enrollment_check`, since comparing keys needs the adapter): startup
+  (`validate_identity_not_root`) and the handshake engine refuse an identity whose private key or
+  certificate key equals a root key; Quark's only route to a certificate is the application's `IssueFn`
+  (the adapter has no certificate-writing code; the test's custodian holds the CA key).
 * All under Release + ASan/UBSan + TSan (enrolment worker and sweep run concurrently with the I/O thread).
 
 ## Implementation status
@@ -257,8 +262,19 @@ binding. Found and folded in:
   `EnrolCrypto` seam, `format_quark_cn`) with `enrollment_test` (single use under races, attempt reservation,
   MAC-before-CSR, role-bit and exact-certificate checks, rate/in-flight/timeout bounds, at-most-once
   completion, exactly-once replies including on destruction, audit per attempt, collapsed wire codes).
-  Next: D4b mbedTLS `EnrolCrypto` + joiner-side CSR/MAC + the C5 startup
-  check; D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning).
+  D4b done: `mbedtls_enrollment.hpp` — `MbedtlsEnrolCrypto` (constant-time HMAC-SHA256; CSR
+  proof-of-possession, which mbedTLS's parser does not check, verified over the CertificationRequestInfo,
+  P-256 and ecdsa-with-SHA256 only; the issued-certificate rules, with the leaf's validity judged on the
+  anchor's clock with a notBefore skew and the chain verified by signature only to the configured
+  TrustStore, overlap window included; it SHARES the TrustStore, since a late completion may outlive the
+  transport), the joiner's `generate_identity_key` / `make_enrol_csr` / `compute_enrol_mac`, and C5
+  enforced in `MbedtlsHandshakeEngine` setup for every handshake, with the same rule as
+  `validate_identity_not_root` for startup (`mbedtls_enrollment_check`: real PKI, custodian simulated in
+  the test from the SPKI alone, Enrollment end to end, concurrent use, each rule mutation-tested).
+  Because a Quark engine now refuses to present a CA:TRUE leaf, the peer-side refusal of one (the
+  handshake's verify callback) is kept for non-Quark peers but has no test that reaches it.
+  Next: D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning,
+  join-code encoding), which also calls `validate_identity_not_root` at transport start.
 
 ## Not decided here
 

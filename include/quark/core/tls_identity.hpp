@@ -33,7 +33,7 @@ using Fingerprint = std::array<std::byte, 32>;
 // of `cert_chain_der`'s leaf entry, precomputed at load.
 struct TlsIdentity {
     std::vector<std::byte> cert_chain_der;   // leaf cert (+ any intermediates), concatenated DER
-    std::vector<std::byte> private_key_der;  // PKCS8 DER
+    std::vector<std::byte> private_key_der;  // DER: PKCS#8, or SEC1 for EC (the mbedTLS adapter parses both)
     Fingerprint fingerprint{};
 };
 

@@ -96,22 +96,11 @@ private:
     return fp;
 }
 
-// The Subject must carry EXACTLY ONE commonName (ADR-067 D3), whose value follows the identity CN
-// grammar (`parse_quark_cn`, tls_identity.hpp). mbedtls_x509_name is a linked list of {oid, val} pairs
-// (asn1.h); every attribute is walked so a second CN is seen wherever it sits.
+// The Subject must carry EXACTLY ONE commonName (ADR-067 D3, detail::single_cn), whose value follows the
+// identity CN grammar (`parse_quark_cn`, tls_identity.hpp).
 [[nodiscard]] inline bool parse_cn_identity(const mbedtls_x509_crt& crt, NodeId& node, ClusterId& cluster) {
-    const std::size_t cn_oid_len = std::strlen(MBEDTLS_OID_AT_CN);
-    const mbedtls_x509_name* cn_attr = nullptr;
-    for (const mbedtls_x509_name* n = &crt.subject; n != nullptr; n = n->next) {
-        if (n->oid.p == nullptr || n->oid.len != cn_oid_len ||
-            std::memcmp(n->oid.p, MBEDTLS_OID_AT_CN, cn_oid_len) != 0)
-            continue;
-        if (cn_attr != nullptr) return false;  // a second CN: ambiguous identity
-        cn_attr = n;
-    }
-    if (cn_attr == nullptr) return false;
-    return parse_quark_cn(std::string_view(reinterpret_cast<const char*>(cn_attr->val.p), cn_attr->val.len),
-                          cluster, node);
+    std::string_view cn;
+    return single_cn(crt, cn) && parse_quark_cn(cn, cluster, node);
 }
 
 }  // namespace detail
@@ -216,6 +205,14 @@ private:
         }
         if (!any_root) {
             setup_failure_ = "no trust roots available (neither current nor previous)";
+            return false;
+        }
+        // ADR-067 C5: a node never runs with CA key material — neither a trusted root's key (the "CA cert as
+        // node cert" shortcut) nor an issuing CA's (a CA-capable own certificate). Refused here, for every
+        // handshake; validate_identity_not_root (mbedtls_enrollment.hpp) is the same rule at startup.
+        if (detail::key_is_a_root(own_key_, ca_chain_) || detail::key_is_a_root(own_cert_.pk, ca_chain_) ||
+            detail::ca_capable(own_cert_)) {
+            setup_failure_ = "own identity is CA key material (ADR-067 C5)";
             return false;
         }
 

@@ -368,7 +368,19 @@ int main() {
                          static_cast<int>(got.size()), got.data());
     };
     refused_for(leaf_trailing, n2, "CN does not encode", "ADR-067: trailing bytes after the node id are refused");
-    refused_for(leaf_ca_flag, n2, "mbedtls_ssl_handshake", "ADR-067: a leaf claiming CA:TRUE is refused");
+    // A CA:TRUE leaf no longer gets as far as the peer: its OWN engine refuses it at setup (ADR-067 C5, a
+    // CA-capable identity is CA key material). The client's verify_cb refusal of a CA:TRUE peer leaf stays,
+    // for a peer that does not run this check; a Quark engine cannot be made to present one.
+    {
+        auto blob = std::make_shared<const TlsIdentity>(TlsIdentity{leaf_ca_flag.cert_der, leaf_ca_flag.key_der, {}});
+        IdentityMaterial server_identity(blob);
+        MbedtlsHandshakeEngineFactory factory;
+        auto server = factory.create(false, n2, n1, cluster, server_identity.snapshot(0), trust_store.snapshot(0), nullptr);
+        std::vector<std::byte> out;
+        check(server->advance({}, out) == HandshakeEngine::Step::Failed &&
+                  server->failure_reason().find("C5") != std::string_view::npos,
+              "ADR-067: a node refuses to run with a leaf claiming CA:TRUE", ok);
+    }
     refused_for(leaf_client_member_id, n2, "CN does not encode",
                 "ADR-067: a client CN carrying a MEMBER id is refused (disjoint id spaces)");
 
