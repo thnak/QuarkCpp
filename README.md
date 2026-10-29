@@ -536,6 +536,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-064](decisions/ADR-064-hot-path-division-and-resolve-flat-map.md) | Counter-guided hot-path wins (003/006, #4) | `MessagePool` partition by mask (no `div` per acquire) + flat open-addressing `by_id_`; 1P->1C 4.9 -> 6.3 M msg/s; five other candidates measured and rejected. |
 | [ADR-065](decisions/ADR-065-pool-per-pool-lanes-and-sibling-borrow.md) | `MessagePool` per-pool lanes + sibling-borrow before heap growth (003, #30/#31) | **Accepted** (2026-10-28) — no lane collisions across pools; growth no longer serialises producers behind malloc. |
 | [ADR-066](decisions/ADR-066-dekker-rendezvous-as-seq-cst-operations.md) | Dekker rendezvous as `seq_cst` operations, not standalone fences (001/002/003/015/024) | Every StoreLoad pair is now a `seq_cst` store/RMW + `seq_cst` load: TSan-modelled (GCC `-Wtsan` gone), `dmb ish` removed on AArch64, x86 one locked op for one; litmus 0/50M, relaxed control fires; benches flat. |
+| [ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md) | Trust-anchor-signed revocation, ticketed enrolment, client identity role (020/021, #35/#36/#37) | **Proposed** (2026-10-29) — CA key never in Quark (verify-only seam; pre-signed revocation records; async `IssueFn`); `quark-client:` CN role + NodeId bit 63 (disjoint id spaces) kept out of SWIM/relay/placement; red-team round 1 (12 findings) folded in; tests outstanding. |
 
 </details>
 

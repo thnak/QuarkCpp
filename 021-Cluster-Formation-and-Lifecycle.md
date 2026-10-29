@@ -91,6 +91,36 @@ its shape is a provisioning choice behind 020's existing `NodeAuthority` seam �
   node's `NodeId` and the cluster id it claims — a mismatch on either is
   rejected before any session exists, not discovered after.
 
+### Enrolment — from a join code to a certificate ([ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed)
+
+With a cluster CA, a new node must obtain a certificate before it can AUTHENTICATE. Quark owns
+that step as a transport-agnostic `Enrollment` state machine on the **anchor** node; the CA
+private key stays in the application's sign-only custodian and is reached only through an
+asynchronous `IssueFn` callback.
+
+- **Join code** = anchor endpoint, anchor NodeId, SHA-256 of the CA root certificate,
+  `ticket_id`, `ticket_secret` (≥ 128 bits, CSPRNG). The CA hash is the joiner's trust bootstrap.
+- The joiner opens a fresh connection on the anchor's listener with an **enrol hello** (no
+  NodeId); that socket never enters the connection or session tables, counts against its own small
+  `max_concurrent_enrolments` cap, and is refused while no unexpired ticket exists. Enrolment
+  crypto runs off the transport I/O thread. Inside server-authenticated TLS the joiner requires a
+  **member**-role server certificate chaining to the pinned CA with exactly the join code's cluster
+  id and anchor NodeId; only then does it send `ticket_id`, a CSR and
+  `HMAC-SHA256(ticket_secret, "QUARK-ENROL-v1\0" ‖ ticket_id ‖ cluster_id ‖ CSR)`. The secret never
+  travels.
+- Check order: ticket valid and under its attempt limit → constant-time HMAC → CSR
+  proof-of-possession → consume → `IssueFn`. Every presentation counts an attempt (reserved before any crypto); a wrong HMAC does not consume
+  the ticket.
+- The anchor **never honours a requested name**: the CSR contributes only its public key and
+  proof-of-possession. The application assigns the NodeId (with the client bit set for a client
+  ticket, 020 §1); the ticket fixes the role and cluster. Quark verifies the returned certificate
+  before sending it: one CN equal to the expected identity, the CSR's public key, CA=false, no
+  certificate- or CRL-signing usage, bounded validity.
+- Tickets are created by the application, held in memory, short-lived and rate-limited. An anchor
+  restart loses them (fail closed). Every attempt is audited.
+- Clusters that share a CA must use distinct cluster ids (signed revocation records are scoped by
+  cluster id, 020).
+
 ### Cluster identity — preventing accidental merges
 
 Beyond *node* identity, the cluster carries a **cluster id** and a monotonic
@@ -239,6 +269,9 @@ A new node does not appear in placement the instant its process starts:
                                           snap)
 ```
 
+- A node without a certificate runs **ENROL** (§1, ADR-067, Proposed) before CONNECT. A
+  **client**-role identity (020 §1) stops at AUTHENTICATE: it never SYNCs, ANNOUNCEs or becomes a
+  MEMBER.
 - Placement (010) **recomputes only at ANNOUNCE**, once the node can actually host
   work — never against a half-connected node. HRW's determinism means every node
   reaches the same new mapping independently. At scale this recompute is the
@@ -464,6 +497,10 @@ the roll:
   indistinguishable from v1; from v2 on the gate is real. A change an N-1 node cannot parse must bump
   the version AND shrink the window via a new ADR. A refused peer behaves as partitioned (its gossip is
   never absorbed) — not an in-band negotiation.
+- **Revocation gossip across ADR-067 is not guaranteed mid-roll** (Proposed). Old nodes gossip bare
+  fingerprints, which upgraded nodes refuse; upgraded nodes gossip signed records, which old nodes
+  cannot use. Until the roll completes, operators revoke locally on every node; signed gossip is
+  relied on only once every node runs ADR-067.
 
 The stabilization window above also means the brief per-node absence during its
 restart does not thrash placement across the rest of the cluster.

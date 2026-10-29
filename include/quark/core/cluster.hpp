@@ -126,15 +126,19 @@ private:
 // this is the whole rule (real socket teardown is 019, there is no socket here to race).
 // ============================================================================================
 
-// The NodeId whose *initiated* connection survives between `a` and `b` (the lower id).
-[[nodiscard]] constexpr NodeId dial_winner(NodeId a, NodeId b) noexcept {
-    return a.value <= b.value ? a : b;
+// From `self`'s vantage: keep the connection I initiated to `peer` (true) or keep the one the peer
+// initiated to me (false)? Between a member and a CLIENT (ADR-067 D3) the client's dial survives — a
+// member never dials a client. Between two peers of the same role: true iff I am the lower id. Both
+// ends compute complementary answers in every case. `self != peer` by construction (no self-dial).
+[[nodiscard]] constexpr bool keep_local_dial(NodeId self, NodeId peer) noexcept {
+    if (is_client_node(self) != is_client_node(peer)) return is_client_node(self);
+    return self.value < peer.value;
 }
 
-// From `self`'s vantage: keep the connection I initiated to `peer` (true) or keep the one the peer
-// initiated to me (false)? True iff I am the lower id. `self != peer` by construction (no self-dial).
-[[nodiscard]] constexpr bool keep_local_dial(NodeId self, NodeId peer) noexcept {
-    return self.value < peer.value;
+// The NodeId whose *initiated* connection survives between `a` and `b` (same rule as keep_local_dial).
+[[nodiscard]] constexpr NodeId dial_winner(NodeId a, NodeId b) noexcept {
+    if (a == b) return a;
+    return keep_local_dial(a, b) ? a : b;
 }
 
 // ============================================================================================
@@ -213,6 +217,10 @@ struct MailboxPressureEntry {
 // legitimate frame from a node configured with a larger budget is never itself rejected.
 inline constexpr std::size_t kMaxDecodedCapabilityBytes = 65536;
 
+// ADR-067 D2 bounds on the signed-revocation section, checked before any allocation.
+inline constexpr std::size_t kMaxSignedRevocationsPerFrame = 64;
+inline constexpr std::size_t kMaxSignedRevocationBlobBytes = 256;
+
 struct ControlMsg {
     ControlKind kind{};
     ClusterId cluster{};
@@ -227,6 +235,11 @@ struct ControlMsg {
     // SwimMembership moves these as opaque 32-byte blobs (set_revocation_gossip); it does not interpret
     // them — that stays 020/RevocationRegistry's job.
     std::vector<Fingerprint> revocations;
+    // ADR-067 D2: anchor-SIGNED revocation records, opaque wire blobs (RevocationRegistry encodes and
+    // verifies them; SwimMembership only carries them, via set_signed_revocation_gossip). Encoded as a
+    // section AFTER the ADR-053 version trailer, which every v2 decoder stops at, so an un-upgraded node
+    // ignores it and keeps decoding the rest of the frame (membership gossip stays mixed-version safe).
+    std::vector<std::vector<std::byte>> signed_revocations;
     // ADR-045: a bounded piggyback of gossiped node capabilities, riding the SAME channel as `updates`/
     // `revocations` above (NOT a new side-channel — the explicit design mandate). SwimMembership moves
     // these opaque entries (set_capability_gossip); it does not interpret them — that stays
@@ -328,6 +341,20 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
     }
     put_u64(b, static_cast<std::uint64_t>(m.congestion_remaining_ns));
     if (m.wire_version != 1) put_u8(b, m.wire_version);  // ADR-053 trailer (v1 stays byte-identical)
+    // ADR-067 D2: the signed-revocation section rides AFTER the trailer (only when one is emitted), so a
+    // decoder that stops at the trailer never sees it; an empty section is not emitted at all.
+    if (m.wire_version != 1 && !m.signed_revocations.empty()) {
+        std::vector<const std::vector<std::byte>*> kept;
+        for (const auto& blob : m.signed_revocations) {
+            if (kept.size() >= kMaxSignedRevocationsPerFrame) break;
+            if (!blob.empty() && blob.size() <= kMaxSignedRevocationBlobBytes) kept.push_back(&blob);
+        }
+        put_u16(b, static_cast<std::uint16_t>(kept.size()));
+        for (const auto* blob : kept) {
+            put_u16(b, static_cast<std::uint16_t>(blob->size()));
+            for (std::byte x : *blob) put_u8(b, static_cast<std::uint8_t>(x));
+        }
+    }
     return b;
 }
 
@@ -384,7 +411,25 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         out.pressure.push_back(e);
     }
     out.congestion_remaining_ns = static_cast<std::int64_t>(r.u64());
-    out.wire_version = (r.ok && r.p < r.end) ? r.u8() : std::uint8_t{1};  // absent trailer == v1
+    const bool has_trailer = r.ok && r.p < r.end;
+    out.wire_version = has_trailer ? r.u8() : std::uint8_t{1};  // absent trailer == v1
+    // ADR-067 D2 signed-revocation section (after the trailer; absent on older senders). Bounded before
+    // allocating; a malformed section fails the frame like any other malformed field.
+    out.signed_revocations.clear();
+    if (has_trailer && r.ok && r.p < r.end) {
+        const std::uint16_t signed_count = r.u16();
+        if (signed_count > kMaxSignedRevocationsPerFrame) r.ok = false;
+        for (std::uint16_t i = 0; i < signed_count && r.ok; ++i) {
+            const std::uint16_t len = r.u16();
+            if (!r.ok || len == 0 || len > kMaxSignedRevocationBlobBytes ||
+                static_cast<std::size_t>(r.end - r.p) < len) {
+                r.ok = false;
+                break;
+            }
+            out.signed_revocations.emplace_back(r.p, r.p + len);
+            r.p += len;
+        }
+    }
     return r.ok;
 }
 
@@ -501,6 +546,7 @@ public:
         std::uint32_t gossip_fanout = 3;                     // peers a gossip round targets
         std::uint32_t max_gossip_updates = 32;               // bounded piggyback digest
         std::uint64_t max_capability_gossip_bytes = 4096;    // ADR-045: bounded capability piggyback
+        std::uint32_t max_signed_revocation_gossip = 8;      // ADR-067 D2: signed records per frame
         std::uint64_t seed = 0;                              // deterministic peer/fanout selection
         // ADR-048 relay correlation secret. 0 ⇒ a fresh random secret per SwimMembership instance.
         // The token must NOT be derivable from the public seed + NodeId (the old derivation
@@ -610,6 +656,16 @@ public:
         revocation_merge_ = std::move(merge);
     }
 
+    // ADR-067 D2: the same piggyback for anchor-SIGNED revocation records, as opaque blobs (wire them to
+    // RevocationRegistry::sample_signed / merge_signed). Bounded by Config::max_signed_revocation_gossip
+    // per frame; SwimMembership neither decodes nor verifies them.
+    using SignedRevocationPullFn = std::function<std::vector<std::vector<std::byte>>(std::size_t max)>;
+    using SignedRevocationMergeFn = std::function<void(const std::vector<std::vector<std::byte>>&)>;
+    void set_signed_revocation_gossip(SignedRevocationPullFn pull, SignedRevocationMergeFn merge) {
+        signed_revocation_pull_ = std::move(pull);
+        signed_revocation_merge_ = std::move(merge);
+    }
+
     // --- ADR-045: capability gossip piggyback + a live network-backed CapabilityView -----------
     // `pull` supplies a bounded set of `CapabilityDigestEntry` to attach to each OUTBOUND control frame
     // (from this node's CapabilityRegistry, up to `Config::max_capability_gossip_bytes`); `merge`
@@ -676,6 +732,7 @@ public:
     // works (ADR-048). -----------------------------------------------------------------------------
     [[nodiscard]] bool admit(NodeId joiner, ClusterId presented) {
         if (presented != cfg_.cluster_id) return false;  // §1 reject: wrong cluster
+        if (is_client_node(joiner)) return false;         // ADR-067 D3: a client is never a member
         std::uint64_t inc = 0;
         if (auto it = members_.find(joiner.value); it != members_.end() && is_tomb(it->second.status))
             inc = it->second.incarnation + 1;
@@ -800,6 +857,10 @@ public:
     [[nodiscard]] std::uint64_t control_sheds() const noexcept {
         return control_sheds_.load(std::memory_order_relaxed);
     }
+    // ADR-067 D3: Control frames from a CLIENT identity, dropped undecoded (a client is never a member).
+    [[nodiscard]] std::uint64_t client_control_drops() const noexcept {
+        return client_control_drops_.load(std::memory_order_relaxed);
+    }
 
 private:
     // Where an update came from — precedence depends on it (ADR-048): only Local may create a Dead
@@ -877,6 +938,9 @@ private:
         m.wire_version = cfg_.wire_version;
         fill_digest(to, m.updates);
         if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
+        if (signed_revocation_pull_)
+            m.signed_revocations = signed_revocation_pull_(
+                std::min<std::size_t>(cfg_.max_signed_revocation_gossip, kMaxSignedRevocationsPerFrame));
         if (capability_pull_)
             m.capabilities = capability_pull_(self_, self_incarnation_, cfg_.max_capability_gossip_bytes);
         if (pressure_query_)
@@ -989,6 +1053,10 @@ private:
             if (data_sink_) data_sink_(std::move(f));  // 010 data plane, untouched
             return;
         }
+        if (is_client_node(f.from)) {  // ADR-067 D3: a client never speaks SWIM; never decode its control
+            client_control_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (!online_) return;  // crashed node ignores control (stops acking)
         // P2: a fixed, per-sender Control-frame budget before decode/handle. Gossip and probe traffic
         // is far below this; a flood is shed here rather than driving republish/probe work.
@@ -1089,6 +1157,8 @@ private:
                              Src::Gossip, now);
             }
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
+            if (signed_revocation_merge_ && !m.signed_revocations.empty())
+                signed_revocation_merge_(m.signed_revocations);
             // C5: capability / pressure entries are keyed by node ids the (authenticated) sender
             // chooses. Accept one only for the sender itself or a verified live member, never for
             // self (a peer must not overwrite our own advertisement) or a fabricated id — otherwise
@@ -1364,6 +1434,9 @@ private:
     //   * a Left is authoritative and is never refuted by its own node.
     void apply_update(NodeId node, std::uint64_t inc, MemberStatus st, Src src, std::int64_t now) {
         if (static_cast<std::uint8_t>(st) > static_cast<std::uint8_t>(MemberStatus::Left)) return;  // wire range
+        // ADR-067 D3: the single membership choke point refuses CLIENT ids however they are named
+        // (Join, gossip update, join snapshot, PingReq subject) — a client never becomes a member.
+        if (is_client_node(node)) return;
         if (node == self_) {
             if (self_left_ || st == MemberStatus::Left) return;  // a departure is never refuted
             if (st != MemberStatus::Alive && inc >= self_incarnation_) {
@@ -1771,6 +1844,8 @@ private:
 
     RevocationPullFn revocation_pull_;
     RevocationMergeFn revocation_merge_;
+    SignedRevocationPullFn signed_revocation_pull_;
+    SignedRevocationMergeFn signed_revocation_merge_;
     CapabilityPullFn capability_pull_;
     CapabilityMergeFn capability_merge_;
     SweepHookFn sweep_hook_;
@@ -1789,6 +1864,7 @@ private:
     std::shared_ptr<const std::vector<NodeId>> verified_snapshot_;
     std::array<ControlBudget, 256> control_budgets_{};
     std::atomic<std::uint64_t> control_sheds_{0};
+    std::atomic<std::uint64_t> client_control_drops_{0};
     std::atomic<std::uint64_t> gossip_rejected_{0};
     std::uint64_t epoch_ = 0;
 };

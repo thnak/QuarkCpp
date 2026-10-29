@@ -7,7 +7,8 @@
 // transparent to it either way.
 //
 // IDENTITY BINDING: NodeId/ClusterId are bound from the peer's verified leaf certificate's Subject
-// Common Name, formatted `"quark:<cluster_id>:<node_id>"` (decimal). A SAN URI is the more
+// Common Name, formatted `"quark:<cluster_id>:<node_id>"` (decimal; `"quark-client:..."` for the
+// ADR-067 client role, grammar in tls_identity.hpp's parse_quark_cn). A SAN URI is the more
 // conventional production choice but requires version-sensitive ASN.1 walking; CN binding is exactly
 // as authenticated (it's inside the signed certificate) and uses a stable, documented mbedTLS API
 // (`mbedtls_x509_name` linked list) — swapping the encoding later does not change this seam's shape.
@@ -47,6 +48,7 @@
 #endif
 
 #include "quark/adapters/mbedtls/mbedtls_aead.hpp"
+#include "quark/adapters/mbedtls/mbedtls_x509_util.hpp"
 #include "quark/core/handshake.hpp"
 
 namespace quark::adapters {
@@ -94,28 +96,11 @@ private:
     return fp;
 }
 
-// CN format: "quark:<cluster_id>:<node_id>" (decimal). Walks the Subject DN's attribute list for the
-// commonName OID — mbedtls_x509_name is a linked list of {oid, val} pairs (asn1.h).
+// The Subject must carry EXACTLY ONE commonName (ADR-067 D3, detail::single_cn), whose value follows the
+// identity CN grammar (`parse_quark_cn`, tls_identity.hpp).
 [[nodiscard]] inline bool parse_cn_identity(const mbedtls_x509_crt& crt, NodeId& node, ClusterId& cluster) {
-    for (const mbedtls_x509_name* n = &crt.subject; n != nullptr; n = n->next) {
-        const std::size_t cn_oid_len = std::strlen(MBEDTLS_OID_AT_CN);
-        if (n->oid.len != cn_oid_len || std::memcmp(n->oid.p, MBEDTLS_OID_AT_CN, cn_oid_len) != 0) continue;
-        const std::string_view cn(reinterpret_cast<const char*>(n->val.p), n->val.len);
-        constexpr std::string_view kPrefix = "quark:";
-        if (cn.size() <= kPrefix.size() || cn.substr(0, kPrefix.size()) != kPrefix) return false;
-        const std::string_view rest = cn.substr(kPrefix.size());
-        const auto sep = rest.find(':');
-        if (sep == std::string_view::npos) return false;
-        std::uint64_t cluster_val = 0, node_val = 0;
-        const auto r1 = std::from_chars(rest.data(), rest.data() + sep, cluster_val);
-        if (r1.ec != std::errc{}) return false;
-        const auto r2 = std::from_chars(rest.data() + sep + 1, rest.data() + rest.size(), node_val);
-        if (r2.ec != std::errc{}) return false;
-        cluster = ClusterId{cluster_val};
-        node = NodeId{node_val};
-        return true;
-    }
-    return false;
+    std::string_view cn;
+    return single_cn(crt, cn) && parse_quark_cn(cn, cluster, node);
 }
 
 }  // namespace detail
@@ -201,21 +186,18 @@ private:
             setup_failure_ = "failed to parse own private key";
             return false;
         }
-        // S4: verify against the UNION of current + (still-in-window) previous trust roots.
+        // S4: verify against the UNION of current + (still-in-window) previous trust roots. Every root in
+        // each bundle is parsed (a bundle may hold several), exactly as the ADR-067 verifier does.
         bool any_root = false;
         if (trust_.current && !trust_.current->ca_chain_der.empty()) {
-            if (mbedtls_x509_crt_parse_der(
-                    &ca_chain_, reinterpret_cast<const unsigned char*>(trust_.current->ca_chain_der.data()),
-                    trust_.current->ca_chain_der.size()) != 0) {
+            if (!detail::parse_der_concat(ca_chain_, trust_.current->ca_chain_der)) {
                 setup_failure_ = "failed to parse current trust root(s)";
                 return false;
             }
             any_root = true;
         }
         if (trust_.previous && !trust_.previous->ca_chain_der.empty()) {
-            if (mbedtls_x509_crt_parse_der(
-                    &ca_chain_, reinterpret_cast<const unsigned char*>(trust_.previous->ca_chain_der.data()),
-                    trust_.previous->ca_chain_der.size()) != 0) {
+            if (!detail::parse_der_concat(ca_chain_, trust_.previous->ca_chain_der)) {
                 setup_failure_ = "failed to parse previous (overlap-window) trust root(s)";
                 return false;
             }
@@ -223,6 +205,14 @@ private:
         }
         if (!any_root) {
             setup_failure_ = "no trust roots available (neither current nor previous)";
+            return false;
+        }
+        // ADR-067 C5: a node never runs with CA key material — neither a trusted root's key (the "CA cert as
+        // node cert" shortcut) nor an issuing CA's (a CA-capable own certificate). Refused here, for every
+        // handshake; validate_identity_not_root (mbedtls_enrollment.hpp) is the same rule at startup.
+        if (detail::key_is_a_root(own_key_, ca_chain_) || detail::key_is_a_root(own_cert_.pk, ca_chain_) ||
+            detail::ca_capable(own_cert_)) {
+            setup_failure_ = "own identity is CA key material (ADR-067 C5)";
             return false;
         }
 
@@ -268,6 +258,9 @@ private:
         if (self->revoked_ && self->revoked_->contains(self->peer_fingerprint_)) {
             *flags |= MBEDTLS_X509_BADCERT_REVOKED;
         }
+        // ADR-067 D1: a node identity is never a CA. A leaf claiming CA:TRUE is refused, so a mis-issued
+        // leaf cannot also serve as an intermediate for peer-sent chains.
+        if (mbedtls_x509_crt_get_ca_istrue(crt) == 1) *flags |= MBEDTLS_X509_BADCERT_NOT_TRUSTED;
         return 0;
     }
 

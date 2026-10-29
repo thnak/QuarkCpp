@@ -1,6 +1,7 @@
 // Tests ADR-048 relay side, shape B (issue #14): a node with set_relay_forwarding() forwards transit
 // frames (to != self) byte-for-byte; the admit predicate gates it (fail-closed open-proxy guard); the
-// origin must match the connection's identity; set_relay_via() gives an ordered failover relay list.
+// origin must match the connection's identity; set_relay_via() gives an ordered failover relay list;
+// ADR-067 D3 client ids are refused by the NodeAuthority form and relayed only by explicit opt-in.
 // Topology: spoke A and spoke B each know ONLY relay R (hub-and-spoke); A -> B must cross R.
 #include <cstdint>
 #include <cstdio>
@@ -63,6 +64,41 @@ void secure_via_relay(bool& ok) {
     ta.stop(); tb.stop(); tr.stop();
 }
 
+// ADR-067 D3: the NodeAuthority form never relays for a CLIENT id (even under admit-all); relaying a
+// device to its home node is an explicit per-pair opt-in through the predicate form.
+void client_relay_policy(bool& ok) {
+    const NodeId C{kClientNodeBit | 31}, B{33};
+    AdmitAllNodeAuthority all;
+    for (const bool opt_in : {false, true}) {
+        const NodeId R{opt_in ? 34u : 32u};
+        net::TcpTransport tr(R, pal::ipv4_loopback, 0);
+        net::TcpTransport tc(C, pal::ipv4_loopback, 0);
+        net::TcpTransport tb(B, pal::ipv4_loopback, 0);
+        Recorder rb;
+        tb.on_receive([&](MessageFrame f) { rb(std::move(f)); });
+        tr.on_receive([](MessageFrame) {});
+        if (opt_in)
+            tr.set_relay_forwarding([C, B](NodeId origin, NodeId dest) { return origin == C && dest == B; });
+        else
+            tr.set_relay_forwarding(all);
+        check(tr.start() && tc.start() && tb.start(), "client relay: listeners start", ok);
+        tc.add_peer(loopback_endpoint(R, tr.listen_port()));
+        tb.add_peer(loopback_endpoint(R, tr.listen_port()));
+        tr.add_peer(loopback_endpoint(B, tb.listen_port()));
+        tc.set_relay_via(B, {R});
+        tc.send(B, seq_frame(C, B, 1));
+        if (opt_in) {
+            check(wait_until([&] { return rb.count() >= 1; }, 5000),
+                  "client relay: an explicit (client, home) opt-in is relayed", ok);
+        } else {
+            check(wait_until([&] { return tr.relay_refused() >= 1; }, 3000),
+                  "client relay: the NodeAuthority form refuses a client origin under admit-all", ok);
+            check(rb.count() == 0, "client relay: the refused client frame is not delivered", ok);
+        }
+        tc.stop(); tb.stop(); tr.stop();
+    }
+}
+
 // Discovery: relays come from the gossiped CapabilityView, not static config.
 void discovery(bool& ok) {
     const NodeId A{21}, R1{22}, R2{23}, B{24}, GHOST{25};
@@ -110,6 +146,7 @@ int main() {
     bool ok = true;
     discovery(ok);
     secure_via_relay(ok);
+    client_relay_policy(ok);
     const NodeId A{1}, R{2}, B{3}, DEAD{9};
 
     net::TcpTransport tr(R, pal::ipv4_loopback, 0);

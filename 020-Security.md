@@ -77,6 +77,22 @@ Every node has a **cryptographic identity** (a key pair; the public half is its
   [021-Cluster-Formation-and-Lifecycle.md](021-Cluster-Formation-and-Lifecycle.md);
   this spec validates against the anchor, 021 establishes it.
 
+**Identity roles — member and client ([ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed).**
+A certificate carries one of two roles in its Subject CN: `quark:<cluster>:<node>` is a
+**member**, `quark-client:<cluster>:<node>` is a **client** (a distinct prefix, so an older
+parser refuses a client certificate rather than reading it as a member). The role is also
+**bit 63 of the NodeId** (set = client), and the CN parser requires the bit to match the
+prefix, consumes both numeric fields exactly, and refuses a Subject with more than one CN — so
+client and member ids are disjoint by construction and a client can never hold a member's id.
+A client is authenticated exactly like a member but is **never** a member: its Control frames
+never reach SWIM, it never appears in a membership view, gossip, or placement, and the
+member-only relay admission (`NodeAuthority`) refuses it; relaying a device to its home node is
+an explicit per-pair opt-in through the relay predicate. Because the role is
+readable from the id before any handshake, a client is always the TLS client and a member never
+initiates a handshake or renegotiation toward a client (member↔member keeps NodeId ordering). A
+revoked client session is actively closed on the sweep tick. Startup is refused if a node's own
+identity key equals a trusted-root key.
+
 This closes the sharpest distributed hole: because placement is *any-node-hosts-any-actor*
 (010), cluster admission **is** data authorization at the node granularity. A
 rogue node that cannot authenticate cannot be placed onto and therefore cannot
@@ -179,6 +195,24 @@ Two invariants follow, load-bearing (each carries its own test):
   cluster-wide one — otherwise one peer's crypto work stalls every other
   peer's traffic.
 
+**Issuer-authenticated revocation ([ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed).**
+A gossiped revocation is a record signed by the cluster trust anchor (the CA that issues node
+certificates), not a bare fingerprint: `"QUARK-REVOKE-v1\0" ‖ cluster_id ‖ fingerprint ‖
+not_after ‖ issued_at ‖ anchor_key_id ‖ signature` (fixed-length signed portion, ECDSA P-256 with
+SHA-256). It is verified through a `TrustAnchorVerifier` seam against the current and in-window
+previous trusted roots before it enters the registry; unsigned, wrong-signer, tampered,
+wrong-cluster, unknown-root or expired records are dropped and counted, and verify work is
+rate-limited. Records are identified by
+`fingerprint`, never by their bytes (ECDSA is malleable), and a known fingerprint is not
+re-verified. Replay is harmless (the registry is a union-only ratchet), so the record has no nonce
+and `issued_at` is never a validity gate; an entry is pruned once its leaf's `not_after` (plus a skew
+bound) has passed. Signed entries have their own operator-sized cap, and a full cap refuses loudly.
+Root rotation includes re-signing the outstanding signed set under the new root. Without a verifier
+the registry stays in legacy unsigned mode and `revoke()` of a signed record returns an error;
+`SecurityMode::Strict` with the handshake enabled refuses to start in that configuration. Enabling
+signed mode is one-way and discards previously gossiped unsigned entries. **Quark never holds the CA private key**: the application
+supplies pre-signed records, and the core contains no signing primitive.
+
 ### Capability gossip decode discipline (ADR-045)
 
 Node capability entries (`ControlMsg.capabilities`, cluster.hpp) piggyback on the
@@ -197,6 +231,7 @@ boundary — a compromised or buggy peer already admitted to the cluster can sti
 advertise a false capability (e.g. a false `Flag{"gpu"}`). This is the identical
 trust model membership and revocation gossip already operate under; no new gap is
 introduced by capability gossip, and no new mitigation is added for it either.
+(Revocation gossip leaves this trust model under ADR-067: it becomes anchor-signed.)
 
 ## 3. Authorization and principal propagation
 

@@ -63,3 +63,11 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   target_link_libraries(mbedtls_handshake_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
   add_test(NAME mbedtls_handshake_check COMMAND mbedtls_handshake_check)
 endif()
+# tests/adapters/mbedtls_enrollment_check.cpp: ADR-067 D4/C5 — MbedtlsEnrolCrypto (HMAC, CSR proof-of-possession,
+# issued-certificate rules), the joiner key/CSR/MAC helpers, Enrollment end to end, the C5 startup check.
+if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrollment_check.cpp")
+  add_executable(mbedtls_enrollment_check tests/adapters/mbedtls_enrollment_check.cpp)
+  target_include_directories(mbedtls_enrollment_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(mbedtls_enrollment_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
+  add_test(NAME mbedtls_enrollment_check COMMAND mbedtls_enrollment_check)
+endif()
