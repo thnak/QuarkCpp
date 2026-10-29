@@ -99,9 +99,10 @@ std::vector<std::string> split(const std::string& s) {
 struct Gate {
     std::atomic<int> arrived{0};
     int need = 0;
+    std::chrono::milliseconds patience{2000};  // how long an arrival waits for the rest
     void arrive_and_wait() {
         arrived.fetch_add(1);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const auto deadline = std::chrono::steady_clock::now() + patience;
         while (arrived.load() < need && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
     }
 };
@@ -329,6 +330,7 @@ int main() {
         Harness g(cfg);
         Gate guess_gate;
         guess_gate.need = 6;  // reached only if more than the 5-attempt budget gets to the MAC
+        guess_gate.patience = std::chrono::milliseconds{300};  // a correct run always waits this out
         g.crypto->on_mac = [&] { guess_gate.arrive_and_wait(); };
         auto t2 = g.e->issue_ticket(Role::Member, 10 * kSec, 0);
         threads.clear();
@@ -478,6 +480,9 @@ int main() {
         std::optional<Reply> retry;
         h.e->submit(request_for(*t2, "K"), [&](Reply r) { retry = std::move(r); }, 2);
         check(!retry && h.requests.size() == 2, "control: the late Busy refunded t2's single attempt; the retry issues", ok);
+        // Complete it before `retry` leaves scope: destroying the harness would otherwise reply Shutdown into it.
+        h.completions.at(1)(Issued{NodeId{9}, toy_cert("quark:77:9", "K")});
+        check(retry && retry->status == Status::Issued, "and the retry's certificate is delivered", ok);
     }
 
     // ---- Per-source rate limit and its table bound --------------------------------------------------
