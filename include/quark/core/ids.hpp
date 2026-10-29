@@ -16,6 +16,11 @@ struct NodeId {
     friend constexpr bool operator==(NodeId, NodeId) = default;
 };
 
+// ADR-067 D3: bit 63 marks a CLIENT identity (authenticated, never a member). Member and client ids are
+// disjoint by construction, and a peer's role is readable from its id before any handshake.
+inline constexpr std::uint64_t kClientNodeBit = 1ULL << 63;
+[[nodiscard]] constexpr bool is_client_node(NodeId n) noexcept { return (n.value & kClientNodeBit) != 0; }
+
 // Cluster identity (021 §1). Opaque; provisioned out of band (013). A mismatch on join is rejected.
 struct ClusterId {
     std::uint64_t value = 0;
