@@ -48,6 +48,7 @@
 #endif
 
 #include "quark/adapters/mbedtls/mbedtls_aead.hpp"
+#include "quark/adapters/mbedtls/mbedtls_x509_util.hpp"
 #include "quark/core/handshake.hpp"
 
 namespace quark::adapters {
@@ -196,21 +197,18 @@ private:
             setup_failure_ = "failed to parse own private key";
             return false;
         }
-        // S4: verify against the UNION of current + (still-in-window) previous trust roots.
+        // S4: verify against the UNION of current + (still-in-window) previous trust roots. Every root in
+        // each bundle is parsed (a bundle may hold several), exactly as the ADR-067 verifier does.
         bool any_root = false;
         if (trust_.current && !trust_.current->ca_chain_der.empty()) {
-            if (mbedtls_x509_crt_parse_der(
-                    &ca_chain_, reinterpret_cast<const unsigned char*>(trust_.current->ca_chain_der.data()),
-                    trust_.current->ca_chain_der.size()) != 0) {
+            if (!detail::parse_der_concat(ca_chain_, trust_.current->ca_chain_der)) {
                 setup_failure_ = "failed to parse current trust root(s)";
                 return false;
             }
             any_root = true;
         }
         if (trust_.previous && !trust_.previous->ca_chain_der.empty()) {
-            if (mbedtls_x509_crt_parse_der(
-                    &ca_chain_, reinterpret_cast<const unsigned char*>(trust_.previous->ca_chain_der.data()),
-                    trust_.previous->ca_chain_der.size()) != 0) {
+            if (!detail::parse_der_concat(ca_chain_, trust_.previous->ca_chain_der)) {
                 setup_failure_ = "failed to parse previous (overlap-window) trust root(s)";
                 return false;
             }

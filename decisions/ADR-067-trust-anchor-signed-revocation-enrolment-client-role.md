@@ -34,8 +34,9 @@ Found during design: `parse_cn_identity` (`mbedtls_handshake.hpp:99-116`) does n
 * A new `TrustAnchorVerifier` seam (std-only interface; mbedTLS adapter) verifies a signature against the
   cluster `TrustStore` — current roots plus the still-in-window previous roots (ADR-040 overlap). The
   std-only core contains **no** signing primitive.
-* **Roots are ECDSA P-256; signatures are ECDSA-with-SHA-256, DER-encoded.** A root of any other key type
-  is refused at `TrustStore` load when a verifier is installed.
+* **Roots are ECDSA P-256; signatures are ECDSA-with-SHA-256, DER-encoded.** Only a CA root (CA:TRUE,
+  keyCertSign when keyUsage is present) with a P-256 key is a revocation signer; any other certificate in
+  the trust bundle is skipped by the verifier, so a record naming it never verifies (it still anchors TLS).
 * **Revocation uses pre-signed records.** The application's custodian signs; the application calls
   `revoke(SignedRevocation)`; Quark verifies, applies locally, gossips. Revocation is an operator act and
   may be produced offline.
@@ -67,15 +68,23 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
 
 * Fixed-length, fixed-layout signed portion: no length ambiguity, no reinterpretation.
 * Accepted iff `cluster_id` matches, `anchor_key_id` names a currently trusted root, and the signature
-  verifies. Otherwise dropped, counted (`rejected()`) and audited.
+  verifies. Otherwise dropped and counted (`signed_rejected()`); turning counters into audit records is the
+  application's job.
 * **Identity is the fingerprint, never the record bytes.** ECDSA is malleable (`(r, n−s)` also verifies),
   so dedup and gossip key on `fingerprint`; a record whose fingerprint is already present is **not
-  re-verified** (also bounds verify-CPU flooding).
+  re-verified**, so re-gossip of known records costs no signature check. Verifies of never-seen
+  fingerprints are bounded per merge and by a token bucket (`SignedRevocationLimits`); a record over budget
+  is deferred, not lost (`signed_deferred()`): every node gossips its whole held set round-robin, so the
+  record arrives again. Expired records are refused before any verify (`signed_expired()`). This bounds
+  verify CPU. The budget is node-wide, not per sender, so a member flooding forged records keeps genuine
+  NEW records deferred for as long as the flood lasts; per-sender budgeting is a follow-up (honest nodes
+  re-gossip only verified records, so a bad signature identifies its immediate sender).
 * **Replay is harmless**: the registry is a union-only ratchet. No nonce — deliberately.
 * **Pruning:** an entry is removed once `now > not_after + skew_bound` — an expired leaf already fails
   the handshake, so pruning cannot re-admit it. Signed entries have their **own cap**, sized by the
   operator for the fleet; the existing `max_entries` cap keeps bounding the unsigned/local set only. A
-  full signed cap refuses loudly (error + audit), never silently.
+  full signed cap refuses loudly (`revoke()` returns `errc::overloaded`; gossip counts `signed_cap_refused()`),
+  never silently, and the cap is checked before any verify is spent.
 * **Distinct cluster ids** are required for clusters sharing a CA (otherwise records replay across them);
   stated in 021 §1.
 * **Root rotation:** a record verifies only while its signing root is trusted. Rotation therefore
@@ -83,9 +92,13 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
   (`signed_revocations()`), the application has the custodian re-sign, and calls `revoke()` with the new
   records before the old root's window closes. A node joining after the window learns only re-signed
   records — the rotation runbook makes this a required step.
-* **Without a verifier** (handshake enabled): gossiped revocations are refused, and `revoke()` **returns
-  an error** (`errc::unavailable`) instead of silently revoking on one node; `SecurityMode::Strict`
-  refuses to start in that configuration. **Mixed versions:** during a rolling upgrade old nodes gossip
+* **Without a verifier** the registry stays in legacy unsigned mode (local `revoke_locally()` plus bare-
+  fingerprint gossip, the pre-067 behaviour); signed records are ignored and `revoke(SignedRevocation)`
+  **returns an error** (`errc::unavailable`) instead of silently revoking on one node.
+  `SecurityMode::Strict` with the handshake enabled refuses to start in that configuration
+  (`validate_revocation_trust`). `enable_signed()` is one-way: it drops all previously gossiped unsigned
+  entries and from then on refuses unsigned gossip (counted in `rejected()`). A peer pinned to SWIM wire
+  v1 carries no signed section, so Strict also refuses a node whose SWIM is pinned to wire v1. **Mixed versions:** during a rolling upgrade old nodes gossip
   bare fingerprints (refused by new nodes) and new nodes gossip records (unknown to old nodes), so
   revocation propagation is not guaranteed until the upgrade completes; documented in the 021 rolling
   upgrade section, and operators revoke locally on every node meanwhile.
@@ -218,11 +231,25 @@ binding. Found and folded in:
   refused when own identity key equals a root key.
 * All under Release + ASan/UBSan + TSan (enrolment worker and sweep run concurrently with the I/O thread).
 
+## Implementation status
+
+* **D3 client role — done** (`security_client_role_test`, `security_cn_parse_strict_test`, mbedTLS check).
+* **D2 signed revocation — done**: `signed_revocation.hpp` (record, `TrustAnchorVerifier` seam),
+  `RevocationRegistry` signed mode, `mbedtls_trust_anchor.hpp` (`MbedtlsTrustAnchorVerifier`,
+  `anchor_key_id_of_cert`), `validate_revocation_trust` (Strict startup check)
+  (`security_signed_revocation_test`; real ECDSA P-256 in the mbedTLS check).
+  **SWIM wire encoding (settled):** signed records ride as opaque blobs in a section appended *after*
+  the ADR-053 version trailer — every v2 decoder stops at the trailer, so un-upgraded nodes keep
+  decoding membership and simply ignore the section (no version bump). Bounded before allocation: at
+  most 64 blobs of at most 256 B per frame; `Config::max_signed_revocation_gossip` (default 8, about
+  1.4 KB) caps what a node attaches. Successive frames walk the held set round-robin, so every record is gossiped
+  however large the set. A malformed section fails the frame, like any malformed field.
+  The application still owns `prune_expired` scheduling and the rotation re-sign step.
+* **D4 enrolment — not started.**
+
 ## Not decided here
 
 * **Device-side client implementation** (#37 gap 4): a written client wire-protocol spec vs. a small
   portable client library without the PAL reactor. Scoping decision with the consumer.
-* Wire encoding of signed records inside SWIM revocation gossip (~184 B/record vs 32 B today) and its
-  per-round budget — settle in implementation, measure.
 * Issuance availability: the anchor is a single point of availability for enrolment (not for safety).
   Electing an issuing anchor among replicas (028 leases) is a possible follow-up.

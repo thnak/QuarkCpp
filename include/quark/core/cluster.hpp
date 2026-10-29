@@ -217,6 +217,10 @@ struct MailboxPressureEntry {
 // legitimate frame from a node configured with a larger budget is never itself rejected.
 inline constexpr std::size_t kMaxDecodedCapabilityBytes = 65536;
 
+// ADR-067 D2 bounds on the signed-revocation section, checked before any allocation.
+inline constexpr std::size_t kMaxSignedRevocationsPerFrame = 64;
+inline constexpr std::size_t kMaxSignedRevocationBlobBytes = 256;
+
 struct ControlMsg {
     ControlKind kind{};
     ClusterId cluster{};
@@ -231,6 +235,11 @@ struct ControlMsg {
     // SwimMembership moves these as opaque 32-byte blobs (set_revocation_gossip); it does not interpret
     // them — that stays 020/RevocationRegistry's job.
     std::vector<Fingerprint> revocations;
+    // ADR-067 D2: anchor-SIGNED revocation records, opaque wire blobs (RevocationRegistry encodes and
+    // verifies them; SwimMembership only carries them, via set_signed_revocation_gossip). Encoded as a
+    // section AFTER the ADR-053 version trailer, which every v2 decoder stops at, so an un-upgraded node
+    // ignores it and keeps decoding the rest of the frame (membership gossip stays mixed-version safe).
+    std::vector<std::vector<std::byte>> signed_revocations;
     // ADR-045: a bounded piggyback of gossiped node capabilities, riding the SAME channel as `updates`/
     // `revocations` above (NOT a new side-channel — the explicit design mandate). SwimMembership moves
     // these opaque entries (set_capability_gossip); it does not interpret them — that stays
@@ -332,6 +341,20 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
     }
     put_u64(b, static_cast<std::uint64_t>(m.congestion_remaining_ns));
     if (m.wire_version != 1) put_u8(b, m.wire_version);  // ADR-053 trailer (v1 stays byte-identical)
+    // ADR-067 D2: the signed-revocation section rides AFTER the trailer (only when one is emitted), so a
+    // decoder that stops at the trailer never sees it; an empty section is not emitted at all.
+    if (m.wire_version != 1 && !m.signed_revocations.empty()) {
+        std::vector<const std::vector<std::byte>*> kept;
+        for (const auto& blob : m.signed_revocations) {
+            if (kept.size() >= kMaxSignedRevocationsPerFrame) break;
+            if (!blob.empty() && blob.size() <= kMaxSignedRevocationBlobBytes) kept.push_back(&blob);
+        }
+        put_u16(b, static_cast<std::uint16_t>(kept.size()));
+        for (const auto* blob : kept) {
+            put_u16(b, static_cast<std::uint16_t>(blob->size()));
+            for (std::byte x : *blob) put_u8(b, static_cast<std::uint8_t>(x));
+        }
+    }
     return b;
 }
 
@@ -388,7 +411,25 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
         out.pressure.push_back(e);
     }
     out.congestion_remaining_ns = static_cast<std::int64_t>(r.u64());
-    out.wire_version = (r.ok && r.p < r.end) ? r.u8() : std::uint8_t{1};  // absent trailer == v1
+    const bool has_trailer = r.ok && r.p < r.end;
+    out.wire_version = has_trailer ? r.u8() : std::uint8_t{1};  // absent trailer == v1
+    // ADR-067 D2 signed-revocation section (after the trailer; absent on older senders). Bounded before
+    // allocating; a malformed section fails the frame like any other malformed field.
+    out.signed_revocations.clear();
+    if (has_trailer && r.ok && r.p < r.end) {
+        const std::uint16_t signed_count = r.u16();
+        if (signed_count > kMaxSignedRevocationsPerFrame) r.ok = false;
+        for (std::uint16_t i = 0; i < signed_count && r.ok; ++i) {
+            const std::uint16_t len = r.u16();
+            if (!r.ok || len == 0 || len > kMaxSignedRevocationBlobBytes ||
+                static_cast<std::size_t>(r.end - r.p) < len) {
+                r.ok = false;
+                break;
+            }
+            out.signed_revocations.emplace_back(r.p, r.p + len);
+            r.p += len;
+        }
+    }
     return r.ok;
 }
 
@@ -505,6 +546,7 @@ public:
         std::uint32_t gossip_fanout = 3;                     // peers a gossip round targets
         std::uint32_t max_gossip_updates = 32;               // bounded piggyback digest
         std::uint64_t max_capability_gossip_bytes = 4096;    // ADR-045: bounded capability piggyback
+        std::uint32_t max_signed_revocation_gossip = 8;      // ADR-067 D2: signed records per frame
         std::uint64_t seed = 0;                              // deterministic peer/fanout selection
         // ADR-048 relay correlation secret. 0 ⇒ a fresh random secret per SwimMembership instance.
         // The token must NOT be derivable from the public seed + NodeId (the old derivation
@@ -612,6 +654,16 @@ public:
     void set_revocation_gossip(RevocationPullFn pull, RevocationMergeFn merge) {
         revocation_pull_ = std::move(pull);
         revocation_merge_ = std::move(merge);
+    }
+
+    // ADR-067 D2: the same piggyback for anchor-SIGNED revocation records, as opaque blobs (wire them to
+    // RevocationRegistry::sample_signed / merge_signed). Bounded by Config::max_signed_revocation_gossip
+    // per frame; SwimMembership neither decodes nor verifies them.
+    using SignedRevocationPullFn = std::function<std::vector<std::vector<std::byte>>(std::size_t max)>;
+    using SignedRevocationMergeFn = std::function<void(const std::vector<std::vector<std::byte>>&)>;
+    void set_signed_revocation_gossip(SignedRevocationPullFn pull, SignedRevocationMergeFn merge) {
+        signed_revocation_pull_ = std::move(pull);
+        signed_revocation_merge_ = std::move(merge);
     }
 
     // --- ADR-045: capability gossip piggyback + a live network-backed CapabilityView -----------
@@ -886,6 +938,9 @@ private:
         m.wire_version = cfg_.wire_version;
         fill_digest(to, m.updates);
         if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
+        if (signed_revocation_pull_)
+            m.signed_revocations = signed_revocation_pull_(
+                std::min<std::size_t>(cfg_.max_signed_revocation_gossip, kMaxSignedRevocationsPerFrame));
         if (capability_pull_)
             m.capabilities = capability_pull_(self_, self_incarnation_, cfg_.max_capability_gossip_bytes);
         if (pressure_query_)
@@ -1102,6 +1157,8 @@ private:
                              Src::Gossip, now);
             }
             if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
+            if (signed_revocation_merge_ && !m.signed_revocations.empty())
+                signed_revocation_merge_(m.signed_revocations);
             // C5: capability / pressure entries are keyed by node ids the (authenticated) sender
             // chooses. Accept one only for the sender itself or a verified live member, never for
             // self (a peer must not overwrite our own advertisement) or a fabricated id — otherwise
@@ -1787,6 +1844,8 @@ private:
 
     RevocationPullFn revocation_pull_;
     RevocationMergeFn revocation_merge_;
+    SignedRevocationPullFn signed_revocation_pull_;
+    SignedRevocationMergeFn signed_revocation_merge_;
     CapabilityPullFn capability_pull_;
     CapabilityMergeFn capability_merge_;
     SweepHookFn sweep_hook_;

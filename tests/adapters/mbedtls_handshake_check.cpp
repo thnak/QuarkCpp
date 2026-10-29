@@ -21,6 +21,9 @@
 #include <mbedtls/x509_crt.h>
 
 #include "quark/adapters/mbedtls/mbedtls_handshake.hpp"
+#include "quark/adapters/mbedtls/mbedtls_trust_anchor.hpp"
+#include "quark/core/revocation_registry.hpp"
+#include "quark/core/signed_revocation.hpp"
 #include "quark/core/handshake.hpp"
 #include "quark/core/ids.hpp"
 #include "quark/core/tls_identity.hpp"
@@ -68,6 +71,20 @@ struct GeneratedCert {
 void gen_ec_key(mbedtls_pk_context& pk, Rng& rng) {
     mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
     mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(pk), &Rng::f_rng, rng.ctx());
+}
+
+// The application custodian's job (ADR-067 D1), done here in the TEST only: sign a revocation record's
+// exact signed bytes with a CA key (ECDSA-with-SHA-256, DER). Quark itself has no such code path.
+[[nodiscard]] std::vector<std::byte> custodian_sign(mbedtls_pk_context& key, Rng& rng, const SignedRevocation& r) {
+    const auto msg = revocation_signed_bytes(r);
+    unsigned char hash[32];
+    mbedtls_sha256(reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), hash, 0);
+    unsigned char sig[MBEDTLS_PK_SIGNATURE_MAX_SIZE];
+    std::size_t sig_len = 0;
+    if (mbedtls_pk_sign(&key, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sizeof(sig), &sig_len, &Rng::f_rng,
+                        rng.ctx()) != 0)
+        return {};
+    return std::vector<std::byte>(reinterpret_cast<const std::byte*>(sig), reinterpret_cast<const std::byte*>(sig) + sig_len);
 }
 
 [[nodiscard]] std::vector<std::byte> tail_bytes(std::vector<unsigned char>& buf, int written_len) {
@@ -210,6 +227,25 @@ int main() {
     const GeneratedCert leaf_client =
         make_leaf(rng, ca, ca_key, cluster.value, 0, "CN=quark-client:" + cl + ":" + std::to_string(client_id.value));
     const GeneratedCert leaf_client_member_id = make_leaf(rng, ca, ca_key, cluster.value, 0, "CN=quark-client:" + cl + ":2");
+
+    // ADR-067 D2 records, signed now (the CA key is freed below): one by the trusted CA, and one by a
+    // second, UNTRUSTED CA that falsely claims the trusted CA's anchor key id.
+    AnchorKeyId trusted_id{};
+    const bool have_trusted_id = anchor_key_id_of_cert(ca.cert_der, trusted_id);
+    SignedRevocation anchor_rec;
+    anchor_rec.cluster = cluster;
+    anchor_rec.fingerprint[0] = std::byte{0x42};
+    anchor_rec.not_after = 2'000'000'000;
+    anchor_rec.issued_at = 1'700'000'000;
+    anchor_rec.anchor_key_id = trusted_id;
+    anchor_rec.signature = custodian_sign(ca_key, rng, anchor_rec);
+    SignedRevocation rogue_rec = anchor_rec;
+    rogue_rec.fingerprint[0] = std::byte{0x43};
+    mbedtls_pk_context rogue_key;
+    mbedtls_pk_init(&rogue_key);
+    const GeneratedCert rogue_ca = make_ca(rng, rogue_key, "quark-rogue-ca");
+    rogue_rec.signature = custodian_sign(rogue_key, rng, rogue_rec);
+    mbedtls_pk_free(&rogue_key);
     mbedtls_pk_free(&ca_key);
 
     auto id1 = std::make_shared<const TlsIdentity>(TlsIdentity{leaf1.cert_der, leaf1.key_der, {}});
@@ -388,6 +424,82 @@ int main() {
               "ADR-067: a Subject with two CNs is refused", ok);
         crt.subject.next = nullptr;  // the attributes are stack-owned: never hand them to mbedtls_x509_crt_free
         mbedtls_x509_crt_free(&crt);
+    }
+
+    // --- ADR-067 D2: real ECDSA P-256 revocation records against the TrustStore's roots. -------------
+    {
+        check(have_trusted_id && !anchor_rec.signature.empty() && anchor_rec.signature.size() <= kMaxRevocationSignatureBytes,
+              "ADR-067: the custodian produced a DER signature within the 72-byte bound", ok);
+        MbedtlsTrustAnchorVerifier verifier(trust_store);
+        check(verify_signed_revocation(anchor_rec, cluster, verifier),
+              "ADR-067 positive: an anchor-signed record verifies against the trusted root", ok);
+        SignedRevocation tampered = anchor_rec;
+        tampered.fingerprint[0] = std::byte{0x44};
+        check(!verify_signed_revocation(tampered, cluster, verifier), "ADR-067: a re-targeted record fails", ok);
+        check(!verify_signed_revocation(rogue_rec, cluster, verifier),
+              "ADR-067: an untrusted CA claiming the trusted anchor id fails", ok);
+        check(!verify_signed_revocation(anchor_rec, ClusterId{cluster.value + 1}, verifier),
+              "ADR-067: a record for another cluster fails", ok);
+        SignedRevocation unknown_root = anchor_rec;
+        unknown_root.anchor_key_id[0] ^= std::byte{0xFF};
+        check(!verify_signed_revocation(unknown_root, cluster, verifier), "ADR-067: an unknown anchor id fails", ok);
+
+        // Two trusted roots (as during a rotation), the signing CA listed SECOND: the anchor key id must
+        // select it among several parsed roots, not just the first one.
+        std::vector<std::byte> two_roots = rogue_ca.cert_der;
+        two_roots.insert(two_roots.end(), ca.cert_der.begin(), ca.cert_der.end());
+        TrustStore two_root_store(std::make_shared<const TrustedRoots>(TrustedRoots{two_roots}));
+        MbedtlsTrustAnchorVerifier two_root_verifier(two_root_store);
+        check(verify_signed_revocation(anchor_rec, cluster, two_root_verifier),
+              "ADR-067: the anchor key id selects the signing root among several trusted roots", ok);
+
+        // Only a CA can sign revocations: a non-CA certificate in the trust bundle (here node 2's leaf, whose
+        // private key a compromised node holds) is never a signer, even under its own anchor key id.
+        {
+            mbedtls_pk_context leaf_key;
+            mbedtls_pk_init(&leaf_key);
+            const bool key_ok =
+                mbedtls_pk_parse_key(&leaf_key, reinterpret_cast<const unsigned char*>(leaf2.key_der.data()),
+                                     leaf2.key_der.size(), nullptr, 0, &Rng::f_rng, rng.ctx()) == 0;
+            SignedRevocation leaf_rec = anchor_rec;
+            leaf_rec.fingerprint[0] = std::byte{0x45};
+            const bool id_ok = anchor_key_id_of_cert(leaf2.cert_der, leaf_rec.anchor_key_id);
+            leaf_rec.signature = key_ok ? custodian_sign(leaf_key, rng, leaf_rec) : std::vector<std::byte>{};
+            mbedtls_pk_free(&leaf_key);
+            std::vector<std::byte> mixed = leaf2.cert_der;
+            mixed.insert(mixed.end(), ca.cert_der.begin(), ca.cert_der.end());
+            TrustStore mixed_store(std::make_shared<const TrustedRoots>(TrustedRoots{mixed}));
+            MbedtlsTrustAnchorVerifier mixed_verifier(mixed_store);
+            check(key_ok && id_ok && !leaf_rec.signature.empty(), "ADR-067: a leaf-signed record was produced", ok);
+            check(!verify_signed_revocation(leaf_rec, cluster, mixed_verifier),
+                  "ADR-067: a non-CA certificate in the bundle is never a revocation signer", ok);
+            check(verify_signed_revocation(anchor_rec, cluster, mixed_verifier),
+                  "ADR-067 control: the CA in the same bundle still verifies", ok);
+        }
+
+        // End to end through the registry, as an application would wire it.
+        constexpr std::uint64_t kNowUnix = 1'800'000'000;
+        RevocationRegistry reg;
+        check(static_cast<bool>(reg.enable_signed(std::make_shared<MbedtlsTrustAnchorVerifier>(trust_store), cluster)),
+              "ADR-067: signed mode enables with the mbedTLS verifier", ok);
+        check(static_cast<bool>(reg.revoke(anchor_rec, kNowUnix)) && reg.is_revoked(anchor_rec.fingerprint),
+              "ADR-067: the registry accepts and enforces the anchor-signed record", ok);
+        const auto res = reg.revoke(rogue_rec, kNowUnix);
+        check(!res && !reg.is_revoked(rogue_rec.fingerprint), "ADR-067: the registry refuses the rogue record", ok);
+    }
+
+    // --- Multi-root trust bundle in the TLS handshake (fixed with ADR-067): the peer's CA listed SECOND
+    // must still be trusted — mbedtls_x509_crt_parse_der alone parses only the first certificate. ------
+    {
+        std::vector<std::byte> bundle = rogue_ca.cert_der;
+        bundle.insert(bundle.end(), ca.cert_der.begin(), ca.cert_der.end());
+        TrustStore bundle_store(std::make_shared<const TrustedRoots>(TrustedRoots{bundle}));
+        MbedtlsHandshakeEngineFactory factory;
+        auto client = factory.create(true, n1, n2, cluster, identity1.snapshot(0), bundle_store.snapshot(0), nullptr);
+        auto server = factory.create(false, n2, n1, cluster, identity2.snapshot(0), bundle_store.snapshot(0), nullptr);
+        const DriveResult r = drive(*client, *server);
+        check(r.client_step == HandshakeEngine::Step::Done && r.server_step == HandshakeEngine::Step::Done,
+              "a TLS handshake trusts every root in a multi-root bundle (CA listed second)", ok);
     }
 
     std::printf("mbedtls_handshake_check: %s\n", ok ? "OK" : "FAIL");

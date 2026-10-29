@@ -201,14 +201,16 @@ certificates), not a bare fingerprint: `"QUARK-REVOKE-v1\0" ‖ cluster_id ‖ f
 not_after ‖ issued_at ‖ anchor_key_id ‖ signature` (fixed-length signed portion, ECDSA P-256 with
 SHA-256). It is verified through a `TrustAnchorVerifier` seam against the current and in-window
 previous trusted roots before it enters the registry; unsigned, wrong-signer, tampered,
-wrong-cluster or unknown-root records are dropped, counted and audited. Records are identified by
+wrong-cluster, unknown-root or expired records are dropped and counted, and verify work is
+rate-limited. Records are identified by
 `fingerprint`, never by their bytes (ECDSA is malleable), and a known fingerprint is not
 re-verified. Replay is harmless (the registry is a union-only ratchet), so the record has no nonce
 and `issued_at` is never a validity gate; an entry is pruned once its leaf's `not_after` (plus a skew
 bound) has passed. Signed entries have their own operator-sized cap, and a full cap refuses loudly.
-Root rotation includes re-signing the outstanding signed set under the new root. With the handshake
-enabled and no verifier installed, gossiped revocations are refused and `revoke()` returns an error
-(`SecurityMode::Strict` refuses to start). **Quark never holds the CA private key**: the application
+Root rotation includes re-signing the outstanding signed set under the new root. Without a verifier
+the registry stays in legacy unsigned mode and `revoke()` of a signed record returns an error;
+`SecurityMode::Strict` with the handshake enabled refuses to start in that configuration. Enabling
+signed mode is one-way and discards previously gossiped unsigned entries. **Quark never holds the CA private key**: the application
 supplies pre-signed records, and the core contains no signing primitive.
 
 ### Capability gossip decode discipline (ADR-045)
