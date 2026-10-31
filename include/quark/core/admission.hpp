@@ -42,6 +42,7 @@
 
 #include "quark/core/ids.hpp"
 #include "quark/core/node_authority.hpp"
+#include "quark/detail/atomic_shared_ptr.hpp"
 
 namespace quark {
 
@@ -113,8 +114,7 @@ public:
     using Listener = std::function<void(const AdmissionSnapshot&)>;
 
     // Starts at generation 0 with an EMPTY snapshot: nobody is admitted until the application publishes.
-    AdmissionAuthority()
-        : current_(AdmissionSnapshot::Builder(0).build()) {}
+    AdmissionAuthority() { current_.store(AdmissionSnapshot::Builder(0).build()); }
 
     AdmissionAuthority(const AdmissionAuthority&) = delete;
     AdmissionAuthority& operator=(const AdmissionAuthority&) = delete;
@@ -177,7 +177,8 @@ private:
         return flag;
     }
 
-    std::atomic<std::shared_ptr<const AdmissionSnapshot>> current_;
+    // detail::AtomicSharedPtr is std::atomic<std::shared_ptr> where the library has it (ADR-071 section 3).
+    detail::AtomicSharedPtr<const AdmissionSnapshot> current_;
     std::mutex mu_;
     std::vector<Slot> listeners_;
     std::uint64_t next_listener_id_ = 0;

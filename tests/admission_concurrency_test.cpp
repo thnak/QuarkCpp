@@ -50,13 +50,21 @@ Result run(bool gate_removed, bool& ok) {
     s1.on_receive([](MessageFrame) {});
 
     std::atomic<bool> stop{false};
+    // Senders keep sending until the publisher has walked every generation, so the run overlaps the deny
+    // phases whatever the scheduler does (on a slow emulator the fixed count finished before the first deny).
+    std::atomic<bool> published_all{false};
+    std::atomic<std::uint64_t> sent{0};
     std::thread publisher([&] {
         for (std::uint64_t g = 2; g <= kLastGen; ++g) {
             const bool admit = g % 2 == 1;
             (void)auth.publish(admit ? snap(g, {n1}) : snap(g, {}));
             returned.store(g, std::memory_order_release);
-            std::this_thread::yield();
+            // Hold each generation until some frames were sent under it, so admit and deny phases both see
+            // traffic on any scheduler (senders run until published_all, so this always makes progress).
+            const std::uint64_t base = sent.load(std::memory_order_acquire);
+            while (sent.load(std::memory_order_acquire) < base + 8) std::this_thread::yield();
         }
+        published_all.store(true, std::memory_order_release);
     });
     std::thread reader([&] {
         std::uint64_t last = 0;
@@ -71,8 +79,9 @@ Result run(bool gate_removed, bool& ok) {
     std::vector<std::thread> senders;
     for (int t = 0; t < kSenders; ++t)
         senders.emplace_back([&] {
-            for (int i = 0; i < kFramesPerSender; ++i) {
+            for (int i = 0; i < kFramesPerSender || !published_all.load(std::memory_order_acquire); ++i) {
                 s1.send(n2, make_frame(n1, n2));
+                sent.fetch_add(1, std::memory_order_relaxed);
                 if (i % 64 == 0) std::this_thread::yield();
             }
         });
@@ -82,7 +91,7 @@ Result run(bool gate_removed, bool& ok) {
     reader.join();
 
     Result r;
-    r.sent = static_cast<std::uint64_t>(kSenders) * kFramesPerSender;
+    r.sent = sent.load();
     r.delivered = delivered.load();
     r.discarded = s2.admission_stats().inbound_discarded;
     r.p1_violations = p1.load();

@@ -115,6 +115,12 @@ proxy keeps one source IP, and the PAL has no bind-to-source call to vary it. Re
   `serialize_fingerprint_mismatch_oob` (ASan-only) and `stream_drain_zero_rmw` (an `objdump` script), are not runnable on a device) were
   `llvm-strip`ped, `adb push`ed to `/data/local/tmp` and run with `timeout 300`: **246 / 246 exit 0, 0 failures**, including the three mobile tests
   and the two Dekker-litmus tests (the slowest, 28-29 s). x86-64 only; the arm64 weak-memory behaviour is untouched by this.
+- **A4 rerun after rebasing onto ADR-068/069/070 (2026-11-01).** ADR-069's `AdmissionAuthority` used `std::atomic<std::shared_ptr>` and did
+  not compile on NDK libc++ 19; it now uses `detail::AtomicSharedPtr`. Then on the same emulator: 257 `ctest` entries, 254 exit 0, 1 skipped
+  (no binary), `serialize_fingerprint_mismatch_oob` exits non-zero as its `WILL_FAIL` requires, and `admission_concurrency_test` (T8) failed
+  because the emulator's scheduler let every send finish before the first deny. T8 now holds each generation until frames are sent under it
+  and keeps senders running until every generation is published: 10 of 10 runs on the emulator and 3 of 3 on Windows pass, with 1,200 to
+  3,100 frames discarded per run.
 - **A5 — emulator <-> Windows, over TCP.** Network path: **`adb reverse tcp:47002 tcp:47002`** (the emulator's `127.0.0.1:47002` is carried by the adb
   server to the host's `127.0.0.1:47002`; the host's `mixed_os_node a` listens there, the emulator runs `mixed_os_node b`). Result: both
   sides `PASS`: 50 Req/Resp pairs in each direction (`req_handled=50 resp_got=50 sum=2450`), `peer_abi` 0x414E4452 (Android) vs 0x78866457 (Windows),
