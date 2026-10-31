@@ -31,6 +31,7 @@
 #include <cstdint>
 
 #include "quark/core/config.hpp"
+#include "quark/detail/atomic_relaxed.hpp"
 
 namespace quark {
 
@@ -183,12 +184,12 @@ struct HistogramBlock {
     [[nodiscard]] HistogramBlockSnapshot<kBuckets> snapshot() noexcept {
         HistogramBlockSnapshot<kBuckets> s;
         for (std::size_t i = 0; i < kBuckets; ++i)
-            s.buckets[i] = std::atomic_ref<std::uint64_t>(buckets[i]).load(std::memory_order_relaxed);
-        s.count = std::atomic_ref<std::uint64_t>(count).load(std::memory_order_relaxed);
-        s.sum = std::atomic_ref<std::uint64_t>(sum).load(std::memory_order_relaxed);
-        const std::uint64_t mn = std::atomic_ref<std::uint64_t>(min).load(std::memory_order_relaxed);
+            s.buckets[i] = detail::load_relaxed(buckets[i]);
+        s.count = detail::load_relaxed(count);
+        s.sum = detail::load_relaxed(sum);
+        const std::uint64_t mn = detail::load_relaxed(min);
         s.min = (s.count == 0) ? 0 : mn;
-        s.max = std::atomic_ref<std::uint64_t>(max).load(std::memory_order_relaxed);
+        s.max = detail::load_relaxed(max);
         return s;
     }
 };

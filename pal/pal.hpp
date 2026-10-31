@@ -53,6 +53,10 @@ namespace quark::pal {
 inline constexpr std::uint32_t platform_abi_tag = 0x41'36'34'57;  // 'A','64','W' (Windows/ARM64)
 #elif defined(_WIN32)
 inline constexpr std::uint32_t platform_abi_tag = 0x78'86'64'57;  // 'x','86','64','W' (Windows)
+#elif defined(__ANDROID__)
+// Android (ADR-071): Linux kernel + bionic, epoll backend. Its OWN tag, not Linux's: bionic struct layout is
+// not proven equal to glibc's, so no tagless fast path to a Linux peer until it is (cf. the Windows tag).
+inline constexpr std::uint32_t platform_abi_tag = 0x41'4E'44'52;  // 'A','N','D','R' (Android)
 #else
 inline constexpr std::uint32_t platform_abi_tag = 0x78'86'64'4C;  // 'x','86','64','L' (Linux)
 #endif

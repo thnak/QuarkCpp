@@ -75,6 +75,7 @@
 #include "quark/core/ids.hpp"
 #include "quark/core/membership.hpp"
 #include "quark/core/admission.hpp"  // ADR-069: application-driven eviction
+#include "quark/core/mobile_lease.hpp"  // ADR-071: suspension leases for mobile members
 #include "quark/core/tls_identity.hpp"  // Fingerprint — ADR-040 Phase 5 revocation-gossip piggyback
 #include "quark/core/transport.hpp"
 #include "quark/detail/hash.hpp"
@@ -169,6 +170,11 @@ enum class ControlKind : std::uint8_t {
     JoinAck = 7,     // seed → joiner: admitted; snapshot rides the `updates` digest
     JoinReject = 8,  // seed → joiner: cluster-id mismatch, refused (§1 accidental-merge guard)
     Congested = 9,   // ADR-046: edge-triggered cross-node mailbox backpressure signal
+    // ADR-071: a member announces a GRACEFUL SUSPEND (phone backgrounded / Doze). `seq` = the requested
+    // lease in ns (a relative duration, so no clock skew travels; the receiver clamps it), and
+    // `subject_incarnation` = the SuspendReason. Additive: an N-1 node ignores the unknown kind (its
+    // switch has no case) and merely treats the frame as first-hand liveness evidence.
+    Suspend = 10,
 };
 
 // One gossiped member fact: node, incarnation, status. Higher incarnation wins on merge; a node
@@ -541,6 +547,9 @@ public:
         // out) and the application's admission snapshot is the only source of denial. Default false keeps
         // the ADR-040 behaviour (any admitted member can gossip a revocation).
         bool authority_only_revocation = false;
+        // ADR-071: receiver-side policy for peers' graceful-suspend announcements (lease cap, table cap)
+        // and the default lease this node announces for itself.
+        MobileProfile mobile{};
     };
 
     // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
@@ -705,6 +714,62 @@ public:
     void set_online(bool on) noexcept { online_ = on; }
     [[nodiscard]] bool online() const noexcept { return online_; }
 
+    // --- ADR-071 mobile lifecycle (host-called; Quark never calls up into Java/Kotlin) ------------------
+    // SELF side. The host app calls suspend() when the process is about to be frozen (Activity stopped,
+    // Doze, network lost): this node tells every live peer, once, that it is going quiet for at most
+    // `lease_ns` (0 = Config::mobile.default_lease_ns), then stops probing, gossiping and answering until
+    // resume(). Best-effort by design: a phone cannot wait for acks while the OS freezes it, and a peer that
+    // missed the announcement simply treats the silence as any other (resume() then refutes at a higher
+    // incarnation). A self-left or offline node ignores the call.
+    void suspend(SuspendReason why = SuspendReason::AppBackground, std::int64_t lease_ns = 0) {
+        if (suspended_self_ || self_left_ || !online_) return;
+        if (lease_ns <= 0) lease_ns = cfg_.mobile.default_lease_ns;
+        for (const NodeId peer : live_peers_excluding(self_)) {
+            ControlMsg m;
+            m.kind = ControlKind::Suspend;
+            m.seq = static_cast<std::uint64_t>(lease_ns);
+            m.subject_incarnation = static_cast<std::uint64_t>(why);
+            send_control(peer, m);
+        }
+        suspended_self_ = true;
+    }
+    // The process is running again. The suspension is lifted, the incarnation is raised (so peers can tell
+    // a post-resume frame from a pre-suspend straggler, and a Suspect/Dead the peers reached meanwhile is
+    // refuted), local time-based state that the sleep made meaningless is forgiven (the boot clock counted
+    // the sleep: an in-flight probe is void, a held Suspect gets a fresh suspicion window), and every live
+    // peer is told at once with a Gossip frame, so the rejoin is immediate, not "next gossip round".
+    void resume() {
+        if (!suspended_self_) return;
+        suspended_self_ = false;
+        const std::int64_t now = now_ns();
+        Member& me = members_[self_.value];
+        self_incarnation_ += 1;
+        me.incarnation = self_incarnation_;
+        forgive_local_state(now);
+        for (const NodeId peer : live_peers_excluding(self_)) {
+            ControlMsg g;
+            g.kind = ControlKind::Gossip;
+            send_control(peer, g);
+        }
+        flush_events();
+    }
+    // The device's network changed (Wi-Fi <-> cellular, new address). The transport reconnect is the host's
+    // (MobileMember calls Transport::reset_peer_connection per peer); the membership's part is the same
+    // forgiveness as resume(): a probe that was in flight on the dead path says nothing about the peer,
+    // and any Suspect this node reached because OUR path was down gets a fresh window.
+    void network_changed() {
+        if (suspended_self_ || !online_) return;
+        forgive_local_state(now_ns());
+        ++network_changes_;
+    }
+    [[nodiscard]] bool self_suspended() const noexcept { return suspended_self_; }
+    // PEER side: do we currently hold a suspension lease for `n`? (health(n).suspended is the same fact.)
+    [[nodiscard]] bool is_suspended(NodeId n) const { return suspended_leases_.contains(n.value); }
+    [[nodiscard]] std::size_t suspended_count() const noexcept { return suspended_leases_.size(); }
+    [[nodiscard]] std::uint64_t network_changes() const noexcept { return network_changes_; }
+    // Gossiped Suspect/Dead accusations ignored because we hold the accused's own lease (ADR-071 C1).
+    [[nodiscard]] std::uint64_t suspicions_suppressed() const noexcept { return suspicions_suppressed_; }
+
     // --- Join (021 §1/§3). Admit `joiner` iff its presented cluster id matches (accidental-merge
     // guard) — the in-process form of the join gate the 020 AUTHENTICATE step precedes. Returns true
     // and advances the epoch on admission; false on cluster-id mismatch. Unit-testable directly. Uses
@@ -754,8 +819,9 @@ public:
     // test advances virtual time between ticks to drive ping→miss→indirect→suspect→dead deterministic-
     // ally. NO sleeping, NO wall-clock wait. ------------------------------------------------------
     void tick() {
-        if (!online_) return;
+        if (!online_ || suspended_self_) return;  // a suspended process does not run the protocol (ADR-071)
         const std::int64_t now = now_ns();
+        expire_suspend_leases(now);  // ADR-071: a lapsed lease becomes an ordinary Suspect -> Dead path
         reap_suspects(now);   // Suspect → Dead once the suspicion timeout lapses with no refutation
         reap_tombstones(now);  // erase tombstones older than tombstone_ttl_ns
         reap_unverified(now);  // P2: drop gossip-only members that never answered
@@ -785,6 +851,7 @@ public:
             h.incarnation = it->second.incarnation;
             h.protocol_version = it->second.wire_version;
             h.verified = it->second.verified;
+            h.suspended = suspended_leases_.contains(n.value);
             found = true;
         }
         if (const auto r = refusals_.find(n.value); r != refusals_.end()) {
@@ -861,6 +928,7 @@ private:
         std::int64_t first_seen_ns = 0;  // P2: start of the unverified TTL
         std::uint8_t wire_version = 0;   // ADR-053: last wire version heard directly (0 = never)
         std::uint8_t reported = 0;       // last state shown to subscribers: 0 none, 1 live, 2 Dead, 3 Left
+        std::uint64_t lease_expired_inc = 0;  // ADR-071: incarnation a suspend lease lapsed at (0 = never)
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -1026,7 +1094,7 @@ private:
             if (data_sink_) data_sink_(std::move(f));  // 010 data plane, untouched
             return;
         }
-        if (!online_) return;  // crashed node ignores control (stops acking)
+        if (!online_ || suspended_self_) return;  // crashed or suspended node ignores control (stops acking)
         // P2: a fixed, per-sender Control-frame budget before decode/handle. Gossip and probe traffic
         // is far below this; a flood is shed here rather than driving republish/probe work.
         if (!admit_control(f.from, now_ns())) {
@@ -1113,6 +1181,8 @@ private:
                 if (auto it = members_.find(m.from.value); it != members_.end()) {
                     it->second.last_direct_ns = now;
                     apply_update(m.from, m.from_incarnation, MemberStatus::Alive, Src::Direct, now);
+                    // ADR-071: any non-Suspend frame from a leased member at a higher incarnation = resumed.
+                    if (m.kind != ControlKind::Suspend) on_leased_peer_spoke(m);
                 }
             }
             for (const MemberUpdate& u : m.updates) {  // may trigger self-refutation
@@ -1234,6 +1304,9 @@ private:
             }
             case ControlKind::JoinReject:
                 break;  // handled above (ADR-053); a cluster-mismatch reject never reaches here
+            case ControlKind::Suspend:
+                on_suspend_announced(m, now);  // ADR-071
+                break;
             case ControlKind::Congested: {
                 // C1 epoch gen-gate (proven): a stale pre-restart signal never advances the throttle —
                 // mirrors apply_update's Alive-branch precedence (strictly-not-older incarnation wins).
@@ -1246,6 +1319,73 @@ private:
         }
     }
 
+    // --- ADR-071 mobile-member internals ---------------------------------------------------------------
+    // A peer announced a graceful suspend. The sender is authenticated (handle_control checked m.from), so
+    // the announcement speaks only for ITSELF. Ignored unless the sender is a known, live, first-hand-
+    // verified member and the announcement is not stale (incarnation below what we hold).
+    void on_suspend_announced(const ControlMsg& m, std::int64_t now) {
+        const auto it = members_.find(m.from.value);
+        if (it == members_.end() || m.from == self_) return;
+        Member& cur = it->second;
+        if (is_tomb(cur.status) || !cur.verified) return;
+        if (m.from_incarnation < cur.incarnation) return;  // stale replay of an older suspend
+        // A lease that lapsed is not renewable at the same incarnation: a member that never answered cannot
+        // keep itself alive by re-announcing. It must first prove liveness (refute at a higher incarnation).
+        if (cur.lease_expired_inc != 0 && m.from_incarnation <= cur.lease_expired_inc) return;
+        const auto reason = static_cast<SuspendReason>(
+            std::min<std::uint64_t>(m.subject_incarnation, static_cast<std::uint64_t>(SuspendReason::Other)));
+        const bool was_leased = suspended_leases_.contains(m.from.value);
+        const std::int64_t asked = static_cast<std::int64_t>(
+            std::min<std::uint64_t>(m.seq, static_cast<std::uint64_t>(cfg_.mobile.max_lease_ns)));
+        if (!suspended_leases_.grant(m.from.value, m.from_incarnation, asked, reason, now, cfg_.mobile))
+            return;  // zero lease or table full: treat the silence like any other
+        if (cur.status == MemberStatus::Suspect) {  // we had started to doubt it; its own word outranks that
+            cur.status = MemberStatus::Alive;
+            cur.verify_pending = false;
+            set_tx(cur, piggyback_count());
+            note_transition(m.from, cur, MemberStatus::Suspect);  // Recovered
+        }
+        if (probe_.active && probe_.target == m.from) probe_.active = false;  // do not escalate on silence
+        if (!was_leased) push_event(MembershipEventKind::Suspended, m.from, cur);
+    }
+
+    // A first-hand frame from a leased member at a HIGHER incarnation than its suspend: it is back.
+    void on_leased_peer_spoke(const ControlMsg& m) {
+        const SuspendLeases::Entry* e = suspended_leases_.find(m.from.value);
+        if (!e || m.from_incarnation <= e->incarnation) return;  // pre-suspend straggler: keep the lease
+        suspended_leases_.clear(m.from.value);
+        if (const auto it = members_.find(m.from.value); it != members_.end())
+            push_event(MembershipEventKind::Resumed, m.from, it->second);
+    }
+
+    // Lapsed leases: the member never resumed within the bound. Hand it to the ordinary failure path:
+    // Suspect now (a full suspicion window to refute), Dead if it stays silent. No zombie (ADR-071 C2).
+    void expire_suspend_leases(std::int64_t now) {
+        if (suspended_leases_.size() == 0) return;
+        for (const std::uint64_t id : suspended_leases_.expire(now)) {
+            const auto it = members_.find(id);
+            if (it == members_.end() || is_tomb(it->second.status)) continue;
+            it->second.lease_expired_inc = it->second.incarnation;
+            apply_update(NodeId{id}, it->second.incarnation, MemberStatus::Suspect, Src::Local, now);
+        }
+    }
+
+    // After a sleep or a path change our timers describe a world that no longer exists.
+    void forgive_local_state(std::int64_t now) {
+        probe_ = Probe{};
+        for (auto& [id, m] : members_)
+            if (m.status == MemberStatus::Suspect && id != self_.value)
+                m.suspect_deadline_ns = now + cfg_.suspicion_timeout_ns;
+    }
+
+    // Live peers that are awake: the targets of gossip fan-out and relay selection (a leased member is
+    // asleep by its own announcement; sending to it only wastes the budget).
+    [[nodiscard]] std::vector<NodeId> awake_peers_excluding(NodeId excl) const {
+        std::vector<NodeId> v = live_peers_excluding(excl);
+        std::erase_if(v, [&](NodeId n) { return suspended_leases_.contains(n.value); });
+        return v;
+    }
+
     // --- probe FSM ----------------------------------------------------------------------------
     void drive_probe(std::int64_t now) {
         if (!probe_.active) return;
@@ -1254,7 +1394,8 @@ private:
             return;
         }
         // Target tombstoned or erased meanwhile: abandon (a Suspect here would re-create it).
-        if (auto it = members_.find(probe_.target.value); it == members_.end() || is_tomb(it->second.status)) {
+        if (auto it = members_.find(probe_.target.value);
+            it == members_.end() || is_tomb(it->second.status) || suspended_leases_.contains(probe_.target.value)) {
             probe_.active = false;
             return;
         }
@@ -1296,7 +1437,7 @@ private:
     void send_indirect(NodeId target, std::uint64_t seq, std::int64_t /*now*/) {
         std::uint32_t sent = 0;
         std::uint64_t r = mix(self_.value, seq, 0x51D3);
-        std::vector<NodeId> relays = live_peers_excluding(target);
+        std::vector<NodeId> relays = awake_peers_excluding(target);
         for (std::uint32_t i = 0; i < relays.size() && sent < cfg_.indirect_k; ++i) {
             const NodeId relay = relays[(r + i) % relays.size()];
             ControlMsg req;
@@ -1353,7 +1494,7 @@ private:
     }
 
     void gossip_round(std::int64_t now) {
-        std::vector<NodeId> peers = live_peers_excluding(self_);
+        std::vector<NodeId> peers = awake_peers_excluding(self_);
         if (peers.empty()) return;
         std::uint64_t r = mix(self_.value, static_cast<std::uint64_t>(now), 0xF00D);
         for (std::uint32_t i = 0; i < peers.size() && i < cfg_.gossip_fanout; ++i) {
@@ -1420,6 +1561,16 @@ private:
                 me.status = MemberStatus::Alive;
             }
             return;  // we never mark ourselves Suspect/Dead
+        }
+
+        // ADR-071 C1: we hold this member's own lease. A second-hand Suspect/Dead at or below the
+        // incarnation it suspended at is a peer that never heard the announcement; the member's word
+        // outranks it. (A LOCAL accusation cannot occur: leased members are not probed.)
+        if ((st == MemberStatus::Suspect || st == MemberStatus::Dead) && src != Src::Local) {
+            if (const SuspendLeases::Entry* le = suspended_leases_.find(node.value); le && inc <= le->incarnation) {
+                ++suspicions_suppressed_;
+                return;
+            }
         }
 
         auto it = members_.find(node.value);
@@ -1654,7 +1805,8 @@ private:
             while (probe_order_idx_ < probe_order_.size()) {
                 const NodeId n = probe_order_[probe_order_idx_++];
                 const auto it = members_.find(n.value);
-                if (it != members_.end() && !is_tomb(it->second.status)) return n;
+                if (it != members_.end() && !is_tomb(it->second.status) && !suspended_leases_.contains(n.value))
+                    return n;  // ADR-071: a leased (suspended) member is not probed
             }
         }
         return std::nullopt;
@@ -1834,6 +1986,11 @@ private:
     std::function<void(MessageFrame)> data_sink_;
     std::function<bool(NodeId)> link_reachable_;
     bool online_ = true;
+    // ADR-071 mobile lifecycle state (driving thread only).
+    SuspendLeases suspended_leases_;          // peers that announced a graceful suspend (receiver-side)
+    bool suspended_self_ = false;             // this node called suspend() and has not resume()d
+    std::uint64_t network_changes_ = 0;
+    std::uint64_t suspicions_suppressed_ = 0;
 
     RevocationPullFn revocation_pull_;
     RevocationMergeFn revocation_merge_;

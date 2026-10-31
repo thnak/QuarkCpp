@@ -19,7 +19,8 @@ endif()
 # IOCP proactor backend (Windows currently runs WSAPoll — see pal/windows_x86_64/net.hpp) are still
 # open. Windows/ARM64 (ADR-059) is accepted here and cross-compiles, but is unproven on real ARM64
 # hardware until the windows-11-arm CI leg has run. Anything else (macOS, other arches) has no PAL backend yet.
-if(NOT ((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|aarch64|arm64")
+if(NOT ((CMAKE_SYSTEM_NAME STREQUAL "Android" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|aarch64")  # ADR-071
+    OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|aarch64|arm64")
     OR (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|ARM64|arm64")))
   message(WARNING "Quark is verified on Linux/x86-64 and CI-verified on Linux/arm64 and "
                   "Windows/x86-64; this is ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}. Other "
@@ -28,6 +29,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(QuarkWarnings)
+include(QuarkAndroid)  # ADR-071: no-op unless CMAKE_SYSTEM_NAME is Android (NDK toolchain)
 
 # ---- Windows toolchain wiring -----------------------------------------------
 # NOMINMAX/WIN32_LEAN_AND_MEAN are already guarded per-header in pal/windows_x86_64/*.hpp; setting
@@ -61,6 +63,17 @@ if(WIN32)
   target_link_libraries(quark PUBLIC ws2_32 bcrypt mincore)
 endif()
 add_library(quark::quark ALIAS quark)
+if(QUARK_ANDROID)
+  quark_add_android_targets()  # ADR-071: libquark_android.so (JNI-loadable C ABI node)
+endif()
+# ADR-071: the native one-node-per-process runner over the same C ABI. Built on EVERY OS, not registered with
+# CTest (it needs a peer process): the NDK build is `adb push`ed to the emulator, the Windows build is the
+# always-on PC it talks to. See src/android/quark_mobile_runner.cpp.
+if(QUARK_BUILD_TESTS)
+  find_package(Threads REQUIRED)
+  add_executable(quark_mobile_runner src/android/quark_mobile_runner.cpp src/android/quark_android.cpp)
+  target_link_libraries(quark_mobile_runner PRIVATE quark::quark quark_warnings Threads::Threads)
+endif()
 
 # ---- Tests, benchmarks & samples -------------------------------------------
 option(QUARK_BUILD_TESTS "Build Quark tests" ON)

@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "quark/detail/atomic_shared_ptr.hpp"
 #include "quark/core/capabilities.hpp"
 #include "quark/core/cluster.hpp"
 #include "quark/core/ids.hpp"
@@ -255,8 +256,8 @@ private:
     std::atomic<std::uint64_t> rejected_{0};
     std::atomic<std::size_t> size_{0};
     std::uint32_t local_seq_ = 0;
-    std::atomic<std::shared_ptr<const NodeCapabilities>> pending_local_;
-    std::atomic<std::shared_ptr<const CapMap>> published_;
+    detail::AtomicSharedPtr<const NodeCapabilities> pending_local_;
+    detail::AtomicSharedPtr<const CapMap> published_;
 };
 
 }  // namespace quark

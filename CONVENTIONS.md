@@ -19,6 +19,10 @@ with the ADR that proved it), then the code — never silently diverge.
   seams proven only on x86-TSO (the `seq_cst` Dekker close-out, fiber
   handshakes, big-endian serialization), and the 023 perf budgets are not re-baselined for it. Do
   not promote a spec's gate to "Accepted (arm64)" off CI-green alone.
+- **Android (ADR-071, Proposed) builds with the NDK (r28+, API 35+) for `arm64-v8a` and `x86_64`**, on the Linux
+  epoll backend (no `io_uring`). Only the x86-64 emulator has run it; arm64 is built and linked, never executed,
+  and nothing has run on a physical device. A mobile host calls `suspend`/`resume`/`network_changed` (the node
+  never calls up into Java). See 019 §"Android target" and 021 §"Mobile member profile".
 - **Cross-platform by construction otherwise.** All OS/arch specifics live behind the **PAL**
   (`pal/`, spec 019); Windows/macOS come later — do not add them speculatively, but never bake an
   OS/arch assumption into the core; route it through a PAL seam.

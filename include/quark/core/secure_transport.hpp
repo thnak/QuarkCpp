@@ -50,6 +50,7 @@
 
 #include <unordered_set>
 
+#include "quark/detail/atomic_shared_ptr.hpp"
 #include "quark/core/aead.hpp"
 #include "quark/core/audit.hpp"
 #include "quark/core/handshake.hpp"
@@ -952,7 +953,7 @@ private:
     NodeId self_;
     std::shared_ptr<const Aead> shared_cipher_;  // aliasing shared_ptr over cipher_ (non-owning)
     // D4: set by on_receive (any thread) and read per frame on the I/O thread ⇒ atomic shared_ptr.
-    std::atomic<std::shared_ptr<const std::function<void(MessageFrame)>>> receiver_;
+    detail::AtomicSharedPtr<const std::function<void(MessageFrame)>> receiver_;
     AuditSink audit_{};
     ShardCounters* metrics_ = nullptr;  // ADR-040 Phase 8; see set_metrics() banner
 
@@ -966,7 +967,7 @@ private:
     const IdentityMaterial* identity_ = nullptr;
     const TrustStore* trust_ = nullptr;
     // D4: written by set_revoked/sweep_revocations, read at every handshake creation ⇒ atomic shared_ptr.
-    std::atomic<std::shared_ptr<const std::unordered_set<Fingerprint>>> revoked_snapshot_;
+    detail::AtomicSharedPtr<const std::unordered_set<Fingerprint>> revoked_snapshot_;
 
     // ADR-040 Phase 6: rotation/renegotiate policy + the reset-hook fallback (set_reset_hook banner above).
     std::function<void(NodeId)> reset_hook_;

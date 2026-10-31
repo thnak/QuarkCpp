@@ -49,6 +49,7 @@
 #include <utility>
 #include <vector>
 
+#include "quark/detail/atomic_shared_ptr.hpp"
 #include "quark/core/descriptor.hpp"      // quark::MessageId
 #include "quark/core/ids.hpp"             // quark::ActorId
 #include "quark/core/stream_channel.hpp"  // quark::StreamChannel
@@ -330,7 +331,7 @@ private:
     using SubVec = std::vector<Sub>;
 
     std::mutex mu_;                                        // registry (subscribe/unsubscribe) COLD
-    std::atomic<std::shared_ptr<const SubVec>> snapshot_;  // immutable COW membership (safe-acquire)
+    detail::AtomicSharedPtr<const SubVec> snapshot_;  // immutable COW membership (safe-acquire)
     std::atomic<std::uint64_t> in_flight_{0};              // publishes that may hold the old snapshot
     std::atomic<std::uint64_t> seq_{0};                    // per-FanOut message sequence (017 id)
     std::pmr::memory_resource* mr_;

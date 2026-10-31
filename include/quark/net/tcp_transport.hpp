@@ -901,7 +901,12 @@ private:
         // the canonical connection deterministically from node ids so data only ever flows over it (needs
         // a two-connection-slot rework + gossiped-endpoint dial-back); once settled, delivery is lossless.
         const bool want_self_initiated = keep_local_dial(self_, peer);
-        Conn* survivor = (c->initiated_by_self == want_self_initiated) ? c : existing;
+        // ADR-071 C7: the election is for a dial RACE (one self-initiated conn, one inbound). When BOTH are
+        // inbound, the peer simply dialed again: a RECONNECT (a phone that changed network while this side
+        // still holds the old, possibly half-open, connection). The fresh one supersedes the old; electing
+        // by node id here kept the dead inbound forever when self < peer and refused the live one.
+        const bool both_inbound = !existing->initiated_by_self && !c->initiated_by_self;
+        Conn* survivor = both_inbound ? c : ((c->initiated_by_self == want_self_initiated) ? c : existing);
         dedup_closed_.fetch_add(1, std::memory_order_relaxed);
         if (survivor == c) {
             // `c` (the new conn) wins: take its ownership into conns_[peer], drop the old existing.

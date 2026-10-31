@@ -56,6 +56,8 @@ enum class MembershipEventKind : std::uint8_t {
     VersionRefused = 5,  // wire-protocol version outside the supported window (ADR-053); see `refusal`
     Evicted = 6,         // ADR-069: the application's admission snapshot denied a live member; it is out of
                          // the view (tombstoned) and re-admission is refused until a later snapshot admits it
+    Suspended = 7,       // ADR-071: the node announced a graceful suspend; a bounded lease is held for it
+    Resumed = 8,         // ADR-071: a suspended node spoke again (higher incarnation); lease cleared
 };
 
 // Distinct, observable reason a peer was refused (never conflated with a timeout / cluster mismatch).
@@ -86,6 +88,7 @@ struct NodeHealth {
     bool verified = false;              // first-hand evidence seen (in the placement view)
     RefusalReason last_refusal = RefusalReason::None;  // sticky: why we last refused this node
     std::uint8_t refused_version = 0;                  // the version it presented then
+    bool suspended = false;  // ADR-071: a suspension lease is held (state is still Alive, not Suspect)
 };
 
 using MembershipEventSink = std::function<void(const MembershipEvent&)>;
@@ -203,7 +206,7 @@ public:
     void add_event_sink(MembershipEventSink s) override { sinks_.push_back(std::move(s)); }
     [[nodiscard]] std::optional<NodeHealth> health(NodeId n) const override {
         if (!view().contains(n)) return std::nullopt;
-        return NodeHealth{n, MemberStatus::Alive, 0, 0, true, RefusalReason::None, 0};
+        return NodeHealth{n, MemberStatus::Alive, 0, 0, true, RefusalReason::None, 0, false};
     }
 
     [[nodiscard]] std::uint64_t epoch() const noexcept {

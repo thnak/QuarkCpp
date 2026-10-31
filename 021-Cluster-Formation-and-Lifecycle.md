@@ -492,6 +492,45 @@ A future relay-discovery ADR should only need to address these three items —
 the fallback-threshold mechanism itself (`resolve_dial_endpoint()`, the fenced
 relay↔direct cutover) is settled and should not be re-litigated.
 
+### Mobile member profile (ADR-071)
+
+> **Status: Draft** — see [ADR-071](decisions/ADR-071-android-pal-and-mobile-lifecycle.md) for the claims, the
+> experiments that break them, and what is owed. Lifecycle contract: [019 §"Android target"](019-Platform-Abstraction-Layer.md).
+
+A phone is a full member that is *often absent on purpose*: the OS freezes the app. Plain SWIM reads that
+silence as a failure, so every backgrounding would raise suspicion and, after the suspicion window, declare the
+phone dead and re-place its actors. The profile makes a **planned** absence distinguishable from a crash, with
+no new membership *state* and no new failure detector:
+
+- **Announce (`ControlKind::Suspend = 10`).** Before going quiet, the member sends one control frame to each
+  live peer: `seq` = the lease it asks for (a relative duration in ns; no clock skew travels), `subject_incarnation`
+  = a reason code. It speaks only for itself (`from` is the authenticated sender, as for Left). Best-effort: it
+  cannot wait for acks while the OS freezes it.
+- **The receiver holds a lease, and the receiver bounds it.** A peer that accepts the announcement records
+  "do not probe, suspect or kill this member until `now + min(asked, max_lease_ns)`" (`MobileProfile`,
+  default cap 15 min, default self-announced lease 10 min) and caps how many leases it holds (`max_suspended`,
+  64). A request of zero, beyond the table cap, from an unknown or unverified member, or at an incarnation
+  below what the receiver holds (a replay) is ignored — the silence is then treated like any other.
+- **While leased:** the member is not probed, not chosen as an indirect-ping relay, not a gossip fan-out
+  target; its status stays **Alive** (`NodeHealth::suspended == true`, events `Suspended` / `Resumed`); a
+  second-hand Suspect/Dead about it at or below its suspend incarnation is ignored (counted in
+  `suspicions_suppressed()`), so one peer that missed the announcement cannot drag the others along. It stays
+  in `view()` and placement for the lease: that is the point, nothing re-places.
+- **Resume = rejoin without churn.** `resume()` raises the member's incarnation and sends a Gossip frame to
+  every live peer at once. Any non-Suspend frame from a leased member at a *higher* incarnation clears the
+  lease on arrival (a pre-suspend straggler does not). The resumed node also forgives its own timers: the
+  in-flight probe is voided and any Suspect it held gets a fresh suspicion window (the boot clock counted the
+  sleep, so every deadline would otherwise read as expired).
+- **No zombie.** When the lease lapses without a resume, the receiver moves the member to **Suspect** (a full
+  suspicion window to refute) and the ordinary path ends in Dead and removal. A peer that never heard the
+  announcement behaves as plain SWIM; the member heals on resume by refuting at its higher incarnation
+  (R3: strictly higher beats a tombstone).
+- **Wire compatibility.** Additive. An N-1 node has no `case` for the new kind and ignores it, treating the frame
+  as first-hand liveness evidence; it simply gets no benefit (it suspects the silent phone as before). The SWIM
+  wire version is not bumped.
+- **Not in this profile:** discovery on Android (Q3), the foreground service and Doze policy (the app), and
+  the connection-level handling of an address change (010's transport rule, 019 §"Android target").
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping
