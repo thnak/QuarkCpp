@@ -85,6 +85,9 @@ include(QuarkPersistenceAdapters)
 # std-only core keeps MockCipher/no-op handshake as its dev/loopback default; see
 # cmake/QuarkSecurityAdapters.cmake for enabling instructions.
 include(QuarkSecurityAdapters)
+
+# Optional 021 LAN discovery platform (Windows DNS-SD, ADR-070). OFF by default.
+include(QuarkDiscoveryAdapters)
 if(QUARK_BUILD_BENCH)
   add_subdirectory(bench)
 endif()

@@ -147,6 +147,36 @@ struct Discovery {
   running cluster. This is the property that keeps the system coordinator-free
   (010) while still bootstrappable.
 
+### LAN discovery adapter (DNS-SD) — Draft amendment (ADR-070, issue #42)
+
+> **Status: Draft.** Owner of the evidence: [ADR-070](decisions/ADR-070-lan-discovery-adapter.md) (Proposed). It adds an adapter
+> behind the `Discovery` seam above; it changes nothing in the core, SWIM, or the handshake.
+
+A node on a local network with no configured address finds peers by DNS-SD/mDNS. This is an **adapter outside the core** (as the
+adapter list above says), in `include/quark/net/lan_discovery.hpp`.
+
+- **Discovery grants nothing.** The adapter yields a `DiscoveredPeer` (address, port, the instance id the peer advertised). It
+  carries no `NodeId` and no trust. It may only feed the normal connection path (`lan_discovery_feed.hpp` teaches
+  `TcpTransport::add_peer`); the handshake and `NodeAuthority` admission still decide whether the peer is a member.
+- **The advertisement carries only what the application supplies:** the service type, one opaque instance id (encoded as RFC 4648
+  base32, lowercase, no padding, into the DNS-SD instance label, at most 36 bytes), a host label, the listening port, and TXT pairs
+  only if the application supplied them. Quark derives nothing from a host name, user name, node id or product, and hard-codes no
+  service type. Nothing is advertised if the application supplies no id or no host label.
+- **Rotation is the application's.** The application supplies a `WindowProvider` returning the id to advertise, the ids to accept
+  (current and previous window), and the host label for that window; it signals a boundary (`window_boundary`) and the adapter
+  re-reads the provider and re-advertises. The adapter owns neither the clock nor any key. Browsing accepts a sighting whose decoded
+  label **starts with** an accepted id, so an application may append random bytes for uniqueness (mDNS instance names are unique per
+  network; two members advertising an identical id collide).
+- **Runtime control, per scope.** `open_scope` / `start_advertising` / `stop_advertising` / `start_browsing` / `stop_browsing` /
+  `close_scope`; several scopes may advertise at once with different ids and service types. Destroying the adapter withdraws every advert.
+- **Platform seam.** The OS calls sit behind `DnsSdPlatform` (`register_service`, `deregister_service`, `browse`, `stop_browse`), which
+  the application may implement itself (AeroCoWorker routes OS authority through its own HAL). Quark ships an in-memory fake and, behind
+  the opt-in `QUARK_WITH_DNSSD`, a Windows implementation over dnsapi. **Linux (Avahi) is out of scope**; there the application supplies its own platform.
+- **Client isolation is not detectable passively.** `visibility()` returns `Unknown`. No probing or scanning is performed to tell
+  "no peers visible" from "no peers present"; that distinction is owed (ADR-070 section 5).
+- **Known leaks, stated rather than hidden:** the SRV record carries the listening port; the A record carries the advertised IPv4
+  address; a platform that forces a stable host name makes that name a stable identifier (the host label must therefore rotate with the window).
+
 ### Establishment: lazy, not full mesh (self-debate)
 
 - **Eager full mesh.** Every node dials every other at join → *predictable
