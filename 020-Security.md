@@ -128,6 +128,15 @@ admission as a numbered snapshot**:
   source of denial. This node's own operator revocation (`revoke_locally`) still applies. The default
   keeps ADR-040 behaviour (any admitted member can gossip a revocation).
 
+- **Frame origin (Draft amendment, ADR-069 "Red-team of the merged changes (#47)", M1).** A frame delivered locally
+  must carry `from` equal to the identity of the connection it arrived on (`TcpTransport` drops and counts any other,
+  `spoofed_origin_dropped()`); a shape-B relay (ADR-048) delivers its origin's frames only where the receiver opted in
+  (`set_accept_relayed_frames`). A handshake this node merely **answered** that fails never erases an existing session;
+  only a renegotiation this side initiated may.
+- **Close path (N3).** `TcpTransport::set_admission(authority)` makes the transport refuse a denied peer at HELLO,
+  close its connection when a snapshot denies it (reporting peer-down), never dial or redial it, and lift that when a
+  later snapshot no longer denies it. `reset_peer_connection` is not a close path for a denied device (it redials).
+
 Residual risks, stated: a receive callback that blocks stalls `publish`; the generation fence is per
 transport, so two transports on one thread publishing concurrently through synchronous loopback can
 deadlock (a test-double shape, not a network one); `publish` is synchronous work proportional to the live

@@ -34,6 +34,8 @@ int main() {
     net::TcpTransport tr(R, pal::ipv4_loopback, 0), ta(A, pal::ipv4_loopback, 0), tb(B, pal::ipv4_loopback, 0);
     tr.on_receive([](MessageFrame) {});
     tr.set_relay_forwarding([&](NodeId, NodeId) { return true; });
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
 
     SwimMembership::Config cfg;
     cfg.cluster_id = cluster;

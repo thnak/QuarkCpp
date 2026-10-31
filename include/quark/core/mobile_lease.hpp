@@ -9,6 +9,8 @@
 // lapses (ADR-071 claim C2), so a lease can never make a zombie. The receiver, not the announcer, bounds the
 // lease (`max_lease_ns`), and bounds how many leases it will hold (`max_suspended`), so a hostile member
 // cannot park itself forever or exhaust the table (ADR-071 claim C6).
+// ADR-071 "Red-team of the merged changes (#47)" (M3): the owner clears a lease at every tombstone/eviction/Join,
+// so the table needs no prune() (removed: it had no caller).
 #pragma once
 
 #include <algorithm>
@@ -73,12 +75,6 @@ public:
         std::sort(out.begin(), out.end());
         for (std::uint64_t id : out) map_.erase(id);
         return out;
-    }
-
-    // Drop leases for nodes the predicate says are no longer eligible (erased / tombstoned).
-    template <class Pred>
-    void prune(Pred&& gone) {
-        std::erase_if(map_, [&](const auto& kv) { return gone(kv.first); });
     }
 
 private:

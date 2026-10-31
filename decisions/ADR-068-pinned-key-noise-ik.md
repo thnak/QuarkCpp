@@ -100,3 +100,14 @@ engineering findings. Each is dispositioned:
 Windows 11, MSVC (VS 18), x64 Release, `build-noise` with `QUARK_WITH_SODIUM=ON` and (for the cross-mode check) `QUARK_WITH_MBEDTLS=ON`:
 see the final report for the counts of this run. The 245 pre-existing tests (including `mbedtls_aead_check` and `mbedtls_handshake_check`,
 TLS/CA mode unchanged) pass unchanged beside the 8 new ones (6 adapter checks + 2 isolation tests).
+
+## 6. Red-team of the merged changes (#47), 2026-11-01 (no change to the Noise engine)
+
+The interaction red-team (ADR-069 section 8, ADR-071 section 10) touched this ADR only at the transport seam; the engine is unchanged.
+- **M1/N5 closed at the transport**, not in the handshake: an `Authenticate` frame's `from` is a claim until the Noise handshake pins the key, and
+  the transport now refuses a frame whose `from` is not its connection's identity, and a failed handshake that this node only answered no longer
+  erases a live session. The pinned handshake itself (which already authenticates `Result::peer_node_id`) was not the defect.
+- **N1 remains**: the HELLO identity is still an unauthenticated claim at the TCP layer; displacing a live connection needs the same source IP
+  (DoS only, payloads stay sealed). It is closed only by follow-up 1 above (a pinned accept path with no HELLO, issue #45).
+- B1 (a reconnect after a network change) is a `TcpTransport` dedup rule and is independent of the handshake mode: the matrix test runs the
+  mock handshake under both client/server roles; the Noise engine was not exercised in it.

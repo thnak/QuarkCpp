@@ -52,6 +52,8 @@
 //     in for a real network partition (a partial partition that exercises indirect-ping); a real
 //     partition is observed by the 019 PAL socket layer, not injected here.
 // ============================================================================================
+// ADR-071 / ADR-069 "Red-team of the merged changes (#47)": leases ignore every second-hand Suspect/Dead while held
+// (M2), end on tombstone/eviction/Join (M3), and a suspended node still applies a pending eviction (N2).
 #pragma once
 
 #include <algorithm>
@@ -550,6 +552,14 @@ public:
         // ADR-071: receiver-side policy for peers' graceful-suspend announcements (lease cap, table cap)
         // and the default lease this node announces for itself.
         MobileProfile mobile{};
+        // Test-only CONTROLS for ADR-071 "Red-team of the merged changes (#47)": each restores one pre-fix
+        // behaviour so a test can show the old failure. Never set in production code.
+        struct TestFaults {
+            bool incarnation_gated_suppression = false;  // M2: only Suspect/Dead at or below the lease incarnation is dropped
+            bool keep_lease_on_tombstone = false;        // M3: a tombstone / eviction leaves the lease behind
+            bool join_keeps_lease = false;               // M3: a Join does not clear the lease
+            bool defer_eviction_while_suspended = false; // N2: no eviction check while this node is suspended
+        } test_faults{};
     };
 
     // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
@@ -741,6 +751,9 @@ public:
     void resume() {
         if (!suspended_self_) return;
         suspended_self_ = false;
+        // ADR-071 #47 N2: apply the CURRENT admission snapshot before any gossip leaves, so a peer denied
+        // while we slept is evicted first and never receives our rejoin frame.
+        if (!cfg_.test_faults.defer_eviction_while_suspended) evict_denied();
         const std::int64_t now = now_ns();
         Member& me = members_[self_.value];
         self_incarnation_ += 1;
@@ -819,7 +832,13 @@ public:
     // test advances virtual time between ticks to drive ping→miss→indirect→suspect→dead deterministic-
     // ally. NO sleeping, NO wall-clock wait. ------------------------------------------------------
     void tick() {
-        if (!online_ || suspended_self_) return;  // a suspended process does not run the protocol (ADR-071)
+        if (!online_) return;
+        if (suspended_self_) {
+            // A suspended process does not run the protocol (ADR-071), but eviction is local state, not
+            // traffic: a snapshot published while we sleep is applied now, not at some later resume (#47 N2).
+            if (!cfg_.test_faults.defer_eviction_while_suspended) flush_events();
+            return;
+        }
         const std::int64_t now = now_ns();
         expire_suspend_leases(now);  // ADR-071: a lapsed lease becomes an ordinary Suspect -> Dead path
         reap_suspects(now);   // Suspect → Dead once the suspicion timeout lapses with no refutation
@@ -1094,7 +1113,11 @@ private:
             if (data_sink_) data_sink_(std::move(f));  // 010 data plane, untouched
             return;
         }
-        if (!online_ || suspended_self_) return;  // crashed or suspended node ignores control (stops acking)
+        if (!online_) return;  // a crashed node ignores control (stops acking)
+        if (suspended_self_) {  // a suspended node ignores control too, but still applies a pending eviction (#47 N2)
+            if (!cfg_.test_faults.defer_eviction_while_suspended) flush_events();
+            return;
+        }
         // P2: a fixed, per-sender Control-frame budget before decode/handle. Gossip and probe traffic
         // is far below this; a flood is shed here rather than driving republish/probe work.
         if (!admit_control(f.from, now_ns())) {
@@ -1283,6 +1306,9 @@ private:
                         it != members_.end() && is_tomb(it->second.status))
                         inc = std::max(inc, it->second.incarnation + 1);
                     apply_update(m.subject, inc, MemberStatus::Alive, Src::Join, now);  // epoch++
+                    // ADR-071 #47 M3: a Join is first-hand proof of life of a (possibly restarted) process;
+                    // a lease granted to its previous incarnation does not cover it.
+                    if (!cfg_.test_faults.join_keeps_lease) clear_lease_on_proof_of_life(m.from);
                     reply.kind = ControlKind::JoinAck;  // snapshot rides fill_digest()
                     reply.subject_incarnation = incarnation_of(m.subject);
                 }
@@ -1347,6 +1373,15 @@ private:
         }
         if (probe_.active && probe_.target == m.from) probe_.active = false;  // do not escalate on silence
         if (!was_leased) push_event(MembershipEventKind::Suspended, m.from, cur);
+    }
+
+    // Drop the lease for `n` (it spoke first-hand through a Join, or it left the live set). Emits Resumed
+    // only if a lease was held and the member is still live and admitted (never for a tombstone).
+    void clear_lease_on_proof_of_life(NodeId n) {
+        if (!suspended_leases_.contains(n.value)) return;
+        suspended_leases_.clear(n.value);
+        const auto it = members_.find(n.value);
+        if (it != members_.end() && !is_tomb(it->second.status)) push_event(MembershipEventKind::Resumed, n, it->second);
     }
 
     // A first-hand frame from a leased member at a HIGHER incarnation than its suspend: it is back.
@@ -1566,8 +1601,13 @@ private:
         // ADR-071 C1: we hold this member's own lease. A second-hand Suspect/Dead at or below the
         // incarnation it suspended at is a peer that never heard the announcement; the member's word
         // outranks it. (A LOCAL accusation cannot occur: leased members are not probed.)
+        // #47 M2: while the lease is held EVERY second-hand Suspect/Dead about the member is dropped, at any
+        // incarnation: an incarnation above the lease's is just a peer (possibly a log-only one) claiming a
+        // number the member never used. The member itself ends the lease by speaking first-hand at a
+        // higher incarnation (on_leased_peer_spoke), a Join, or the lease lapsing.
         if ((st == MemberStatus::Suspect || st == MemberStatus::Dead) && src != Src::Local) {
-            if (const SuspendLeases::Entry* le = suspended_leases_.find(node.value); le && inc <= le->incarnation) {
+            if (const SuspendLeases::Entry* le = suspended_leases_.find(node.value);
+                le && (!cfg_.test_faults.incarnation_gated_suppression || inc <= le->incarnation)) {
                 ++suspicions_suppressed_;
                 return;
             }
@@ -1684,7 +1724,8 @@ private:
         const std::uint8_t tx = piggyback_count();
         std::vector<std::uint64_t> died;
         for (auto& [id, m] : members_) {
-            if (m.status == MemberStatus::Suspect && now >= m.suspect_deadline_ns) {
+            if (m.status == MemberStatus::Suspect && now >= m.suspect_deadline_ns &&
+                (cfg_.test_faults.incarnation_gated_suppression || !suspended_leases_.contains(id))) {  // #47 M2
                 died.push_back(id);
                 m.status = MemberStatus::Dead;
                 m.death_ns = now;
@@ -1845,6 +1886,9 @@ private:
     void note_transition(NodeId node, Member& m, MemberStatus prev) {
         using K = MembershipEventKind;
         if (is_tomb(m.status)) {
+            // ADR-071 #47 M3 / ADR-069 C11: a tombstoned (dead, left or evicted) member holds no lease. A
+            // lease left behind shielded a re-admitted, restarted process and let a denied one raise Resumed.
+            if (!cfg_.test_faults.keep_lease_on_tombstone) suspended_leases_.clear(node.value);
             if (m.reported != 0 && m.reported != static_cast<std::uint8_t>(m.status)) {
                 m.reported = static_cast<std::uint8_t>(m.status);
                 push_event(m.status == MemberStatus::Left ? K::Left : evicting_ ? K::Evicted : K::Dead, node, m);

@@ -182,3 +182,39 @@ Spec: `019-Platform-Abstraction-Layer.md`, `021-Cluster-Formation-and-Lifecycle.
 `include/quark/net/tcp_transport.hpp`, `include/quark/detail/{atomic_shared_ptr,atomic_relaxed}.hpp` (new), `pal/pal.hpp`,
 `pal/linux_x86_64/file_io.hpp`. Android: `include/quark/android/quark_android.h`, `src/android/{quark_android,quark_mobile_runner}.cpp` (new). Tests:
 `tests/mobile_member_{suspend,lease_expiry,network_changed}_test.cpp` (new).
+
+## 10. Red-team of the merged changes (#47), 2026-11-01
+
+An independent red-team of ADR-068..071 together (master 763750f) found one blocker, three major and several minor defects; every
+finding had an executable probe with a control, and the probes are now repo tests. Status stays **Proposed**. Section 5's C7 and
+C1/C2 rows are **amended** by this section (the first fix of C7 was incomplete).
+
+| Finding | Defect | Fix | Test (the proof) | Control, observed |
+|---|---|---|---|---|
+| **B1** (blocker) | C7's "both inbound" rule did not cover a connection the PC DIALLED: the lower-id election kept the dead one and closed every connection from the phone (0/50 both ways, 440 reconnects in 6 s); the superseded connection never fired `peer_down_hook`, so `SecureTransport` kept a session the phone had dropped | a new connection from an identified peer supersedes any existing one confirmed longer than a race window (default 1 s, `set_reconnect_supersede_window_ns`) whichever side dialled; the election stays for a genuine simultaneous dial; the superseded connection fires `peer_down_hook` | `tcp_reconnect_supersede_test`: plaintext and secure (mock handshake) x PC id lower/higher, the phone as handshake responder included: 50/50 both ways, 1 phone reconnect, 1-2 dedup closes; a connection that dies inside the window is let in after it (6 attempts, 50/50) | `TcpTestFaults::legacy_dial_election`: PC=1 dials, phone=2: 0/50 both ways, ~880 reconnects in 4 s (red-team: 440 in 5 s); ids swapped: 50/50 |
+| **M2** | a second-hand Suspect at lease incarnation +1 passed the suppression and `reap_suspects` ignored leases: any member (even a log-only one) removed a suspended admitted member everywhere | while a lease is held every second-hand Suspect/Dead is dropped at any incarnation; `reap_suspects` skips leased members | `swim_lease_hardening_test` T1 (Suspect and Dead at +1): phone stays Alive at both holders, lease held, `suspicions_suppressed() > 0` | `incarnation_gated_suppression`: phone Dead at both holders (+0 never was) |
+| **M3** | leases were never cleared (`SuspendLeases::prune` had no caller): suspend, kill, restart: crash undetected for 564 s; evict, reap, re-admit, restart: first Suspect at +807 s; an evicted member kept `is_suspended`, and could raise `Resumed` while denied | a lease is cleared when the member is tombstoned/evicted/erased (`note_transition`) and when a Join arrives (first-hand proof of life; `Resumed` only if still live); `SuspendLeases::prune` deleted (moot) | T2 (restart within lease): first Suspect at +600 ms (suspicion window 500 ms); T3 (evict/reap/re-admit/restart): +480 ms with both fixes, with the tombstone fix alone and with the Join fix alone (each is sufficient); T4: evicted member `is_suspended=0`, `health.suspended=0`, `Resumed=0` | `keep_lease_on_tombstone` + `join_keeps_lease`: +866 400 ms (T2), +806 400 ms (T3), `is_suspended=1` and `Resumed=1` (T4) |
+| **N2** | no eviction while this node was suspended, and `resume()` gossiped to a newly denied peer before evicting it | `tick()`/`on_frame` apply a pending eviction while suspended (no traffic); `resume()` evicts first | T5: 1 eviction while suspended, 0 frames to the denied peer at resume | `defer_eviction_while_suspended`: 0 evictions, 1 frame to the denied peer |
+
+**Better fix than the red-team suggested (B1).** The red-team's alternative was a reconnect epoch in HELLO. Not done: it widens the wire
+format and the cheaper rule is already symmetric (each end sees "a new connection, old one aged"). The cost is the race window: a connection
+that dies in its first second is refused until the window passes (bounded, about six backoff attempts); a window shorter than the real
+one-way delay would break the symmetry of a genuine simultaneous dial, hence 1 s. **Widened exposure, recorded under N1:** the supersede now
+also applies when the old connection was self-dialled, so a same-IP host that claims the HELLO identity can displace it on both ids
+(denial of service only, payloads stay sealed; closed by the pinned accept path of #45).
+
+**Composition test (the red-team's "untested").** `admission_mobile_composition_test`: node A runs SwimMembership + SecureTransport +
+TcpTransport on ONE `AdmissionAuthority` and holds a 10-minute lease for B; A's application denies B mid-run. Observed: exactly one
+`Evicted`, B out of the view, `is_suspended=0`, session closed (`sessions_closed +1`), TCP connection closed and not reopened (0/150
+samples, 0 redials, 8 dials refused at HELLO), no `Resumed` while denied; a later admitting snapshot lets B back in (`Joined`). Control
+(old wiring: reset close hook, lease kept on tombstone): lease still held, a connection open in 130/150 samples, 1 redial.
+
+**Residuals recorded, not fixed.**
+- **N1** HELLO-claim displacement (the `Inbound replaces inbound` path and, now, the aged supersede): a same-IP host that claims an admitted
+  identity can displace its connection. DoS only, payloads stay sealed. Closed only by #45 (identify by handshake, dedup after it). Tracked in #46.
+- **N4** a log-only peer can keep a crashed admitted member Alive by gossiping Alive at rising incarnations. This is pre-existing SWIM behaviour
+  (higher incarnation wins) and not specific to leases; mitigated by authenticating gossip subjects (not done).
+- The secure-transport legacy control for B1 (old rule + `SecureTransport`) was dropped from the test: that run made no progress for minutes
+  (each `send` loop iteration became very slow under the reconnect storm). Not investigated; the plaintext control shows the lock-out and the
+  secure variants pass with the fix.
+- Source-address change (Wi-Fi to cellular) is still untested (section 5), still refused by strict per-IP binding.

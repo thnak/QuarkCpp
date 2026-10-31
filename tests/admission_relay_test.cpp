@@ -31,6 +31,8 @@ int main() {
     tr.on_receive([](MessageFrame) {});
     tr.set_allow_insecure_plaintext(true);  // the relay carries only already-sealed end-to-end frames
     tr.set_relay_forwarding(authority);
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "relay: listeners start", ok);
     ta.add_peer(loopback_endpoint(R, tr.listen_port()));
     tb.add_peer(loopback_endpoint(R, tr.listen_port()));

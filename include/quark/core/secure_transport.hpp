@@ -31,6 +31,8 @@
 // (include/quark/adapters/mbedtls/), linked only when a secure cluster is configured. The "plaintext
 // dev transport" is simply the inner `Transport` used WITHOUT this wrapper — labeled dev-only, rejected
 // under Strict+multi-node (security.hpp `validate_security`).
+// ADR-069 "Red-team of the merged changes (#47)" (M1): a handshake this node merely ANSWERED that fails never
+// erases an existing session; only a renegotiation this side initiated may (see drive_handshake).
 #pragma once
 
 #include <algorithm>
@@ -77,6 +79,12 @@ inline void put_u64_le(std::vector<std::byte>& out, std::uint64_t v) {
     return v;
 }
 }  // namespace detail
+
+// Test-only fault switch (CONTROL for ADR-069 "Red-team of the merged changes (#47)", finding M1): restores
+// the pre-fix rule that a FAILED handshake this node merely ANSWERED erases the peer's live session.
+struct SecureTransportTestFaults {
+    bool erase_session_on_answered_failure = false;
+};
 
 class SecureTransport final : public Transport {
 public:
@@ -152,6 +160,7 @@ public:
     // unset for a transport (e.g. a test double) that has no such concept — a failed renegotiation then
     // simply drops the session and waits for the next application send to re-trigger a fresh handshake.
     void set_reset_hook(std::function<void(NodeId)> fn) noexcept { reset_hook_ = std::move(fn); }
+    void set_test_faults(const SecureTransportTestFaults& f) noexcept { test_faults_ = f; }
 
     // The connection this peer's session was negotiated on has died. An mTLS session is
     // per-connection: keep it and the peer (which necessarily lost its own half) silently drops every
@@ -609,7 +618,8 @@ private:
         }
         renegotiations_attempted_.fetch_add(1, std::memory_order_relaxed);
         if (metrics_) metrics_->security_handshakes_attempted.inc();
-        drive_handshake(peer, std::move(engine), std::span<const std::byte>{}, admission_.generation());
+        drive_handshake(peer, std::move(engine), std::span<const std::byte>{}, admission_.generation(), nullptr,
+                        false, /*initiated_here=*/true);
     }
 
     // Advances `engine` with inbound `in`, sends any resulting bytes, and stores/finalizes the outcome.
@@ -619,7 +629,7 @@ private:
     // (arriving synchronously from send_authenticate_frame below) can never deadlock on pending_mu_.
     void drive_handshake(NodeId peer, std::unique_ptr<HandshakeEngine> engine,
                          std::span<const std::byte> in, std::uint64_t answered_gen,
-                         const PeerAddress* source = nullptr, bool known = false) {
+                         const PeerAddress* source = nullptr, bool known = false, bool initiated_here = false) {
         std::vector<std::byte> out;
         const HandshakeEngine::Step step = engine->advance(in, out);
         if (step == HandshakeEngine::Step::Done) {
@@ -651,7 +661,10 @@ private:
             // session and force a fresh connection via reset_hook_ — 021's existing reconnect/backoff
             // redials and a brand-new handshake carries a fresh generation, rather than leaving a
             // session whose peer no longer validates silently in place.
-            if (try_get_session(peer)) {
+            // ADR-069 #47 M1: ONLY a renegotiation THIS side initiated may erase the session. A handshake
+            // we merely ANSWERED is driven by a frame whose `from` is a claim; erasing on its failure let a
+            // denied host cut an admitted peer's session with one forged Authenticate frame.
+            if (try_get_session(peer) && (initiated_here || test_faults_.erase_session_on_answered_failure)) {
                 {
                     std::unique_lock<std::shared_mutex> g(map_mu_);
                     sessions_.erase(peer.value);
@@ -669,6 +682,7 @@ private:
                 ph.source_ip_valid = true;
             }
             ph.known = known;
+            ph.initiated_here = initiated_here;
             std::unique_ptr<HandshakeEngine> displaced;  // the reservation/old engine dies unlocked (D6)
             {
                 std::lock_guard<std::mutex> g(pending_mu_);
@@ -723,7 +737,8 @@ private:
                                                 revoked_snapshot_.load());
         }
         if (metrics_) metrics_->security_handshakes_attempted.inc();
-        drive_handshake(peer, std::move(engine), std::span<const std::byte>{}, admission_.generation());
+        drive_handshake(peer, std::move(engine), std::span<const std::byte>{}, admission_.generation(), nullptr,
+                        false, /*initiated_here=*/true);
     }
 
     void handle_authenticate_frame(MessageFrame frame) {
@@ -734,6 +749,7 @@ private:
         std::unique_ptr<HandshakeEngine> engine;
         std::unique_ptr<HandshakeEngine> stale;  // destroyed after pending_mu_ is released (D6)
         std::uint64_t answered_gen = admission_.generation();  // generation this handshake's answer is read under
+        bool initiated_here = false;  // the parked engine, if any, is one WE started
         {
             std::lock_guard<std::mutex> g(pending_mu_);
             const auto it = pending_.find(peer.value);
@@ -753,6 +769,7 @@ private:
                 if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_) {
                     engine = std::move(it->second.engine);
                     answered_gen = it->second.admission_gen;
+                    initiated_here = it->second.initiated_here;
                 } else {
                     stale = std::move(it->second.engine);
                     handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
@@ -810,7 +827,7 @@ private:
             if (metrics_) metrics_->security_handshakes_attempted.inc();
         }
         drive_handshake(peer, std::move(engine), std::span<const std::byte>(frame.payload), answered_gen,
-                        &source, known);
+                        &source, known, initiated_here);
     }
 
     void deliver(MessageFrame frame) {
@@ -1009,6 +1026,7 @@ private:
         bool source_ip_valid = false;
         bool known = false;             // may use the reserved slots / bypass the per-IP cap
         std::uint64_t admission_gen = 0;  // generation this handshake's admission answer was read under
+        bool initiated_here = false;      // we are the client-role initiator (M1: only these may erase a session)
     };
     std::unordered_map<std::uint64_t, PendingHandshake> pending_;
     // A parked handshake with no progress for this long is abandoned and retried (set_handshake_timeout
@@ -1069,6 +1087,7 @@ private:
     std::atomic<std::uint64_t> renegotiations_completed_{0};
     std::atomic<std::uint64_t> renegotiations_failed_{0};
 
+    SecureTransportTestFaults test_faults_;
     std::function<void(NodeId)> close_hook_;  // set_admission: drop the connection of a denied peer
     detail::AdmissionGate admission_;         // LAST member: destroyed first, detaches its listener
 };

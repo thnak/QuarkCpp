@@ -201,6 +201,16 @@ round-trip:
 > lower `NodeId`** is kept and the other is closed. Both ends compute the same
 > winner from ids alone.
 
+> **Reconnect supersedes (Draft amendment, ADR-071 "Red-team of the merged changes (#47)", B1).** The
+> election above is for a *simultaneous dial*. A **new** connection from an already-identified peer whose existing
+> connection has been confirmed for longer than a short **race window** (default 1 s) is a **reconnect** (the peer
+> changed network, restarted, or the old socket is half-open): it supersedes the old one **whichever side dialled**,
+> and the superseded connection reports peer-down to the layer above (so `SecureTransport` drops the session
+> negotiated on it). Both ends apply the same rule, so both keep the new connection and the old one closes on both
+> without a redial. Younger than the window the pair is a genuine race and the election decides. A new connection
+> inside the window is refused, retries with backoff, and is let in once the window has passed (bounded:
+> about six attempts at the default).
+
 The AEAD handshake (020) rides the surviving connection; the loser is dropped
 before any application frame flows, so dedup costs nothing steady-state.
 Certificate rotation (see below) also reuses this same reconnect/backoff
@@ -273,6 +283,9 @@ node **evicts** it:
 - **re-admission is refused** while the snapshot denies the node: every Alive or Suspect update for it
   (gossip, direct ack, join) is dropped and counted (`admission_refusals`). A later snapshot that admits it
   lets it rejoin by the ordinary higher-incarnation rule, with a fresh `Joined` event.
+
+A node that is itself **suspended** (ADR-071) still applies a pending eviction, at its next `tick()`/inbound
+frame and again at the start of `resume()` before any gossip leaves (#47, N2): eviction is local state, not traffic.
 
 A published generation marks eviction pending with a thread-safe flag; the membership's driving thread
 performs it at its next `tick()`, inbound frame or `apply_admission()` (at most one protocol tick of
@@ -513,14 +526,20 @@ no new membership *state* and no new failure detector:
   below what the receiver holds (a replay) is ignored — the silence is then treated like any other.
 - **While leased:** the member is not probed, not chosen as an indirect-ping relay, not a gossip fan-out
   target; its status stays **Alive** (`NodeHealth::suspended == true`, events `Suspended` / `Resumed`); a
-  second-hand Suspect/Dead about it at or below its suspend incarnation is ignored (counted in
-  `suspicions_suppressed()`), so one peer that missed the announcement cannot drag the others along. It stays
+  second-hand Suspect/Dead about it is ignored **at any incarnation** while the lease is held (counted in
+  `suspicions_suppressed()`; ADR-071 "Red-team of the merged changes (#47)", M2: an incarnation above the lease's is just
+  a peer claiming a number the member never used), and `reap_suspects` skips it, so one peer that missed the announcement
+  (or lies) cannot drag the others along. It stays
   in `view()` and placement for the lease: that is the point, nothing re-places.
 - **Resume = rejoin without churn.** `resume()` raises the member's incarnation and sends a Gossip frame to
   every live peer at once. Any non-Suspend frame from a leased member at a *higher* incarnation clears the
   lease on arrival (a pre-suspend straggler does not). The resumed node also forgives its own timers: the
   in-flight probe is voided and any Suspect it held gets a fresh suspicion window (the boot clock counted the
   sleep, so every deadline would otherwise read as expired).
+- **A lease ends with the member's liveness or standing (#47, M3).** It is cleared when the member is tombstoned
+  (Dead, Left or **Evicted**), erased, or **Joins** (first-hand proof of life of a possibly restarted process: the
+  previous process's lease does not cover it). An evicted member therefore holds no lease and raises no `Resumed` while
+  the snapshot denies it.
 - **No zombie.** When the lease lapses without a resume, the receiver moves the member to **Suspect** (a full
   suspicion window to refute) and the ordinary path ends in Dead and removal. A peer that never heard the
   announcement behaves as plain SWIM; the member heals on resume by refuting at its higher incarnation

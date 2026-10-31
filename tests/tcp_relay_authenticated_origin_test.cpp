@@ -152,6 +152,8 @@ int main() {
     sr.on_receive([](MessageFrame) {});
     sb.on_receive([&](MessageFrame f) { rb(std::move(f)); });
     tr.set_relay_forwarding([&](NodeId origin, NodeId dest) { return sr.has_session(origin) && sr.has_session(dest); });
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(ta.start() && tr.start() && tb.start(), "listeners start", ok);
     if (!ok) return 1;
     ta.add_peer(loopback_endpoint(R, tr.listen_port()));

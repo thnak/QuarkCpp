@@ -43,6 +43,8 @@ void secure_via_relay(bool& ok) {
     tr.on_receive([](MessageFrame) {});
     tr.set_allow_insecure_plaintext(true);  // the relay carries only already-sealed end-to-end frames
     tr.set_relay_forwarding(authority);
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "secure: listeners start", ok);
     ta.add_peer(loopback_endpoint(R, tr.listen_port()));
     tb.add_peer(loopback_endpoint(R, tr.listen_port()));
@@ -92,6 +94,8 @@ void discovery(bool& ok) {
     tb.on_receive([&](MessageFrame f) { rb(std::move(f)); });
     tr.on_receive([](MessageFrame) {});
     tr.set_relay_forwarding([](NodeId, NodeId) { return true; });
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "discovery: listeners start", ok);
     tr.add_peer(loopback_endpoint(NodeId{28}, tb.listen_port()));
     const Endpoint relay_ep = loopback_endpoint(R, tr.listen_port());
@@ -120,6 +124,8 @@ int main() {
     tr.on_receive([&](MessageFrame f) { rr(std::move(f)); });
     std::atomic<bool> allow{false};
     tr.set_relay_forwarding([&](NodeId, NodeId) { return allow.load(); });
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "all three listeners start", ok);
     if (!ok) return 1;
 

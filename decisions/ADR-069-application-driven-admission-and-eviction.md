@@ -98,8 +98,9 @@ count is recorded in the implementation report). Not yet run: sanitizers, GCC/Cl
   invert on their fences. That is a test-double shape (a real network separates the threads).
 - With the handshake disabled (shared-cipher shape) sessions are not erased on deny (recreating one would restart its sequence spaces,
   nonce reuse, B12); the per-frame gate is the closure there.
-- `close_hook` for TcpTransport: use `reset_peer_connection` (redial stays possible, and a denied handshake is refused at start), not
-  `close_peer` (which suppresses reconnect with no way to lift it; re-admission would then rely on the peer redialling).
+- `close_hook` for TcpTransport: **superseded by section 8 (#47, N3).** `reset_peer_connection` redials the removed device; the recommended
+  wiring is now `TcpTransport::set_admission(authority)` (refuse at HELLO, close, never redial, lifted by a later admitting snapshot) with the
+  session layer's close hook empty. `close_peer` still suppresses reconnect with no way to lift it.
 - `LogExchangeOnly` peers stay in membership and gossip over the control lane; they are not placement-eligible (not Admit).
 
 - **Lifetime.** The authority must outlive every listener owner (they unregister in their destructors); a test that declared it after
@@ -113,3 +114,32 @@ count is recorded in the implementation report). Not yet run: sanitizers, GCC/Cl
 4. When Q1 lands: change `AdmissionKey`, re-run T0-T8; the handshake completion already asks on `Result::peer_node_id`.
 5. A bench: the fence adds one shared-lock acquire per frame on the secure path (not the actor hot path); not yet measured.
 6. Signed, issuer-authenticated revocation (issue #35) is unchanged by this ADR; authority-only mode is the interim answer.
+
+## 8. Red-team of the merged changes (#47), 2026-11-01
+
+Status stays **Proposed**. Findings against this ADR and their fixes (the lease findings M2/M3/N2 are in ADR-071 section 10):
+
+| Finding | Defect | Fix | Test (claim) | Control, observed |
+|---|---|---|---|---|
+| **M1** (major; also closes **N5**) | `TcpTransport` never compared `frame.from` with the connection's HELLO identity and `SecureTransport` erased a session when a handshake it only ANSWERED failed. Admission is asked about the claimed `from`, so a DENIED host (HELLO id 99) sending `Authenticate{from=1}` at 10/s cut 1->2 delivery from 100% to 9% | (a) `TcpTransport` drops and counts (`spoofed_origin_dropped()`) any locally delivered frame whose `from` differs from the connection's identified peer; a shape-B relay delivers its origin's frames only where the receiver opted in (`set_accept_relayed_frames`, default none; relayed frames are end-to-end sealed, ADR-048). (b) `SecureTransport` erases a session on a failed handshake only if THIS side initiated it (`PendingHandshake::initiated_here`) | `tcp_frame_origin_test` (C13, C14): no attacker 100%; attack with both fixes 100%, 0 samples without a session, 30 spoofed frames dropped; each fix alone also holds 100% (defence in depth); relay: 0/5 delivered and 5 counted without opt-in, 5/5 with it | both fixes off: **8%** delivery, session missing in 269/300 samples (red-team: 9%) |
+| **N3** | the close hook this ADR recommended (`reset_peer_connection`) redialled the removed device: after a deny node 2 still held or reopened a connection to it | `TcpTransport::set_admission(authority)`: a denied peer is refused at HELLO, never dialled or queued for, its connection closed on the publish (peer-down reported so the session drops), reconnect not scheduled, and a later snapshot that does not deny it lifts all of that and dials it if its endpoint is known | `tcp_admission_redial_test` (C15): 3 s after a deny, 0/300 samples with a connection open, 0 redials, 0 frames delivered, 8 dials refused (two bare `TcpTransport`s); a later admitting snapshot restores traffic | the old close path (`reset_peer_connection`, no transport admission): connection open in 300/300 samples |
+| (composition) | SWIM + SecureTransport + TcpTransport on one authority with a lease and a mid-run deny was untested | `admission_mobile_composition_test` (C16), see ADR-071 section 10 | eviction, session closed, no redial, no `Resumed`; re-admission lets the node back | old wiring: lease kept, connection open 130/150 |
+
+**Why the origin check lives in the transport, not above it.** Admission and the handshake gate both read the claimed `from`; the transport is the
+only layer that knows which socket delivered the frame. The relay opt-in exists because a shape-B relay (ADR-048) forwards a frame byte-for-byte
+with the origin's `from`; without the opt-in every relayed frame would be dropped (four of the five relay test programs, all but the sealed-relay one, were updated to opt in at the
+destination).
+
+**Found while proving N3 (test double, not fixed).** With the mock handshake, a SECOND stale ClientHello queued behind a dead connection (the
+5 s handshake timeout re-issues one) is answered twice, and the peer, holding no pending engine, treats the other's reply as an opener: an
+unbounded renegotiation ping-pong (300 000+ completed renegotiations in 10 s, every frame `tamper_rejected`, a core pegged; 5 of 24 runs of
+the first version of the N3 test, which ran over `SecureTransport`, and still 1 of 11 with a 1.5 s window). Not reachable with the Noise engine as far as read (a stray message fails to parse, and with the M1 fix an
+answered failure no longer erases the session), but NOT verified with Noise. The root cause is that handshake frames queued per peer outlive the
+connection they were meant for; purging queued `Authenticate` frames when their connection dies is the real fix and is not done. The N3 test
+therefore runs over bare `TcpTransport`s (the session layer is covered once, in the composition test, which passed every run); the
+reflection itself is not tested and its exact trigger was not pinned down (`handshakes_timed_out` was 0, so it is not the 5 s re-issue).
+
+**Residuals (not fixed here).** **N1**: a HELLO claim still displaces a live connection from the same source IP (DoS only; payloads stay sealed
+under `SecureTransport`); closed only by the pinned accept path (#45, ADR-068 follow-up 1). #46's frame-identity concern is closed by the origin
+check, its HELLO-claim concern is not. `TcpTransport::set_admission` answers on the CLAIMED HELLO id; the authenticated check remains the handshake's
+(`Result::peer_node_id`). A denied peer that is only a relay target is not refused as a dial target by shape-B routing through another node.
