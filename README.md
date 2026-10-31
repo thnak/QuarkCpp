@@ -544,6 +544,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-065](decisions/ADR-065-pool-per-pool-lanes-and-sibling-borrow.md) | `MessagePool` per-pool lanes + sibling-borrow before heap growth (003, #30/#31) | **Accepted** (2026-10-28) — no lane collisions across pools; growth no longer serialises producers behind malloc. |
 | [ADR-066](decisions/ADR-066-dekker-rendezvous-as-seq-cst-operations.md) | Dekker rendezvous as `seq_cst` operations, not standalone fences (001/002/003/015/024) | Every StoreLoad pair is now a `seq_cst` store/RMW + `seq_cst` load: TSan-modelled (GCC `-Wtsan` gone), `dmb ish` removed on AArch64, x86 one locked op for one; litmus 0/50M, relaxed control fires; benches flat. |
 | [ADR-067](decisions/ADR-067-direction-aerocoworker-network-center.md) | Direction: AeroCoWorker's network center, not a general actor engine (owner) | Accepted as direction, no evidence claimed; roadmap #35-#37, #40-#44; Windows and Android first-class; unused features frozen. |
+| [ADR-068](decisions/ADR-068-pinned-key-noise-ik.md) | Pinned-key handshake: Noise IK over libsodium (020, 021; issue #40) | A second handshake mode beside the CA chain, for clusters with no CA: peers are their full Ed25519 key (NodeId derived from it), the application's `PinnedTrust` decides at every handshake, and a responder that cannot authenticate and admit the first message sends **nothing** (no cleartext HELLO in this mode). `Noise_IK_25519_ChaChaPoly_BLAKE2b` written from libsodium primitives and matched to the official cacophony vector byte for byte; replay refused by timestamp; the CA and pinned modes cannot complete with each other. Windows-only runs; CI, sanitizers, and the TcpTransport wiring (no HELLO, sealed headers) are **not** done. |
 
 </details>
 
@@ -577,6 +578,7 @@ adapters that are never linked into a minimal build:
 | Subsystem | Std-only default | Optional adapter (behind a seam) |
 |---|---|---|
 | Transport (010) | TCP + length-prefixed frames; per-OS event loop (epoll/io_uring · kqueue · IOCP) via the PAL | gRPC/QUIC/RDMA |
+| Transport security (020) | none with real crypto (a named dev-only plaintext/`MockCipher` path; crypto is the one deliberate exception) | mbedTLS (CA-chain mTLS, ADR-040) and libsodium (pinned-key Noise IK, ADR-068), each `QUARK_WITH_*`, never linked into the core |
 | Serialization (016) | canonical tagged TLV from one `QUARK_SERIALIZE` per type + negotiated tagless wire fast path | protobuf / FlatBuffers / Cap'n Proto |
 | Membership (010) | in-house SWIM gossip | etcd / Consul |
 | Persistence (012) | `InMemoryStore` (reference) + `FileStore` (append-only WAL + `fdatasync`, crash-durable) — see [PersistenceAdapters.md](PersistenceAdapters.md) | `SqliteStore` / `RocksStore` (opt-in: `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`); Postgres/object-store behind the same `Store` seam |

@@ -334,6 +334,32 @@ if(NOT QUARK_WITH_MBEDTLS)
   endif()
 endif()
 
+# Issue #40 / ADR-068: the same proof for the libsodium pinned-key adapter. Registered REGARDLESS of QUARK_WITH_SODIUM:
+# `quark` (the core static library) never links the adapter, so it must show no sodium_/crypto_ symbol even in a build that
+# has the adapter ON — which is exactly where a regression would hide (build-noise runs this with the adapter enabled).
+find_program(QUARK_DUMPBIN_EXE_SODIUM dumpbin)
+if(QUARK_DUMPBIN_EXE_SODIUM)
+  add_test(NAME security_sodium_symbol_isolation
+           COMMAND ${CMAKE_COMMAND}
+                   -DDUMPBIN_EXE=${QUARK_DUMPBIN_EXE_SODIUM}
+                   -DTARGET_LIB=$<TARGET_FILE:quark>
+                   -DSYMBOL_PREFIXES=sodium_|crypto_
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
+else()
+  message(STATUS "Quark: skipping security_sodium_symbol_isolation (dumpbin not found — non-MSVC toolchain)")
+endif()
+# CONTROL (must FAIL): the same scan pointed at libsodium's own static library, which certainly exports sodium_/crypto_
+# symbols — proves the scan can see them, so the clean result on `quark` above is evidence rather than a blind check.
+if(QUARK_DUMPBIN_EXE_SODIUM AND QUARK_SODIUM_LIBRARY)
+  add_test(NAME security_sodium_symbol_isolation_control
+           COMMAND ${CMAKE_COMMAND}
+                   -DDUMPBIN_EXE=${QUARK_DUMPBIN_EXE_SODIUM}
+                   -DTARGET_LIB=${QUARK_SODIUM_LIBRARY}
+                   -DSYMBOL_PREFIXES=sodium_|crypto_
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
+  set_tests_properties(security_sodium_symbol_isolation_control PROPERTIES WILL_FAIL TRUE)
+endif()
+
 # Multi-process SWIM chaos node (tests/netem/): one process per node, each in its own network
 # namespace, driven by tests/netem/run_swim_chaos.sh (needs sudo). Built but NOT registered with
 # CTest — partitions need root, which the correctness suite must not require.

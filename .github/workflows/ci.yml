@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Install toolchain (versions recorded in the SBOM)
-        run: bash ci/install-deps.sh --with-clang
+        run: bash ci/install-deps.sh --with-clang --with-sodium
 
       - name: Cache-prune planner self-test
         run: python3 -I ci/prune_caches.py --self-test
@@ -249,6 +249,38 @@ jobs:
           name: ctest-${{ matrix.config.name }}-${{ matrix.arch }}
           path: build/Testing/**/*.log
           if-no-files-found: ignore
+
+  # Issue #40 / ADR-068: the opt-in libsodium pinned-key adapter (Noise IK). One Linux leg: it builds with QUARK_WITH_SODIUM=ON
+  # and runs the adapter checks (official Noise test vector, handshake, privacy on real sockets, SecureTransport composition)
+  # plus the core symbol-isolation proof. UNRUN at the time it was written: CI cannot be executed locally; the cross-mode check
+  # (needs mbedTLS too) is not built here. Informational until its first green run (continue-on-error).
+  test-pinned-sodium:
+    name: test-pinned-sodium (gcc-release, informational, unrun)
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:13686cb105f4d2650dd83c469945f85d2ca603a3b674c7799499098d370bcebe
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install toolchain + libsodium (exact lock)
+        run: bash ci/install-deps.sh --with-sodium
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-sodium -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 \
+            -DQUARK_WITH_SODIUM=ON -DQUARK_BUILD_BENCH=OFF
+
+      - name: Build
+        run: cmake --build build-sodium -j 2
+
+      - name: Test (adapter checks)
+        run: ctest --test-dir build-sodium -R "noise_ik|sodium_aead|pinned_" -j 2 --output-on-failure --timeout 600
 
   test-windows:
     name: test-windows (${{ matrix.config.name }})

@@ -6,6 +6,7 @@
 #
 #   bash ci/install-deps.sh              # g++ + cmake/ninja/gdb
 #   bash ci/install-deps.sh --with-clang # ... plus LLVM/clang (hash-pinned installer + exact lock)
+#   bash ci/install-deps.sh --with-sodium # ... plus libsodium-dev (exact lock) for QUARK_WITH_SODIUM builds
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,9 +14,14 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$root/ci/pins.env"
 
 with_clang=0
-if [[ "${1:-}" == "--with-clang" ]]; then
-    with_clang=1
-fi
+with_sodium=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-clang) with_clang=1 ;;
+        --with-sodium) with_sodium=1 ;;
+        *) echo "install-deps: unknown option '$arg'" >&2; exit 2 ;;
+    esac
+done
 
 # The CI image builds as root; the GitHub-hosted runner needs sudo. Keep one code path.
 SUDO=""
@@ -45,6 +51,10 @@ $SUDO apt-get update
 # Toolchain + the container/job prerequisites (checkout/HTTP, Python audit/SBOM, release CLI).
 install_locked "g++-${GCC_MAJOR}" cmake ninja-build ccache gdb \
     git curl ca-certificates python3 gh wget gnupg lsb-release software-properties-common
+
+if ((with_sodium)); then
+    install_locked libsodium-dev
+fi
 
 if ((with_clang)); then
     curl -fsSL -o /tmp/llvm.sh https://apt.llvm.org/llvm.sh

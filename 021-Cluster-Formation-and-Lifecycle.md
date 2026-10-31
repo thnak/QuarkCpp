@@ -178,6 +178,28 @@ machinery on a failed renegotiation, rather than inventing a parallel rekey
 protocol or a new glare-breaking rule — connection establishment already
 handles this class of race.
 
+### HELLO and dial dedup in pinned-key mode (#40, ADR-068)
+
+In CA mode the dialer sends a cleartext HELLO (`QRK1`, version, u64 NodeId) before anything else and the dedup rule above reads the
+NodeId from it. In pinned-key mode that would hand a stable identifier to every prober, so **the HELLO is not sent** (020
+"Pinned-key mode"). What it carried travels inside the encrypted Noise payloads instead:
+
+- the **version** (checked against the same +-1 window as ADR-053, a refusal being silent, not a `VersionRefused` message) is in
+  Msg1 and Msg2;
+- the **NodeId** is **derived from the Ed25519 key** (first 8 bytes of SHA-256), so it is not a claim at all: Msg1 and Msg2 carry
+  it, the receiver refuses one that is not the derived id, and the application's pinned key for a dialled peer must derive the
+  NodeId being dialled.
+
+Dial dedup keeps its rule unchanged ("the connection initiated by the lower `NodeId` is kept") but now applies it **after** the
+handshake: each side learns the peer's NodeId only once Msg1 (responder) or Msg2 (initiator) has authenticated, and an
+unauthenticated connection has no NodeId to dedup on, so it holds no peer slot. The glare-free client/server role
+(`local_is_client`: lower NodeId initiates) is unchanged, so with `SecureTransport` driving the engine only one handshake runs per
+pair.
+
+**Status:** the engine and its `SecureTransport` composition are implemented and tested; the `TcpTransport` side (an accept path that
+identifies a connection by the handshake instead of a HELLO, per-IP pre-auth caps keyed on the socket rather than a claimed id, and
+sealed frame headers so `from`/`to` are not in the clear) is **not** built. See ADR-068 "What remains unproven".
+
 ### Certificate rotation and revocation on a live cluster
 
 A node's own certificate/key and the cluster's trusted CA roots are

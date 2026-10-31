@@ -7,6 +7,10 @@
     {
       "name": "mbedtls",
       "version>=": "3.6.2"
+    },
+    {
+      "name": "libsodium",
+      "version>=": "1.0.18"
     }
   ]
 }
