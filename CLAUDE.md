@@ -4,8 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Quark is a header-first C++23 actor engine (mailbox, work-stealing scheduler, hybrid sync/async
-handlers, cluster distribution, persistence, supervision). The project is spec-driven: 28 RFC
+Quark is **AeroCoWorker's network center** (owner direction 2026-10-31,
+[ADR-067](decisions/ADR-067-direction-aerocoworker-network-center.md)): a header-first C++23 actor-based networking core (mailbox,
+work-stealing scheduler, hybrid sync/async handlers, cluster distribution, persistence, supervision). It no longer aims to be a
+general actor engine competing with CAF: the roadmap is AeroCoWorker's machine-to-machine networking (issues #35-#37, #40-#44),
+Windows and Android are first-class beside Linux, and features no network use needs are frozen (no new work; removed only by an ADR).
+It may be shaped by AeroCoWorker's needs; the process below is unchanged. The project is spec-driven: 28 RFC
 documents (`NNN-*.md`) are the authoritative design, `decisions/ADR-*.md` are executed proofs
 (real C++23 built under GCC+Clang, run under ASan/UBSan/TSan, benchmarked) that settle contested
 hot-path/safety choices. **When code and a spec disagree, the spec wins**; if the spec is wrong,

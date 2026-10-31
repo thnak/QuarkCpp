@@ -1,7 +1,12 @@
 # Quark Engine
 
-**A high-performance C++23 actor engine for building highly concurrent, distributed systems.**
-The runtime owns optimization; developers express only intent.
+**The network center of [AeroCoWorker](https://github.com/thnak/AeroCoWorker): a C++23 actor-based networking core.**
+
+> **Direction (owner, 2026-10-31, [ADR-067](decisions/ADR-067-direction-aerocoworker-network-center.md)):** Quark no longer aims to be a
+> general-purpose distributed actor engine competing with CAF. It is AeroCoWorker's network center: every machine-to-machine path (node plane,
+> hosted Team and hub, serverless LAN group, phones and devices attaching to their home PC, relays, headless Linux nodes). The actor runtime is
+> kept as internal machinery; features no network use needs are frozen (no new work or promises). The description below is the engine as built,
+> and is kept accurate; read it with that direction in mind.
 
 [![CI](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
@@ -317,6 +322,8 @@ CTest gates in [`tests/`](tests/), not noise-sensitive benchmarks; see PERFORMAN
 
 ## Comparing to CAF
 
+> **Historical (ADR-067):** Quark no longer positions itself against CAF; this comparison is kept as the record of its hot-path claims.
+
 [`bench/caf_comparison/`](bench/caf_comparison/) benchmarks Quark head-to-head against
 **CAF** (the C++ Actor Framework), a mature, general-purpose actor toolkit. **The goal of that
 comparison is to sanity-check Quark's hot-path claims against an established alternative, not to
@@ -536,6 +543,7 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-064](decisions/ADR-064-hot-path-division-and-resolve-flat-map.md) | Counter-guided hot-path wins (003/006, #4) | `MessagePool` partition by mask (no `div` per acquire) + flat open-addressing `by_id_`; 1P->1C 4.9 -> 6.3 M msg/s; five other candidates measured and rejected. |
 | [ADR-065](decisions/ADR-065-pool-per-pool-lanes-and-sibling-borrow.md) | `MessagePool` per-pool lanes + sibling-borrow before heap growth (003, #30/#31) | **Accepted** (2026-10-28) — no lane collisions across pools; growth no longer serialises producers behind malloc. |
 | [ADR-066](decisions/ADR-066-dekker-rendezvous-as-seq-cst-operations.md) | Dekker rendezvous as `seq_cst` operations, not standalone fences (001/002/003/015/024) | Every StoreLoad pair is now a `seq_cst` store/RMW + `seq_cst` load: TSan-modelled (GCC `-Wtsan` gone), `dmb ish` removed on AArch64, x86 one locked op for one; litmus 0/50M, relaxed control fires; benches flat. |
+| [ADR-067](decisions/ADR-067-direction-aerocoworker-network-center.md) | Direction: AeroCoWorker's network center, not a general actor engine (owner) | Accepted as direction, no evidence claimed; roadmap #35-#37, #40-#44; Windows and Android first-class; unused features frozen. |
 
 </details>
 
