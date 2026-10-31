@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -55,6 +56,7 @@
 #include "quark/core/ids.hpp"
 #include "quark/core/metrics.hpp"
 #include "quark/core/peer_session.hpp"
+#include "quark/core/secure_transport_admission.hpp"
 #include "quark/core/tls_identity.hpp"
 #include "quark/core/transport.hpp"
 #include "quark/detail/hash.hpp"
@@ -110,6 +112,24 @@ public:
         clock_fn_ = fn;
         clock_ctx_ = ctx;
     }
+
+    // ADR-069 (020 §1a): drive admission from the application's published snapshots. Cold setup; `a` must
+    // outlive this transport. Without it behaviour is unchanged. Every inbound/outbound frame and every
+    // handshake completion asks the CURRENT snapshot; `a.publish(g)` re-answers pending handshakes and live
+    // sessions before it returns (see secure_transport_admission.hpp). `close_hook` tells the inner
+    // transport to drop the connection of a session a generation denied (wire it to
+    // `[&tcp](NodeId p){ tcp.reset_peer_connection(p); }`).
+    void set_admission(AdmissionAuthority& a, std::function<void(NodeId)> close_hook = {}) {
+        close_hook_ = std::move(close_hook);
+        admission_.attach(a, [this](const AdmissionSnapshot& s) { on_admission_published(s); });
+    }
+    [[nodiscard]] AdmissionStats admission_stats() const noexcept { return admission_.stats(); }
+    // Generation the live session with `peer` was last re-answered under (nullopt: no session).
+    [[nodiscard]] std::optional<std::uint64_t> session_admission_generation(NodeId peer) const {
+        const auto s = try_get_session(peer);
+        return s ? std::optional<std::uint64_t>(s->admission_generation()) : std::nullopt;
+    }
+    void set_admission_test_faults(const AdmissionTestFaults& f) noexcept { admission_.faults = f; }
 
     // ADR-040 Phase 3+: gate this transport on a real mTLS handshake. Once enabled, PeerSessions are
     // no longer auto-vivified on first use (the pre-handshake Phase 2 shape) — a peer must complete a
@@ -219,6 +239,18 @@ public:
     // peers' sessions never contend with each other (map_mu_, taken only to find/insert, is released
     // before this lock is taken).
     void send(NodeId to, MessageFrame frame) override {
+        detail::AdmissionGate::Scope admission_scope(admission_);  // publish() waits for us (020 §1a)
+        if (admission_.enabled() && !admission_.faults.skip_inbound_gate) {
+            const auto a = admission_.ask(to);
+            if (a.verdict == AdmissionVerdict::Deny) {
+                admission_.send_dropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (a.verdict == AdmissionVerdict::LogExchangeOnly && frame.kind != FrameKind::Control) {
+                admission_.lane_refused.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
         std::shared_ptr<PeerSession> session;
         if (handshake_factory_) {
             session = try_get_session(to);
@@ -499,7 +531,8 @@ private:
     // Returns true iff this was an in-place RENEGOTIATION (an existing session was swapped), false iff
     // it installed a fresh session (including the identity-mismatch reject, which installs nothing).
     // The caller (drive_handshake) uses this to route the ADR-040 Phase 8 metric correctly.
-    bool install_session_from_result(NodeId expected_peer, HandshakeEngine::Result result) {
+    bool install_session_from_result(NodeId expected_peer, HandshakeEngine::Result result,
+                                     std::uint64_t answered_gen, bool& admission_denied) {
         // Cross-check identity BEFORE touching sessions_ — a mismatch (spoofed/wrong peer, wrong
         // cluster) leaves nothing behind to clean up (closes S6's leak-on-rejection by construction, not
         // by a follow-up eviction).
@@ -507,6 +540,22 @@ private:
             audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, expected_peer.value,
                                "secure transport: handshake identity mismatch (NodeId/ClusterId)", 0});
             return false;
+        }
+        // 020 §1a(a): re-answer from the CURRENT snapshot at completion, on the AUTHENTICATED identity, inside
+        // the fence so a publish that races us either sees this session in its sweep or is read here.
+        detail::AdmissionGate::Scope admission_scope(admission_);
+        if (admission_.enabled() && !admission_.faults.skip_handshake_recheck) {
+            const auto a = admission_.ask(result.peer_node_id);
+            if (a.generation != answered_gen)
+                admission_.handshakes_reanswered.fetch_add(1, std::memory_order_relaxed);
+            if (a.verdict == AdmissionVerdict::Deny) {
+                admission_.handshakes_denied_at_completion.fetch_add(1, std::memory_order_relaxed);
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, expected_peer.value,
+                                   "secure transport: peer denied by admission snapshot at handshake completion", 0});
+                if (close_hook_) close_hook_(expected_peer);
+                admission_denied = true;  // the caller sends no reply: a denied peer never completes
+                return false;
+            }
         }
         // S2 guarantees sessions_ is populated ONLY by a completed handshake — so a session that already
         // exists for this peer unambiguously means THIS completed handshake is a Phase 6 RENEGOTIATION,
@@ -525,6 +574,7 @@ private:
                                                       std::move(result.recv_cipher),
                                                       identity_->generation(), result.peer_fingerprint,
                                                       now_ns());
+        session->set_admission_generation(admission_.generation());
         std::unique_lock<std::shared_mutex> g(map_mu_);
         sessions_[expected_peer.value] = std::move(session);
         return false;
@@ -558,7 +608,7 @@ private:
         }
         renegotiations_attempted_.fetch_add(1, std::memory_order_relaxed);
         if (metrics_) metrics_->security_handshakes_attempted.inc();
-        drive_handshake(peer, std::move(engine), std::span<const std::byte>{});
+        drive_handshake(peer, std::move(engine), std::span<const std::byte>{}, admission_.generation());
     }
 
     // Advances `engine` with inbound `in`, sends any resulting bytes, and stores/finalizes the outcome.
@@ -567,13 +617,19 @@ private:
     // across advance() or inner_->send() — so a reentrant inbound Authenticate frame for this same peer
     // (arriving synchronously from send_authenticate_frame below) can never deadlock on pending_mu_.
     void drive_handshake(NodeId peer, std::unique_ptr<HandshakeEngine> engine,
-                         std::span<const std::byte> in,
+                         std::span<const std::byte> in, std::uint64_t answered_gen,
                          const PeerAddress* source = nullptr, bool known = false) {
         std::vector<std::byte> out;
         const HandshakeEngine::Step step = engine->advance(in, out);
         if (step == HandshakeEngine::Step::Done) {
             release_reservation(peer);
-            const bool was_renegotiate = install_session_from_result(peer, engine->take_result());
+            bool admission_denied = false;
+            const bool was_renegotiate =
+                install_session_from_result(peer, engine->take_result(), answered_gen, admission_denied);
+            if (admission_denied) {
+                if (metrics_) metrics_->security_handshakes_failed.inc();
+                return;
+            }
             if (metrics_) (was_renegotiate ? metrics_->security_rotations_completed
                                            : metrics_->security_handshakes_succeeded)
                               .inc();
@@ -606,6 +662,7 @@ private:
         }
         {  // WantWrite / WantRead: store BEFORE sending, so a synchronous reentrant reply finds it.
             PendingHandshake ph{std::move(engine), now_ns()};
+            ph.admission_gen = answered_gen;
             if (source && source->valid) {
                 ph.source_ip = source->addr;
                 ph.source_ip_valid = true;
@@ -665,7 +722,7 @@ private:
                                                 revoked_snapshot_.load());
         }
         if (metrics_) metrics_->security_handshakes_attempted.inc();
-        drive_handshake(peer, std::move(engine), std::span<const std::byte>{});
+        drive_handshake(peer, std::move(engine), std::span<const std::byte>{}, admission_.generation());
     }
 
     void handle_authenticate_frame(MessageFrame frame) {
@@ -675,6 +732,7 @@ private:
         const bool known = known_peer_ && known_peer_(peer);
         std::unique_ptr<HandshakeEngine> engine;
         std::unique_ptr<HandshakeEngine> stale;  // destroyed after pending_mu_ is released (D6)
+        std::uint64_t answered_gen = admission_.generation();  // generation this handshake's answer is read under
         {
             std::lock_guard<std::mutex> g(pending_mu_);
             const auto it = pending_.find(peer.value);
@@ -691,9 +749,10 @@ private:
                 // — discard it so the peer's retry meets a fresh server-role engine below, instead of
                 // this stale one silently swallowing the retry's frame with a state machine that no
                 // longer matches what the peer just sent.
-                if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_)
+                if (now_ns() - it->second.last_progress_ns < handshake_timeout_ns_) {
                     engine = std::move(it->second.engine);
-                else {
+                    answered_gen = it->second.admission_gen;
+                } else {
                     stale = std::move(it->second.engine);
                     handshakes_timed_out_.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -701,6 +760,12 @@ private:
             }
         }
         if (!engine) {  // no engine in flight ⇒ we're the server side seeing the opening message
+            if (admission_.enabled() && admission_.ask(peer).verdict == AdmissionVerdict::Deny) {
+                admission_.handshakes_refused.fetch_add(1, std::memory_order_relaxed);  // 020 §1a: Deny opens nothing
+                audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, peer.value,
+                                   "secure transport: handshake refused, peer denied by admission snapshot", 0});
+                return;
+            }
             bool admitted = true;
             if (handshake_admission_addr_)
                 admitted = handshake_admission_addr_(peer, source);
@@ -743,8 +808,8 @@ private:
                                                 revoked_snapshot_.load());
             if (metrics_) metrics_->security_handshakes_attempted.inc();
         }
-        drive_handshake(peer, std::move(engine), std::span<const std::byte>(frame.payload), &source,
-                        known);
+        drive_handshake(peer, std::move(engine), std::span<const std::byte>(frame.payload), answered_gen,
+                        &source, known);
     }
 
     void deliver(MessageFrame frame) {
@@ -761,6 +826,22 @@ private:
             reap_stale_pending(now_ns());
             handle_authenticate_frame(std::move(frame));
             return;
+        }
+        detail::AdmissionGate::Scope admission_scope(admission_);  // held across the receiver call
+        std::uint64_t admitted_gen = 0;
+        if (admission_.enabled() && !admission_.faults.skip_inbound_gate) {
+            // 020 §1a(c)/(d): the verdict is read per frame from the CURRENT snapshot, never cached; a frame
+            // from a denied peer is discarded and counted whether it was queued before or after the publish.
+            const auto a = admission_.ask(frame.from);
+            if (a.verdict == AdmissionVerdict::Deny) {
+                admission_.inbound_discarded.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (a.verdict == AdmissionVerdict::LogExchangeOnly && frame.kind != FrameKind::Control) {
+                admission_.lane_refused.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            admitted_gen = a.generation;
         }
         if (frame.payload.size() < 8) {  // malformed: no seq prefix
             tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
@@ -818,6 +899,7 @@ private:
             handle_schema_frame(std::move(frame));
             return;
         }
+        frame.admission_generation = admitted_gen;  // never taken from the wire (not serialized)
         if (const auto r = receiver_.load(); r && *r) (*r)(std::move(frame));
     }
 
@@ -925,6 +1007,7 @@ private:
         std::uint64_t source_ip = 0;    // per-IP accounting; valid only when source_ip_valid
         bool source_ip_valid = false;
         bool known = false;             // may use the reserved slots / bypass the per-IP cap
+        std::uint64_t admission_gen = 0;  // generation this handshake's admission answer was read under
     };
     std::unordered_map<std::uint64_t, PendingHandshake> pending_;
     // A parked handshake with no progress for this long is abandoned and retried (set_handshake_timeout
@@ -936,6 +1019,41 @@ private:
     std::size_t max_pending_handshakes_ = kMaxPendingHandshakes;
     std::size_t max_pending_per_ip_ = 64;
     std::size_t reserved_handshake_slots_ = 16;
+
+    // ADR-069: re-answer everything the transport holds against the freshly published snapshot. Runs on the
+    // publishing thread inside AdmissionAuthority::publish(), AFTER the swap.
+    void on_admission_published(const AdmissionSnapshot& snap) {
+        admission_.barrier();  // every operation that read an older generation has finished (020 §1a)
+        admission_.publishes_seen.fetch_add(1, std::memory_order_relaxed);
+        admission_.generation_swept.store(snap.generation(), std::memory_order_relaxed);
+        std::vector<NodeId> doomed_peers;
+        if (!admission_.faults.skip_handshake_recheck) {  // (a) in-flight handshakes of denied peers die
+            std::lock_guard<std::mutex> g(pending_mu_);
+            for (const auto& [id, ph] : pending_) {
+                (void)ph;
+                if (snap.lookup(NodeId{id}) == AdmissionVerdict::Deny) doomed_peers.push_back(NodeId{id});
+            }
+            admission_.handshakes_aborted.fetch_add(doomed_peers.size(), std::memory_order_relaxed);
+        }
+        if (!admission_.faults.skip_live_sweep) {  // (b) live sessions: re-answer, close the now-denied
+            for (const auto& session : snapshot_sessions()) {
+                if (snap.lookup(session->peer()) == AdmissionVerdict::Deny) {
+                    // Handshake shape only: with the handshake disabled every session shares one cipher and
+                    // dropping it would restart its seq spaces (B12); there the per-frame gate is the closure.
+                    if (handshake_factory_) {
+                        admission_.sessions_closed.fetch_add(1, std::memory_order_relaxed);
+                        doomed_peers.push_back(session->peer());
+                    }
+                } else {
+                    session->set_admission_generation(snap.generation());
+                }
+            }
+        }
+        for (NodeId p : doomed_peers) {
+            on_peer_disconnected(p);  // erases session, pending handshake and schema (handshake shape)
+            if (close_hook_) close_hook_(p);
+        }
+    }
 
     std::atomic<std::uint64_t> sealed_{0};
     std::atomic<std::uint64_t> opened_{0};
@@ -949,6 +1067,9 @@ private:
     std::atomic<std::uint64_t> renegotiations_attempted_{0};
     std::atomic<std::uint64_t> renegotiations_completed_{0};
     std::atomic<std::uint64_t> renegotiations_failed_{0};
+
+    std::function<void(NodeId)> close_hook_;  // set_admission: drop the connection of a denied peer
+    detail::AdmissionGate admission_;         // LAST member: destroyed first, detaches its listener
 };
 
 }  // namespace quark

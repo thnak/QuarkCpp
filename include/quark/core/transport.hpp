@@ -86,6 +86,10 @@ struct MessageFrame {
                                        // anonymous. Stamped ATTENUATED from the sender's inbound context
                                        // at the wire edge; re-established as the ambient on receive.
     PeerAddress source_address{};      // transport-local, never serialized (pre-auth per-IP accounting)
+    std::uint64_t admission_generation = 0;  // ADR-069: set by SecureTransport on delivery = the admission
+                                             // snapshot generation this frame was admitted under (the peer
+                                             // identity is `from`, authenticated by the session). Never
+                                             // serialized; 0 when no AdmissionAuthority is attached.
 };
 
 // The transport seam (010). Fire-and-forget by contract; ordering/at-most-once are the transport's

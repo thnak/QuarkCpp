@@ -53,12 +53,29 @@ public:
         return rejected_;
     }
 
+    // ADR-069 / 020 §1a authority-only mode: peer-gossiped revocations are IGNORED (counted in
+    // `ignored_gossip()`, never merged) and nothing is offered to `sample()` for gossip, because the
+    // application's admission snapshot is the only source of denial. `revoke_locally` (this node's own
+    // operator) still works. Default off: ADR-040 behaviour (any admitted member can gossip a revocation).
+    void set_authority_only(bool on) {
+        std::lock_guard<std::mutex> g(mu_);
+        authority_only_ = on;
+    }
+    [[nodiscard]] std::uint64_t ignored_gossip() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return ignored_gossip_;
+    }
+
     // Merge a peer's gossiped revocation set into ours (union). Returns true iff this added at least
     // one NEW fingerprint — callers (e.g. a future gossip-priority policy) can use this to decide
     // whether the change is worth re-announcing sooner.
     bool merge(const std::vector<Fingerprint>& incoming) {
         if (incoming.empty()) return false;
         std::lock_guard<std::mutex> g(mu_);
+        if (authority_only_) {
+            ignored_gossip_ += incoming.size();
+            return false;
+        }
         bool changed = false;
         for (const Fingerprint& fp : incoming) {
             if (set_.contains(fp)) continue;  // dedupe: already revoked is not a change
@@ -98,6 +115,7 @@ public:
     [[nodiscard]] std::vector<Fingerprint> sample(std::size_t max) const {
         std::lock_guard<std::mutex> g(mu_);
         std::vector<Fingerprint> out;
+        if (authority_only_) return out;
         out.reserve(std::min(max, set_.size()));
         for (const Fingerprint& fp : set_) {
             if (out.size() >= max) break;
@@ -123,6 +141,8 @@ private:
     std::unordered_set<Fingerprint> protected_;
     std::size_t max_entries_;
     std::uint64_t rejected_ = 0;
+    bool authority_only_ = false;
+    std::uint64_t ignored_gossip_ = 0;
     std::shared_ptr<const std::unordered_set<Fingerprint>> snapshot_;
 };
 

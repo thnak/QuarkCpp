@@ -82,6 +82,57 @@ This closes the sharpest distributed hole: because placement is *any-node-hosts-
 rogue node that cannot authenticate cannot be placed onto and therefore cannot
 observe state.
 
+### 1a. Application-driven admission snapshots and authority-only revocation *(Draft amendment, ADR-069, 2026-10-31)*
+
+> **Status: Draft amendment.** Specified here first, implemented in `include/quark/core/admission.hpp`
+> and `secure_transport_admission.hpp`, proven by the tests ADR-069 lists. Not yet Accepted: ADR-069 is
+> Proposed. Consumer: AeroCoWorker RFC 002 section 6e item 4 (gate G10 b), ADR-044 L6b/L6c; issue #41.
+
+`NodeAuthority::admitted(NodeId)` (section 1) is a static yes/no consulted after a handshake. It cannot
+express "the application changed its mind about a connected node", and the gossiped `RevocationRegistry`
+lets *any admitted member* revoke a third party. Both gaps are closed by letting the **application own
+admission as a numbered snapshot**:
+
+- **Snapshot.** An **immutable** `AdmissionSnapshot` with a strictly increasing **generation**, mapping a
+  peer key to a tri-state verdict: **Admit**; **LogExchangeOnly** (only the designated control lane,
+  `FrameKind::Control`, may carry traffic; the question is re-asked when the next generation is
+  published); **Deny**. A key the snapshot does not list is **Deny** (closed world; an empty snapshot
+  admits nobody). `lookup` is a pure read: no lock, no allocation, no call into application state. The
+  authority holds the current snapshot behind an atomic `shared_ptr` swap (the repo's idiom for a
+  cold-written, hot-read pointer). A publish whose generation is not greater than the current one is
+  refused and counted, so a replayed or reordered publish can never re-admit a denied peer.
+- **Never cache a yes.** Every inbound frame, every outbound frame and every handshake completion asks
+  the *current* snapshot. A session records the generation it was last re-answered under for
+  diagnostics only; the verdict is never read from it.
+- **Publish guarantees.** When `publish(g)` returns: (a) a handshake whose answer was read under a
+  generation below *g* has been re-answered, on the **authenticated** identity, before it completes (an
+  in-flight handshake of a now-denied peer is aborted; one racing the swap is denied at completion and
+  no reply is sent); (b) every live session has been re-answered and every now-denied one is closed (the
+  inner connection is told to drop via a close hook; with the handshake disabled, where all sessions
+  share one cipher and recreating one would restart its sequence spaces, the per-frame gate is the
+  closure); (c) a message from a now-denied peer is **discarded and counted, never delivered**, whether
+  it arrives before or after the publish, and a delivery still in progress under the old generation has
+  finished before `publish` returns; (d) every delivered message carries the **generation it was
+  admitted under** (`MessageFrame::admission_generation`, never taken from the wire) and the peer
+  identity (`from`, authenticated by the session). `publish` must not be called from inside a receive
+  callback of a transport that listens to the same authority.
+- **Key.** The snapshot is keyed by `AdmissionKey`, today an alias of `NodeId`. When the transport
+  identity becomes an Ed25519 public key (issue #40) the alias is the one place that changes.
+- **NodeAuthority compatibility.** The snapshot authority *is* a `NodeAuthority`: `admitted(n)` is true
+  only for **Admit**, so `place_admitted` and the relay hook (`TcpTransport::set_relay_forwarding`) see
+  every generation with no further wiring. A relay authorisation ("may relay from X to Y") is that same
+  hook: it is refused when either end is not Admit; the relay holds no per-session state to purge.
+- **Authority-only revocation (per cluster, default off).** When set (`SwimMembership::Config::
+  authority_only_revocation`, and `RevocationRegistry::set_authority_only`), peer-gossiped revocation
+  fingerprints are **ignored and counted** and none are offered for gossip: the snapshot is the only
+  source of denial. This node's own operator revocation (`revoke_locally`) still applies. The default
+  keeps ADR-040 behaviour (any admitted member can gossip a revocation).
+
+Residual risks, stated: a receive callback that blocks stalls `publish`; the generation fence is per
+transport, so two transports on one thread publishing concurrently through synchronous loopback can
+deadlock (a test-double shape, not a network one); `publish` is synchronous work proportional to the live
+sessions.
+
 ## 2. Transport security seam
 
 The `Transport` (010) gains a security wrapper providing **confidentiality,

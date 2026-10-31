@@ -258,6 +258,28 @@ Neither path requires a coordinated cluster-wide restart or a cluster-wide
 barrier — both are purely gossip/local-sweep driven, one node and one session
 at a time.
 
+### Application-driven eviction *(Draft amendment, ADR-069, 2026-10-31)*
+
+> **Status: Draft amendment**, with 020 section 1a (the snapshot semantics live there). Issue #41.
+
+When the application's admission snapshot (020 section 1a) denies a node that is a **live** member, this
+node **evicts** it:
+
+- its sessions are closed (020 section 1a b) and no relay forwards to or from it;
+- it is tombstoned in the roster, so it leaves `view()` and `placement_view()` and the epoch advances;
+- one **`Evicted`** membership event (issue #21) is reported, on every node that observes the
+  generation, distinct from `Dead` (a failure) and `Left` (a graceful departure); the event carries the
+  post-eviction epoch;
+- **re-admission is refused** while the snapshot denies the node: every Alive or Suspect update for it
+  (gossip, direct ack, join) is dropped and counted (`admission_refusals`). A later snapshot that admits it
+  lets it rejoin by the ordinary higher-incarnation rule, with a fresh `Joined` event.
+
+A published generation marks eviction pending with a thread-safe flag; the membership's driving thread
+performs it at its next `tick()`, inbound frame or `apply_admission()` (at most one protocol tick of
+latency, the same contract as the other externally queued reports). Each node decides from its own
+snapshot: eviction is **not gossiped**, so one node cannot evict another's peers. A node whose snapshot
+still admits the peer keeps it.
+
 ### Liveness and teardown
 
 - **Keepalive reuses SWIM.** The direct/indirect pings SWIM already sends (010)

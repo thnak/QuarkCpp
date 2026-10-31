@@ -74,6 +74,7 @@
 
 #include "quark/core/ids.hpp"
 #include "quark/core/membership.hpp"
+#include "quark/core/admission.hpp"  // ADR-069: application-driven eviction
 #include "quark/core/tls_identity.hpp"  // Fingerprint — ADR-040 Phase 5 revocation-gossip piggyback
 #include "quark/core/transport.hpp"
 #include "quark/detail/hash.hpp"
@@ -536,6 +537,10 @@ public:
         std::int64_t unverified_ttl_ns = 30'000'000'000;
         // ADR-053: the wire version this node speaks (default = current). Tests/rolling upgrades only.
         std::uint8_t wire_version = kSwimWireVersion;
+        // ADR-069 / 020 §1a: peer-gossiped revocations are IGNORED (counted, never merged, never sampled
+        // out) and the application's admission snapshot is the only source of denial. Default false keeps
+        // the ADR-040 behaviour (any admitted member can gossip a revocation).
+        bool authority_only_revocation = false;
     };
 
     // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
@@ -565,6 +570,37 @@ public:
 
     SwimMembership(const SwimMembership&) = delete;
     SwimMembership& operator=(const SwimMembership&) = delete;
+    ~SwimMembership() {
+        if (admission_) admission_->remove_listener(admission_listener_);
+    }
+
+    // --- ADR-069 (020 §1a, 021 §"Application-driven eviction") --------------------------------------
+    // Bind the application's admission authority (cold setup; must outlive this object). A published
+    // generation marks eviction pending (thread-safe flag); the driving thread evicts every LIVE member
+    // the snapshot denies at its next tick()/inbound frame/apply_admission(): tombstone (out of view() and
+    // placement), one `Evicted` membership event per node, and from then on apply_update refuses any
+    // Alive/Suspect update for a denied node (so it cannot re-enter by gossip, join or probe) until a later
+    // snapshot admits it - after which it rejoins by the ordinary higher-incarnation rule.
+    void set_admission(AdmissionAuthority& a) {
+        if (admission_) admission_->remove_listener(admission_listener_);
+        admission_ = &a;
+        admission_listener_ = a.add_listener(
+            [this](const AdmissionSnapshot&) { admission_dirty_.store(true, std::memory_order_release); });
+        admission_dirty_.store(true, std::memory_order_release);
+    }
+    // Driving thread: evict now (what tick() does implicitly); events are delivered before it returns.
+    void apply_admission() {
+        evict_denied();
+        flush_events();
+    }
+    [[nodiscard]] std::uint64_t evictions() const noexcept { return evictions_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t admission_refusals() const noexcept {
+        return admission_refusals_.load(std::memory_order_relaxed);
+    }
+    // Revocation fingerprints dropped because `authority_only_revocation` is set.
+    [[nodiscard]] std::uint64_t gossip_revocations_ignored() const noexcept {
+        return gossip_revocations_ignored_.load(std::memory_order_relaxed);
+    }
 
     // --- 010 Membership interface -------------------------------------------------------------
     [[nodiscard]] NodeId self() const noexcept override { return self_; }
@@ -876,7 +912,8 @@ private:
         m.from_incarnation = self_incarnation_;
         m.wire_version = cfg_.wire_version;
         fill_digest(to, m.updates);
-        if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
+        if (revocation_pull_ && !cfg_.authority_only_revocation)
+            m.revocations = revocation_pull_(cfg_.max_gossip_updates);
         if (capability_pull_)
             m.capabilities = capability_pull_(self_, self_incarnation_, cfg_.max_capability_gossip_bytes);
         if (pressure_query_)
@@ -1088,7 +1125,12 @@ private:
                 apply_update(NodeId{u.node}, u.incarnation, static_cast<MemberStatus>(u.status),
                              Src::Gossip, now);
             }
-            if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
+            if (revocation_merge_ && !m.revocations.empty()) {
+                if (cfg_.authority_only_revocation)  // ADR-069: the snapshot is the only source of denial
+                    gossip_revocations_ignored_.fetch_add(m.revocations.size(), std::memory_order_relaxed);
+                else
+                    revocation_merge_(m.revocations);
+            }
             // C5: capability / pressure entries are keyed by node ids the (authenticated) sender
             // chooses. Accept one only for the sender itself or a verified live member, never for
             // self (a peer must not overwrite our own advertisement) or a fabricated id — otherwise
@@ -1364,6 +1406,11 @@ private:
     //   * a Left is authoritative and is never refuted by its own node.
     void apply_update(NodeId node, std::uint64_t inc, MemberStatus st, Src src, std::int64_t now) {
         if (static_cast<std::uint8_t>(st) > static_cast<std::uint8_t>(MemberStatus::Left)) return;  // wire range
+        if (admission_ && node != self_ && st != MemberStatus::Dead && st != MemberStatus::Left &&
+            admission_->verdict(node) == AdmissionVerdict::Deny) {
+            admission_refusals_.fetch_add(1, std::memory_order_relaxed);  // ADR-069: a denied node stays out
+            return;
+        }
         if (node == self_) {
             if (self_left_ || st == MemberStatus::Left) return;  // a departure is never refuted
             if (st != MemberStatus::Alive && inc >= self_incarnation_) {
@@ -1648,7 +1695,7 @@ private:
         if (is_tomb(m.status)) {
             if (m.reported != 0 && m.reported != static_cast<std::uint8_t>(m.status)) {
                 m.reported = static_cast<std::uint8_t>(m.status);
-                push_event(m.status == MemberStatus::Left ? K::Left : K::Dead, node, m);
+                push_event(m.status == MemberStatus::Left ? K::Left : evicting_ ? K::Evicted : K::Dead, node, m);
             }
             return;
         }
@@ -1686,8 +1733,26 @@ private:
         pending_events_.push_back(e);
     }
 
+    // ADR-069: tombstone every live member the current snapshot denies; the Evicted event is queued by
+    // note_transition (evicting_ switches Dead -> Evicted) and delivered by the caller's flush_events().
+    void evict_denied() {
+        if (!admission_) return;
+        const auto snap = admission_->current();
+        std::vector<NodeId> victims;
+        for (const auto& [id, m] : members_)
+            if (id != self_.value && !is_tomb(m.status) && snap->lookup(NodeId{id}) == AdmissionVerdict::Deny)
+                victims.push_back(NodeId{id});
+        for (NodeId v : victims) {
+            evicting_ = true;
+            apply_update(v, incarnation_of(v), MemberStatus::Dead, Src::Local, now_ns());
+            evicting_ = false;
+            evictions_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     void flush_events() {
         if (flushing_) return;  // a callback re-entered us: the outer loop drains what it queued
+        if (admission_dirty_.exchange(false, std::memory_order_acq_rel)) evict_denied();
         std::vector<ExtRefusal> ext;
         {
             std::lock_guard<std::mutex> g(ext_mu_);
@@ -1719,6 +1784,7 @@ private:
     std::vector<MembershipEventSink> sinks_;
     std::vector<MembershipEvent> pending_events_;
     bool flushing_ = false;
+    bool evicting_ = false;  // ADR-069: the tombstone being written is an eviction (event kind Evicted)
     std::unordered_map<std::uint64_t, Refusal> refusals_;  // protocol-thread owned, bounded
     NodeId ctx_from_{};                                    // sender of the frame being handled
     std::uint8_t ctx_version_ = 0;
@@ -1791,6 +1857,13 @@ private:
     std::atomic<std::uint64_t> control_sheds_{0};
     std::atomic<std::uint64_t> gossip_rejected_{0};
     std::uint64_t epoch_ = 0;
+    // ADR-069. Declared last among the members the listener touches; the destructor detaches it first.
+    AdmissionAuthority* admission_ = nullptr;
+    std::uint64_t admission_listener_ = 0;
+    std::atomic<bool> admission_dirty_{false};
+    std::atomic<std::uint64_t> evictions_{0};
+    std::atomic<std::uint64_t> admission_refusals_{0};
+    std::atomic<std::uint64_t> gossip_revocations_ignored_{0};
 };
 
 }  // namespace quark

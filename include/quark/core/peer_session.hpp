@@ -149,6 +149,13 @@ public:
     // S5: mark this session revoked. Lock-free (atomic) since sweep_revocations scans many sessions
     // and the hot send()/deliver() path checks this first, before taking session_mu().
     void revoke() noexcept { revoked_.store(true, std::memory_order_release); }
+
+    // ADR-069: the admission generation this session was last (re-)answered under (diagnostic; the verdict
+    // itself is always re-read from the current snapshot, never cached from here).
+    void set_admission_generation(std::uint64_t g) noexcept { admission_gen_.store(g, std::memory_order_release); }
+    [[nodiscard]] std::uint64_t admission_generation() const noexcept {
+        return admission_gen_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] bool revoked() const noexcept { return revoked_.load(std::memory_order_acquire); }
 
 private:
@@ -163,6 +170,7 @@ private:
     std::array<std::uint64_t, kLanes> recv_high_{};
     std::atomic<std::uint64_t> frames_sealed_on_key_{0};
     std::atomic<bool> revoked_{false};
+    std::atomic<std::uint64_t> admission_gen_{0};
     std::atomic<std::int64_t> renegotiated_at_ns_{0};
 };
 

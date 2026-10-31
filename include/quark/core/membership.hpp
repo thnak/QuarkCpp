@@ -54,6 +54,8 @@ enum class MembershipEventKind : std::uint8_t {
     Dead = 3,            // suspicion timeout lapsed with no refutation (tombstone)
     Left = 4,            // graceful departure (tombstone)
     VersionRefused = 5,  // wire-protocol version outside the supported window (ADR-053); see `refusal`
+    Evicted = 6,         // ADR-069: the application's admission snapshot denied a live member; it is out of
+                         // the view (tombstoned) and re-admission is refused until a later snapshot admits it
 };
 
 // Distinct, observable reason a peer was refused (never conflated with a timeout / cluster mismatch).
