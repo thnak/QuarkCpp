@@ -67,7 +67,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install toolchain (versions recorded in the SBOM)
         run: bash ci/install-deps.sh --with-clang --with-sodium
@@ -87,14 +87,14 @@ jobs:
           sha256sum sbom.json ci/pins.env ci/apt-packages.txt ci/install-deps.sh vcpkg.json > sbom.sha256
           cat sbom.sha256
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: sbom
           path: |
             sbom.json
             sbom.sha256
 
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         # Fork PRs have no OIDC attestation permission; the SBOM is still built/uploaded there.
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         with:
@@ -164,7 +164,7 @@ jobs:
               ctest_jobs: 2
               ctest_env: "ASAN_OPTIONS=abort_on_error=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install toolchain
         # One pinned/hash-verified installer; never pipe a remote script into sudo. The LLVM hash,
@@ -244,7 +244,7 @@ jobs:
 
       - name: Upload ctest logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ctest-${{ matrix.config.name }}-${{ matrix.arch }}
           path: build/Testing/**/*.log
@@ -266,7 +266,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install toolchain + libsodium (exact lock)
         run: bash ci/install-deps.sh --with-sodium
@@ -301,7 +301,7 @@ jobs:
             # msvc-release only) — collects real signal without blocking merges until established.
             informational: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # The Windows toolset is selected EXACTLY from ci/pins.env (MSVC_VERSION), not just the
       # windows-2022 label. A runner-image refresh that no longer ships that toolset fails closed.
@@ -380,7 +380,7 @@ jobs:
 
       - name: Upload ctest logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ctest-${{ matrix.config.name }}-windows
           path: build/Testing/**/*.log
@@ -398,7 +398,7 @@ jobs:
     timeout-minutes: 90
     continue-on-error: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Configure
         shell: cmd
@@ -414,7 +414,7 @@ jobs:
 
       - name: Upload ctest logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ctest-msvc-release-windows-arm64
           path: build/Testing/**/*.log
@@ -430,7 +430,7 @@ jobs:
     timeout-minutes: 60
     continue-on-error: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Configure
         shell: cmd
@@ -454,7 +454,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install toolchain
         run: bash ci/install-deps.sh
@@ -493,7 +493,7 @@ jobs:
     # re-baseline without letting shared-runner arm64 noise veto merges.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install toolchain
         run: bash ci/install-deps.sh
@@ -538,7 +538,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Build + run
         run: |
@@ -553,7 +553,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Read toolchain pins
         shell: bash
