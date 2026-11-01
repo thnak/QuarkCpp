@@ -154,9 +154,9 @@ public:
         }
         current_.store(next);
         publishes_.fetch_add(1, std::memory_order_relaxed);
-        struct Flag {
-            Flag() { publishing_on_this_thread() = true; }
-            ~Flag() { publishing_on_this_thread() = false; }
+        struct PublishingFlag {
+            PublishingFlag() { publishing_on_this_thread() = true; }
+            ~PublishingFlag() { publishing_on_this_thread() = false; }
         } flag;
         for (const Slot& s : listeners_) s.fn(*next);
         return true;

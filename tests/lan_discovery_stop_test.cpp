@@ -58,7 +58,7 @@ int main() {
             net::DiscoveryScopeConfig c;
             c.service_type = type;
             c.port = 7;
-            c.window = [w] { return DiscoveryWindow{window_id(w), {window_id(w)}, "host" + std::to_string(w)}; };
+            c.window = [w] { return DiscoveryWindow{window_id(w), {window_id(w)}, "host" + std::to_string(w), {}}; };
             return *d.open_scope(std::move(c));
         };
         auto s1 = mk("_one._tcp", 1), s2 = mk("_two._tcp", 2);
@@ -77,7 +77,7 @@ int main() {
             net::LanDiscovery d(p, [](const DiscoveredPeer&) {});
             net::DiscoveryScopeConfig c;
             c.service_type = "_x._tcp";
-            c.window = [] { return DiscoveryWindow{window_id(1), {window_id(1)}, "h"}; };
+            c.window = [] { return DiscoveryWindow{window_id(1), {window_id(1)}, "h", {}}; };
             auto s = *d.open_scope(std::move(c));
             (void)d.start_advertising(s);
             check(lan3.live_registrations() == 1, "advertising");

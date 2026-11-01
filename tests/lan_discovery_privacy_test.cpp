@@ -117,7 +117,7 @@ int main() {
         c.service_type = kType;
         c.port = kPort;
         c.txt = {{"k", "v"}};
-        c.window = [&] { return DiscoveryWindow{id, {id}, kHost}; };
+        c.window = [&] { return DiscoveryWindow{id, {id}, kHost, {}}; };
         auto s = *d.open_scope(std::move(c));
         (void)d.start_advertising(s);
         const auto log = lan.adverts_seen();
