@@ -169,7 +169,9 @@ jobs:
       - name: Install toolchain
         # One pinned/hash-verified installer; never pipe a remote script into sudo. The LLVM hash,
         # majors and the apt allowlist live in ci/pins.env + ci/apt-packages.txt (audited above).
-        run: bash ci/install-deps.sh ${{ startsWith(matrix.config.cxx, 'clang') && '--with-clang' || '' }}
+        # The libFuzzer leg below configures QUARK_WITH_SODIUM with explicit system paths, so this
+        # leg installs libsodium-dev here; without it ninja dies on the missing libsodium.a.
+        run: bash ci/install-deps.sh ${{ startsWith(matrix.config.cxx, 'clang') && '--with-clang' || '' }} ${{ matrix.arch == 'x86_64' && matrix.config.name == 'clang-release' && '--with-sodium' || '' }}
 
       - name: ccache restore
         uses: ./.github/actions/ccache-restore
