@@ -18,6 +18,11 @@
 //   * Quark never sees the group key and never owns the clock: the application hands over a window
 //     provider and signals boundaries (`window_boundary`); the adapter advertises the CURRENT id and
 //     browses for current AND previous ids.
+//   * ONE ID PER DEVICE, EXACT MATCH (AeroCoWorker ADR-044 R16, resolves ADR-070 F1): each device
+//     advertises its own rotating id (no shared group prefix, no suffix), and a browser accepts the
+//     EXACT names of every other active device (current + previous window, ~196 names per scope). A
+//     sighting is accepted only when its decoded label bytes EQUAL an accepted id; there is no prefix
+//     matching. The host label must be random per window (ADR-070 F2): the application supplies it.
 //   * Detection of client isolation is passive-only; `visibility()` reports Unknown (ADR-070 §5).
 #pragma once
 
@@ -31,6 +36,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -127,17 +133,20 @@ public:
 };
 
 // ---- Application-facing types ---------------------------------------------------------------------
-// One rotation window, as the application computes it (ADR-044: id = first 10 bytes of
-// HMAC-SHA256(group discovery key, 15-minute window)). Quark treats every byte string as opaque.
+// One rotation window, as the application computes it (ADR-044 R16: this device's id = a truncated
+// HMAC of window || device key; every device has its own id). Quark treats every byte string as opaque.
 struct DiscoveryWindow {
-    // Encoded into the instance label and advertised. The application may append random bytes to a
-    // group-wide id so that two members' instance names do not collide (mDNS names are unique per
-    // network; ADR-070 §4 finding F1).
+    // Encoded into the instance label and advertised: THIS device's own id for the window. It must be
+    // unique per device (mDNS instance names are unique per network; ADR-070 §4 F1, resolved by R16).
     DnsSdBytes advertise_id;
-    // Ids to accept while browsing (current and previous window). A sighting matches when its decoded
-    // label STARTS WITH one of these (so a random suffix after the group id still matches).
+    // The exact ids of every other active device for the CURRENT window. A sighting is accepted only
+    // when its decoded label bytes are EQUAL to one of these (no prefix matching). Empty ids ignored.
     std::vector<DnsSdBytes> accept_ids;
-    std::string host_label;  // must be application-supplied and rotate with the window (see ADR-070 §4 F2)
+    // Must be application-supplied and random per window (ADR-070 §4 F2).
+    std::string host_label;
+    // The exact ids of every other active device for the PREVIOUS window (the overlap while peers
+    // have not rotated yet). A match here reports DiscoveredPeer::previous_window. Empty ids ignored.
+    std::vector<DnsSdBytes> accept_previous_ids;
 };
 using WindowProvider = std::function<DiscoveryWindow()>;
 
@@ -151,11 +160,11 @@ struct DiscoveryScopeConfig {
 
 struct DiscoveredPeer {
     std::uint64_t scope = 0;
-    DnsSdBytes instance_id;  // the full decoded label (group id + whatever suffix the peer chose)
+    DnsSdBytes instance_id;  // the full decoded label: exactly one of the accepted ids (ADR-044 R16)
     std::string host_label;
     std::uint32_t ipv4 = 0;  // host order
     std::uint16_t port = 0;
-    bool previous_window = false;  // matched only via a non-first accept id
+    bool previous_window = false;  // matched via accept_previous_ids (and not accept_ids)
 };
 
 // "No peers visible" vs "no peers present" cannot be told apart passively (ADR-070 §5).
@@ -199,7 +208,7 @@ public:
         Scope* s = find(id);
         if (!s) return fail(errc::not_found, "scope");
         if (s->adv) return {};
-        s->win = s->cfg.window();
+        set_window(*s);
         return register_current(*s);
     }
     void stop_advertising(ScopeId id) {
@@ -211,7 +220,7 @@ public:
         Scope* s = find(id);
         if (!s) return fail(errc::not_found, "scope");
         if (s->browse) return {};
-        s->win = s->cfg.window();
+        set_window(*s);
         s->browse = 0;  // marks browsing before the platform may call back synchronously
         auto h = platform_.browse(s->cfg.service_type,
                                   [this, id](const DnsSdEvent& e) { on_event(id, e); });
@@ -235,7 +244,7 @@ public:
         std::lock_guard g(m_);
         Scope* s = find(id);
         if (!s) return fail(errc::not_found, "scope");
-        s->win = s->cfg.window();
+        set_window(*s);
         if (s->adv) {
             unregister(*s);
             return register_current(*s);
@@ -259,10 +268,27 @@ private:
     struct Scope {
         DiscoveryScopeConfig cfg;
         DiscoveryWindow win;
+        std::unordered_map<std::string, bool> accept;  // exact id bytes -> previous window?
         std::optional<DnsSdHandle> adv, browse;
         std::string own_label;                       // so we never report ourselves
         std::map<std::string, DiscoveredPeer> seen;  // key = instance_label|ipv4|port
     };
+
+    // Every assignment of Scope::win goes through here so the O(1) lookup is never stale.
+    // Value: true = previous window. Current wins when an id is in both lists.
+    static void set_window_into(Scope& s, DiscoveryWindow w) {
+        s.win = std::move(w);
+        s.accept.clear();
+        s.accept.reserve(s.win.accept_ids.size() + s.win.accept_previous_ids.size());
+        auto key = [](const DnsSdBytes& b) {
+            return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+        };
+        for (const auto& id : s.win.accept_previous_ids)
+            if (!id.empty()) s.accept.emplace(key(id), true);
+        for (const auto& id : s.win.accept_ids)
+            if (!id.empty()) s.accept.insert_or_assign(key(id), false);
+    }
+    static void set_window(Scope& s) { set_window_into(s, s.cfg.window()); }
 
     Scope* find(ScopeId id) {
         auto it = scopes_.find(id);
@@ -312,20 +338,14 @@ private:
         if (e.what.instance_label == s->own_label) return;  // our own advert
         auto bytes = decode_instance_label(e.what.instance_label);
         if (!bytes) return;
-        int matched = -1;
-        for (std::size_t i = 0; i < s->win.accept_ids.size(); ++i) {
-            const DnsSdBytes& a = s->win.accept_ids[i];
-            if (!a.empty() && bytes->size() >= a.size() && std::equal(a.begin(), a.end(), bytes->begin())) {
-                matched = static_cast<int>(i);
-                break;
-            }
-        }
-        if (matched < 0) return;  // not our group's id in the current or previous window
+        auto m = s->accept.find(std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size()));
+        if (m == s->accept.end()) return;  // not the exact id of a known device in the current or previous window
+        const bool previous = m->second;
         const std::string key = e.what.instance_label + '|' + std::to_string(e.what.ipv4) + '|' +
                                 std::to_string(e.what.port);
         if (e.kind == DnsSdEventKind::Found) {
             if (s->seen.contains(key)) return;
-            DiscoveredPeer p{id, std::move(*bytes), e.what.host_label, e.what.ipv4, e.what.port, matched > 0};
+            DiscoveredPeer p{id, std::move(*bytes), e.what.host_label, e.what.ipv4, e.what.port, previous};
             auto it = s->seen.emplace(key, std::move(p)).first;
             if (on_found_) on_found_(it->second);
         } else {

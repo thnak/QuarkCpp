@@ -84,8 +84,8 @@ int main() {
         auto second = p2.register_service(ad);
         check(!second.has_value() && second.error().code == errc::validation,
               "F1: second member with the identical id is refused (name conflict)");
-        ad.instance_label = net::encode_instance_label(with_suffix(window_id(1), 5));
-        check(p2.register_service(ad).has_value(), "F1 remedy: id + random suffix registers");
+        ad.instance_label = net::encode_instance_label(device_id(1, 5));
+        check(p2.register_service(ad).has_value(), "F1 remedy (ADR-044 R16): a distinct per-device id registers");
     }
 
     std::printf("lan_discovery_connect_test: %s  (on=%llu off=%llu)\n", check.ok ? "OK" : "FAIL",

@@ -68,10 +68,10 @@ int main() {
     check(labels_differ, "host label changed across the boundary (it is supplied per window)");
 
     // The window two boundaries ago is no longer accepted: A at window 3 does not accept window 1.
+    Node d(lan, 0xD4, 1004);  // known to the application before A's boundary, so A's lists include it
+    d.cur = 1;
     a.cur = 3;
     (void)a.disc.window_boundary(a.scope);
-    Node d(lan, 0xD4, 1004);
-    d.cur = 1;
     d.open();
     (void)d.disc.start_advertising(d.scope);
     {
@@ -79,6 +79,15 @@ int main() {
         bool saw_d = false;
         for (auto& p : a.found) saw_d |= p.port == 1004;
         check(!saw_d, "window 1 is two windows old at A (cur 3): not accepted");
+    }
+    // Control: the same device advertising the PREVIOUS window (2) of A (cur 3) is accepted.
+    d.cur = 2;
+    (void)d.disc.window_boundary(d.scope);
+    {
+        std::lock_guard g(a.m);
+        bool saw_d2 = false;
+        for (auto& p : a.found) saw_d2 |= p.port == 1004;
+        check(saw_d2, "CONTROL: D rotated to window 2 (A's previous window): accepted");
     }
 
     std::printf("lan_discovery_rotation_test: %s\n", check.ok ? "OK" : "FAIL");

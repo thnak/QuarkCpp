@@ -4,7 +4,9 @@
 #pragma once
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,9 +32,17 @@ inline DnsSdBytes window_id(unsigned window) {
     for (unsigned i = 0; i < 10; ++i) b.push_back(static_cast<std::byte>((window * 37u + i * 11u + 5u) & 0xFF));
     return b;
 }
-inline DnsSdBytes with_suffix(DnsSdBytes id, unsigned s) {
-    for (unsigned i = 0; i < 4; ++i) id.push_back(static_cast<std::byte>((s >> (8 * i)) & 0xFF));
+// ADR-044 R16: every device has its OWN id per window (10 bytes: the window stand-in with the last four
+// bytes replaced by the device's number). No shared prefix, no suffix; browsers match it EXACTLY.
+inline DnsSdBytes device_id(unsigned window, unsigned device) {
+    DnsSdBytes id = window_id(window);
+    for (unsigned i = 0; i < 4; ++i) id[6 + i] = static_cast<std::byte>((device >> (8 * i)) & 0xFF);
     return id;
+}
+// The application's knowledge of the other active devices on one fake LAN (keyed by the LAN).
+inline std::vector<unsigned>& known_devices(const void* lan) {
+    static std::map<const void*, std::vector<unsigned>> reg;
+    return reg[lan];
 }
 
 struct Check {
@@ -47,21 +57,27 @@ struct Check {
 
 struct Node {
     Node(net::FakeDnsSdNetwork& lan, unsigned suffix, std::uint16_t port, std::string type = "_aerotest._tcp")
-        : platform(lan), suffix_(suffix), port_(port), type_(std::move(type)),
+        : platform(lan), lan_(&lan), suffix_(suffix), port_(port), type_(std::move(type)),
           disc(platform, [this](const DiscoveredPeer& p) {
               std::lock_guard g(m);
               found.push_back(p);
           }, [this](const DiscoveredPeer& p) {
               std::lock_guard g(m);
               lost.push_back(p);
-          }) {}
+          }) {
+        auto& k = known_devices(lan_);
+        if (std::find(k.begin(), k.end(), suffix_) == k.end()) k.push_back(suffix_);
+    }
 
     // The application's window provider: current + (optionally) previous window ids.
     DiscoveryWindow make_window() const {
         DiscoveryWindow w;
-        w.advertise_id = with_suffix(window_id(cur), suffix_);
-        w.accept_ids.push_back(window_id(cur));
-        if (accept_previous && cur > 0) w.accept_ids.push_back(window_id(cur - 1));
+        w.advertise_id = device_id(cur, suffix_);
+        for (unsigned d : known_devices(lan_)) {
+            if (d == suffix_) continue;
+            w.accept_ids.push_back(device_id(cur, d));
+            if (accept_previous && cur > 0) w.accept_previous_ids.push_back(device_id(cur - 1, d));
+        }
         w.host_label = "h" + std::to_string(cur) + "x" + std::to_string(suffix_);
         return w;
     }
@@ -87,6 +103,7 @@ struct Node {
     std::vector<DiscoveredPeer> found, lost;
 
 private:
+    const void* lan_;
     unsigned suffix_;
     std::uint16_t port_;
     std::string type_;

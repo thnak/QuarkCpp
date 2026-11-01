@@ -149,6 +149,8 @@ struct Discovery {
 
 ### LAN discovery adapter (DNS-SD) — Draft amendment (ADR-070, issue #42)
 
+> **Amended 2026-11-01** (AeroCoWorker ADR-044 R16): one id per device, exact match, two accept lists; prefix matching removed.
+>
 > **Status: Draft.** Owner of the evidence: [ADR-070](decisions/ADR-070-lan-discovery-adapter.md) (Proposed). It adds an adapter
 > behind the `Discovery` seam above; it changes nothing in the core, SWIM, or the handshake.
 
@@ -164,9 +166,12 @@ adapter list above says), in `include/quark/net/lan_discovery.hpp`.
   service type. Nothing is advertised if the application supplies no id or no host label.
 - **Rotation is the application's.** The application supplies a `WindowProvider` returning the id to advertise, the ids to accept
   (current and previous window), and the host label for that window; it signals a boundary (`window_boundary`) and the adapter
-  re-reads the provider and re-advertises. The adapter owns neither the clock nor any key. Browsing accepts a sighting whose decoded
-  label **starts with** an accepted id, so an application may append random bytes for uniqueness (mDNS instance names are unique per
-  network; two members advertising an identical id collide).
+  re-reads the provider and re-advertises. The adapter owns neither the clock nor any key. **Each device advertises its own id**
+  (no shared group prefix, no suffix), and the window carries two lists: `accept_ids` (the exact ids of the other active devices,
+  current window) and `accept_previous_ids` (previous window). Browsing accepts a sighting only when its decoded label bytes
+  **equal** an id in either list; there is no prefix matching. `previous_window` is true iff the match came from
+  `accept_previous_ids` (current wins if an id is in both). Distinct ids avoid the mDNS instance-name collision that a shared id
+  causes (ADR-070 F1, resolved by ADR-044 R16).
 - **Runtime control, per scope.** `open_scope` / `start_advertising` / `stop_advertising` / `start_browsing` / `stop_browsing` /
   `close_scope`; several scopes may advertise at once with different ids and service types. Destroying the adapter withdraws every advert.
 - **Platform seam.** The OS calls sit behind `DnsSdPlatform` (`register_service`, `deregister_service`, `browse`, `stop_browse`), which
