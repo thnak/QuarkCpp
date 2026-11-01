@@ -17,7 +17,7 @@
 // this bench's own atomics — it never calls ask() while producers might still be flooding. Three
 // independent layers guard against a runaway run:
 //   1. The stop-timer never blocks on an ask() — pure steady_clock reads + local atomic sums.
-//   2. A hard global send cap (kMaxTotalSent) is a circuit breaker independent of the timer.
+//   2. A hard global send cap (max_total_sent) is a circuit breaker independent of the timer.
 //   3. A process watchdog thread force-exits (std::quick_exit) past a generous absolute ceiling.
 // The post-run correctness check uses a bounded, non-blocking poll on AskFuture::await_ready()
 // with a timeout, never plain block_on() — abandoning an unawaited future is documented-safe
@@ -29,9 +29,11 @@
 //
 // Build: see CMakeLists.txt
 // Run:   quark_stress_bench.exe [pairs] [duration_seconds] [warmup_seconds] [probe_limit] [ack_spin_limit]
+//        [miss_threshold] [yield_spin_limit] [max_total_sent=300000000]
 // Default: pairs = 2 (4 total OS threads, at this repo's standing multi-thread-stress cap),
 //          duration = 5s, warmup = 1s, probe_limit = 0 (ADR-038 cooperative eviction disabled,
-//          shipped default), ack_spin_limit = 128 (only consulted when probe_limit != 0).
+//          shipped default), ack_spin_limit = 128 (only consulted when probe_limit != 0),
+//          max_total_sent = 300M (raise it for a >~13 s soak at 14 lanes).
 
 #include "quark/core/actor.hpp"
 #include "quark/core/actor_ref.hpp"
@@ -172,7 +174,13 @@ int main(int argc, char** argv) {
     // count isn't itself a memory risk (each lane drains what it sends — this isn't a proxy for
     // live backlog), so this is a generous backstop against a mistyped/runaway duration_s, not a
     // tight per-second budget. 40M tripped on a perfectly healthy 4-pair/~17M-msg/s run.
-    constexpr std::uint64_t kMaxTotalSent = 300'000'000;
+    // Optional 8th arg (argv[8]) raises it: a 60 s 14-lane soak sends ~1.4B, so the 300M default
+    // would truncate it to ~13 s.
+    std::uint64_t max_total_sent = 300'000'000;
+    if (argc > 8) {
+        const unsigned long long v = std::strtoull(argv[8], nullptr, 10);
+        if (v > 0) max_total_sent = static_cast<std::uint64_t>(v);
+    }
     // Drain-wait budget also scales with pairs (see its use below) — a fixed budget under-times
     // at higher pair counts since a single sequential pass over N lanes can itself take N seconds
     // (a real 12-pair CAF run demonstrated this exact bug; fixed here symmetrically even though
@@ -187,7 +195,7 @@ int main(int argc, char** argv) {
     std::printf("Pairs: %u producer<->actor lanes (machine max: %u logical cores) | total OS threads: ~%u\n",
                 pairs, max_workers, total_threads);
     std::printf("Duration:  %.1fs sustained (+%.1fs untimed warmup) | send cap: %llu | watchdog: %.0fs\n",
-                duration_s, warmup_s, static_cast<unsigned long long>(kMaxTotalSent), kWatchdogCeilingS);
+                duration_s, warmup_s, static_cast<unsigned long long>(max_total_sent), kWatchdogCeilingS);
     std::printf("ADR-038 cooperative eviction: probe_limit=%u ack_spin_limit=%u miss_threshold=%u"
                 " | yield_spin_limit=%u (both 0 = shipped default, byte-identical to pre-ADR-038"
                 " behavior)\n",
@@ -317,8 +325,8 @@ int main(int argc, char** argv) {
         std::uint64_t cur_sent = 0;
         for (auto& c : sent_per_thread) cur_sent += c.load(std::memory_order_relaxed);
 
-        if (elapsed >= duration_s || cur_sent >= kMaxTotalSent) {
-            if (cur_sent >= kMaxTotalSent) cap_hit = true;
+        if (elapsed >= duration_s || cur_sent >= max_total_sent) {
+            if (cur_sent >= max_total_sent) cap_hit = true;
             break;
         }
         std::this_thread::sleep_for(milliseconds(200));
@@ -333,7 +341,7 @@ int main(int argc, char** argv) {
                     elapsed,
                     static_cast<unsigned long long>(cur_sent),
                     instant_mps,
-                    cur_sent >= kMaxTotalSent ? "HIT" : "-");
+                    cur_sent >= max_total_sent ? "HIT" : "-");
         last_sent = cur_sent;
         last_elapsed = elapsed;
     }
@@ -351,7 +359,7 @@ int main(int argc, char** argv) {
                     "%llu cap — some lane's consumer likely can't keep up. Stopped early by design "
                     "(see file header) rather than growing memory further.\n",
                     static_cast<unsigned long long>(total_sent), pairs,
-                    static_cast<unsigned long long>(kMaxTotalSent));
+                    static_cast<unsigned long long>(max_total_sent));
     }
 
     // --- Bounded drain-wait: poll each lane (never plain block_on) until every lane's received

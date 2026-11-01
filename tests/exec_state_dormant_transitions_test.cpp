@@ -72,6 +72,41 @@ int main() {
         check(cell.state() == ExecState::Running, "still Running (readmit no-op)", ok);
     }
 
+    // --- ADR-077: notify_enqueued_fast() keeps every transition, and returns false (no locked RMW)
+    // from states whose current owner will drain/re-admit. The concurrent memory-order half is the
+    // separate exec_state_wake_load_dekker_test.
+    {
+        ExecStateCell cell;
+        check(cell.notify_enqueued_fast(), "fast: Idle wakes", ok);
+        check(cell.state() == ExecState::Scheduled, "fast: Idle->Scheduled", ok);
+        check(!cell.notify_enqueued_fast(), "fast: already Scheduled does not wake", ok);
+        check(cell.try_acquire(), "reach Running", ok);
+        check(!cell.notify_enqueued_fast(), "fast: Running does not wake", ok);
+        check(cell.state() == ExecState::Running, "fast: Running unchanged", ok);
+    }
+    {
+        ExecStateCell cell;
+        check(cell.notify_enqueued() && cell.try_acquire(), "reach Running", ok);
+        cell.park();
+        check(!cell.notify_enqueued_fast(), "fast: Parked does not wake (completion re-admits)", ok);
+        check(cell.state() == ExecState::Parked, "fast: Parked unchanged", ok);
+    }
+    {
+        ExecStateCell cell;
+        check(cell.notify_enqueued() && cell.try_acquire(), "reach Running", ok);
+        cell.retire_to_dormant();
+        check(cell.notify_enqueued_fast(), "fast: Dormant re-admits", ok);
+        check(cell.state() == ExecState::Scheduled, "fast: Dormant->Scheduled", ok);
+    }
+    {
+        ExecStateCell cell;
+        check(cell.notify_enqueued() && cell.try_acquire(), "reach Running", ok);
+        cell.retire_to_dormant();
+        check(cell.retire_from_dormant(), "reach Retired", ok);
+        check(!cell.notify_enqueued_fast(), "fast: Retired does not wake (sweep rescues)", ok);
+        check(cell.state() == ExecState::Retired, "fast: Retired unchanged", ok);
+    }
+
     std::printf("exec_state_dormant_transitions_test: %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

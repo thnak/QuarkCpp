@@ -55,6 +55,27 @@ public:
                                           std::memory_order_seq_cst, std::memory_order_seq_cst);
     }
 
+    // ADR-077 (#perf): the same rendezvous with a seq_cst LOAD fast path. Under sustained load the CAS
+    // almost always fails — the actor is Running (drain/linger will observe the message) or already
+    // Scheduled — and a failed locked RMW is not cheap. A seq_cst load participates in the total order S
+    // exactly like the CAS's read half: the producer's seq_cst mailbox exchange precedes it, and the
+    // consumer's seq_cst close-out store precedes its seq_cst probe, so "producer reads non-Idle AND
+    // consumer probes empty" is forbidden. An Idle read still takes the CAS; its failure re-checks
+    // Dormant, preserving the old CAS-only race window (an eviction can slip in between load and CAS).
+    [[nodiscard]] bool notify_enqueued_fast() noexcept {
+        const ExecState st = s_.load(std::memory_order_seq_cst);
+        if (st == ExecState::Idle) {
+            ExecState expected = ExecState::Idle;
+            if (s_.compare_exchange_strong(expected, ExecState::Scheduled,
+                                           std::memory_order_seq_cst, std::memory_order_seq_cst))
+                return true;
+            if (s_.load(std::memory_order_seq_cst) == ExecState::Dormant) return readmit_from_dormant();
+            return false;
+        }
+        if (st == ExecState::Dormant) return readmit_from_dormant();
+        return false;  // Scheduled/Running/Parked/Retired: the owner will drain or re-admit it
+    }
+
     // --- Worker acquire edges (acquire the head_ handoff published by the prior release) ----
     // Normal claim: Scheduled → Running. false ⇒ lost the race / not scheduled ⇒ worker skips.
     [[nodiscard]] bool try_acquire() noexcept {
