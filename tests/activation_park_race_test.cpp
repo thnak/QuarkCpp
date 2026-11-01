@@ -34,15 +34,28 @@
 //     `exec_.park()` (also gated behind the SAME macro, zero cost otherwise) so the control can widen
 //     the SAFE half of the window (fields already validly written, `park()`'s store not yet visible)
 //     instead of the guaranteed-crash half (resuming a still-default-constructed, i.e. null,
-//     coroutine_handle) — a deliberate choice so the control reports a clean, deterministic exit
-//     instead of an uncontrolled SEGV. The pure-UB half (reading the parked fields before ANY write
-//     landed) is already demonstrated by red-team's standalone `park_race_probe.cpp`
-//     (429/429 stuck under a 5us injected delay against the real ExecStateCell) — cited as
-//     corroborating evidence, not reproduced here with a real coroutine for exactly that reason.
+//     coroutine_handle) — a deliberate choice so the control reports a clean exit instead of an
+//     uncontrolled SEGV. The pure-UB half (reading the parked fields before ANY write landed) is
+//     already demonstrated by red-team's standalone `park_race_probe.cpp` (429/429 stuck under a 5us
+//     injected delay against the real ExecStateCell) — cited as corroborating evidence, not
+//     reproduced here with a real coroutine for exactly that reason.
 //   The control must reproduce the permanent-stranding failure (silently dropped re-admit, activation
-//   sealed in Parked forever) at least once, and confirm each stranded activation can truly never be
-//   re-acquired again (a fresh message posted afterward is never admitted) — returns 0 iff it does
-//   (same "must strand to prove the harness has teeth" convention as sched_no_lost_wakeup_test).
+//   sealed in Parked forever) on EVERY iteration, and confirm each stranded activation can truly
+//   never be re-acquired again (a fresh message posted afterward is never admitted) — returns 0 iff
+//   it does (same "must strand to prove the harness has teeth" convention as
+//   sched_no_lost_wakeup_test).
+//
+// WHY THE CONTROL BLOCKS IN THE HOOK (issue #28): the original control widened the window with a 5us
+// sleep. That races against `std::thread` STARTUP — on a large host (Linux g++ ASan) the carrier
+// thread often was not scheduled until after drain_step had already run `exec_.park()`, so its
+// (ungated) complete_parked() observed Parked and re-admitted cleanly: STUCK=0 over 3000 iterations,
+// i.e. the control could not fire and proved nothing. The hook now uses a handshake instead of a
+// fixed delay: it signals the carrier, then BLOCKS until the carrier's complete_parked() has returned.
+// That function therefore always reads the parked fields with exec-state still `Running`, its
+// readmit CAS always fails, and the lane's subsequent park() always seals the activation — the
+// permanent-stranding lost wakeup is reproduced deterministically, independent of thread-startup
+// latency or iteration count. The handshake is bounded so a genuine regression reports a clean
+// failure instead of hanging.
 #include <atomic>
 #include <chrono>
 #include <coroutine>
@@ -118,16 +131,19 @@ bool spin_until(std::atomic<bool>& flag) {
 // window (safe) rather than the pre-write half (a guaranteed null-coroutine-handle crash).
 namespace quark {
 namespace {
-std::atomic<bool> g_writes_done{false};
-// Only ever written by Thread A (the same thread that calls drain_step()) between iterations —
-// never concurrently written, so a plain int is fine; only its EFFECT (the sleep) needs to be
-// observed by Thread B, and that's mediated by g_writes_done above, not by this value directly.
-int g_hook_delay_us = 0;
+std::atomic<bool> g_writes_done{false};   // lane -> carrier: the plain parked-field writes landed
+std::atomic<bool> g_carrier_done{false};  // carrier -> lane: complete_parked() has fully returned
+std::atomic<bool> g_hook_stalled{false};  // bounded-handshake failure (reported, never hung)
 }  // namespace
 
 void quark_activation_park_race_test_hook() {
     g_writes_done.store(true, std::memory_order_release);
-    if (g_hook_delay_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(g_hook_delay_us));
+    // Handshake, NOT a sleep (issue #28): hold the lane here until the carrier's ungated
+    // complete_parked() has returned. Its readmit CAS therefore always runs against `Running` and
+    // always fails; the lane's park() below then always seals the activation. Deterministic on every
+    // iteration, independent of thread-startup latency. The bound turns a broken harness (e.g. a
+    // carrier that never arrives) into a reported failure instead of a hang.
+    if (!spin_until(g_carrier_done)) g_hook_stalled.store(true, std::memory_order_relaxed);
 }
 }  // namespace quark
 #endif
@@ -138,13 +154,11 @@ int main() {
 #if defined(QUARK_ACTIVATION_PARK_NO_GATE)
     constexpr bool kControl = true;
     constexpr int kIters = 3000;
-    constexpr int kDelayPeriod = 5;   // widen every 5th iteration
-    constexpr int kDelayUs = 5;       // same magnitude red-team's probe used
 #else
     constexpr bool kControl = false;
     constexpr int kIters = 3000;
-    constexpr int kDelayPeriod = 5;
-    constexpr int kDelayUs = 5;
+    constexpr int kDelayPeriod = 5;   // widen every 5th iteration
+    constexpr int kDelayUs = 5;       // same magnitude red-team's probe used
 #endif
 
     int widened = 0, stuck = 0, resumed_ok = 0;
@@ -158,14 +172,17 @@ int main() {
         d.payload = &ping;
         stamp<Handler, Ping>(d);
 
+#if defined(QUARK_ACTIVATION_PARK_NO_GATE)
+        // Control: the hook below widens EVERY iteration with a handshake, so there is no
+        // per-iteration delay knob and no dependence on thread-startup timing (issue #28).
+        ++widened;
+        actor.awaiter_delay_us = 0;  // never delay pre-write (see banner) — the hook does the widening
+        quark::g_writes_done.store(false, std::memory_order_relaxed);
+        quark::g_carrier_done.store(false, std::memory_order_relaxed);
+        quark::g_hook_stalled.store(false, std::memory_order_relaxed);
+#else
         const bool widen = (i % kDelayPeriod) == 0;
         if (widen) ++widened;
-
-#if defined(QUARK_ACTIVATION_PARK_NO_GATE)
-        actor.awaiter_delay_us = 0;  // control: never delay pre-write (see banner) — the hook does it
-        quark::g_writes_done.store(false, std::memory_order_relaxed);
-        quark::g_hook_delay_us = widen ? kDelayUs : 0;
-#else
         actor.awaiter_delay_us = widen ? kDelayUs : 0;  // fixed build: widen the FULL pre-write window
 #endif
 
@@ -179,14 +196,23 @@ int main() {
         std::thread carrier([&] {
 #if defined(QUARK_ACTIVATION_PARK_NO_GATE)
             // Control: wait for the SAFE go-signal (plain fields already validly written) — see the
-            // file banner for why the pre-write half isn't exercised here.
-            if (!spin_until(quark::g_writes_done)) carrier_spin_ok = false;
+            // file banner for why the pre-write half isn't exercised here. On a stall do NOT call
+            // complete_parked(): the parked fields would still be null. The lane reports the stall.
+            if (!spin_until(quark::g_writes_done)) {
+                carrier_spin_ok = false;
+            } else {
+                carrier_wake = act.complete_parked();
+            }
+            quark::g_carrier_done.store(true, std::memory_order_release);
 #else
             // Fixed build: wait for the EARLIEST legitimate signal (suspend commit). No wait for
             // Parked here — that would defeat the point of this test.
-            if (!spin_until(actor.handoff_ready)) carrier_spin_ok = false;
+            if (!spin_until(actor.handoff_ready)) {
+                carrier_spin_ok = false;
+            } else {
+                carrier_wake = act.complete_parked();
+            }
 #endif
-            carrier_wake = act.complete_parked();
             carrier_done.store(true, std::memory_order_release);
         });
 
@@ -194,6 +220,10 @@ int main() {
         carrier.join();
 
         check(carrier_spin_ok, "carrier observed the go-signal (no stall)", ok);
+#if defined(QUARK_ACTIVATION_PARK_NO_GATE)
+        check(!quark::g_hook_stalled.load(std::memory_order_relaxed),
+              "lane handshake completed (control hook did not stall)", ok);
+#endif
         check(out == Activation::DrainOutcome::Suspended, "drain suspends on the async handler", ok);
         check(carrier_done.load(std::memory_order_acquire), "carrier completed complete_parked()", ok);
 
@@ -227,11 +257,13 @@ int main() {
     }
 
     if constexpr (kControl) {
-        const bool teeth_ok = stuck > 0;
-        check(teeth_ok, "control reproduced the permanent-stranding lost wakeup at least once", ok);
+        // The handshake makes the race deterministic, so EVERY iteration must strand. A control that
+        // fires only sometimes (or never) is itself a failing signal (issue #28) — not a pass.
+        const bool teeth_ok = stuck == kIters;
+        check(teeth_ok, "control reproduced the permanent-stranding lost wakeup on every iteration", ok);
         std::printf(
             "activation_park_race_test [CONTROL -DQUARK_ACTIVATION_PARK_NO_GATE]: %s  "
-            "(iters=%d widened=%d resumed_ok=%d STUCK=%d)\n",
+            "(iters=%d deterministic_widen=%d resumed_ok=%d STUCK=%d)\n",
             (ok && teeth_ok) ? "OK (correctly reproduced the race — teeth confirmed)" : "FAIL", kIters,
             widened, resumed_ok, stuck);
         return (ok && teeth_ok) ? 0 : 1;

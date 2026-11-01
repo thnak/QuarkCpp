@@ -7,8 +7,21 @@
 // heap-use-after-free / TSan data race. At the end, every constructed payload was destroyed exactly
 // once (g_ctor == g_dtor) — GATE 4 no-leak / no-double-free.
 //
-// MACHINE SAFETY: exactly 3 worker threads (2 publishers + 1 churn), modest iterations. A valid
-// first-class TSan/ASan test (it is correct — it never wedges). Never saturates the box.
+// NEGATIVE CONTROL (this same file, compiled with -DQUARK_TOPIC_NO_QUIESCE — see tests/CMakeLists.txt):
+// Topic::unsubscribe() drops the `wait in_flight==0` barrier, so the caller may free an inbox a
+// publisher still references. That control used to rely on the race window being hit by timing luck
+// across 200k churn rounds; on a large host (Linux g++ ASan) the UAF simply did not trap (issue #28).
+// The control now drives a deterministic single round through the test-only hook in
+// Topic::publish(): the publisher parks AFTER loading the pre-unsubscribe snapshot, passing the
+// active check, and retaining the payload — but BEFORE the inbox push. The churn thread then
+// unsubscribes (no wait under the macro) and frees the inbox, and the publisher resumes into freed
+// memory. ASan must trap; CTest's WILL_FAIL turns that non-zero exit into a PASS. If the hook never
+// arms or no trap happens, the process exits 0 and WILL_FAIL marks the control FAILED — a control
+// that cannot fire is a failing signal, not a silent pass.
+//
+// MACHINE SAFETY: the positive path is exactly 3 worker threads (2 publishers + 1 churn), modest
+// iterations. The control path is a single publisher + the main thread, run once. Neither saturates
+// the box.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -35,18 +48,91 @@ struct Ev {
     Ev& operator=(Ev&& o) noexcept { v = o.v; return *this; }
     ~Ev() { g_live.fetch_sub(1, std::memory_order_relaxed); }
 };
+#ifndef QUARK_TOPIC_NO_QUIESCE
 void check(bool c, const char* what, bool& ok) {
     if (!c) { std::fprintf(stderr, "  CHECK FAILED: %s\n", what); ok = false; }
 }
+#endif
 }  // namespace
 
+#ifdef QUARK_TOPIC_NO_QUIESCE
+// The test-provided widen hook topic.hpp declares under this same macro. publish() calls it after it
+// has decided to deliver (active check + per-enqueue retain) and before the inbox push. For the one
+// inbox under control it signals the churn thread and parks until that inbox has been freed.
+namespace quark {
+namespace {
+std::atomic<const void*> g_control_inbox{nullptr};  // the inbox the churn thread will free
+std::atomic<bool> g_publisher_armed{false};         // a publisher is parked inside the window
+std::atomic<bool> g_inbox_destroyed{false};         // ...and the inbox is now freed
+}  // namespace
+
+void quark_topic_no_quiesce_test_hook(const void* inbox) {
+    if (g_control_inbox.load(std::memory_order_acquire) != inbox) return;  // stable subscriber: ignore
+    g_publisher_armed.store(true, std::memory_order_release);
+    std::uint64_t spins = 0;
+    while (!g_inbox_destroyed.load(std::memory_order_acquire)) {
+        // Bounded so a broken harness reports "did not fire" (exit 0 => WILL_FAIL FAIL) instead of
+        // hanging the suite.
+        if (++spins > 4'000'000'000ULL) return;
+    }
+}
+}  // namespace quark
+
+namespace {
+constexpr std::uint64_t kControlArmSpins = 4'000'000'000ULL;
+
+// Deterministic firing control (issue #28): see the file banner. Returns 0 on every non-trap path
+// ("the control did not fire"), which WILL_FAIL reports as a failure; the only PASS is the ASan trap.
+int run_control() {
+    Topic<Ev> topic(64);
+    const ActorId cid{{7}, 42};
+    auto inbox = std::make_unique<BoundedInbox<Ev>>(8);
+
+    topic.subscribe(cid, inbox.get());
+    quark::g_control_inbox.store(inbox.get(), std::memory_order_release);
+
+    std::atomic<bool> stop{false};
+    std::thread publisher([&] {
+        std::uint64_t k = 0;
+        while (!stop.load(std::memory_order_relaxed)) (void)topic.publish(Ev{k++});
+    });
+
+    std::uint64_t spins = 0;
+    while (!quark::g_publisher_armed.load(std::memory_order_acquire)) {
+        if (++spins > kControlArmSpins) {
+            stop.store(true, std::memory_order_relaxed);
+            publisher.join();
+            std::fprintf(stderr,
+                         "topic_no_quiesce_control: publisher never entered the control window "
+                         "(control did NOT fire)\n");
+            return 0;
+        }
+    }
+
+    // A publisher is parked in the unprotected window. Quiescence is compiled out, so unsubscribe's
+    // barrier is gone and this returns with the publish still in flight; then the inbox is freed.
+    topic.unsubscribe(cid);
+    { Ev out; while (Topic<Ev>::consume(*inbox, out)) {} }
+    inbox.reset();
+    quark::g_inbox_destroyed.store(true, std::memory_order_release);
+    stop.store(true, std::memory_order_relaxed);
+
+    publisher.join();  // resumes into the freed inbox -> ASan trap (the only PASS)
+    std::fprintf(stderr, "topic_no_quiesce_control: no use-after-free trap (control did NOT fire)\n");
+    return 0;
+}
+}  // namespace
+#endif
+
 int main() {
+#ifdef QUARK_TOPIC_NO_QUIESCE
+    return run_control();
+#else
     bool ok = true;
-    // 20,000 churn rounds left the QUARK_TOPIC_NO_QUIESCE control (topic_no_quiesce_control) an
-    // observed NOT-FIRED false-negative on a noisy shared CI runner (the UAF race window is narrow;
-    // fewer rounds means fewer draws against it) — seen on both x86-64 and arm64, so this is runner
-    // scheduling noise, not an architecture difference. 10x the rounds for a much lower false-negative
-    // rate; each round is cheap (µs-scale) even under ASan, so this stays well inside the ctest budget.
+    // Positive-path churn budget. (This count no longer affects topic_no_quiesce_control: that
+    // target now takes the deterministic single-round path above, so its "must fire" property is
+    // independent of timing luck and iteration count — issue #28.) Kept high as a stress test of the
+    // real bounded-quiescence barrier: each round is cheap (µs-scale) even under ASan.
     constexpr std::uint64_t kRounds = 200'000;  // churn rounds
     constexpr std::uint32_t kStable = 8;        // stable subscribers so publishers always have work
 
@@ -116,4 +202,5 @@ int main() {
                  ok ? "PASS" : "FAIL", static_cast<long long>(live),
                  static_cast<unsigned long long>(post_unsub_deliveries.load()));
     return ok ? 0 : 1;
+#endif
 }
