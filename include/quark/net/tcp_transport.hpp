@@ -990,8 +990,10 @@ private:
                 return;
             }
             if (!ok) {  // protocol error on the stream (oversized/malformed) ⇒ untrustworthy, drop
-                if (auto it = conns_.find(c->peer.value); it != conns_.end() && it->second.get() == c)
-                    handle_dead(c);
+                // A still-pending inbound is not in conns_ yet: with the pinned wire there is no HELLO
+                // before the stream, so junk reaches the reassembler while the conn is unidentified.
+                // handle_dead() erases it from pending_in_ (and never touches conns_[peer]).
+                handle_dead(c);
                 return;
             }
         }
