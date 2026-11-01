@@ -54,6 +54,7 @@ Out run(bool attack, bool origin_check, bool erase_on_answered_failure) {
     SecureTransport s1{t1, unused, n1}, s2{t2, unused, n2};
     SecureTransportTestFaults sf;
     sf.erase_session_on_answered_failure = erase_on_answered_failure;
+    sf.no_renegotiate_bound = !origin_check && erase_on_answered_failure;  // the T4 CONTROL is the full pre-fix shape (no #48 bound)
     s2.set_test_faults(sf);
     auto id_blob = std::make_shared<const TlsIdentity>(TlsIdentity{});
     auto trust_blob = std::make_shared<const TrustedRoots>(TrustedRoots{});

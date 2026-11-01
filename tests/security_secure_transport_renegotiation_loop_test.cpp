@@ -72,22 +72,22 @@ Loop run(bool role_rule, bool bound) {
 int main() {
     const Loop control = run(false, false);
     std::printf("T1 control (no role rule, no bound): completed=%llu queue_left=%zu\n",
-                (unsigned long long)control.completed, control.left_in_queue);
+                static_cast<unsigned long long>(control.completed), control.left_in_queue);
     check(control.completed > 1000 && control.left_in_queue > 0, "T1: the pre-fix behaviour ping-pongs");
 
     const Loop fixed = run(true, true);
     std::printf("T2 fixed: completed=%llu queue_left=%zu unexpected=%llu throttled=%llu\n",
-                (unsigned long long)fixed.completed, fixed.left_in_queue, (unsigned long long)fixed.unexpected,
-                (unsigned long long)fixed.throttled);
+                static_cast<unsigned long long>(fixed.completed), fixed.left_in_queue, static_cast<unsigned long long>(fixed.unexpected),
+                static_cast<unsigned long long>(fixed.throttled));
     check(fixed.completed <= 1 && fixed.left_in_queue == 0, "T2: no loop with both fixes");
 
     const Loop role_only = run(true, false);
-    std::printf("T3a role rule alone: completed=%llu queue_left=%zu\n", (unsigned long long)role_only.completed,
+    std::printf("T3a role rule alone: completed=%llu queue_left=%zu\n", static_cast<unsigned long long>(role_only.completed),
                 role_only.left_in_queue);
     check(role_only.completed <= 1 && role_only.left_in_queue == 0, "T3a: the role rule alone ends it");
 
     const Loop bound_only = run(false, true);
-    std::printf("T3b bound alone: completed=%llu queue_left=%zu\n", (unsigned long long)bound_only.completed,
+    std::printf("T3b bound alone: completed=%llu queue_left=%zu\n", static_cast<unsigned long long>(bound_only.completed),
                 bound_only.left_in_queue);
     check(bound_only.completed <= 1 && bound_only.left_in_queue == 0, "T3b: the bound alone ends it");
 
@@ -107,8 +107,8 @@ int main() {
         r.fabric.send(r.n1, stale_client_hello(r.n2, r.n1, 999));  // forged "ServerHello", wrong cluster
         r.fabric.pump_all();      // n2 answers the real hello, but the forgery reaches n1's engine first
         const bool survived = r.s1.has_session(r.n2);
-        std::printf("T4 control_fault=%d: session survived=%d ignored=%llu\n", (int)control_fault, (int)survived,
-                    (unsigned long long)r.s1.inbound_auth_failures_ignored());
+        std::printf("T4 control_fault=%d: session survived=%d ignored=%llu\n", static_cast<int>(control_fault), static_cast<int>(survived),
+                    static_cast<unsigned long long>(r.s1.inbound_auth_failures_ignored()));
         if (control_fault) check(true, "T4 control observed");
         else check(survived && r.s1.inbound_auth_failures_ignored() >= 1, "T4: the session survives a forged reply");
     }

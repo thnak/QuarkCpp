@@ -767,8 +767,72 @@ private:
                         false, /*initiated_here=*/true);
     }
 
+    // #45: the pinned accept path. The opener arrived on an UNIDENTIFIED inbound connection of a transport with no
+    // HELLO (frame.inbound_token != 0, from/to == 0): nothing about the sender is claimed, so nothing is parked,
+    // keyed or answered by a claimed id. The responder engine (expected peer unspecified) authenticates the sender
+    // from the handshake itself (Msg1's static key); only then is a session installed under the AUTHENTICATED
+    // NodeId and the connection bound to it (`identify_inbound`), and only then is Msg2 sent. A failure is silent:
+    // no bytes go back and the connection is closed (`reject_inbound`).
+    void handle_anonymous_opener(MessageFrame frame) {
+        const std::uint64_t token = frame.inbound_token;
+        const PeerAddress source = frame.source_address;
+        auto refuse = [&](errc code, std::string_view why) {
+            handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+            audit_(AuditRecord{AuditKind::AuthnFailure, code, 0, why, 0});
+            if (metrics_) metrics_->security_handshakes_failed.inc();
+            inner_->reject_inbound(token);
+        };
+        if (!handshake_factory_ || frame.from.value != 0) {
+            inner_->reject_inbound(token);
+            return;
+        }
+        if ((handshake_admission_addr_ && !handshake_admission_addr_(NodeId{}, source)) ||
+            (!handshake_admission_addr_ && handshake_admission_ && !handshake_admission_(NodeId{}))) {
+            refuse(errc::validation, "secure transport: anonymous handshake admission rejected");
+            return;
+        }
+        std::unique_ptr<HandshakeEngine> engine = handshake_factory_->create(
+            /*is_client=*/false, self_, NodeId{}, cluster_id_, identity_->snapshot(now_ns()),
+            trust_->snapshot(now_ns()), revoked_snapshot_.load());
+        if (metrics_) metrics_->security_handshakes_attempted.inc();
+        std::vector<std::byte> out;
+        const std::uint64_t answered_gen = admission_.generation();
+        if (engine->advance(std::span<const std::byte>(frame.payload), out) != HandshakeEngine::Step::Done) {
+            refuse(errc::validation, engine->failure_reason());  // silent: `out` is not sent
+            return;
+        }
+        HandshakeEngine::Result result = engine->take_result();
+        const NodeId peer = result.peer_node_id;
+        // Only the HIGHER NodeId answers an opener (#48 role rule): the initiator must be the lower id.
+        if (peer.value == 0 || !(peer.value < self_.value)) {
+            refuse(errc::validation, "secure transport: anonymous opener from a peer that may not initiate");
+            return;
+        }
+        bool admission_denied = false;
+        const bool was_renegotiate = install_session_from_result(peer, std::move(result), answered_gen, admission_denied);
+        if (admission_denied) {
+            if (metrics_) metrics_->security_handshakes_failed.inc();
+            inner_->reject_inbound(token);
+            return;
+        }
+        if (!has_session(peer)) {  // cluster mismatch: install_session_from_result installed nothing
+            inner_->reject_inbound(token);
+            return;
+        }
+        if (metrics_) (was_renegotiate ? metrics_->security_rotations_completed
+                                       : metrics_->security_handshakes_succeeded).inc();
+        inner_->identify_inbound(token, peer);  // posted before Msg2, so Msg2 leaves on the bound connection
+        if (!out.empty()) send_authenticate_frame(peer, std::move(out));
+        send_schema_frame(peer);
+    }
+
     void handle_authenticate_frame(MessageFrame frame) {
         if (!handshake_factory_) return;  // handshake disabled: ignore a stray Authenticate frame
+        if (frame.inbound_token != 0) {
+            handle_anonymous_opener(std::move(frame));
+            return;
+        }
+        if (frame.from.value == 0) return;  // an id-less frame only exists on an anonymous inbound connection
         const NodeId peer = frame.from;
         const PeerAddress source = frame.source_address;
         const bool known = known_peer_ && known_peer_(peer);
