@@ -125,7 +125,7 @@ struct MemCluster {
         s1.enable_handshake(f1, ClusterId{cluster}, identity1, trust1);
         s2.enable_handshake(f2, ClusterId{cluster}, identity2, trust2);
         s1.on_receive([](MessageFrame) {});
-        s2.on_receive([this](MessageFrame f) { got2.push_back(std::move(f)); });
+        s2.on_receive([this](MessageFrame frame) { got2.push_back(std::move(frame)); });
         (void)a1.publish(snap(1, {n2}));
         (void)a2.publish(snap(1, {n1}));
         s1.set_admission(a1);

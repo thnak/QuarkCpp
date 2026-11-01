@@ -123,14 +123,16 @@ void check(bool c, const char* what) {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     for (const bool secure : {false, true}) {
-        for (const auto ids : {std::pair<std::uint64_t, std::uint64_t>{1, 2}, {2, 1}}) {
+        for (const auto& ids : {std::pair<std::uint64_t, std::uint64_t>{1, 2}, {2, 1}}) {
             const Result r = run(ids.first, ids.second, secure, /*legacy=*/false);
             std::printf("%s PC=%llu PHONE=%llu: connected_after=%d pc<-phone %llu/50 phone<-pc %llu/50 phone_reconnects=%llu "
                         "pc_dedup_closed=%llu superseded=%llu\n",
-                        secure ? "secure   " : "plaintext", (unsigned long long)ids.first, (unsigned long long)ids.second,
-                        (int)r.connected_after, (unsigned long long)r.up, (unsigned long long)r.down,
-                        (unsigned long long)r.phone_reconnects, (unsigned long long)r.pc_dedup_closed,
-                        (unsigned long long)r.superseded);
+                        secure ? "secure   " : "plaintext", static_cast<unsigned long long>(ids.first),
+                        static_cast<unsigned long long>(ids.second), static_cast<int>(r.connected_after),
+                        static_cast<unsigned long long>(r.up), static_cast<unsigned long long>(r.down),
+                        static_cast<unsigned long long>(r.phone_reconnects),
+                        static_cast<unsigned long long>(r.pc_dedup_closed),
+                        static_cast<unsigned long long>(r.superseded));
             check(r.connected_after, "traffic flows again both ways after the network switch");
             check(r.up == 50 && r.down == 50, "a 50-frame burst after the switch is delivered 50/50 both ways");
             check(r.phone_reconnects <= 3, "reconnects are bounded (no storm)");
@@ -142,8 +144,8 @@ int main() {
     {
         const Result y = run(1, 2, false, /*legacy=*/false, /*age_ms=*/0);
         std::printf("plaintext young PC=1 PHONE=2: connected_after=%d up=%llu down=%llu phone_reconnects=%llu\n",
-                    (int)y.connected_after, (unsigned long long)y.up, (unsigned long long)y.down,
-                    (unsigned long long)y.phone_reconnects);
+                    static_cast<int>(y.connected_after), static_cast<unsigned long long>(y.up),
+                    static_cast<unsigned long long>(y.down), static_cast<unsigned long long>(y.phone_reconnects));
         check(y.connected_after && y.up == 50 && y.down == 50, "young: the phone is let in once the race window passes");
         check(y.phone_reconnects <= 12, "young: reconnect attempts stay bounded by the window and the backoff");
     }
@@ -153,11 +155,11 @@ int main() {
         const Result low = run(1, 2, false, /*legacy=*/true);
         const Result high = run(2, 1, false, /*legacy=*/true);
         std::printf("CONTROL legacy PC=1 PHONE=2: connected_after=%d up=%llu down=%llu phone_reconnects=%llu\n",
-                    (int)low.connected_after, (unsigned long long)low.up, (unsigned long long)low.down,
-                    (unsigned long long)low.phone_reconnects);
+                    static_cast<int>(low.connected_after), static_cast<unsigned long long>(low.up),
+                    static_cast<unsigned long long>(low.down), static_cast<unsigned long long>(low.phone_reconnects));
         std::printf("CONTROL legacy PC=2 PHONE=1: connected_after=%d up=%llu down=%llu phone_reconnects=%llu\n",
-                    (int)high.connected_after, (unsigned long long)high.up, (unsigned long long)high.down,
-                    (unsigned long long)high.phone_reconnects);
+                    static_cast<int>(high.connected_after), static_cast<unsigned long long>(high.up),
+                    static_cast<unsigned long long>(high.down), static_cast<unsigned long long>(high.phone_reconnects));
         check(!low.connected_after && low.up == 0 && low.down == 0,
               "control: legacy rule locks out when PC dialled with the lower id");
         check(low.phone_reconnects > 3, "control: legacy rule storms reconnects");

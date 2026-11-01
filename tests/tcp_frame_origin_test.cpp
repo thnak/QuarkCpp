@@ -83,7 +83,7 @@ Out run(bool attack, bool origin_check, bool erase_on_answered_failure) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     const std::uint64_t before = got2.load();
-    std::uint64_t sent = 0, samples = 0;
+    std::uint64_t sent = 0;
     for (int ms = 0; ms < 3000; ms += 10) {
         if (attack && ms % 100 == 0) {
             MessageFrame f = make_frame(n1, n2, FrameKind::Authenticate);  // claims to be node 1
@@ -93,7 +93,6 @@ Out run(bool attack, bool origin_check, bool erase_on_answered_failure) {
         s1.send(n2, make_frame(n1, n2));
         ++sent;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        ++samples;
         if (!s2.session_admission_generation(n1)) ++o.session_missing;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -121,8 +120,9 @@ void t5_relayed_frames() {
         for (std::uint64_t s = 0; s < 5; ++s) ta.send(B, seq_frame(A, B, s));
         wait_until([&] { return at_b.count() >= 5; }, 2000);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::printf("T5 relay opt_in=%d: B received %llu/5, spoofed_origin_dropped=%llu\n", (int)opt_in,
-                    (unsigned long long)at_b.count(), (unsigned long long)tb.spoofed_origin_dropped());
+        std::printf("T5 relay opt_in=%d: B received %llu/5, spoofed_origin_dropped=%llu\n", static_cast<int>(opt_in),
+                    static_cast<unsigned long long>(at_b.count()),
+                    static_cast<unsigned long long>(tb.spoofed_origin_dropped()));
         if (opt_in) check(at_b.count() == 5, "T5: an opted-in relayed frame is delivered");
         else check(at_b.count() == 0 && tb.spoofed_origin_dropped() == 5, "T5: without opt-in a relayed frame is dropped and counted");
         ta.stop();
@@ -141,23 +141,24 @@ int main() {
 
     const Out fixed = run(true, true, false);
     std::printf("T2 attack, both fixes: delivery %d%%, session missing in %llu samples, spoofed frames dropped=%llu\n",
-                fixed.ratio, (unsigned long long)fixed.session_missing, (unsigned long long)fixed.spoofed_dropped);
+                fixed.ratio, static_cast<unsigned long long>(fixed.session_missing),
+                static_cast<unsigned long long>(fixed.spoofed_dropped));
     check(fixed.ratio >= 95, "T2: an attacker's spoofed Authenticate does not reduce delivery");
     check(fixed.session_missing == 0, "T2: node 1's session at node 2 is never lost");
     check(fixed.spoofed_dropped >= 25, "T2: the spoofed frames are dropped at the transport and counted");
 
     const Out only_secure = run(true, false, false);
     std::printf("T3a origin check OFF, SecureTransport fix ON: delivery %d%%, session missing %llu\n", only_secure.ratio,
-                (unsigned long long)only_secure.session_missing);
+                static_cast<unsigned long long>(only_secure.session_missing));
     check(only_secure.ratio >= 95 && only_secure.session_missing == 0, "T3a: the SecureTransport fix alone keeps the session");
     const Out only_tcp = run(true, true, true);
     std::printf("T3b origin check ON, answered-failure erase restored: delivery %d%%, session missing %llu\n",
-                only_tcp.ratio, (unsigned long long)only_tcp.session_missing);
+                only_tcp.ratio, static_cast<unsigned long long>(only_tcp.session_missing));
     check(only_tcp.ratio >= 95 && only_tcp.session_missing == 0, "T3b: the origin check alone keeps the frames out");
 
     const Out old = run(true, false, true);
     std::printf("T4 CONTROL both fixes off (pre-fix): delivery %d%%, session missing in %llu samples\n", old.ratio,
-                (unsigned long long)old.session_missing);
+                static_cast<unsigned long long>(old.session_missing));
     check(old.ratio < 50, "T4 control: the pre-fix behaviour collapses delivery");
     check(old.session_missing > 100, "T4 control: the pre-fix behaviour loses the session");
 

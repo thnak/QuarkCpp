@@ -70,7 +70,7 @@ inline void control_msg1_parse_copy(const std::byte* p, std::size_t n) {
 #ifdef QUARK_FUZZ_PLANT_OOB
     if ((static_cast<unsigned>(exact[0]) & 0xF0u) == 0xF0u) acc += static_cast<unsigned>(exact[n]);  // PLANTED: one byte past the buffer
 #endif
-    static volatile unsigned sink;
+    [[maybe_unused]] static volatile unsigned sink;  // the store keeps `acc` (and the parse) alive
     sink = acc;
 }
 
@@ -182,7 +182,7 @@ inline void feed_initiator_noise(std::span<const std::byte> msg2) {
     Bytes pl;
     if (ini.read_msg2(msg2, pl)) {
         const auto d = adapters::decode_pinned_msg2_payload(pl);
-        static volatile std::uint64_t sink;
+        [[maybe_unused]] static volatile std::uint64_t sink;  // the store keeps the decode alive
         sink = d ? d->node.value : 0;
     }
 }

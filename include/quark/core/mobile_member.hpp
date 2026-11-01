@@ -57,9 +57,11 @@ public:
     // over whatever path exists by then; the dead connections are dropped lazily by the transport).
     void network_changed() {
         if (swim_->self_suspended()) return;
-        if (reset_)
-            for (const NodeId peer : swim_->view().nodes())
+        if (reset_) {
+            const MembershipView view = swim_->view();  // hold the snapshot: nodes() points into it
+            for (const NodeId peer : view.nodes())
                 if (peer != swim_->self()) reset_(peer);
+        }
         swim_->network_changed();
         ++network_changes_;
     }
