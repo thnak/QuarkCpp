@@ -32,16 +32,31 @@
 
 namespace quark::adapters {
 
-// NodeId = first 8 bytes (little-endian) of SHA-256 of the 32-byte Ed25519 public key. Derived, never self-claimed:
-// nobody can pick a NodeId without picking the key it hashes to. NodeId 0 is "unspecified" in this API, so a key that
-// hashes to 0 (probability 2^-64) is simply refused wherever a derived id is required.
-[[nodiscard]] inline NodeId derive_pinned_node_id(const Ed25519PublicKey& key) noexcept {
+// How a NodeId is derived from a key (ADR-075). RoleBit is the only production value. LegacyRaw is ADR-068's original
+// derivation (all 64 bits of the hash, so bit 63, ADR-074's client marker, is random); it exists ONLY as the control of the
+// #63 checks, which show the defect it had. Never select it outside a test.
+enum class NodeIdDerivation : std::uint8_t { RoleBit = 0, LegacyRaw = 1 };
+
+// NodeId = (first 8 bytes, little-endian, of SHA-256 of the 32-byte Ed25519 public key, with bit 63 cleared) | role bit
+// (set iff `role` is Client) -- ADR-075. Derived, never self-claimed: nobody can pick the low 63 bits without picking the
+// key they hash to, and the application, not the hash, decides bit 63. NodeId 0 is "unspecified" in this API, so a key whose
+// 63 hash bits are all zero (probability 2^-63) is refused (NodeId{0}) wherever a derived id is required.
+[[nodiscard]] inline NodeId derive_pinned_node_id(const Ed25519PublicKey& key, PinnedRole role = PinnedRole::Member,
+                                                  NodeIdDerivation how = NodeIdDerivation::RoleBit) noexcept {
     if (!noise::init()) return NodeId{0};
     std::array<unsigned char, crypto_hash_sha256_BYTES> digest{};
     ::crypto_hash_sha256(digest.data(), noise::uc(key.data()), key.size());
     std::uint64_t v = 0;
     for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(digest[static_cast<std::size_t>(i)]) << (8 * i);
-    return NodeId{v};
+    if (how == NodeIdDerivation::LegacyRaw) return NodeId{v};
+    const std::uint64_t low = v & ~kClientNodeBit;
+    if (low == 0) return NodeId{0};
+    return NodeId{low | (role == PinnedRole::Client ? kClientNodeBit : 0)};
+}
+
+// The 63 key-derived bits of a NodeId (the whole value for LegacyRaw): what two keys must not share, whatever their roles.
+[[nodiscard]] constexpr std::uint64_t pinned_key_bits(NodeId n, NodeIdDerivation how = NodeIdDerivation::RoleBit) noexcept {
+    return how == NodeIdDerivation::LegacyRaw ? n.value : (n.value & ~kClientNodeBit);
 }
 
 class PinnedIdentity {
@@ -50,7 +65,11 @@ public:
 
     // From a libsodium Ed25519 secret key (seed || public key), e.g. one the application persisted. nullopt when the
     // key is inconsistent or its public half cannot be converted to X25519.
-    [[nodiscard]] static std::optional<PinnedIdentity> from_secret_key(std::span<const std::byte, kSecretKeyBytes> sk) {
+    // `role` is the role the APPLICATION assigns this device (ADR-075); it sets bit 63 of the NodeId and must equal the role
+    // every peer's trust data holds for this key, or peers refuse the handshake.
+    [[nodiscard]] static std::optional<PinnedIdentity> from_secret_key(std::span<const std::byte, kSecretKeyBytes> sk,
+                                                                       PinnedRole role = PinnedRole::Member,
+                                                                       NodeIdDerivation how = NodeIdDerivation::RoleBit) {
         if (!noise::init()) return std::nullopt;
         PinnedIdentity id;
         std::memcpy(id.secret_.data(), sk.data(), kSecretKeyBytes);
@@ -62,19 +81,21 @@ public:
             return std::nullopt;
         // The two derivations of the X25519 public key must agree; if they ever did not, fail closed.
         if (noise::public_from_private(id.noise_.sk) != id.noise_.pk) return std::nullopt;
-        id.node_ = derive_pinned_node_id(id.public_);
+        id.role_ = role;
+        id.node_ = derive_pinned_node_id(id.public_, role, how);
         if (id.node_.value == 0) return std::nullopt;
         return id;
     }
 
     // A fresh random identity (provisioning and tests). Throws only if libsodium cannot initialise.
-    [[nodiscard]] static PinnedIdentity generate() {
+    [[nodiscard]] static PinnedIdentity generate(PinnedRole role = PinnedRole::Member,
+                                                 NodeIdDerivation how = NodeIdDerivation::RoleBit) {
         if (!noise::init()) throw std::runtime_error("PinnedIdentity: libsodium unavailable");
         for (;;) {
             std::array<std::byte, crypto_sign_ed25519_PUBLICKEYBYTES> pk{};
             std::array<std::byte, kSecretKeyBytes> sk{};
             ::crypto_sign_ed25519_keypair(noise::uc(pk.data()), noise::uc(sk.data()));
-            auto id = from_secret_key(std::span<const std::byte, kSecretKeyBytes>(sk));
+            auto id = from_secret_key(std::span<const std::byte, kSecretKeyBytes>(sk), role, how);
             noise::wipe(sk);
             if (id) return std::move(*id);
         }
@@ -83,7 +104,7 @@ public:
     PinnedIdentity(const PinnedIdentity&) = delete;
     PinnedIdentity& operator=(const PinnedIdentity&) = delete;
     PinnedIdentity(PinnedIdentity&& o) noexcept
-        : public_(o.public_), node_(o.node_), secret_(o.secret_), noise_(o.noise_) {
+        : public_(o.public_), node_(o.node_), role_(o.role_), secret_(o.secret_), noise_(o.noise_) {
         o.wipe_secrets();
     }
     PinnedIdentity& operator=(PinnedIdentity&& o) noexcept {
@@ -91,6 +112,7 @@ public:
             wipe_secrets();
             public_ = o.public_;
             node_ = o.node_;
+            role_ = o.role_;
             secret_ = o.secret_;
             noise_ = o.noise_;
             o.wipe_secrets();
@@ -101,6 +123,7 @@ public:
 
     [[nodiscard]] const Ed25519PublicKey& public_key() const noexcept { return public_; }
     [[nodiscard]] NodeId node_id() const noexcept { return node_; }
+    [[nodiscard]] PinnedRole role() const noexcept { return role_; }
     // For the application to persist (it owns key storage; Quark never writes it anywhere).
     [[nodiscard]] std::span<const std::byte, kSecretKeyBytes> secret_key() const noexcept {
         return std::span<const std::byte, kSecretKeyBytes>(secret_);
@@ -115,6 +138,7 @@ private:
     }
     Ed25519PublicKey public_{};
     NodeId node_{};
+    PinnedRole role_ = PinnedRole::Member;
     std::array<std::byte, kSecretKeyBytes> secret_{};
     noise::KeyPair noise_{};
 };
@@ -129,11 +153,18 @@ private:
 // seen by the NEXT handshake; live sessions are not touched (#41). Thread-safe (reader/writer lock).
 class PinnedKeyBook final : public PinnedTrust, public PinnedKeyDirectory {
 public:
-    // Admit `key` to `cluster`. False (and nothing changes) if a DIFFERENT key already holds the same derived NodeId in
-    // that cluster: the NodeId is 64 bits of a hash, so the application, which chooses what it admits, refuses a
-    // colliding key rather than let two admitted keys share a routing identity.
-    bool admit(ClusterId cluster, const Ed25519PublicKey& key) {
-        const NodeId node = derive_pinned_node_id(key);
+    explicit PinnedKeyBook(NodeIdDerivation how = NodeIdDerivation::RoleBit) : how_(how) {}
+
+    // Admit `key` to `cluster` in `role` (ADR-075; default Member). False (and nothing changes) if:
+    //  - a DIFFERENT key already holds the same 63 key-derived NodeId bits in that cluster (whatever role either has): the
+    //    NodeId is only 63 bits of a hash, so the application, which chooses what it admits, refuses a colliding key rather
+    //    than let two admitted keys share a routing identity;
+    //  - the key is ALREADY admitted in the OTHER role. ROLE CONFLICT POLICY: refuse, never replace. A key is admitted in one
+    //    role per cluster; the application changes it deliberately with revoke() then admit(), so a role flip is never a side
+    //    effect of an admit call (and a stale or hostile "admit as Member" cannot demote a Client in place).
+    // Re-admitting a key in the role it already has is a successful no-op.
+    bool admit(ClusterId cluster, const Ed25519PublicKey& key, PinnedRole role = PinnedRole::Member) {
+        const NodeId node = derive_pinned_node_id(key, role, how_);
         if (node.value == 0) return false;
         // A and -A (sign bit of the last byte flipped) convert to the SAME X25519 key, so whoever holds A's secret can
         // authenticate as -A, which has a different NodeId. Trust compares exact Ed25519 bytes, so that is only safe if
@@ -144,45 +175,61 @@ public:
         auto& m = by_cluster_[cluster.value];
         for (const auto& [n, other] : m) {
             noise::Key32 other_image{};
-            if (!(other == key) && ed25519_to_x25519(other, other_image) && other_image == image) return false;
+            if (!(other.key == key) && ed25519_to_x25519(other.key, other_image) && other_image == image) return false;
         }
-        const auto it = m.find(node.value);
-        if (it != m.end()) return it->second == key;  // already admitted: ok; a different key: refuse
-        m.emplace(node.value, key);
+        const std::uint64_t slot = pinned_key_bits(node, how_);
+        const auto it = m.find(slot);
+        if (it != m.end()) return it->second.key == key && it->second.role == role;  // same key+role: ok; else refuse
+        m.emplace(slot, Entry{key, role});
         return true;
     }
     bool revoke(ClusterId cluster, const Ed25519PublicKey& key) {
-        const NodeId node = derive_pinned_node_id(key);
+        const std::uint64_t slot = pinned_key_bits(derive_pinned_node_id(key, PinnedRole::Member, how_), how_);
         std::unique_lock g(mu_);
         const auto c = by_cluster_.find(cluster.value);
         if (c == by_cluster_.end()) return false;
-        const auto it = c->second.find(node.value);
-        if (it == c->second.end() || !(it->second == key)) return false;
+        const auto it = c->second.find(slot);
+        if (it == c->second.end() || !(it->second.key == key)) return false;
         c->second.erase(it);
         return true;
     }
 
     [[nodiscard]] bool admitted(ClusterId cluster, const Ed25519PublicKey& key) const noexcept override {
-        const NodeId node = derive_pinned_node_id(key);
-        std::shared_lock g(mu_);
-        const auto c = by_cluster_.find(cluster.value);
-        if (c == by_cluster_.end()) return false;
-        const auto it = c->second.find(node.value);
-        return it != c->second.end() && it->second == key;  // the FULL key must match, not just its hash prefix
+        return role_of(cluster, key).has_value();
     }
 
+    [[nodiscard]] std::optional<PinnedRole> role_of(ClusterId cluster, const Ed25519PublicKey& key) const noexcept override {
+        const std::uint64_t slot = pinned_key_bits(derive_pinned_node_id(key, PinnedRole::Member, how_), how_);
+        std::shared_lock g(mu_);
+        const auto c = by_cluster_.find(cluster.value);
+        if (c == by_cluster_.end()) return std::nullopt;
+        const auto it = c->second.find(slot);
+        if (it == c->second.end() || !(it->second.key == key)) return std::nullopt;  // the FULL key must match
+        return it->second.role;
+    }
+
+    // `peer` carries the role bit: a peer id whose bit 63 disagrees with the role this key was admitted in finds nothing.
     [[nodiscard]] std::optional<Ed25519PublicKey> key_of(ClusterId cluster, NodeId peer) const noexcept override {
         std::shared_lock g(mu_);
         const auto c = by_cluster_.find(cluster.value);
         if (c == by_cluster_.end()) return std::nullopt;
-        const auto it = c->second.find(peer.value);
+        const auto it = c->second.find(pinned_key_bits(peer, how_));
         if (it == c->second.end()) return std::nullopt;
-        return it->second;
+        if (how_ == NodeIdDerivation::RoleBit && is_client_node(peer) != (it->second.role == PinnedRole::Client))
+            return std::nullopt;
+        return it->second.key;
     }
 
 private:
+    struct Entry {
+        Ed25519PublicKey key;
+        PinnedRole role;
+    };
+    NodeIdDerivation how_;
     mutable std::shared_mutex mu_;
-    std::map<std::uint64_t, std::map<std::uint64_t, Ed25519PublicKey>> by_cluster_;
+    // cluster -> (63 key-derived NodeId bits -> entry). Keyed WITHOUT the role bit so two keys that collide in the 63 bits
+    // are refused whatever role each holds.
+    std::map<std::uint64_t, std::map<std::uint64_t, Entry>> by_cluster_;
 };
 
 }  // namespace quark::adapters

@@ -49,20 +49,24 @@ struct TestClock {
     void advance_s(std::int64_t s) { now->fetch_add(s * 1'000'000'000LL); }
 };
 
-// A node: its factory (identity inside), its key book (trust + directory), its derived NodeId and public key.
+// A node: its factory (identity inside), its key book (trust + directory), its derived NodeId and public key. A test node is a
+// MEMBER unless the test passes `role` (ADR-075): its NodeId's bit 63 states the role and the key hash no longer decides it, so
+// fully random keys are used (#63; the old "redraw until bit 63 is clear" masking is gone).
 struct Node {
-    std::shared_ptr<PinnedKeyBook> book = std::make_shared<PinnedKeyBook>();
+    std::shared_ptr<PinnedKeyBook> book;
     std::unique_ptr<PinnedHandshakeEngineFactory> factory;
     NodeId id{};
     Ed25519PublicKey pub{};
+    PinnedRole role = PinnedRole::Member;
 
-    explicit Node(PinnedOptions opt = {}, std::shared_ptr<const PinnedTrust> trust_override = nullptr) {
+    explicit Node(PinnedOptions opt = {}, std::shared_ptr<const PinnedTrust> trust_override = nullptr,
+                  PinnedRole r = PinnedRole::Member)
+        : Node(PinnedIdentity::generate(r, opt.node_id_derivation), std::move(opt), std::move(trust_override)) {}
+
+    // A node over a GIVEN identity (so one key can be run under two derivations or two roles); its role is the identity's.
+    Node(PinnedIdentity identity, PinnedOptions opt, std::shared_ptr<const PinnedTrust> trust_override = nullptr)
+        : book(std::make_shared<PinnedKeyBook>(opt.node_id_derivation)), role(identity.role()) {
         if (!opt.clock_unix_ns) opt.clock_unix_ns = TestClock{}.fn();  // fixed 1.8e18 ns unless the test supplies one
-        // A derived pinned NodeId has a random bit 63, which ADR-074 D3 reads as "client" (a member never dials a client,
-        // and the client always initiates). These checks model member<->member pairs with a fixed dialler/responder, so draw
-        // a member id; otherwise half of all pairs silently change roles and the checks flake (issue #49b).
-        PinnedIdentity identity = PinnedIdentity::generate();
-        while (is_client_node(identity.node_id())) identity = PinnedIdentity::generate();
         id = identity.node_id();
         pub = identity.public_key();
         factory = std::make_unique<PinnedHandshakeEngineFactory>(
@@ -74,10 +78,10 @@ struct Node {
     }
 };
 
-// Mutual admission: each node's book admits the other (and itself harmlessly) in `c`.
+// Mutual admission: each node's book admits the other (and itself harmlessly) in `c`, each in the role its owner holds.
 inline void pair_up(Node& a, Node& b, ClusterId c) {
-    (void)a.book->admit(c, b.pub);
-    (void)b.book->admit(c, a.pub);
+    (void)a.book->admit(c, b.pub, b.role);
+    (void)b.book->admit(c, a.pub, a.role);
 }
 
 struct Outcome {

@@ -110,6 +110,9 @@ signature            ≤72 B  DER ECDSA-SHA256 over the 104 preceding bytes
 
 ### D3 — Identity role: in the certificate AND in the NodeId
 
+> **Pinned-key mode (ADR-075, #63):** there is no certificate; the role is the application's, recorded with the key in its trust data,
+> and the pinned NodeId's bit 63 states it (the other 63 bits come from the key hash). The rules below then apply unchanged.
+
 * Two CN forms: `quark:<cluster>:<node>` = **member** (unchanged), `quark-client:<cluster>:<node>` =
   **client**. A distinct prefix, so an un-upgraded parser **rejects** a client cert instead of reading it
   as a member.

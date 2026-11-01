@@ -252,9 +252,16 @@ that is Noise IK.
   different modes; a TLS peer's bytes are not Noise at all and are refused on their own, so the cross-mode guarantee rests on
   both and the test exercises both.
 - **Identity is the full public key.** A peer is its **Ed25519 public key** (32 bytes), never a hash or a truncation; the trust
-  decision compares the full key. Its **NodeId is derived**, never self-claimed: the first 8 bytes (little-endian) of SHA-256 of
-  the public key. Msg1 carries the NodeId and the responder refuses one that is not the derived one, so nobody can claim
-  another key's NodeId. Because the id is 64 bits, the application's key book refuses to admit a second key whose derived id
+  decision compares the full key. Its **NodeId is derived**, never self-claimed: **63 bits of the key and one bit of role**
+  ([ADR-075](decisions/ADR-075-pinned-nodeid-role-bit.md), amending ADR-068 section 1): `NodeId = (LE64(SHA-256(key)[0..8]) &
+  ~kClientNodeBit) | (role == Client ? kClientNodeBit : 0)`. Bit 63 is ADR-074 D3's client marker and states the **role the
+  application admitted the key in** (`PinnedTrust::role_of`, `PinnedKeyBook::admit(cluster, key, role = Member)`); the key hash
+  never decides it (it did before ADR-075, which made about half of all pinned keys clients). Msg1 and Msg2 carry the NodeId
+  unchanged (no wire change), and each verifier requires (a) the low 63 bits to be the ones derived from the authenticated key
+  and (b) bit 63 to equal the role **its own trust data** holds for that key; a mismatch is refused silently like any failed
+  check. Two keys whose 63-bit derivations collide are refused by the book whatever role either holds, and a key is admitted in
+  **one role per cluster** (admitting it in the other role is refused; the application changes it with `revoke()` then
+  `admit()`). So nobody can claim another key's NodeId or role. Because the key part is only 63 bits, the application's key book refuses to admit a second key whose derived id
   collides with an admitted one (`PinnedKeyBook::admit`); NodeId `0` is "unspecified" and never a valid derived id. **Sign-bit
   malleability:** Ed25519 keys A and -A (top bit of the last byte flipped) convert to the same X25519 key, so the holder of A's
   secret can authenticate as -A. Trust compares exact Ed25519 bytes, which is safe only if the book never holds both, so

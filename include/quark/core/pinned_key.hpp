@@ -26,18 +26,29 @@ namespace quark {
 enum class TrustMode : std::uint8_t { CaChain = 0, PinnedKey = 1 };
 
 // A peer's identity in pinned mode: its FULL Ed25519 public key (32 bytes), never a hash or a truncation. The NodeId is
-// DERIVED from it (adapter: first 8 bytes of SHA-256 of this key), never self-claimed.
+// DERIVED from it (adapter: 63 bits of SHA-256 of this key plus the role bit, ADR-075), never self-claimed.
 using Ed25519PublicKey = std::array<std::byte, 32>;
+
+// The ROLE an admitted key plays (ADR-075, ADR-074 D3). It is the APPLICATION's decision, recorded with the key, and the
+// NodeId's bit 63 (`kClientNodeBit`) states it: a Client key's NodeId has the bit set, a Member key's has it clear. The
+// other 63 bits of the NodeId come from the key (adapter: SHA-256), so the key hash no longer decides the role.
+enum class PinnedRole : std::uint8_t { Member = 0, Client = 1 };
 
 // Is `key` admitted to `cluster` now? `noexcept`, thread-safe, non-blocking, std-only types in the signature.
 class PinnedTrust {
 public:
     virtual ~PinnedTrust() = default;
     [[nodiscard]] virtual bool admitted(ClusterId cluster, const Ed25519PublicKey& key) const noexcept = 0;
+    // The role `key` is admitted in, or nullopt when it is not admitted (ADR-075). The handshake requires the peer's
+    // NodeId bit 63 to equal this role. A provider that does not distinguish roles inherits "admitted => Member".
+    [[nodiscard]] virtual std::optional<PinnedRole> role_of(ClusterId cluster, const Ed25519PublicKey& key) const noexcept {
+        return admitted(cluster, key) ? std::optional<PinnedRole>(PinnedRole::Member) : std::nullopt;
+    }
 };
 
 // The key the initiator PINS for a peer it dials: given the peer's (derived) NodeId within `cluster`, its full public
-// key, or nullopt when the application knows none (the initiator then sends nothing at all). Same threading contract.
+// key, or nullopt when the application knows none (the initiator then sends nothing at all). The NodeId includes the role
+// bit (ADR-075): an id whose bit 63 disagrees with the role the key was admitted in finds no key. Same threading contract.
 class PinnedKeyDirectory {
 public:
     virtual ~PinnedKeyDirectory() = default;

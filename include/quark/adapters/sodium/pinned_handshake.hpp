@@ -16,7 +16,8 @@
 // SILENT REFUSAL: a responder that cannot authenticate and admit the initiator sends NOTHING (advance() returns Failed
 // with `out` untouched) and the caller closes the connection. That covers: Msg1 does not decrypt (a prober without our
 // static key), a wrong length, an initiator that is not admitted, a revoked key, a wrong cluster, an out-of-window version,
-// a NodeId that is not the one derived from the key, a stale or replayed timestamp. What an attacker CAN still learn: that
+// a NodeId whose 63 key bits are not the ones derived from the key, or whose bit 63 (ADR-074 D3's client marker) is not the
+// role the verifier's trust data holds for that key (ADR-075), a stale or replayed timestamp. What an attacker CAN still learn: that
 // some TCP service listens on the port, and (by timing) that a connection was closed after N bytes.
 //
 // REPLAY RULE (WireGuard's TAI64N idea): Msg1's timestamp must be (a) within `max_clock_skew_ns` of the responder's clock
@@ -168,6 +169,11 @@ struct PinnedOptions {
     bool replay_guard = true;
     // Unix-epoch nanoseconds. Empty = std::chrono::system_clock. Injectable so tests control time (014 idiom).
     std::function<std::int64_t()> clock_unix_ns;
+    // ADR-075 (#63). false ONLY for the test control "with the role check off a NodeId whose bit 63 disagrees with the role
+    // the trust data holds is accepted". Never in production.
+    bool check_role_bit = true;
+    // ADR-075. LegacyRaw ONLY for the #63 control (ADR-068's original derivation). Must equal the identity's and book's.
+    NodeIdDerivation node_id_derivation = NodeIdDerivation::RoleBit;
 };
 
 // Shared by every engine one factory creates; engines hold it by shared_ptr so they may outlive the factory.
@@ -252,8 +258,14 @@ private:
             // unknown or un-admitted key, so a removed device is not even dialled with an encrypted Msg1.
             const auto key = ctx_->directory ? ctx_->directory->key_of(cluster_, expected_peer_) : std::nullopt;
             if (!key) return fail("no pinned key for peer");
-            if (!(derive_pinned_node_id(*key) == expected_peer_)) return fail("pinned key does not derive the NodeId");
-            if (!ctx_->trust || !ctx_->trust->admitted(cluster_, *key)) return fail("peer key not admitted");
+            const NodeIdDerivation how = ctx_->options.node_id_derivation;
+            const auto role = ctx_->trust ? ctx_->trust->role_of(cluster_, *key) : std::nullopt;
+            if (!role) return fail("peer key not admitted");
+            if (pinned_key_bits(derive_pinned_node_id(*key, *role, how), how) != pinned_key_bits(expected_peer_, how))
+                return fail("pinned key does not derive the NodeId");
+            if (ctx_->options.check_role_bit && !(derive_pinned_node_id(*key, *role, how) == expected_peer_))
+                return fail("peer NodeId role bit is not the role the key is admitted in");
+            peer_role_ = *role;
             if (revoked_key(*key)) return fail("peer key revoked");
             noise::Key32 rs{};
             if (!ed25519_to_x25519(*key, rs)) return fail("peer key is not a valid curve point");
@@ -281,7 +293,7 @@ private:
         if (!p2) return fail("malformed Msg2 payload");
         if (!version_ok(p2->version)) return fail("peer version outside the supported window");
         if (!(p2->node == expected_peer_)) return fail("Msg2 NodeId is not the pinned key's NodeId");
-        if (!ctx_->trust->admitted(cluster_, peer_key_)) return fail("peer key no longer admitted");
+        if (ctx_->trust->role_of(cluster_, peer_key_) != peer_role_) return fail("peer key no longer admitted in that role");
         return finish(peer_key_, expected_peer_, cluster_);
     }
 
@@ -306,10 +318,17 @@ private:
         if (!ed25519_to_x25519(p->ed25519, x) ||
             ::sodium_memcmp(x.data(), hs_->remote_static().data(), x.size()) != 0)
             return fail("payload key does not match the Noise static key");
-        const NodeId derived = derive_pinned_node_id(p->ed25519);
-        if (derived.value == 0 || !(p->node == derived)) return fail("claimed NodeId is not derived from the key");
+        // ADR-075: the 63 key bits are checked against the key, bit 63 against the role the application admitted the key in.
+        const NodeIdDerivation how = ctx_->options.node_id_derivation;
+        const NodeId key_derived = derive_pinned_node_id(p->ed25519, PinnedRole::Member, how);
+        if (key_derived.value == 0 || pinned_key_bits(p->node, how) != pinned_key_bits(key_derived, how))
+            return fail("claimed NodeId is not derived from the key");
+        const auto role = ctx_->trust ? ctx_->trust->role_of(cluster_, p->ed25519) : std::nullopt;
+        if (!role) return fail("initiator not admitted");
+        const NodeId derived = derive_pinned_node_id(p->ed25519, *role, how);
+        if (ctx_->options.check_role_bit && !(p->node == derived))
+            return fail("claimed NodeId role bit is not the role the key is admitted in");
         if (expected_peer_.value != 0 && !(expected_peer_ == derived)) return fail("peer is not the expected NodeId");
-        if (!ctx_->trust || !ctx_->trust->admitted(cluster_, p->ed25519)) return fail("initiator not admitted");
         if (revoked_key(p->ed25519)) return fail("initiator key revoked");
         const std::int64_t skew = ctx_->options.max_clock_skew_ns;
         if (skew > 0) {
@@ -325,7 +344,7 @@ private:
         noise::Bytes msg;
         if (!hs_->write_msg2(encode_pinned_msg2_payload({ctx_->options.version, self_}), msg))
             return fail("Noise message 2 could not be built");
-        if (finish(p->ed25519, derived, cluster_) != Step::Done) return Step::Failed;
+        if (finish(p->ed25519, ctx_->options.check_role_bit ? derived : p->node, cluster_) != Step::Done) return Step::Failed;
         out.insert(out.end(), msg.begin(), msg.end());  // Done carries Msg2; a failure above sent nothing
         return Step::Done;
     }
@@ -367,6 +386,7 @@ private:
     State state_ = State::Start;
     std::unique_ptr<noise::IkHandshake> hs_;
     Ed25519PublicKey peer_key_{};
+    std::optional<PinnedRole> peer_role_;
     Result result_{};
     std::string_view failure_{};
 };

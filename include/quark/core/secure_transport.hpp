@@ -831,8 +831,10 @@ private:
         }
         HandshakeEngine::Result result = engine->take_result();
         const NodeId peer = result.peer_node_id;
-        // Only the HIGHER NodeId answers an opener (#48 role rule): the initiator must be the lower id.
-        if (peer.value == 0 || !(peer.value < self_.value)) {
+        // Only the peer whom the role rule makes the initiator may open (#48; ADR-074 D3 via #63): between a member and a
+        // client the CLIENT initiates whatever the numeric ids (a client id has bit 63 set, so it is the HIGHER one: the
+        // old "initiator must be the lower id" test refused every pinned client), between same-role peers the lower id.
+        if (peer.value == 0 || !local_is_client(peer, self_)) {
             refuse(errc::validation, "secure transport: anonymous opener from a peer that may not initiate");
             return;
         }

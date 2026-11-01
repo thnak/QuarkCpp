@@ -47,6 +47,7 @@ build needs libsodium only.
   was in the owner's chosen dependency (libsodium) and a hand-rolled state machine over vetted primitives with a published vector is
   the smaller risk surface than a second dependency. It still wants an audit.
 - Identity = the full Ed25519 public key; Noise static = its X25519 conversion; NodeId = first 8 bytes (LE) of SHA-256 of the key.
+  **Amended by [ADR-075](ADR-075-pinned-nodeid-role-bit.md) (#63): bit 63 is the application-assigned role (ADR-074 D3's client bit), the other 63 bits come from the hash.**
   Msg1 carries the Ed25519 key (the map is one-way) and the responder checks the conversion equals the authenticating static key.
 - Application trust: `PinnedTrust::admitted(cluster, key)` + `PinnedKeyDirectory::key_of(cluster, node)`, consulted by both ends at
   every handshake. `PinnedKeyBook` is the ready-made implementation.
