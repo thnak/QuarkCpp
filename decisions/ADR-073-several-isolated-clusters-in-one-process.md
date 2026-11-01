@@ -31,3 +31,9 @@ T5 cost per extra instance, measured (Windows, Debug): 1 IO thread, 1 listening 
   dedicated cross-cluster relay test.
 - The 50-device cap is the application's; per-cluster cost with 50 live sessions is not measured (idle instances only).
 - Linux/TSan not run for this test.
+
+## Issue #49 evidence (2026-11-01)
+
+thnak-server (Ubuntu, x86-64), libsodium 1.0.18 built from `libsodium-1.0.18.tar.gz` into `~/local/sodium` (sha256 `6f504490b342a4f8a4c4a02fc9b866cbef8622d5df4e5452b46be121e46636c1`, the value libsodium publishes; the `.minisig` was downloaded but `minisign` is not installed there, so only the checksum was verified), `-DQUARK_WITH_SODIUM=ON`, RelWithDebInfo. 28 (ASan/UBSan) / 27 (TSan) CTest tests: the noise/sodium/pinned checks, `admission_*`, `lan_discovery_*`, `multi_cluster_isolation_test`, `tcp_reconnect_supersede_test`, `tcp_admission_redial_test`, `swim_lease_hardening_test`, `security_secure_transport_renegotiation_loop_test`, `pinned_flood_check`, the nm isolation test and its control. Results: GCC 15.2 ASan+UBSan 28/28, Clang 21.1 ASan+UBSan 28/28, GCC 15.2 TSan (-j1) 27/27, GCC 15.2 TSan with `-DQUARK_FORCE_ATOMIC_SHARED_PTR_FALLBACK` 27/27, Clang 21.1 TSan (-j1) 27/27; zero sanitizer reports. Windows MSVC Release: 271/271.
+
+- `multi_cluster_isolation_test` runs clean under GCC/Clang ASan+UBSan and TSan (-j1).
