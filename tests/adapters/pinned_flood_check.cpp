@@ -132,6 +132,7 @@ struct Result {
     int opened = 0;
     std::uint64_t max_pending = 0;
     std::uint64_t drops = 0;
+    std::size_t sec_pending = 0;
     std::int64_t admitted_ms = -1;  // time from the admitted peer's first send to its first delivered frame; -1 = none
 };
 
@@ -174,6 +175,7 @@ Result run(Node& a, Node& b, bool other_ip, std::uint32_t per_ip_cap, int total,
         sleep_ms(15);
     }
     r.drops = sb.tcp.drops();
+    r.sec_pending = sb.sec.pending_handshake_count();
     for (const long long fd : held) flood_close(fd, other_ip);
     return r;
 }
@@ -181,7 +183,7 @@ Result run(Node& a, Node& b, bool other_ip, std::uint32_t per_ip_cap, int total,
 void report(const char* tag, const Result& r) {
     std::printf("%s: opened=%d max_pending=%llu drops=%llu admitted_ms=%lld\n", tag, r.opened,
                 static_cast<unsigned long long>(r.max_pending), static_cast<unsigned long long>(r.drops),
-                static_cast<long long>(r.admitted_ms));
+                r.sec_pending, static_cast<long long>(r.admitted_ms));
 }
 }  // namespace
 
@@ -207,6 +209,11 @@ int main() {
             rl.rlim_cur = rl.rlim_max;
             (void)::setrlimit(RLIMIT_NOFILE, &rl);
         }
+    }
+    {
+        const Result r = run(lo, hi, /*other_ip=*/true, kPerIp, 0, 3000);
+        report("F0 BASELINE (no flood)", r);
+        check(r.admitted_ms >= 0, "F0 BASELINE: with no flood the admitted peer is served (the harness works)", ok);
     }
     {
         const Result r = run(lo, hi, /*other_ip=*/true, kPerIp, kFlood, 3000);
