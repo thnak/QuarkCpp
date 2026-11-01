@@ -58,7 +58,11 @@ struct Node {
 
     explicit Node(PinnedOptions opt = {}, std::shared_ptr<const PinnedTrust> trust_override = nullptr) {
         if (!opt.clock_unix_ns) opt.clock_unix_ns = TestClock{}.fn();  // fixed 1.8e18 ns unless the test supplies one
+        // A derived pinned NodeId has a random bit 63, which ADR-074 D3 reads as "client" (a member never dials a client,
+        // and the client always initiates). These checks model member<->member pairs with a fixed dialler/responder, so draw
+        // a member id; otherwise half of all pairs silently change roles and the checks flake (issue #49b).
         PinnedIdentity identity = PinnedIdentity::generate();
+        while (is_client_node(identity.node_id())) identity = PinnedIdentity::generate();
         id = identity.node_id();
         pub = identity.public_key();
         factory = std::make_unique<PinnedHandshakeEngineFactory>(

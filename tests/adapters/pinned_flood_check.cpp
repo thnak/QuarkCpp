@@ -197,6 +197,9 @@ int main() {
     std::sort(nodes.begin(), nodes.end(), [](auto& x, auto& y) { return x->id.value < y->id.value; });
     Node& lo = *nodes[0];
     Node& hi = *nodes[1];
+    std::printf("ids: lo=%016llx (client bit %d) hi=%016llx (client bit %d)\n", static_cast<unsigned long long>(lo.id.value),
+                static_cast<int>(is_client_node(lo.id)), static_cast<unsigned long long>(hi.id.value),
+                static_cast<int>(is_client_node(hi.id)));
     pair_up(lo, hi, kCluster);
 
     constexpr int kFlood = 3000;
