@@ -7,13 +7,13 @@
 //
 //   * 4 nodes x 4 receivers = 16 send lanes fire concurrently -> up to 12 simultaneous first-dials
 //     across 6 node pairs, which is exactly the scenario 021's lower-NodeId-wins dial-dedup exists for
-//     (both sides of a pair can race to dial before either hello lands). Every pair still converges to
-//     EXACTLY ONE connection — but tcp_transport.hpp documents that the LOSING side of that race can
-//     drop frames it had already handed to its socket (at-most-once, see the NOTE in
-//     register_identified()). This sample's 6-way simultaneous race hits that window far more often
-//     than the 2-node samples, so don't be surprised to see a node short by exactly one sender's whole
-//     lane — that is the documented tradeoff, not a bug; a non-lane-sized shortfall or a broken FIFO
-//     order would be.
+//     (both sides of a pair can race to dial before either hello lands). Every pair converges to EXACTLY
+//     ONE connection — and since ADR-076 (#65) the loser writes no application byte: the accepting side
+//     sends a DialHint before any frame and the dialer waits for it, so the race burst itself is
+//     LOSSLESS. This gate therefore requires every (sender,receiver) lane to arrive in full, in order.
+//   * F15: the router's per-peer inbound token bucket (default 4096/s, burst 1024) is a production
+//     overload guard and would shed a deliberate burst above 1024 frames/lane; this sample disables it
+//     (`set_peer_budget(0,0)`) so it measures the transport, not the guard.
 //   * Per-(sender,receiver) FIFO must hold even while messages from the OTHER 3 senders interleave on
 //     the same receiving Logger.
 //   * Every wait on cluster convergence is a SINGLE combined bounded poll across all nodes (not one
@@ -52,26 +52,43 @@ struct Seq {
 };
 QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable (016)
 
-// One Logger per node. `last_seen[src]` tracks the last in-order sequence number received FROM that
-// sender, so FIFO can be checked per-(sender,receiver) pair even though all 4 senders' traffic
-// interleaves on the same actor. Single Sequential executor drains this actor, so no lock is needed.
+// One Logger per node. Per source it tracks the frames actually delivered and any out-of-order
+// (seq <= last_seen, i.e. reordered or duplicated) arrival. A GAP (seq > last_seen+1) is LOSS, not
+// reordering: the final `missing = N - received[src]` accounts for lost prefixes, middles and tails
+// alike, so the two failure modes are reported separately (the old `seq != last_seen+1` check
+// conflated a lost prefix with FIFO breakage). Single Sequential executor drains this actor, so no
+// lock is needed.
 struct Logger : Actor<Logger, Sequential> {
     static constexpr std::string_view quark_type_name = "quark.sample.17_tcp_cluster_mesh.Logger";
     using protocol = Protocol<Seq>;
     std::array<int, NUM_NODES> last_seen{};
+    std::array<int, NUM_NODES> received{};
+    std::array<int, NUM_NODES> out_of_order{};
     std::atomic<int> count{0};
     bool ordered = true;
 
-    Logger() { last_seen.fill(-1); }
+    Logger() {
+        last_seen.fill(-1);
+        received.fill(0);
+        out_of_order.fill(0);
+    }
 
     void handle(const Seq& s) noexcept {
         const int src = s.n / SRC_MUL;
         const int seq = s.n % SRC_MUL;
-        if (src < 0 || src >= NUM_NODES || seq != last_seen[static_cast<std::size_t>(src)] + 1) {
+        if (src < 0 || src >= NUM_NODES) {
+            ordered = false;
+            count.fetch_add(1, std::memory_order_release);
+            return;
+        }
+        const std::size_t i = static_cast<std::size_t>(src);
+        if (seq <= last_seen[i]) {  // reordered or duplicated, never a gap
+            ++out_of_order[i];
             ordered = false;
         } else {
-            last_seen[static_cast<std::size_t>(src)] = seq;
+            last_seen[i] = seq;
         }
+        ++received[i];
         count.fetch_add(1, std::memory_order_release);
     }
 };
@@ -96,6 +113,11 @@ struct ClusterNode {
         dist = std::make_unique<DistributedRouter>(membership, local, transport);
         static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
         dist->set_authorizer(authz);
+        // F15: the router's per-peer inbound token bucket (default 4096 frames/s, burst 1024) is a
+        // production overload guard. This sample sends an N-frame burst per lane and is a losslessness
+        // gate, so disable it here; a real deployment keeps it (or raises both numbers to its measured
+        // data-plane rate) and accepts shedding as the documented overload behavior.
+        dist->set_peer_budget(0, 0);
         dist->template register_remote<Logger, Seq>();  // decode+post inbound (Logger,Seq)
     }
 };
@@ -204,27 +226,36 @@ int main() {
     for (int i = 0; i < NUM_NODES; ++i) {
         auto& n = *nodes[static_cast<std::size_t>(i)];
         const int got = n.actor.count.load();
-        const int shortfall = expected_per_node - got;
-        // 021's dial-dedup rule is deterministic (lower NodeId wins) and DOES converge every pair to
-        // one connection (checked above) — but tcp_transport.hpp's register_identified() documents that
-        // the LOSING side of a simultaneous first-dial race can drop frames it had already handed to its
-        // (about-to-close) socket: "at-most-once... a future refinement... once settled, delivery is
-        // lossless" (see the NOTE there). With 6 pairs racing at once this sample hits that window far
-        // more often than the 2-node samples do. The loss is always one sender's WHOLE lane at once
-        // (the doomed connection never delivered anything, so no partial/torn frame) — anything else
-        // (a non-lane-sized shortfall, or a broken FIFO order) would be a real, different bug.
-        const bool shortfall_is_documented_race = shortfall >= 0 && shortfall <= N * (NUM_NODES - 1) && shortfall % N == 0;
-        const bool ordered = n.actor.ordered;
-        ok &= ordered;
-        ok &= shortfall_is_documented_race;
+        int missing = 0;
+        int reordered = 0;
+        std::printf("node %d: received=%d/%d ordered=%s connections=%llu frames_sent=%llu "
+                    "transport_rx=%llu drops=%llu peer_sheds=%llu hints=%llu/%llu deferred=%llu "
+                    "timeouts=%llu dedup=%llu\n",
+                    i + 1, got, expected_per_node, n.actor.ordered ? "yes" : "NO",
+                    static_cast<unsigned long long>(n.transport.connections_open()),
+                    static_cast<unsigned long long>(n.transport.frames_sent()),
+                    static_cast<unsigned long long>(n.transport.frames_received()),
+                    static_cast<unsigned long long>(n.transport.drops()),
+                    static_cast<unsigned long long>(n.dist->peer_sheds()),
+                    static_cast<unsigned long long>(n.transport.dial_hints_sent()),
+                    static_cast<unsigned long long>(n.transport.dial_hints_received()),
+                    static_cast<unsigned long long>(n.transport.settle_deferred()),
+                    static_cast<unsigned long long>(n.transport.settle_timeouts()),
+                    static_cast<unsigned long long>(n.transport.dedup_closed()));
+        for (int src = 0; src < NUM_NODES; ++src) {
+            const int lost = N - n.actor.received[static_cast<std::size_t>(src)];
+            if (lost > 0) missing += lost;
+            reordered += n.actor.out_of_order[static_cast<std::size_t>(src)];
+            std::printf("  src %d: received=%d/%d missing=%d out_of_order=%d\n", src + 1,
+                        n.actor.received[static_cast<std::size_t>(src)], N, lost > 0 ? lost : 0,
+                        n.actor.out_of_order[static_cast<std::size_t>(src)]);
+        }
+        // #65: after the DialHint settle, a simultaneous first dial must be LOSSLESS. A gap is loss; an
+        // arrival at or below last_seen is reordering/duplication. Both are failures now.
+        ok &= (missing == 0);
+        ok &= (reordered == 0);
+        ok &= n.actor.ordered;
         total_frames += n.transport.frames_sent();
-        std::printf(
-            "node %d: received=%d/%d FIFO=%s connections=%llu frames_sent=%llu dedup_closed=%llu%s\n",
-            i + 1, got, expected_per_node, ordered ? "intact" : "BROKEN",
-            static_cast<unsigned long long>(n.transport.connections_open()),
-            static_cast<unsigned long long>(n.transport.frames_sent()),
-            static_cast<unsigned long long>(n.transport.dedup_closed()),
-            shortfall > 0 ? "  <- dial-dedup race dropped a lane (documented at-most-once, tcp_transport.hpp)" : "");
     }
     // 12 remote lanes x N messages must have crossed real sockets (4 local lanes touch none).
     ok &= total_frames >= static_cast<std::uint64_t>(NUM_NODES) * (NUM_NODES - 1) * N;

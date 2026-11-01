@@ -61,13 +61,28 @@ namespace quark::net {
 // already knows the peer's id). Fixed layout, LE: [u32 magic][u16 version][u64 node]. Not length-prefixed
 // (it is fixed-size); frames begin only after both hellos are exchanged.
 inline constexpr std::uint32_t hello_magic = 0x51'52'4B'31u;  // 'Q','R','K','1'
-inline constexpr std::uint16_t hello_version = 1;
+// #65: version 2 advertises the DialHint settle capability. The 14-byte layout is unchanged, and the
+// ADR-053 window below accepts v1 <-> v2 both ways: a v2 transport simply never sends a DialHint to a peer
+// that advertised v1, and a v1 peer keeps the old confirm-on-HELLO behavior (documented at-most-once).
+inline constexpr std::uint16_t hello_version = 2;
 inline constexpr std::size_t hello_size = 4 + 2 + 8;  // 14 bytes
 // ADR-053: supported HELLO version window. A peer is accepted iff |peer - ours| <= hello_version_window
 // (N and its neighbours); anything further is REFUSED with a distinct, observable reason (see
-// TcpTransport::set_hello_refusal_handler) instead of the old silent "version != ours => drop". The
-// layout and the current value (1) are unchanged, so existing peers interoperate byte-for-byte.
+// TcpTransport::set_hello_refusal_handler) instead of the old silent "version != ours => drop".
 inline constexpr std::uint16_t hello_version_window = 1;
+
+// #65: DialHint flag bits (one payload byte, sent by the ACCEPTOR on a v2 connection, after its HELLO and
+// before any application frame). The dialer defers confirmation until it arrives, so a losing dial never
+// puts an application byte on the wire. `established_*` describe the acceptor's resident connection (if
+// any); `has_outbound` means the acceptor is itself dialing the initiator (a genuine simultaneous dial).
+inline constexpr std::uint8_t kHintHasOutbound = 1u << 0;
+inline constexpr std::uint8_t kHintHasEstablished = 1u << 1;
+inline constexpr std::uint8_t kHintEstablishedHasData = 1u << 2;
+inline constexpr std::uint8_t kHintEstablishedAged = 1u << 3;
+// The acceptor's DECISION for THIS connection (authoritative): it will keep and confirm it. Without
+// this bit a raw-state hint is ambiguous — e.g. an ADR-071 both-inbound reconnect has an "established"
+// resident connection yet the newcomer is the one being kept; the dialer must not back off there.
+inline constexpr std::uint8_t kHintAccepted = 1u << 4;
 
 enum class HelloVerdict : std::uint8_t { Ok, BadMagic, VersionTooOld, VersionTooNew };
 
@@ -88,6 +103,8 @@ inline constexpr std::int64_t reconnect_cap_ns = 2'000'000'000;  // 2 s ceiling
 struct TcpTestFaults {
     bool legacy_dial_election = false;  // B1: only the both-inbound rule supersedes; no aged supersede, no hook
     bool skip_origin_check = false;     // M1: do not compare frame.from with the connection's identity
+    bool suppress_dial_hint = false;    // #65 control: the acceptor never sends its DialHint (the dialer must
+                                        // still confirm on the settle timeout — proves the liveness fallback)
 };
 
 class TcpTransport final : public Transport {
@@ -165,6 +182,24 @@ public:
     void set_reconnect_supersede_window_ns(std::int64_t ns) noexcept { supersede_window_ns_ = ns; }
     [[nodiscard]] std::uint64_t reconnects_superseded() const noexcept {
         return reconnects_superseded_.load(std::memory_order_relaxed);
+    }
+
+    // #65: how long a DIALER waits for the acceptor's DialHint before confirming anyway. The hint is
+    // written immediately after the peer's HELLO, so the normal wait is ~one half-RTT; this bound only
+    // matters when the peer is silent mid-handshake. 0 disables the settle handshake entirely (confirm at
+    // HELLO, the pre-#65 behavior). Default 500 ms. Set before start().
+    void set_dial_settle_timeout_ns(std::int64_t ns) noexcept { dial_settle_timeout_ns_ = ns; }
+    [[nodiscard]] std::uint64_t settle_deferred() const noexcept {
+        return settle_deferred_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t settle_timeouts() const noexcept {
+        return settle_timeouts_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t dial_hints_sent() const noexcept {
+        return dial_hints_sent_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t dial_hints_received() const noexcept {
+        return dial_hints_received_.load(std::memory_order_relaxed);
     }
 
     // ADR-069 (#47 M1): a frame delivered locally must carry `from` equal to its connection's identified
@@ -552,6 +587,24 @@ private:
         std::uint32_t fallback_epoch = 0;
         bool opener_seen = false;       // #45: an anonymous inbound may send exactly one Authenticate frame
         std::int64_t confirmed_ns = 0;  // when it won dedup / was confirmed (B1: age decides reconnect vs race)
+
+        // --- #65: dial-settle handshake (plaintext HELLO wire, v2 peers only) ---------------------
+        // The acceptor writes `hint` (one encoded DialHint frame) immediately after its HELLO, before any
+        // application frame. The dialer does not confirm until `hint_received`, bounded by the settle
+        // timeout. The hint lives on the Conn (like `hello`), never in the per-peer `outq_`: it is bound to
+        // THIS connection and must not survive a reconnect.
+        std::uint16_t peer_hello_version = 1;  // version the peer advertised (hint gating)
+        std::vector<std::byte> hint;           // encoded DialHint frame, empty when none is due
+        std::size_t hint_sent = 0;             // bytes of `hint` handed to the kernel
+        std::uint8_t hint_flags = 0;           // received (dialer) or sent (acceptor) hint flags
+        bool hint_received = false;            // a dialer is waiting for / has consumed the acceptor's hint
+        bool settle_armed = false;             // dialer: confirmation deferred until the hint/timeout
+        std::uint32_t settle_epoch = 0;        // invalidates a stale settle timeout callback
+        // Data-bearing evidence in BOTH directions, so both ends agree that a connection has carried
+        // application data and must not be closed by a dedup race (the receiver may not have sent on it).
+        bool app_data_sent = false;            // we have put a Data frame on this connection's wire
+        bool app_data_received = false;        // a Data frame has arrived on this connection
+        bool out_is_data = false;              // the frame currently in `out` is a Data frame
     };
 
     // ADR-048: an out-of-band connection that only ever proves "peer is reachable at its own direct
@@ -611,7 +664,7 @@ private:
         // is bound to the connection it was meant for; left queued it is sent on the NEXT connection, where the
         // peer answers a stale opener as if it were new. Returns the number dropped.
         std::size_t purge_authenticate() {
-            constexpr std::size_t kind_off = 4 + 5 * 8 + 1;
+            constexpr std::size_t kind_off = net::frame_kind_offset;
             std::size_t n = 0;
             for (auto it = control.begin(); it != control.end();) {
                 if (it->size() > kind_off &&
@@ -715,9 +768,15 @@ private:
         if (c->out_sent < c->out.size()) return;  // a frame is still in flight — do not touch it
         c->out.clear();
         c->out_sent = 0;
+        c->out_is_data = false;
         const auto qit = outq_.find(c->peer.value);
         if (qit == outq_.end()) return;
         c->out = qit->second.pop_next();
+        // #65: remember whether this frame is application data, so a successful write marks the
+        // connection data-bearing (the dedup race must never close such a connection).
+        c->out_is_data = c->out.size() > net::frame_kind_offset &&
+                         static_cast<FrameKind>(static_cast<std::uint8_t>(c->out[net::frame_kind_offset])) ==
+                             FrameKind::Data;
     }
 
     // Kick the (confirmed) connection to pick up whatever is newly queued and flush.
@@ -866,7 +925,8 @@ private:
         if (ev & EPOLLIN) do_read(c);
     }
 
-    // Drain as much of `out` (hello first) to the kernel as it will take; adjust EPOLLOUT interest.
+    // Drain to the kernel what this connection may legally put on the wire, in order:
+    // hello → DialHint (#65) → application frames (only once confirmed). Adjust EPOLLOUT interest.
     void flush(Conn* c) {
         // 1) hello must precede every frame on a fresh stream.
         while (c->hello_sent < hello_size) {
@@ -881,6 +941,21 @@ private:
             }
             if (*r == 0) { update_interest(c); return; }
             c->hello_sent += *r;
+        }
+        // 1b) #65: the acceptor's one-shot dial-settle hint, BEFORE any application frame. It is written
+        // while still unconfirmed on purpose — it is what lets the dialer decide whether to confirm.
+        while (c->hint_sent < c->hint.size()) {
+            auto r = pal::send_some(c->fd, c->hint.data() + c->hint_sent, c->hint.size() - c->hint_sent);
+            if (!r) {
+                if (r.error() == pal::would_block()) {
+                    update_interest(c);
+                    return;
+                }
+                handle_dead(c);
+                return;
+            }
+            if (*r == 0) { update_interest(c); return; }
+            c->hint_sent += *r;
         }
         // 2) then whichever frame is current, rotating to the NEXT one (control preferred — ADR-046
         // S4) only once each fully drains — populated by pump() only for a CONFIRMED connection (021
@@ -914,6 +989,9 @@ private:
                 }
                 if (*r == 0) break;
                 c->out_sent += *r;
+                // #65: once any byte of a Data frame is on the wire this connection is data-bearing; a
+                // dedup race must never close it (the peer has the matching evidence via disposal/recv).
+                if (c->out_is_data) c->app_data_sent = true;
             }
         }
         update_interest(c);
@@ -943,7 +1021,8 @@ private:
                 n -= take;
                 if (c->hello_in_.size() < hello_size) return;  // partial hello — wait for more
                 NodeId learned{};
-                if (!check_hello(c->hello_in_.data(), learned)) {  // bad magic / out-of-window version ⇒ drop
+                std::uint16_t learned_ver = 0;
+                if (!check_hello(c->hello_in_.data(), learned, learned_ver)) {  // bad magic / out-of-window version ⇒ drop
                     handle_dead(c);
                     return;
                 }
@@ -952,7 +1031,8 @@ private:
                     return;
                 }
                 c->peer_hello_read = true;
-                if (!register_identified(c, learned)) return;  // c was the dedup LOSER and is gone
+                c->peer_hello_version = learned_ver;  // #65: gates the DialHint settle capability
+                if (!register_identified(c, learned, learned_ver)) return;  // c was the dedup LOSER and is gone
                 // register_identified returning true keeps `c` as the registered connection for the
                 // peer; the remaining bytes below belong to its stream.
             }
@@ -962,6 +1042,15 @@ private:
             const std::uint64_t anon_token = (anonymous_ && !c->identified) ? c->accept_serial : 0;
             bool kill = false;
             const bool ok = c->in.feed(p, n, [this, c, src, origin, anon_token, &kill](MessageFrame f) {
+                // #65: the dial-settle hint is transport-internal — consume it here, never deliver it to
+                // the router/relay, and never count it as an application frame.
+                if (f.kind == FrameKind::DialHint) {
+                    apply_dial_hint(c, f);
+                    return;
+                }
+                // #65: data evidence in the receive direction too, so both ends agree a connection has
+                // carried application data (the receiver may never have sent on it).
+                if (f.kind == FrameKind::Data && c->identified) c->app_data_received = true;
                 frames_received_.fetch_add(1, std::memory_order_relaxed);
                 f.source_address = src;  // transient: never encoded, used for pre-auth admission
                 if (anonymous_) {
@@ -1048,7 +1137,188 @@ private:
         return true;
     }
 
-    bool register_identified(Conn* c, NodeId peer) {
+    // ---- #65: dial-settle handshake -----------------------------------------------------------
+    // A connection may carry application frames only once `confirmed`. Because the dialer cannot know
+    // whether the peer also dialed until the rival connection is identified, the ACCEPTOR sends one
+    // DialHint frame immediately after its HELLO and before any application frame; a v2 dialer defers
+    // confirmation until that hint arrives (bounded by `dial_settle_timeout_ns_`). The loser therefore
+    // never puts an application byte on the wire — 021 §2's "dropped before any application frame flows",
+    // now enforced rather than merely documented.
+
+    [[nodiscard]] static bool data_bearing(const Conn* c) noexcept {
+        return c != nullptr && (c->app_data_sent || c->app_data_received);
+    }
+    [[nodiscard]] bool confirmed_aged(const Conn* c) const noexcept {
+        return c->confirmed && c->confirmed_ns != 0 &&
+               now_ns() - c->confirmed_ns >= supersede_window_ns_;
+    }
+    // What the acceptor reports about its RESIDENT connection (excluding `c` itself).
+    [[nodiscard]] std::uint8_t dial_hint_flags(const Conn* existing, const Conn* c) const noexcept {
+        if (existing == nullptr || existing == c || existing->st == St::Backoff) return 0;
+        std::uint8_t f = 0;
+        if (!existing->confirmed && existing->initiated_by_self) f |= kHintHasOutbound;
+        if (existing->confirmed) {
+            f |= kHintHasEstablished;
+            if (data_bearing(existing)) f |= kHintEstablishedHasData;
+            if (confirmed_aged(existing)) f |= kHintEstablishedAged;
+        }
+        return f;
+    }
+    [[nodiscard]] bool hint_capable(const Conn* c) const noexcept {
+        // The legacy control restores the WHOLE pre-#65 election (including confirm-on-HELLO), so its
+        // documented lock-out/storm behavior stays reproducible for the negative control.
+        if (faults_.legacy_dial_election) return false;
+        return !anonymous_ && hello_ver_ >= 2 && c->peer_hello_version >= 2;
+    }
+
+    // Build + write the acceptor's one-shot hint (HELLO -> hint -> [frames] in flush()). Returns true if a
+    // hint was queued (v2 peer); a v1 peer gets the pre-#65 confirm-on-HELLO behavior.
+    bool queue_dial_hint(Conn* c, std::uint8_t flags) {
+        if (faults_.suppress_dial_hint) return false;
+        if (c->initiated_by_self || !hint_capable(c)) return false;
+        if (!c->hint.empty()) return true;
+        MessageFrame f;
+        f.from = self_;
+        f.to = c->peer;
+        f.kind = FrameKind::DialHint;
+        f.payload.push_back(static_cast<std::byte>(flags));
+        c->hint = encode_frame(f);
+        c->hint_sent = 0;
+        c->hint_flags = flags;
+        dial_hints_sent_.fetch_add(1, std::memory_order_relaxed);
+        flush(c);  // never waits: a would-block leaves it for the next EPOLLOUT
+        return true;
+    }
+
+    // A dialer consumes the acceptor's hint (transport-internal; never reaches the router/relay).
+    // Record the flags here — this runs INSIDE FrameStream::feed — and defer the settle to the loop.
+    // Acting synchronously would re-enter the transport: a rejected dial parks via schedule_reconnect(),
+    // which clears the SAME Conn::in stream feed() is iterating (the vector-bounds abort ASan caught).
+    void apply_dial_hint(Conn* c, const MessageFrame& f) {
+        if (!c->initiated_by_self || !c->identified || !hint_capable(c)) return;
+        if (f.payload.size() != 1 || f.from != c->peer || f.to != self_) return;
+        c->hint_flags = static_cast<std::uint8_t>(f.payload[0]);
+        c->hint_received = true;
+        dial_hints_received_.fetch_add(1, std::memory_order_relaxed);
+        const NodeId peer = c->peer;
+        io_.post([this, peer] {
+            const auto it = conns_.find(peer.value);
+            if (it == conns_.end()) return;
+            Conn* cc = it->second.get();
+            if (!cc->initiated_by_self || cc->confirmed) return;
+            settle(cc);
+        });
+    }
+
+    void confirm_conn(Conn* c) {
+        if (c->confirmed) return;
+        c->confirmed = true;
+        c->confirmed_ns = now_ns();
+        c->settle_armed = false;
+        ++c->settle_epoch;  // invalidate a pending settle timeout
+        mark_open(c);
+        pump(c);
+        on_confirmed(c);
+    }
+
+    // Park a dial that lost to a resident connection the peer already has. The fd goes away; the peer
+    // queue (and every frame in it) survives and a jittered reconnect retries later.
+    void backoff_unconfirmed(Conn* c) {
+        salvage_out(c);
+        if (c->fd != pal::invalid_fd) {
+            retire_fd(c->fd);
+            by_fd_.erase(c->fd);
+        }
+        if (was_open(c)) unmark_open(c);
+        c->settle_armed = false;
+        ++c->settle_epoch;
+        schedule_reconnect(c->peer);
+    }
+
+    void arm_settle_timeout(Conn* c) {
+        if (dial_settle_timeout_ns_ <= 0) return;
+        const std::uint32_t epoch = ++c->settle_epoch;
+        io_.post_after(dial_settle_timeout_ns_, [this, peer = c->peer, epoch] {
+            const auto it = conns_.find(peer.value);
+            if (it == conns_.end()) return;
+            Conn* cc = it->second.get();
+            if (cc->settle_epoch != epoch || cc->confirmed) return;
+            if (cc->st == St::Backoff || cc->fd == pal::invalid_fd) return;
+            settle_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            confirm_conn(cc);
+        });
+    }
+
+    // The dialer's decision, once the acceptor's hint is in (or the settle timeout fires).
+    void settle(Conn* c) {
+        if (!c->initiated_by_self || c->confirmed) return;
+        if (!c->hint_received) return;  // a replacement Conn has not consumed its own hint yet
+        if (c->st == St::Backoff || c->fd == pal::invalid_fd) return;  // parked/retired meanwhile
+        const auto it = conns_.find(c->peer.value);
+        if (it == conns_.end() || it->second.get() != c) return;  // superseded meanwhile
+        const std::uint8_t f = c->hint_flags;
+        if (f & (kHintAccepted | kHintEstablishedAged)) {
+            // The acceptor will keep THIS connection (including an ADR-071 reconnect that supersedes its
+            // old one, and a simultaneous dial whose lower-NodeId connection this is).
+            confirm_conn(c);
+            return;
+        }
+        if (f & (kHintHasEstablished | kHintEstablishedHasData)) {
+            // The peer already holds a live connection to us; this dial is redundant and must stay silent.
+            backoff_unconfirmed(c);
+            return;
+        }
+        if (f & kHintHasOutbound) {
+            // Rejected in favour of the acceptor's own outbound: wait for that inbound rival (the local
+            // election replaces us); the settle timeout is the liveness fallback if it never arrives.
+            return;
+        }
+        confirm_conn(c);  // no rival (or a v1 peer hinting nothing)
+    }
+
+    void confirm_or_settle(Conn* c) {
+        if (!c->initiated_by_self) {  // the accept side knows its own state and decides locally
+            confirm_conn(c);
+            return;
+        }
+        if (!hint_capable(c) || dial_settle_timeout_ns_ == 0) {  // v1 peer / settle disabled
+            confirm_conn(c);
+            return;
+        }
+        c->settle_armed = true;
+        settle_deferred_.fetch_add(1, std::memory_order_relaxed);
+        arm_settle_timeout(c);
+        if (c->hint_received) settle(c);
+    }
+
+    // Remove an accepted-but-losing connection without touching it afterwards. It is still owned by
+    // pending_in_ at this point.
+    void discard_pending(pal::fd_t fd) {
+        retire_fd(fd);
+        by_fd_.erase(fd);
+        if (auto pit = pending_in_.find(fd); pit != pending_in_.end()) pending_in_.erase(pit);
+    }
+
+    // A rejected accepted-side connection owes the dialer exactly one thing: its DialHint. Once those
+    // bytes are in the kernel (send() accepted them; TCP delivers them before our FIN), close instead of
+    // pinning a pending fd until the 5 s slowloris timeout — holding it makes every rejected dial look
+    // like a multi-second stall and delayed convergence under a heavy simultaneous start.
+    void close_rejected_pending(Conn* c) {
+        const pal::fd_t fd = c->fd;
+        const std::uint64_t serial = c->accept_serial;
+        if (c->hint_sent >= c->hint.size()) {  // includes the no-hint (v1) case
+            discard_pending(fd);
+            return;
+        }
+        const std::int64_t delay = dial_settle_timeout_ns_ > 0 ? dial_settle_timeout_ns_ : 500'000'000;
+        io_.post_after(delay, [this, fd, serial] {
+            const auto pit = pending_in_.find(fd);
+            if (pit == pending_in_.end() || pit->second->accept_serial != serial) return;
+            discard_pending(fd);
+        });
+    }
+
+    bool register_identified(Conn* c, NodeId peer, std::uint16_t peer_ver = 1) {
         if (!c->initiated_by_self && denied(peer)) {  // ADR-069 N3: a denied device is refused at HELLO
             admission_refused_.fetch_add(1, std::memory_order_relaxed);
             handle_dead(c);
@@ -1061,86 +1331,109 @@ private:
         }
         c->peer = peer;
         c->identified = true;
-        // Move an accepted conn out of pending_in_ (keyed by fd) if that is where it lives.
-        std::unique_ptr<Conn> owned_c;
-        if (auto pit = pending_in_.find(c->fd); pit != pending_in_.end()) {
-            owned_c = std::move(pit->second);
-            pending_in_.erase(pit);
+        if (peer_ver != 0) c->peer_hello_version = peer_ver;
+        const pal::fd_t cfd = c->fd;
+
+        // An accepted conn stays in pending_in_ (keyed by fd) until the election installs it.
+        auto pit = pending_in_.find(cfd);
+
+        Conn* existing = nullptr;
+        if (const auto it = conns_.find(peer.value); it != conns_.end() && it->second.get() != c)
+            existing = it->second.get();
+
+        // A Backoff husk is an fd-less dead socket, never a live rival: drop it before the election (its
+        // queued frames live in outq_ and survive). This mirrors the pre-#65 `st == Backoff` handling.
+        if (existing != nullptr && existing->st == St::Backoff) {
+            drop_conn(existing);
+            existing = nullptr;
         }
-        auto it = conns_.find(peer.value);
-        if (it == conns_.end() || it->second->st == St::Backoff) {
-            // No live existing (or only a fd-less Backoff husk): a fresh live inbound supersedes it.
-            if (it != conns_.end()) drop_conn(it->second.get());  // cancels the husk (do_reconnect no-ops)
-            if (owned_c) conns_[peer.value] = std::move(owned_c);
-            c->confirmed = true;
-            c->confirmed_ns = now_ns();  // sole connection to this peer — frames may flow
-            mark_open(c);
-            pump(c);
-            on_confirmed(c);
-            return true;
-        }
-        Conn* existing = it->second.get();
-        if (existing == c) {  // the dialer's own conn confirming the peer it dialed — no rival, it wins
-            c->confirmed = true;
-            c->confirmed_ns = now_ns();
-            mark_open(c);
-            pump(c);
-            on_confirmed(c);
-            return true;
-        }
-        // Two connections between the same pair — keep the one the dedup rule elects, close the other.
-        // The peer's queued frames live in outq_ (survivor pumps them once confirmed); salvage_out below
-        // reclaims any frames the loser had queued but not yet sent. NOTE (at-most-once, 010): a frame the
-        // loser had ALREADY put on the wire in the sub-ms simultaneous-dial race window is dropped when
-        // its socket closes — within at-most-once semantics. A future refinement (documented seam) elects
-        // the canonical connection deterministically from node ids so data only ever flows over it (needs
-        // a two-connection-slot rework + gossiped-endpoint dial-back); once settled, delivery is lossless.
-        const bool want_self_initiated = keep_local_dial(self_, peer);
-        // ADR-071 C7: the election is for a dial RACE (one self-initiated conn, one inbound). When BOTH are
-        // inbound, the peer simply dialed again: a RECONNECT (a phone that changed network while this side
-        // still holds the old, possibly half-open, connection). The fresh one supersedes the old; electing
-        // by node id here kept the dead inbound forever when self < peer and refused the live one.
-        const bool both_inbound = !existing->initiated_by_self && !c->initiated_by_self;
-        // ADR-071 #47 B1: the election is for a simultaneous dial only. An existing connection that has
-        // been confirmed longer than the race window and is rivalled by a NEW connection from the same
-        // peer is a RECONNECT whoever dialled it: electing by id kept a dead PC-dialled connection and
-        // closed every connection from the phone (0/50 both ways). Both ends apply the same rule, so both
-        // keep the new connection and the old one closes on both sides without a redial.
-        const bool existing_aged = existing->confirmed && existing->confirmed_ns != 0 &&
-                                   now_ns() - existing->confirmed_ns >= supersede_window_ns_;
-        // #45: an inbound connection identified by the handshake has PROVED the peer's key, so it always replaces
-        // what we hold for that peer (a spoofed HELLO claim, the old way to displace a connection, is gone). Its
-        // session was already swapped in place by that handshake, so the peer-down hook must NOT fire for it.
+
+        const std::uint8_t flags = dial_hint_flags(existing, c);
+        const bool established = (flags & kHintHasEstablished) != 0;
+        const bool aged = (flags & kHintEstablishedAged) != 0;
+        // ADR-071 C7: two INBOUND conns from one peer is a reconnect (a phone that changed network),
+        // not a race.
+        const bool both_inbound = existing != nullptr && !existing->initiated_by_self && !c->initiated_by_self;
+        // #45: a handshake-identified inbound has PROVED the peer's key and always replaces what we hold.
         const bool authed_bind = anonymous_ && !c->initiated_by_self;
-        const bool reconnect = authed_bind || both_inbound || (existing_aged && !faults_.legacy_dial_election);
-        Conn* survivor = reconnect ? c : ((c->initiated_by_self == want_self_initiated) ? c : existing);
-        dedup_closed_.fetch_add(1, std::memory_order_relaxed);
-        if (survivor == c) {
-            // `c` (the new conn) wins: take its ownership into conns_[peer], drop the old existing.
-            const bool tell_down = reconnect && !authed_bind && !faults_.legacy_dial_election && was_open(existing);
-            salvage_out(existing);       // recover any unsent frames the loser queued (race window)
-            drop_conn_detach(existing);  // remove existing from conns_, close it
-            if (reconnect) reconnects_superseded_.fetch_add(1, std::memory_order_relaxed);
-            // The session negotiated on the superseded connection is stale (the peer dropped its half).
-            if (tell_down && peer_down_hook_) peer_down_hook_(peer);
-            if (owned_c) conns_[peer.value] = std::move(owned_c);
-            c->confirmed = true;
-            c->confirmed_ns = now_ns();
-            mark_open(c);
-            pump(c);  // the surviving connection drains the peer queue (incl. salvaged frames)
-            on_confirmed(c);
-            return true;
+        const bool reconnect = existing != nullptr &&
+                               (authed_bind || both_inbound || (aged && !faults_.legacy_dial_election));
+
+        // Compute the acceptor's DECISION first, and put it in the hint. The dialer follows it rather than
+        // re-deriving the winner from raw state: the ADR-071 both-inbound reconnect keeps the newcomer
+        // even though an "established" resident exists, and a raw-state hint would make the dialer back
+        // off from the connection the acceptor just accepted.
+        const bool want_self_initiated = keep_local_dial(self_, peer);
+        const bool accepted = existing == nullptr || reconnect ||
+                              (!established && (c->initiated_by_self == want_self_initiated));
+        const std::uint8_t hint = static_cast<std::uint8_t>(flags | (accepted ? kHintAccepted : 0));
+
+        // The acceptor reports its state BEFORE deciding or closing anything (v2 peers only).
+        const bool hinted = !c->initiated_by_self && queue_dial_hint(c, hint);
+        if (hinted && by_fd_.find(cfd) == by_fd_.end()) return false;  // the hint write killed `c`
+
+        // A live confirmed resident connection beats an unconfirmed newcomer in a race. This is the
+        // data-bearing protection: a connection that has carried application data in EITHER direction is
+        // never closed by dedup. An aged one is a genuine reconnect and is superseded below instead.
+        if (existing != nullptr && established && !reconnect && !faults_.legacy_dial_election) {
+            dedup_closed_.fetch_add(1, std::memory_order_relaxed);
+            if (c->initiated_by_self) {
+                backoff_unconfirmed(c);  // the peer holds a live conn; the queue survives, retry later
+                return false;
+            }
+            close_rejected_pending(c);  // deliver the hint, then close (never wait for the 5 s timeout)
+            return false;
         }
-        // existing wins: close `c`. owned_c (if set) drops here with its fd closed.
-        salvage_out(c);  // recover any unsent frames `c` queued before losing (race window)
-        retire_fd(c->fd);
-        by_fd_.erase(c->fd);
-        existing->confirmed = true;
-        if (existing->confirmed_ns == 0) existing->confirmed_ns = now_ns();
-        mark_open(existing);
-        pump(existing);  // the surviving connection drains the peer queue
-        on_confirmed(existing);
-        return false;
+
+        if (existing == nullptr || existing == c) {
+            // No rival (or the dialer's own connection). Install an accepted conn, then settle/confirm.
+            if (!c->initiated_by_self && pit != pending_in_.end()) {
+                std::unique_ptr<Conn> owned_c = std::move(pit->second);
+                pending_in_.erase(pit);
+                conns_[peer.value] = std::move(owned_c);
+            }
+            confirm_or_settle(c);
+            // confirm_conn() pumps; a failing write can retire/destroy `c` via handle_dead(). Only report
+            // it as still registered when its fd is still live.
+            return by_fd_.find(cfd) != by_fd_.end();
+        }
+
+        // Two live, unconfirmed connections: a genuine simultaneous dial. (A dialer's own Conn is always
+        // conns_[peer], so `c` here is the accepted side.)
+        if (c->initiated_by_self) {
+            backoff_unconfirmed(c);
+            if (!existing->confirmed) confirm_or_settle(existing);
+            return false;
+        }
+        // `accepted` is the same decision the hint carried; both ends must agree.
+        const bool c_wins = accepted;
+        dedup_closed_.fetch_add(1, std::memory_order_relaxed);
+        if (!c_wins) {
+            close_rejected_pending(c);
+            // The resident wins. If it is an outbound awaiting its own hint, leave it to settle.
+            if (existing->confirmed) {
+                // already usable
+            } else if (!existing->initiated_by_self) {
+                confirm_conn(existing);
+            }
+            return false;
+        }
+
+        // `c` wins: drop the resident. Its unsent frames are salvaged into outq_ (the survivor pumps
+        // them); under settle it has not carried application data unless this is an aged reconnect,
+        // where the old socket is presumed dead (ADR-071's at-most-once reconnect contract).
+        const bool tell_down = reconnect && !authed_bind && !faults_.legacy_dial_election && was_open(existing);
+        salvage_out(existing);
+        drop_conn_detach(existing);
+        if (reconnect) reconnects_superseded_.fetch_add(1, std::memory_order_relaxed);
+        if (tell_down && peer_down_hook_) peer_down_hook_(peer);
+        if (pit != pending_in_.end()) {
+            std::unique_ptr<Conn> owned_c = std::move(pit->second);
+            pending_in_.erase(pit);
+            conns_[peer.value] = std::move(owned_c);
+        }
+        confirm_conn(c);  // accept side decides locally; the dialer confirms on our hint
+        return by_fd_.find(cfd) != by_fd_.end();  // a failed pump may already have retired `c`
     }
 
     // ADR-048: a connection that the PEER dialed (accepted, or won dedup as the accept side) is direct
@@ -1245,6 +1538,18 @@ private:
         c->confirmed = false;  // the new socket must re-exchange hello + re-confirm before frames flow
         c->hello_in_.clear();
         c->in.clear();
+        // #65: the hint and all settle/data-bearing state belong to the OLD socket. The next one
+        // re-exchanges HELLO and its own hint before any application frame.
+        c->peer_hello_version = 1;
+        c->hint.clear();
+        c->hint_sent = 0;
+        c->hint_flags = 0;
+        c->hint_received = false;
+        c->settle_armed = false;
+        ++c->settle_epoch;
+        c->app_data_sent = false;
+        c->app_data_received = false;
+        c->out_is_data = false;
         // c->out was already salvaged to outq_ by handle_dead; the frames survive the reconnect there.
         const std::uint32_t attempt = c->backoff_attempt++;
         const std::int64_t delay = backoff_delay(peer, attempt);
@@ -1350,9 +1655,11 @@ private:
         if (c->fd == pal::invalid_fd) return;  // a Backoff husk has no socket to arm
         std::uint32_t want = EPOLLIN;
         if (c->st == St::Connecting) want |= EPOLLOUT;  // connect completion
-        // Arm EPOLLOUT for pending hello, or for pending frames ONLY once confirmed — otherwise an
-        // unconfirmed conn with queued frames would spin on writable readiness it will not act on.
-        if (c->hello_sent < hello_size || (c->confirmed && c->out_sent < c->out.size())) want |= EPOLLOUT;
+        // Arm EPOLLOUT for a pending hello or dial hint, or for pending frames ONLY once confirmed —
+        // otherwise an unconfirmed conn with queued frames would spin on writable readiness it will not act on.
+        if (c->hello_sent < hello_size || c->hint_sent < c->hint.size() ||
+            (c->confirmed && c->out_sent < c->out.size()))
+            want |= EPOLLOUT;
         if (want != c->interest) {
             c->interest = want;
             io_.mod_fd(c->fd, want);
@@ -1501,10 +1808,12 @@ private:
                 p->hello_in.insert(p->hello_in.end(), buf.data(), buf.data() + *r);
             }
             NodeId learned{};
-            if (!check_hello(p->hello_in.data(), learned) || learned != p->peer) {
+            std::uint16_t learned_ver = 0;
+            if (!check_hello(p->hello_in.data(), learned, learned_ver) || learned != p->peer) {
                 fail_probe(fd);  // wrong/garbled answer — not the peer we're trying to recover
                 return;
             }
+            (void)learned_ver;  // the probe only proves reachability; the real connection negotiates the hint
             succeed_probe(fd);
         }
     }
@@ -1561,6 +1870,13 @@ private:
         by_fd_[new_fd] = c;
         io_.add_fd(new_fd, EPOLLIN, [this, fd = new_fd](std::uint32_t ev) { on_conn(fd, ev); });
         relay_routed_.erase(c->peer.value);
+        // #65: the hint belongs to the OLD socket; the probe's socket already exchanged HELLO and is
+        // confirmed, so nothing is due on the new one.
+        c->hint.clear();
+        c->hint_sent = 0;
+        c->hint_received = false;
+        c->settle_armed = false;
+        ++c->settle_epoch;
         c->fallback_epoch++;       // a fresh generation: any outstanding probe/timer for the old one is stale
         c->first_connecting_ns = 0;
         update_interest(c);
@@ -1601,8 +1917,8 @@ private:
     }
     // Parse + version-gate a peer hello. Returns true iff accepted; on a version refusal it records the
     // distinct reason (counter + handler) BEFORE returning false.
-    [[nodiscard]] bool check_hello(const std::byte* p, NodeId& out) {
-        std::uint16_t ver = 0;
+    [[nodiscard]] bool check_hello(const std::byte* p, NodeId& out, std::uint16_t& ver) {
+        ver = 0;
         const HelloVerdict v = parse_hello(p, out, ver);
         if (v == HelloVerdict::Ok) return true;
         if (v != HelloVerdict::BadMagic) {
@@ -1650,6 +1966,9 @@ private:
     std::uint32_t max_inbound_per_ip_ = 64;       // identified inbound connections per source IP
     bool strict_peer_addr_binding_ = true;        // a live peer's slot cannot be taken from another IP
     std::int64_t supersede_window_ns_ = 1'000'000'000;  // B1: older than this ⇒ a new conn is a reconnect
+    // #65: how long a dialer defers confirmation waiting for the acceptor's DialHint. The hint follows
+    // the peer's HELLO immediately, so this only bounds a silent/misbehaving peer. 0 = pre-#65 behavior.
+    std::int64_t dial_settle_timeout_ns_ = 500'000'000;
     std::function<bool(NodeId, NodeId)> accept_relayed_;  // M1: (relay, origin) opt-in for relayed frames
     TcpTestFaults faults_;
     AdmissionAuthority* admission_ = nullptr;             // N3 (set_admission)
@@ -1702,6 +2021,10 @@ private:
     std::atomic<std::uint64_t> posted_data_bytes_{0};       // C1: data payload bytes posted, not yet on loop
     std::atomic<std::uint64_t> dedup_closed_{0};
     std::atomic<std::uint64_t> reconnects_superseded_{0};  // B1
+    std::atomic<std::uint64_t> settle_deferred_{0};        // #65: dials that waited for a DialHint
+    std::atomic<std::uint64_t> settle_timeouts_{0};        // #65: hints that never arrived in time
+    std::atomic<std::uint64_t> dial_hints_sent_{0};
+    std::atomic<std::uint64_t> dial_hints_received_{0};
     std::atomic<std::uint64_t> spoofed_origin_dropped_{0};  // M1
     std::atomic<std::uint64_t> admission_refused_{0};       // N3
     std::atomic<std::uint64_t> reconnects_{0};

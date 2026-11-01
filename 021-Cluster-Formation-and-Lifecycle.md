@@ -246,8 +246,19 @@ round-trip:
 > inside the window is refused, retries with backoff, and is let in once the window has passed (bounded:
 > about six attempts at the default).
 
+> **Settle handshake (ADR-076, issue #65).** "Before any application frame flows" is now enforced, not
+> just intended. The ACCEPTING side sends a one-shot `DialHint` immediately after its HELLO (before any
+> application frame); a dialer that advertised HELLO v2 does not confirm until that hint arrives, bounded
+> by `dial_settle_timeout_ns`. The hint reports whether the acceptor has an outbound dial in flight, a
+> confirmed resident connection, whether that connection has carried application data, and whether it is
+> old enough to be an ADR-071 reconnect. A connection that has carried application data (either
+> direction) is never closed by a race; a confirmed resident connection beats an unconfirmed newcomer. A
+> v1 peer keeps the pre-ADR-076 confirm-on-HELLO behavior (at-most-once); the anonymous/pinned wire has
+> no HELLO and keeps ADR-072's authenticated supersede unchanged.
+
 The AEAD handshake (020) rides the surviving connection; the loser is dropped
-before any application frame flows, so dedup costs nothing steady-state.
+before any application frame flows (enforced by ADR-076's settle handshake), so dedup costs nothing
+steady-state.
 Certificate rotation (see below) also reuses this same reconnect/backoff
 machinery on a failed renegotiation, rather than inventing a parallel rekey
 protocol or a new glare-breaking rule — connection establishment already

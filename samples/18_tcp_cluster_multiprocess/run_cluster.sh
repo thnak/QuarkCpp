@@ -46,7 +46,7 @@ for ((i = 1; i <= NUM_NODES; i++)); do
   if [[ $rc -ne 0 ]]; then
     ok=0
     if [[ $rc -eq 124 ]]; then
-      echo "  ^ killed by timeout — treat as a real hang/deadlock, not the documented at-most-once race"
+      echo "  ^ killed by timeout — treat as a real hang/deadlock"
     fi
   fi
 done

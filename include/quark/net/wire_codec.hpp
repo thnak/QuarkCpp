@@ -31,6 +31,11 @@ namespace quark::net {
 // (reassembler buffer + MessageFrame payload) per frame.
 inline constexpr std::uint32_t max_frame_body = 4u * 1024u * 1024u;
 
+// Wire offset of the one-byte FrameKind: [u32 body_len][from u64][to u64][target.type u64][target.key u64]
+// [msg_type u64][mode u8][kind u8]... Simple consumers (TcpTransport's Authenticate purge and its
+// data-bearing marker) need to classify a queued encoded frame without decoding it again.
+inline constexpr std::size_t frame_kind_offset = 4 + 5 * 8 + 1;  // 45
+
 namespace detail {
 
 // GCC's inliner sometimes loses track of std::vector<std::byte>'s growth-reallocation pointer
@@ -175,9 +180,14 @@ public:
             if (buf_.size() - pos < 4) break;  // not even a full length prefix yet
             const std::uint32_t body_len = read_u32(&buf_[pos]);
             if (body_len > max_body_) return false;  // protocol error: implausible frame size
+            // A MessageFrame body always contains the fixed header fields, so an empty body is a
+            // malformed stream. Reject it here rather than taking a span at the vector's end.
+            if (body_len == 0) return false;
             if (buf_.size() - pos < 4u + body_len) break;  // partial frame — wait for more bytes
+            // `data() +` (not `&buf_[pos + 4]`): valid even when the body ends exactly at the buffer end
+            // (a zero-length span), where `operator[]` would trip the libstdc++ bounds assertion.
             std::optional<MessageFrame> f =
-                decode_frame_body(std::span<const std::byte>(&buf_[pos + 4], body_len));
+                decode_frame_body(std::span<const std::byte>(buf_.data() + pos + 4, body_len));
             if (!f) return false;  // malformed body on a length-consistent stream ⇒ untrustworthy
             pos += 4u + body_len;
             on_frame(std::move(*f));
