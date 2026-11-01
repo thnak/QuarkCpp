@@ -366,7 +366,18 @@ if(QUARK_DUMPBIN_EXE_SODIUM)
                    -DSYMBOL_PREFIXES=sodium_|crypto_
                    -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
 else()
-  message(STATUS "Quark: skipping security_sodium_symbol_isolation (dumpbin not found — non-MSVC toolchain)")
+  # Linux (issue #49): the nm variant of the same scan, same script, same control below.
+  find_program(QUARK_NM_EXE_SODIUM nm)
+  if(QUARK_NM_EXE_SODIUM)
+    add_test(NAME security_sodium_symbol_isolation
+             COMMAND ${CMAKE_COMMAND}
+                     -DNM_EXE=${QUARK_NM_EXE_SODIUM}
+                     -DTARGET_LIB=$<TARGET_FILE:quark>
+                     -DSYMBOL_PREFIXES=sodium_|crypto_
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
+  else()
+    message(STATUS "Quark: skipping security_sodium_symbol_isolation (neither dumpbin nor nm found)")
+  endif()
 endif()
 # CONTROL (must FAIL): the same scan pointed at libsodium's own static library, which certainly exports sodium_/crypto_
 # symbols — proves the scan can see them, so the clean result on `quark` above is evidence rather than a blind check.
