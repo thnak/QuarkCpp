@@ -181,7 +181,7 @@ Result run(Node& a, Node& b, bool other_ip, std::uint32_t per_ip_cap, int total,
 }
 
 void report(const char* tag, const Result& r) {
-    std::printf("%s: opened=%d max_pending=%llu drops=%llu admitted_ms=%lld\n", tag, r.opened,
+    std::printf("%s: opened=%d max_pending=%llu drops=%llu sec_pending=%zu admitted_ms=%lld\n", tag, r.opened,
                 static_cast<unsigned long long>(r.max_pending), static_cast<unsigned long long>(r.drops),
                 r.sec_pending, static_cast<long long>(r.admitted_ms));
 }
