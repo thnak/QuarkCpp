@@ -70,6 +70,21 @@ if(QUARK_BUILD_FUZZ)
   target_link_libraries(fuzz_seed_corpus PRIVATE quark::quark quark_warnings Threads::Threads)
 endif()
 
+# Issue #50 CONTROL: the deterministic fuzz driver rebuilt with -DQUARK_FUZZ_PLANT_OOB, which plants a one-byte
+# overread in control_msg1_parse_copy (a copy of the Msg1 prefix parse). Under ASan the campaign MUST trap; WILL_FAIL
+# inverts that, so this test passes only when the campaign finds the planted bug (a campaign that cannot is unproven).
+# Registered only in an ASan build (QUARK_SANITIZE=address): without ASan an overread is silent by design.
+if(QUARK_SANITIZE MATCHES "address")
+  add_executable(fuzz_pinned_oob_control fuzz_decoders_test.cpp)
+  target_include_directories(fuzz_pinned_oob_control PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(fuzz_pinned_oob_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(fuzz_pinned_oob_control PRIVATE QUARK_ALLOW_INSECURE QUARK_FUZZ_PLANT_OOB)
+  add_test(NAME fuzz_pinned_oob_control COMMAND fuzz_pinned_oob_control --iters 200000)
+  set_tests_properties(fuzz_pinned_oob_control PROPERTIES
+                       WILL_FAIL TRUE
+                       ENVIRONMENT "ASAN_OPTIONS=symbolize=0:abort_on_error=0:exitcode=1")
+endif()
+
 # --- Special targets (positive controls / -D variants) that can't be auto-discovered ----------
 # The no-lost-wakeup CONTROL: -DQUARK_SCHED_BROKEN_WAKEUP drops the park Dekker barrier+rescan, so
 # the harness MUST strand — proving it detects a lost wakeup. The control binary returns 0 iff it

@@ -108,6 +108,14 @@ if(QUARK_WITH_SODIUM)
     endif()
   endif()
   add_library(quark::security_sodium ALIAS quark_security_sodium)
+  # Issue #50: the fuzz targets for the pinned Noise engine compile only with libsodium. The drivers are created in
+  # tests/ (before this module runs), so wire the dependency here; without sodium the targets compile out cleanly.
+  foreach(_fz fuzz_decoders_test fuzz_decoders fuzz_seed_corpus fuzz_pinned_oob_control)
+    if(TARGET ${_fz})
+      target_link_libraries(${_fz} PRIVATE quark::security_sodium)
+      target_compile_definitions(${_fz} PRIVATE QUARK_FUZZ_SODIUM=1)
+    endif()
+  endforeach()
   message(STATUS "Quark: libsodium pinned-key adapter ENABLED")
 endif()
 

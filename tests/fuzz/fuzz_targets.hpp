@@ -17,6 +17,7 @@
 #include "quark/core/snapshot.hpp"
 #include "quark/core/wire.hpp"
 #include "quark/net/wire_codec.hpp"
+#include "fuzz_pinned_targets.hpp"  // issue #50: pre-authentication pinned-key parsers
 
 namespace quark::fuzz {
 
@@ -100,6 +101,13 @@ inline void run_one(const std::byte* p, std::size_t size) {
     (void)net::decode_frame_body(std::span<const std::byte>(p, size));
     net::FrameStream fs(1024);
     (void)fs.feed(p, size, [](MessageFrame&&) {});
+
+    // Issue #50: pinned Noise Msg1/Msg2 (needs libsodium), the anonymous inbound gate, discovery decode, and the
+    // planted-OOB control copy (benign unless QUARK_FUZZ_PLANT_OOB).
+    run_pinned_noise(p, size);
+    run_anonymous_wire(p, size);
+    run_discovery_decode(p, size);
+    control_msg1_parse_copy(p, size);
 }
 
 inline void run_one(const std::uint8_t* data, std::size_t size) {
@@ -162,6 +170,8 @@ inline std::vector<std::vector<std::byte>> seed_corpus() {
     f.msg_type = TypeKey{fingerprint_v<Msg>};
     f.payload = {std::byte{1}, std::byte{2}, std::byte{3}};
     out.push_back(net::encode_frame(f));
+
+    add_pinned_seeds(out);
 
     // Truncated variants exercise the partial-frame/bounds paths with a plausible prefix.
     const std::size_t n = out.size();

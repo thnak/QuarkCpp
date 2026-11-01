@@ -1,8 +1,9 @@
 // P5 deterministic decoder fuzz (every platform/compiler; runs in the default ctest).
 //
-// Seeds every target from `fuzz/fuzz_targets.hpp`, then drives a deterministic random/mutated
+// Seeds every target from `fuzz/fuzz_targets.hpp`, then drives a deterministic random + mutated-seed
 // campaign over: 016 tagged + bounds-checked tagless, the F17 mixed-schema pair + gate, SWIM
-// control, schema advert, durable records + migration, frame bodies, TCP frame reassembly, and a
+// control, schema advert, durable records + migration, frame bodies, TCP frame reassembly, the pinned
+// Noise Msg1/Msg2 + anonymous-wire + discovery-decode targets (issue #50), and a
 // random bytes-in-.qwal FileStore replay. Any ASan/UBSan trap or crash is a finding.
 //
 //   fuzz_decoders_test [--iters N]   (default 50000; CI/lab use 2000000 for the long campaign)
@@ -50,9 +51,31 @@ int main(int argc, char** argv) {
     std::mt19937_64 rng{0x5EEDF00D1234ULL};
     std::vector<std::uint8_t> buf;
     for (std::uint64_t i = 0; i < iters; ++i) {
-        const std::size_t len = 1 + static_cast<std::size_t>(rng() % 2048);
-        buf.resize(len);
-        for (auto& b : buf) b = static_cast<std::uint8_t>(rng() & 0xFF);
+        if ((i & 1) == 0) {
+            const std::size_t len = 1 + static_cast<std::size_t>(rng() % 2048);
+            buf.resize(len);
+            for (auto& b : buf) b = static_cast<std::uint8_t>(rng() & 0xFF);
+        } else {
+            // Mutation phase (issue #50): start from a seed and apply 1-4 havoc steps, so inputs keep the structure
+            // of a valid Msg1/Msg2/frame/label and reach the code behind the first length or tag check.
+            static constexpr std::uint8_t kInteresting[] = {0x00, 0x01, 0x7F, 0x80, 0xFF, 0x02, 0x10, 0x20};
+            const auto& seed = seeds[rng() % seeds.size()];
+            buf.assign(reinterpret_cast<const std::uint8_t*>(seed.data()),
+                       reinterpret_cast<const std::uint8_t*>(seed.data()) + seed.size());
+            const unsigned steps = 1 + static_cast<unsigned>(rng() % 4);
+            for (unsigned st = 0; st < steps && !buf.empty(); ++st) {
+                const std::size_t pos = static_cast<std::size_t>(rng() % buf.size());
+                switch (rng() % 6) {
+                    case 0: buf[pos] = static_cast<std::uint8_t>(rng() & 0xFF); break;
+                    case 1: buf[pos] = kInteresting[rng() % sizeof kInteresting]; break;
+                    case 2: buf[pos] ^= static_cast<std::uint8_t>(1u << (rng() % 8)); break;
+                    case 3: buf.resize(1 + pos); break;  // truncate
+                    case 4: buf.insert(buf.begin() + static_cast<std::ptrdiff_t>(pos), static_cast<std::uint8_t>(rng() & 0xFF)); break;
+                    default: buf.erase(buf.begin() + static_cast<std::ptrdiff_t>(pos)); break;
+                }
+            }
+            if (buf.empty()) buf.push_back(0);
+        }
         fuzz::run_one(buf.data(), buf.size());
         if ((i + 1) % 250000 == 0) {
             std::printf("fuzz_decoders_test: %llu/%llu\n",

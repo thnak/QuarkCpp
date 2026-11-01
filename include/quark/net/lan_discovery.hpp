@@ -88,6 +88,9 @@ inline constexpr std::size_t kMaxInstanceIdBytes = 36;
         acc &= (1u << bits) - 1u;
     }
     if (acc != 0) return std::nullopt;  // non-canonical trailing bits
+    // Canonical length too (found by the #50 fuzz): a whole spare 5-bit group of zeros ("a", "aaa") would decode to
+    // the same id as the shorter label, giving one device several accepted spellings. At most 4 padding bits exist.
+    if (bits >= 5) return std::nullopt;
     return out;
 }
 

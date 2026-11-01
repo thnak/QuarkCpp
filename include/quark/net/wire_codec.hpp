@@ -133,6 +133,18 @@ inline void encode_frame_body(const MessageFrame& f, std::vector<std::byte>& out
     return f;
 }
 
+// ---- Pinned wire: the anonymous-inbound rule (#45, ADR-072; fuzzed by #50) --------------------------
+// An accepted connection that no handshake has identified yet may send exactly ONE frame: an Authenticate
+// opener of at most kAnonOpenerMax bytes with from == to == 0 (the pinned wire carries no ids). Anything else
+// closes the connection. This is the whole decision, with no socket in it, so TcpTransport and the fuzz target
+// share it (a narrow test seam: the transport's receive loop calls exactly this).
+inline constexpr std::size_t kAnonOpenerMax = 1024;  // a Noise IK Msg1 is 154 bytes
+
+[[nodiscard]] inline bool anonymous_opener_admissible(const MessageFrame& f, bool opener_already_seen) noexcept {
+    return !opener_already_seen && f.kind == FrameKind::Authenticate && f.from.value == 0 && f.to.value == 0 &&
+           f.payload.size() <= kAnonOpenerMax;
+}
+
 // ================================================================================================
 // FrameStream — the "stream" reassembler (010): feed it whatever bytes a recv() delivered (a partial
 // frame, exactly one frame, or several coalesced frames), and it emits each COMPLETE frame in order,

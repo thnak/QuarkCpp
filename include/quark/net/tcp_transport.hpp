@@ -205,7 +205,7 @@ public:
     // `from`/`to` of a direct frame are not put on the wire (both 0) and are restored from the connection's
     // identity, so a capture shows no NodeId in any frame header. Requires a SecureTransport above; incompatible
     // with the HELLO-based features (relay fallback probes, ADR-048). Call before start().
-    static constexpr std::size_t kAnonOpenerMax = 1024;  // a Noise IK Msg1 is 154 bytes
+    static constexpr std::size_t kAnonOpenerMax = net::kAnonOpenerMax;  // wire_codec.hpp: the shared rule
     void set_pinned_wire(bool on) noexcept { anonymous_ = on; }
     [[nodiscard]] bool pinned_wire() const noexcept { return anonymous_; }
     [[nodiscard]] std::uint64_t anonymous_frames_refused() const noexcept {
@@ -956,8 +956,7 @@ private:
                 f.source_address = src;  // transient: never encoded, used for pre-auth admission
                 if (anonymous_) {
                     if (anon_token != 0) {  // unidentified inbound: exactly one handshake opener, nothing else
-                        if (kill || c->opener_seen || f.kind != FrameKind::Authenticate || f.from.value != 0 ||
-                            f.to.value != 0 || f.payload.size() > kAnonOpenerMax) {
+                        if (kill || !anonymous_opener_admissible(f, c->opener_seen)) {
                             anon_refused_.fetch_add(1, std::memory_order_relaxed);
                             kill = true;
                             return;
