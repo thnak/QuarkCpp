@@ -235,12 +235,41 @@ jobs:
         run: |
           cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_CXX_COMPILER=clang++-22 -DQUARK_BUILD_TESTS=ON \
-            -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_FUZZ=ON -DQUARK_SANITIZE=address
+            -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_FUZZ=ON -DQUARK_SANITIZE=address \
+            -DQUARK_WITH_SODIUM=ON -DQUARK_SODIUM_INCLUDE_DIR=/usr/include \
+            -DQUARK_SODIUM_LIBRARY=/usr/lib/x86_64-linux-gnu/libsodium.a
           cmake --build build-fuzz --target fuzz_decoders fuzz_seed_corpus -j 2
           mkdir -p build-fuzz/corpus
           build-fuzz/tests/fuzz_seed_corpus build-fuzz/corpus
           build-fuzz/tests/fuzz_decoders -max_total_time=60 -timeout=10 \
             -artifact_prefix=build-fuzz/corpus/ build-fuzz/corpus
+
+      # Issue #50 / #49 CONTROL: the same campaign rebuilt with the planted one-byte overread
+      # (-DQUARK_FUZZ_PLANT_OOB). It MUST crash within 20 s; a campaign that cannot find a planted bug is unproven.
+      - name: Fuzz control (planted OOB must crash)
+        if: matrix.arch == 'x86_64' && matrix.config.name == 'clang-release'
+        run: |
+          cmake -S . -B build-fuzz-plant -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++-22 -DQUARK_BUILD_TESTS=ON \
+            -DQUARK_BUILD_BENCH=OFF -DQUARK_BUILD_FUZZ=ON -DQUARK_SANITIZE=address \
+            -DQUARK_WITH_SODIUM=ON -DQUARK_SODIUM_INCLUDE_DIR=/usr/include \
+            -DQUARK_SODIUM_LIBRARY=/usr/lib/x86_64-linux-gnu/libsodium.a \
+            -DCMAKE_CXX_FLAGS=-DQUARK_FUZZ_PLANT_OOB
+          cmake --build build-fuzz-plant --target fuzz_decoders -j 2
+          mkdir -p build-fuzz-plant/corpus
+          cp build-fuzz/corpus/* build-fuzz-plant/corpus/ 2>/dev/null || true
+          set +e
+          build-fuzz-plant/tests/fuzz_decoders -max_total_time=20 -timeout=10 \
+            -artifact_prefix=build-fuzz-plant/corpus/ build-fuzz-plant/corpus > fuzz-control.log 2>&1
+          rc=$?
+          set -e
+          tail -5 fuzz-control.log
+          if [[ $rc -eq 0 ]]; then
+            echo "::error::fuzz control FAILED: the planted overread was NOT found in 20 s"
+            exit 1
+          fi
+          grep -q "AddressSanitizer" fuzz-control.log || { echo "::error::control exited $rc but not on an ASan report"; exit 1; }
+          echo "fuzz control OK: the planted overread was found (exit $rc)"
 
       - name: Upload ctest logs on failure
         if: failure()
