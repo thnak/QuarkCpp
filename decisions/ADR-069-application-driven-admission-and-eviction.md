@@ -143,3 +143,24 @@ reflection itself is not tested and its exact trigger was not pinned down (`hand
 under `SecureTransport`); closed only by the pinned accept path (#45, ADR-068 follow-up 1). #46's frame-identity concern is closed by the origin
 check, its HELLO-claim concern is not. `TcpTransport::set_admission` answers on the CLAIMED HELLO id; the authenticated check remains the handshake's
 (`Result::peer_node_id`). A denied peer that is only a relay target is not refused as a dial target by shape-B routing through another node.
+
+## 9. Renegotiation ping-pong closed (#48) and unauthenticated failures (#46, session half), 2026-11-01
+
+Root cause of the ping-pong (reproduced deterministically in `security_secure_transport_renegotiation_loop_test`, no timing): a client-role
+node (lower NodeId) with NO engine in flight treated an inbound `Authenticate` frame as an OPENER and answered it as a server. Under the mock
+handshake a ServerHello has the same shape as a ClientHello, so two nodes bounced handshakes indefinitely (20 000 completed renegotiations in
+20 000 frames). Fixes, each sufficient alone (test T3):
+
+1. **Role rule.** Only the higher NodeId is ever a server. A client-role node with no engine in flight drops an inbound Authenticate frame and
+   counts it (`unexpected_authenticate()`). This matches the glare-free rule already stated in handshake.hpp.
+2. **Bound.** A server-role node answers an opener for an already-live session at most once per `set_min_renegotiate_interval` (default 250 ms;
+   `renegotiations_throttled()`); a failed forgery does not move the clock, only a completed handshake does.
+3. **Purge.** `TcpTransport` drops the queued `Authenticate` frames of a peer when its established connection dies
+   (`stale_authenticate_purged()`): a handshake frame is bound to the connection it was meant for. (Verified through the SecureTransport tests
+   and the 48-test regression subset; the TCP purge itself has no isolated deterministic test, the queue is private and a connection that dies
+   with frames still queued cannot be produced without a stalled peer.)
+
+#46 (session half): a failure produced by bytes taken from an inbound Authenticate frame never erases a session, even for a renegotiation this
+side initiated (`inbound_auth_failures_ignored()`); only a failure of this side's own step (empty input) does. Control fault
+`erase_session_on_inbound_failure` restores the old behaviour: the session is erased (T4). Test-side consequence: tests that flooded a LOWER
+NodeId with forged openers now flood a higher one; rotation tests that rekey immediately set the bound to 0.

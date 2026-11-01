@@ -84,6 +84,12 @@ inline void put_u64_le(std::vector<std::byte>& out, std::uint64_t v) {
 // the pre-fix rule that a FAILED handshake this node merely ANSWERED erases the peer's live session.
 struct SecureTransportTestFaults {
     bool erase_session_on_answered_failure = false;
+    // CONTROL for #46: restores the pre-fix rule that a failure of a renegotiation THIS side initiated erases the
+    // session even when the failure came from an unauthenticated inbound frame.
+    bool erase_session_on_inbound_failure = false;
+    // CONTROL for #48: restores the pre-fix behaviour (a client-role node answers an opener; no renegotiation bound).
+    bool answer_opener_as_client = false;
+    bool no_renegotiate_bound = false;
 };
 
 class SecureTransport final : public Transport {
@@ -206,6 +212,17 @@ public:
     static constexpr std::size_t kMaxAuthenticateFrameBytes = 64 * 1024;
     static constexpr std::size_t kMaxSchemaFrameBytes = 64 * 1024;
     static constexpr std::size_t kMaxSchemaTypes = 4096;
+    // #48: a server-role node answers an opener for an already-live session at most once per this interval (default 250 ms).
+    void set_min_renegotiate_interval(std::int64_t ns) noexcept { min_renegotiate_interval_ns_ = ns; }
+    [[nodiscard]] std::uint64_t unexpected_authenticate() const noexcept {
+        return unexpected_authenticate_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t renegotiations_throttled() const noexcept {
+        return renegotiations_throttled_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t inbound_auth_failures_ignored() const noexcept {
+        return inbound_auth_failures_ignored_.load(std::memory_order_relaxed);
+    }
     void set_rotation_policy(std::uint64_t max_frames_per_key, std::int64_t renegotiate_interval_ns) noexcept {
         max_frames_per_key_ = max_frames_per_key;
         renegotiate_interval_ns_ = renegotiate_interval_ns;
@@ -664,7 +681,16 @@ private:
             // ADR-069 #47 M1: ONLY a renegotiation THIS side initiated may erase the session. A handshake
             // we merely ANSWERED is driven by a frame whose `from` is a claim; erasing on its failure let a
             // denied host cut an admitted peer's session with one forged Authenticate frame.
-            if (try_get_session(peer) && (initiated_here || test_faults_.erase_session_on_answered_failure)) {
+            // #46: a failure produced by bytes taken from an inbound Authenticate frame is attributed to an
+            // UNAUTHENTICATED frame (its `from` is a claim), so it never erases the session either; only a
+            // failure of this side's own step (empty input: the engine refused to open, e.g. its own identity
+            // is gone) is trusted.
+            const bool own_failure = in.empty();
+            if (!own_failure && initiated_here && try_get_session(peer))
+                inbound_auth_failures_ignored_.fetch_add(1, std::memory_order_relaxed);
+            if (try_get_session(peer) && ((initiated_here && own_failure) ||
+                                          test_faults_.erase_session_on_answered_failure ||
+                                          test_faults_.erase_session_on_inbound_failure)) {
                 {
                     std::unique_lock<std::shared_mutex> g(map_mu_);
                     sessions_.erase(peer.value);
@@ -778,6 +804,22 @@ private:
             }
         }
         if (!engine) {  // no engine in flight ⇒ we're the server side seeing the opening message
+            // #48: only the HIGHER NodeId is ever the server. A client-role node with no engine in flight that
+            // receives an Authenticate frame has been sent a stale reply (or a forgery); answering it as if it
+            // were an opener is what let two nodes bounce handshakes forever (300 000+ renegotiations).
+            if (local_is_client(self_, peer) && !test_faults_.answer_opener_as_client) {
+                unexpected_authenticate_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            // #48: bound renegotiations of a LIVE session per peer: a peer may not make this node rekey more often
+            // than the interval, however it got the opener to us.
+            if (!test_faults_.no_renegotiate_bound) {
+                if (const auto existing = try_get_session(peer);
+                    existing && now_ns() - existing->renegotiated_at_ns() < min_renegotiate_interval_ns_) {
+                    renegotiations_throttled_.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
             if (admission_.enabled() && admission_.ask(peer).verdict == AdmissionVerdict::Deny) {
                 admission_.handshakes_refused.fetch_add(1, std::memory_order_relaxed);  // 020 §1a: Deny opens nothing
                 audit_(AuditRecord{AuditKind::AuthnFailure, errc::validation, peer.value,
@@ -990,6 +1032,10 @@ private:
     std::function<void(NodeId)> reset_hook_;
     std::uint64_t max_frames_per_key_ = kDefaultMaxFramesPerKey;
     std::int64_t renegotiate_interval_ns_ = kDefaultRenegotiateIntervalNs;
+    std::int64_t min_renegotiate_interval_ns_ = 250'000'000;  // #48: 250 ms
+    std::atomic<std::uint64_t> unexpected_authenticate_{0};
+    std::atomic<std::uint64_t> renegotiations_throttled_{0};
+    std::atomic<std::uint64_t> inbound_auth_failures_ignored_{0};
 
     // Structural-only lock: session lookup/insert. Never held while AEAD seal/open runs — see the
     // required-fix banner above.

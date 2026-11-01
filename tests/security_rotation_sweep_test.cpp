@@ -222,7 +222,9 @@ int main() {
         QueuedTransport n1_inner(fabric, n1), n2_inner(fabric, n2);
         MockCipher unused_cipher(0);
         SecureTransport n1_secure(n1_inner, unused_cipher, n1);
+        n1_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
         SecureTransport n2_secure(n2_inner, unused_cipher, n2);
+        n2_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
         n1_secure.set_clock(&vclock_read, &clk);
         n2_secure.set_clock(&vclock_read, &clk);
         n1_secure.set_rotation_policy(/*max_frames_per_key=*/3, /*renegotiate_interval_ns=*/1'000'000'000'000LL);
@@ -288,7 +290,9 @@ int main() {
         QueuedTransport n3_inner(fabric, n3), n4_inner(fabric, n4);
         MockCipher unused_cipher(0);
         SecureTransport n3_secure(n3_inner, unused_cipher, n3);
+        n3_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
         SecureTransport n4_secure(n4_inner, unused_cipher, n4);
+        n4_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
         n3_secure.set_clock(&vclock_read, &clk);
         n4_secure.set_clock(&vclock_read, &clk);
         constexpr std::int64_t kIdleIntervalNs = 500'000'000;  // 500 ms
@@ -330,7 +334,9 @@ int main() {
         QueuedTransport n5_inner(fabric, n5), n6_inner(fabric, n6);
         MockCipher unused_cipher(0);
         SecureTransport n5_secure(n5_inner, unused_cipher, n5);
+        n5_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
         SecureTransport n6_secure(n6_inner, unused_cipher, n6);
+        n6_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
         n5_secure.set_clock(&vclock_read, &clk);
         n6_secure.set_clock(&vclock_read, &clk);
         n5_secure.set_rotation_policy(/*max_frames_per_key=*/1, /*renegotiate_interval_ns=*/1'000'000'000'000LL);

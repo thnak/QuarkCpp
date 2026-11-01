@@ -149,6 +149,18 @@ public:
     void attach(NodeId n, std::function<void(MessageFrame)> receiver) { receivers_[n] = std::move(receiver); }
     void send(NodeId to, MessageFrame frame) { queue_.push_back({to, std::move(frame)}); }
     [[nodiscard]] std::size_t queued() const noexcept { return queue_.size(); }
+    // Bounded pump: delivers at most `max` frames (a ping-pong never empties the queue). Returns frames delivered.
+    std::size_t pump(std::size_t max) {
+        std::size_t n = 0;
+        while (!queue_.empty() && n < max) {
+            auto [to, frame] = std::move(queue_.front());
+            queue_.pop_front();
+            ++n;
+            const auto it = receivers_.find(to);
+            if (it != receivers_.end()) it->second(std::move(frame));
+        }
+        return n;
+    }
     void pump_all() {
         while (!queue_.empty()) {
             auto [to, frame] = std::move(queue_.front());

@@ -303,11 +303,14 @@ public:
     }
 };
 
+// #48: only the higher NodeId answers an opener, so the node under flood must outrank every claimed sender.
+const NodeId kSelf{100000};
+
 void pending_handshake_cap() {
     LoopbackFabric fab;
-    LoopbackTransport node_tx{fab, NodeId{1}};
+    LoopbackTransport node_tx{fab, kSelf};
     MockCipher cipher{1};
-    SecureTransport secure{node_tx, cipher, NodeId{1}};
+    SecureTransport secure{node_tx, cipher, kSelf};
 
     auto identity = std::make_shared<const TlsIdentity>();
     auto roots = std::make_shared<const TrustedRoots>();
@@ -321,10 +324,10 @@ void pending_handshake_cap() {
     for (std::uint64_t i = 0; i < 300; ++i) {
         MessageFrame f;
         f.from = NodeId{1000 + i};
-        f.to = NodeId{1};
+        f.to = kSelf;
         f.kind = FrameKind::Authenticate;
         f.payload = {std::byte{0x16}, std::byte{0x03}, std::byte{0x01}};
-        attacker.send(NodeId{1}, std::move(f));
+        attacker.send(kSelf, std::move(f));
     }
     check(secure.pending_handshake_count() == SecureTransport::kMaxPendingHandshakes,
           "pending handshakes are capped");
@@ -334,9 +337,9 @@ void pending_handshake_cap() {
 
 void per_ip_pending_cap() {
     LoopbackFabric fab;
-    LoopbackTransport node_tx{fab, NodeId{1}};
+    LoopbackTransport node_tx{fab, kSelf};
     MockCipher cipher{1};
-    SecureTransport secure{node_tx, cipher, NodeId{1}};
+    SecureTransport secure{node_tx, cipher, kSelf};
 
     auto identity = std::make_shared<const TlsIdentity>();
     auto roots = std::make_shared<const TrustedRoots>();
@@ -354,11 +357,11 @@ void per_ip_pending_cap() {
     auto send = [&](std::uint64_t id, std::uint64_t ip) {
         MessageFrame f;
         f.from = NodeId{id};
-        f.to = NodeId{1};
+        f.to = kSelf;
         f.kind = FrameKind::Authenticate;
         f.payload = {std::byte{0x16}, std::byte{0x03}, std::byte{0x01}};
         f.source_address = PeerAddress{ip, 4444, true};
-        attacker.send(NodeId{1}, std::move(f));
+        attacker.send(kSelf, std::move(f));
     };
 
     // Same-IP flood: only 3 pending engines.
@@ -391,9 +394,9 @@ void per_ip_pending_cap() {
 // evicting the legitimate engine, and (b) a claimed-known NodeId must not bypass the per-IP cap.
 void handshake_spoof_resistance() {
     LoopbackFabric fab;
-    LoopbackTransport node_tx{fab, NodeId{1}};
+    LoopbackTransport node_tx{fab, kSelf};
     MockCipher cipher{1};
-    SecureTransport secure{node_tx, cipher, NodeId{1}};
+    SecureTransport secure{node_tx, cipher, kSelf};
 
     auto identity = std::make_shared<const TlsIdentity>();
     auto roots = std::make_shared<const TrustedRoots>();
@@ -409,11 +412,11 @@ void handshake_spoof_resistance() {
     auto send = [&](std::uint64_t id, std::uint64_t ip) {
         MessageFrame f;
         f.from = NodeId{id};
-        f.to = NodeId{1};
+        f.to = kSelf;
         f.kind = FrameKind::Authenticate;
         f.payload = {std::byte{0x16}, std::byte{0x03}, std::byte{0x01}};
         f.source_address = PeerAddress{ip, 4444, true};
-        attacker.send(NodeId{1}, std::move(f));
+        attacker.send(kSelf, std::move(f));
     };
     constexpr std::uint64_t kLegitIp = 0x0A000001;
     constexpr std::uint64_t kAttackIp = 0x0A0000FF;

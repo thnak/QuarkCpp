@@ -409,6 +409,9 @@ public:
     // RST, EOF, network drop) — before any reconnect is armed. `SecureTransport` wires this to
     // `on_peer_disconnected()` (ADR-040) so a per-connection mTLS session never outlives the
     // connection it was negotiated on. Set before start(); called on the loop thread.
+    [[nodiscard]] std::uint64_t stale_authenticate_purged() const noexcept {
+        return stale_auth_purged_.load(std::memory_order_relaxed);
+    }
     void set_peer_down_hook(std::function<void(NodeId)> fn) { peer_down_hook_ = std::move(fn); }
 
     // --- diagnostic counters (atomic; read from a test thread after a sync point) ---------------
@@ -554,6 +557,24 @@ private:
                 data_bytes -= out.size();
             }
             return out;
+        }
+        // #48: drop every queued Authenticate frame (kind byte at wire offset 4 + 5*8 + 1). A handshake frame
+        // is bound to the connection it was meant for; left queued it is sent on the NEXT connection, where the
+        // peer answers a stale opener as if it were new. Returns the number dropped.
+        std::size_t purge_authenticate() {
+            constexpr std::size_t kind_off = 4 + 5 * 8 + 1;
+            std::size_t n = 0;
+            for (auto it = control.begin(); it != control.end();) {
+                if (it->size() > kind_off &&
+                    static_cast<FrameKind>(static_cast<std::uint8_t>((*it)[kind_off])) == FrameKind::Authenticate) {
+                    control_bytes -= it->size();
+                    it = control.erase(it);
+                    ++n;
+                } else {
+                    ++it;
+                }
+            }
+            return n;
         }
         [[nodiscard]] bool consistent() const noexcept {
             std::uint64_t c = 0, d = 0;
@@ -1042,6 +1063,10 @@ private:
         const bool was_identified = c->identified;
         const bool was_established = was_open(c);  // captured before unmark_open() clears it below
         salvage_out(c);  // return unsent whole frames to the peer queue BEFORE the fd/state go away
+        if (was_established && was_identified) {  // #48: handshake frames die with the connection they were for
+            if (const auto qit = outq_.find(peer.value); qit != outq_.end())
+                stale_auth_purged_.fetch_add(qit->second.purge_authenticate(), std::memory_order_relaxed);
+        }
         retire_fd(c->fd);
         by_fd_.erase(c->fd);
         if (was_open(c)) unmark_open(c);
@@ -1536,6 +1561,7 @@ private:
     std::atomic<bool> started_{false};
 
     std::function<void(MessageFrame)> receiver_;  // set before start(); read on the loop thread
+    std::atomic<std::uint64_t> stale_auth_purged_{0};  // #48
     std::function<void(NodeId)> peer_down_hook_;  // set before start(); called on the loop thread
 
     // Connection state — all loop-thread-owned. conns_: identified peers (keyed by NodeId). pending_in_:

@@ -279,7 +279,7 @@ bool test_d6_engine_destroyed_outside_pending_lock() {
     const ClusterId cluster{556};
     auto identity_blob = std::make_shared<const TlsIdentity>(TlsIdentity{});
     auto trust_blob = std::make_shared<const TrustedRoots>(TrustedRoots{});
-    const NodeId self{1}, peer{5};
+    const NodeId self{9}, peer{5};  // #48: only the higher id answers an opener
     RecordingTransport inner;
     MockCipher cipher(7);
     SecureTransport st(inner, cipher, self);
@@ -311,7 +311,7 @@ bool test_a9_pending_cap_not_overshot_by_concurrent_receive() {
     const ClusterId cluster{556};
     auto identity_blob = std::make_shared<const TlsIdentity>(TlsIdentity{});
     auto trust_blob = std::make_shared<const TrustedRoots>(TrustedRoots{});
-    const NodeId self{1};
+    const NodeId self{1000};  // #48: only the higher id answers an opener
     constexpr std::size_t kCap = 4;
     constexpr int kThreads = 16;
     RecordingTransport inner;
