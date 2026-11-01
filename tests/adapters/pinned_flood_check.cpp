@@ -163,6 +163,7 @@ Result run(Node& a, Node& b, bool other_ip, std::uint32_t per_ip_cap, int total,
     r.max_pending = std::max(r.max_pending, sb.tcp.pending_inbound_count());
 
     Stack sa(a);
+    (void)sa.tcp.start();
     sa.tcp.add_peer(loopback_endpoint(b.id, port));
     const auto t0 = Clock::now();
     while (since_ms(t0) < limit_ms) {
