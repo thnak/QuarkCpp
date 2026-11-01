@@ -8,15 +8,24 @@ if(NOT EXISTS "${TARGET_LIB}")
     message(FATAL_ERROR "security_mbedtls_symbol_isolation: TARGET_LIB does not exist: ${TARGET_LIB}")
 endif()
 
+# Symbol lister: MSVC `dumpbin /symbols` (DUMPBIN_EXE) or the GNU/LLVM `nm` (NM_EXE; Linux, issue #49). nm lists
+# defined AND undefined symbols of every member of the archive, so a reference to a sodium_/crypto_ symbol counts too.
+if(DEFINED NM_EXE)
+    set(_quark_lister_cmd "${NM_EXE}" "${TARGET_LIB}")
+elseif(DEFINED DUMPBIN_EXE)
+    set(_quark_lister_cmd "${DUMPBIN_EXE}" /symbols "${TARGET_LIB}")
+else()
+    message(FATAL_ERROR "security_symbol_isolation: neither DUMPBIN_EXE nor NM_EXE given")
+endif()
 execute_process(
-    COMMAND "${DUMPBIN_EXE}" /symbols "${TARGET_LIB}"
+    COMMAND ${_quark_lister_cmd}
     OUTPUT_VARIABLE _quark_dumpbin_out
     ERROR_VARIABLE _quark_dumpbin_err
     RESULT_VARIABLE _quark_dumpbin_rc
 )
 if(NOT _quark_dumpbin_rc EQUAL 0)
     message(FATAL_ERROR
-        "security_mbedtls_symbol_isolation: dumpbin failed (rc=${_quark_dumpbin_rc}): ${_quark_dumpbin_err}")
+        "security_symbol_isolation: symbol lister failed (rc=${_quark_dumpbin_rc}): ${_quark_dumpbin_err}")
 endif()
 
 string(TOLOWER "${_quark_dumpbin_out}" _quark_dumpbin_out_lower)

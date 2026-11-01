@@ -19,7 +19,9 @@
 
 namespace quark::detail {
 
-#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+// QUARK_FORCE_ATOMIC_SHARED_PTR_FALLBACK (issue #49) forces the mutex fallback on a toolchain that has the standard
+// feature, so the Android code path can be run under TSan on Linux.
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L &&     !defined(QUARK_FORCE_ATOMIC_SHARED_PTR_FALLBACK)
 template <class T>
 using AtomicSharedPtr = std::atomic<std::shared_ptr<T>>;
 #else

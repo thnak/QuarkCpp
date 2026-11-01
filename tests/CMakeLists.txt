@@ -378,6 +378,14 @@ if(QUARK_DUMPBIN_EXE_SODIUM AND QUARK_SODIUM_LIBRARY)
                    -DSYMBOL_PREFIXES=sodium_|crypto_
                    -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
   set_tests_properties(security_sodium_symbol_isolation_control PROPERTIES WILL_FAIL TRUE)
+elseif(NOT QUARK_DUMPBIN_EXE_SODIUM AND QUARK_NM_EXE_SODIUM AND QUARK_SODIUM_LIBRARY)
+  add_test(NAME security_sodium_symbol_isolation_control
+           COMMAND ${CMAKE_COMMAND}
+                   -DNM_EXE=${QUARK_NM_EXE_SODIUM}
+                   -DTARGET_LIB=${QUARK_SODIUM_LIBRARY}
+                   -DSYMBOL_PREFIXES=sodium_|crypto_
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/security_mbedtls_symbol_isolation_check.cmake")
+  set_tests_properties(security_sodium_symbol_isolation_control PROPERTIES WILL_FAIL TRUE)
 endif()
 
 # Multi-process SWIM chaos node (tests/netem/): one process per node, each in its own network
