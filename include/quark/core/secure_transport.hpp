@@ -90,6 +90,8 @@ struct SecureTransportTestFaults {
     // CONTROL for #48: restores the pre-fix behaviour (a client-role node answers an opener; no renegotiation bound).
     bool answer_opener_as_client = false;
     bool no_renegotiate_bound = false;
+    // CONTROL for #44: restores the pre-fix AAD, which did not bind the cluster id.
+    bool omit_cluster_in_aad = false;
 };
 
 class SecureTransport final : public Transport {
@@ -297,7 +299,7 @@ public:
         const std::size_t lane = lane_of(frame.kind);
         const std::uint64_t seq = session->next_send_seq(lane);
         const std::uint64_t nonce = nonce_for(self_, to, lane, seq);
-        std::vector<std::byte> aad = build_aad(self_, to, frame, lane, seq);
+        std::vector<std::byte> aad = build_aad(self_, to, frame, lane, seq);  // binds the cluster id (#44)
 
         std::vector<std::byte> envelope;
         detail::put_u64_le(envelope, seq);  // seq travels in the clear (it is the nonce) but is AAD-bound
@@ -1048,9 +1050,14 @@ private:
     // in the CLEAR (only `payload` is sealed), so omitting them let an on-path attacker rewrite, e.g.,
     // principal.rights to an ACL-satisfying value or flip mode to Tagless while the AEAD tag still
     // verified. Authenticated, not encrypted (routing needs it in the clear).
-    [[nodiscard]] static std::vector<std::byte> build_aad(NodeId from, NodeId to, const MessageFrame& f,
-                                                          std::size_t lane, std::uint64_t seq) {
+    //
+    // #44: the cluster id is bound too. Sessions of different clusters already hold different keys (each handshake
+    // derives its own), but a process that is in several clusters with the same device keys must not rely on key
+    // freshness alone: a sealed frame captured in cluster A fails authentication in cluster B even under an identical key.
+    [[nodiscard]] std::vector<std::byte> build_aad(NodeId from, NodeId to, const MessageFrame& f,
+                                                   std::size_t lane, std::uint64_t seq) const {
         std::vector<std::byte> aad;
+        if (!test_faults_.omit_cluster_in_aad) detail::put_u64_le(aad, cluster_id_.value);
         detail::put_u64_le(aad, from.value);
         detail::put_u64_le(aad, to.value);
         detail::put_u64_le(aad, f.target.type.value);
