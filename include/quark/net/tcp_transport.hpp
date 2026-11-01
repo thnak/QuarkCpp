@@ -18,6 +18,11 @@
 //     <sys/*>/<netinet/*>/<winsock2.h> here. Written against `pal::fd_t` (not a raw POSIX `int`), so
 //     this file is unchanged between the Linux (epoll) and Windows (WSAPoll) backends.
 //
+// ADR-071 / ADR-069 "Red-team of the merged changes (#47)": (B1) a new connection from an identified peer
+// supersedes an old one older than the race window whoever dialled (and fires peer_down_hook); (M1) a frame
+// whose `from` differs from the connection's identified peer is dropped unless the receiver opted in for
+// that relay; (N3) set_admission() makes the transport itself refuse, close and not redial a denied peer.
+//
 // THREADING: one dedicated I/O thread runs the IoContext loop; ALL connection state lives on it. `send()`
 // is thread-safe (marshals the frame onto the loop via IoContext::post); the inbound `on_receive` sink is
 // invoked ON the I/O thread (its DistributedRouter/engine target is an ordinary cross-thread producer edge,
@@ -78,6 +83,13 @@ struct HelloRefusal {
 inline constexpr std::int64_t reconnect_base_ns = 20'000'000;    // 20 ms
 inline constexpr std::int64_t reconnect_cap_ns = 2'000'000'000;  // 2 s ceiling
 
+// Test-only fault switches (CONTROLS: each restores one pre-#47 behaviour so a test can show the old
+// failure). Never set in production code.
+struct TcpTestFaults {
+    bool legacy_dial_election = false;  // B1: only the both-inbound rule supersedes; no aged supersede, no hook
+    bool skip_origin_check = false;     // M1: do not compare frame.from with the connection's identity
+};
+
 class TcpTransport final : public Transport {
 public:
     // `self` is this node's identity; `bind_addr`/`bind_port` are where this node LISTENS (port 0 ⇒ the
@@ -94,7 +106,10 @@ public:
         : self_(self), bind_addr_(bind_addr), bind_port_(bind_port),
           fallback_timeout_ns_(fallback_timeout_ns) {}
 
-    ~TcpTransport() override { stop(); }
+    ~TcpTransport() override {
+        if (admission_) admission_->remove_listener(admission_listener_);
+        stop();
+    }
 
     TcpTransport(const TcpTransport&) = delete;
     TcpTransport& operator=(const TcpTransport&) = delete;
@@ -143,6 +158,84 @@ public:
     // multi-homed peers that legitimately reconnect from a different address while the old link lives.
     void set_strict_peer_addr_binding(bool on) noexcept { strict_peer_addr_binding_ = on; }
 
+    // ADR-071 (#47 B1): a new connection from an identified peer whose existing connection has been
+    // confirmed for at least this long is a RECONNECT (the peer changed network, restarted, or the old
+    // socket is half-open) and supersedes it whichever side dialled. Younger than this, the pair is a
+    // genuine simultaneous dial and the lower-NodeId election decides (021 §2). Default 1 s. Set before start().
+    void set_reconnect_supersede_window_ns(std::int64_t ns) noexcept { supersede_window_ns_ = ns; }
+    [[nodiscard]] std::uint64_t reconnects_superseded() const noexcept {
+        return reconnects_superseded_.load(std::memory_order_relaxed);
+    }
+
+    // ADR-069 (#47 M1): a frame delivered locally must carry `from` equal to its connection's identified
+    // peer. A shape-B relay (ADR-048) legitimately delivers a frame whose `from` is the origin; a receiver
+    // opts in per (relay, origin) with this predicate. Default: none (strict). Thread-safe.
+    void set_accept_relayed_frames(std::function<bool(NodeId relay, NodeId origin)> fn) {
+        if (started_.load(std::memory_order_acquire))
+            io_.post([this, f = std::move(fn)]() mutable { accept_relayed_ = std::move(f); });
+        else
+            accept_relayed_ = std::move(fn);
+    }
+    [[nodiscard]] std::uint64_t spoofed_origin_dropped() const noexcept {
+        return spoofed_origin_dropped_.load(std::memory_order_relaxed);
+    }
+
+    // ADR-069 (#47 N3): bind the application's admission authority. A peer whose verdict is Deny is then
+    // refused at HELLO, never dialled and never redialled, its live connection is closed when a snapshot
+    // denies it (no reconnect), and a later snapshot that no longer denies it lifts all of that and dials
+    // it again if its endpoint is known. LogExchangeOnly is not Deny (it needs its connection). Use this
+    // instead of `reset_peer_connection` as SecureTransport's close hook. Cold setup, before start();
+    // `a` must outlive this transport.
+    void set_admission(AdmissionAuthority& a) {
+        if (admission_) admission_->remove_listener(admission_listener_);
+        admission_ = &a;
+        admission_listener_ = a.add_listener([this](const AdmissionSnapshot&) {
+            io_.post([this] { admission_sweep(); });
+        });
+    }
+    [[nodiscard]] std::uint64_t admission_refused() const noexcept {
+        return admission_refused_.load(std::memory_order_relaxed);
+    }
+    void set_test_faults(const TcpTestFaults& f) noexcept { faults_ = f; }
+
+    // #45 (ADR-068 follow-up): PINNED WIRE. No HELLO is sent or expected, so an observer or a prober sees no
+    // NodeId, version or magic from this transport. The dialler knows who it dialled; an accepted connection
+    // stays anonymous until the handshake above (SecureTransport + the Noise IK engine) authenticates its peer and
+    // calls `identify_inbound`. Until then only ONE Authenticate frame is accepted from it. After that the
+    // `from`/`to` of a direct frame are not put on the wire (both 0) and are restored from the connection's
+    // identity, so a capture shows no NodeId in any frame header. Requires a SecureTransport above; incompatible
+    // with the HELLO-based features (relay fallback probes, ADR-048). Call before start().
+    static constexpr std::size_t kAnonOpenerMax = 1024;  // a Noise IK Msg1 is 154 bytes
+    void set_pinned_wire(bool on) noexcept { anonymous_ = on; }
+    [[nodiscard]] bool pinned_wire() const noexcept { return anonymous_; }
+    [[nodiscard]] std::uint64_t anonymous_frames_refused() const noexcept {
+        return anon_refused_.load(std::memory_order_relaxed);
+    }
+
+    void identify_inbound(std::uint64_t token, NodeId peer) override {
+        io_.post([this, token, peer] {
+            for (auto& [fd, c] : pending_in_) {
+                (void)fd;
+                if (c->accept_serial == token) {
+                    (void)register_identified(c.get(), peer);  // authenticated: supersedes (see register_identified)
+                    return;
+                }
+            }
+        });
+    }
+    void reject_inbound(std::uint64_t token) override {
+        io_.post([this, token] {
+            for (auto& [fd, c] : pending_in_) {
+                (void)fd;
+                if (c->accept_serial == token) {
+                    anon_refused_.fetch_add(1, std::memory_order_relaxed);
+                    handle_dead(c.get());
+                    return;
+                }
+            }
+        });
+    }
+
     void add_peer(Endpoint ep) {
         if (started_.load(std::memory_order_acquire))
             io_.post([this, ep] { peers_[ep.node.value] = ep; });
@@ -186,7 +279,7 @@ public:
     // Admission by cluster trust anchor: relay only when BOTH the origin and the destination are
     // admitted by `authority` (the same NodeAuthority SecureTransport/021 admission consults — an
     // AllowlistNodeAuthority populated from membership, or a CA-backed one). `authority` must outlive
-    // this transport; its answers must be safe to read from the I/O thread. ADR-067 D3: this member-only
+    // this transport; its answers must be safe to read from the I/O thread. ADR-074 D3: this member-only
     // form never relays for a CLIENT id on either end; relaying a device to its home node is an explicit
     // per-pair decision made through the predicate overload above (which sees the client bit).
     void set_relay_forwarding(const NodeAuthority& authority) {
@@ -357,6 +450,9 @@ public:
     // RST, EOF, network drop) — before any reconnect is armed. `SecureTransport` wires this to
     // `on_peer_disconnected()` (ADR-040) so a per-connection mTLS session never outlives the
     // connection it was negotiated on. Set before start(); called on the loop thread.
+    [[nodiscard]] std::uint64_t stale_authenticate_purged() const noexcept {
+        return stale_auth_purged_.load(std::memory_order_relaxed);
+    }
     void set_peer_down_hook(std::function<void(NodeId)> fn) { peer_down_hook_ = std::move(fn); }
 
     // --- diagnostic counters (atomic; read from a test thread after a sync point) ---------------
@@ -447,6 +543,8 @@ private:
         // has since moved on (recycled, torn down, or already flipped again).
         std::int64_t first_connecting_ns = 0;
         std::uint32_t fallback_epoch = 0;
+        bool opener_seen = false;       // #45: an anonymous inbound may send exactly one Authenticate frame
+        std::int64_t confirmed_ns = 0;  // when it won dedup / was confirmed (B1: age decides reconnect vs race)
     };
 
     // ADR-048: an out-of-band connection that only ever proves "peer is reachable at its own direct
@@ -502,6 +600,24 @@ private:
             }
             return out;
         }
+        // #48: drop every queued Authenticate frame (kind byte at wire offset 4 + 5*8 + 1). A handshake frame
+        // is bound to the connection it was meant for; left queued it is sent on the NEXT connection, where the
+        // peer answers a stale opener as if it were new. Returns the number dropped.
+        std::size_t purge_authenticate() {
+            constexpr std::size_t kind_off = 4 + 5 * 8 + 1;
+            std::size_t n = 0;
+            for (auto it = control.begin(); it != control.end();) {
+                if (it->size() > kind_off &&
+                    static_cast<FrameKind>(static_cast<std::uint8_t>((*it)[kind_off])) == FrameKind::Authenticate) {
+                    control_bytes -= it->size();
+                    it = control.erase(it);
+                    ++n;
+                } else {
+                    ++it;
+                }
+            }
+            return n;
+        }
         [[nodiscard]] bool consistent() const noexcept {
             std::uint64_t c = 0, d = 0;
             for (const auto& f : control) c += f.size();
@@ -542,11 +658,24 @@ private:
         enqueue_to(dest, std::move(f));
     }
 
+    [[nodiscard]] bool denied(NodeId peer) const {
+        return admission_ != nullptr && admission_->verdict(peer) == AdmissionVerdict::Deny;
+    }
+
     void enqueue_to(NodeId to, MessageFrame frame) {
+        if (denied(to)) {  // ADR-069 N3: never dial or queue for a device the snapshot denies
+            admission_refused_.fetch_add(1, std::memory_order_relaxed);
+            drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         Conn* c = ensure_conn(to);
         if (!c) {  // no endpoint known for `to` ⇒ cannot dial; fire-and-forget drop (010 dead-letter)
             drops_.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
+        if (anonymous_ && frame.from == self_ && frame.to == to) {  // #45: direct frame, ids implied by the connection
+            frame.from = NodeId{};
+            frame.to = NodeId{};
         }
         std::vector<std::byte> bytes = encode_frame(frame);
         const bool is_control = (frame.kind == FrameKind::Control);
@@ -636,6 +765,10 @@ private:
         c->initiated_by_self = true;
         c->identified = true;  // we know exactly who we dialed
         build_hello(c->hello);
+        if (anonymous_) {  // #45: no HELLO either way
+            c->hello_sent = hello_size;
+            c->peer_hello_read = true;
+        }
         Conn* raw = c.get();
         conns_[to.value] = std::move(c);
         by_fd_[raw->fd] = raw;
@@ -678,6 +811,10 @@ private:
             c->initiated_by_self = false;    // the PEER dialed us
             c->identified = false;           // learn their NodeId from their hello
             build_hello(c->hello);
+            if (anonymous_) {  // #45: no HELLO; identified later by the handshake (identify_inbound)
+                c->hello_sent = hello_size;
+                c->peer_hello_read = true;
+            }
             Conn* raw = c.get();
             pending_in_[raw->fd] = std::move(c);
             by_fd_[raw->fd] = raw;
@@ -711,6 +848,9 @@ private:
                 return;
             }
             mark_open(c);  // flips Connecting → Open and counts the connection exactly once
+            // #45: there is no HELLO to confirm a dialled connection; it is the peer's by construction and the
+            // handshake above proves it. Confirm now (a rival connection is resolved inside).
+            if (anonymous_ && c->initiated_by_self && !c->confirmed && !register_identified(c, c->peer)) return;
         }
         if (ev & EPOLLOUT) {
             if (c->confirmed) pump(c);  // drain the peer queue + continue any partial write
@@ -812,15 +952,46 @@ private:
             // Remaining bytes are length-prefixed frames — the "stream" reassembler emits each whole one.
             const PeerAddress src{c->peer_addr, c->peer_port, c->has_peer_addr};
             const NodeId origin = c->peer;
-            const bool ok = c->in.feed(p, n, [this, src, origin](MessageFrame f) {
+            const std::uint64_t anon_token = (anonymous_ && !c->identified) ? c->accept_serial : 0;
+            bool kill = false;
+            const bool ok = c->in.feed(p, n, [this, c, src, origin, anon_token, &kill](MessageFrame f) {
                 frames_received_.fetch_add(1, std::memory_order_relaxed);
                 f.source_address = src;  // transient: never encoded, used for pre-auth admission
+                if (anonymous_) {
+                    if (anon_token != 0) {  // unidentified inbound: exactly one handshake opener, nothing else
+                        if (kill || c->opener_seen || f.kind != FrameKind::Authenticate || f.from.value != 0 ||
+                            f.to.value != 0 || f.payload.size() > kAnonOpenerMax) {
+                            anon_refused_.fetch_add(1, std::memory_order_relaxed);
+                            kill = true;
+                            return;
+                        }
+                        c->opener_seen = true;
+                        f.inbound_token = anon_token;
+                        if (receiver_) receiver_(std::move(f));
+                        return;
+                    }
+                    if (f.from.value == 0 && f.to.value == 0) {  // the wire carries no ids: restore them
+                        f.from = origin;
+                        f.to = self_;
+                    }
+                }
                 if (relay_forwarding_enabled_ && f.to != self_ && f.to.value != 0) {
                     forward_transit(origin, std::move(f));  // never delivered locally
                     return;
                 }
+                // ADR-069 M1: the frame's claimed origin must be the identified peer of THIS connection
+                // (a relay delivers its origin's frames only where the receiver opted in).
+                if (f.from != origin && !faults_.skip_origin_check &&
+                    !(accept_relayed_ && accept_relayed_(origin, f.from))) {
+                    spoofed_origin_dropped_.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
                 if (receiver_) receiver_(std::move(f));
             });
+            if (kill) {  // #45: an anonymous connection broke the one-opener rule
+                handle_dead(c);
+                return;
+            }
             if (!ok) {  // protocol error on the stream (oversized/malformed) ⇒ untrustworthy, drop
                 if (auto it = conns_.find(c->peer.value); it != conns_.end() && it->second.get() == c)
                     handle_dead(c);
@@ -842,10 +1013,13 @@ private:
     //    peer). The rejected dialer just retries with backoff; the live connection is untouched.
     // Must run BEFORE `c->identified`/`c->peer` are set: handle_dead() on an unidentified conn only
     // removes it from pending_in_ and never touches conns_[peer].
-    [[nodiscard]] bool admit_inbound_identity(const Conn* c, NodeId peer) const {
+    [[nodiscard]] bool admit_inbound_identity(const Conn* c, NodeId peer, bool authenticated = false) const {
         const auto it = conns_.find(peer.value);
         const Conn* existing = it != conns_.end() ? it->second.get() : nullptr;
-        if (strict_peer_addr_binding_ && existing != nullptr && existing->st == St::Open &&
+        // #45: with the pinned wire the identity was PROVEN by the handshake (`authenticated`), so a peer that changed
+        // network (new source IP) legitimately supersedes its old connection: the address binding exists only to
+        // stop a spoofed HELLO claim, which no longer exists.
+        if (strict_peer_addr_binding_ && !authenticated && existing != nullptr && existing->st == St::Open &&
             existing->confirmed && existing->has_peer_addr && c->has_peer_addr &&
             existing->peer_addr != c->peer_addr)
             return false;
@@ -864,7 +1038,12 @@ private:
     }
 
     bool register_identified(Conn* c, NodeId peer) {
-        if (!c->initiated_by_self && !admit_inbound_identity(c, peer)) {
+        if (!c->initiated_by_self && denied(peer)) {  // ADR-069 N3: a denied device is refused at HELLO
+            admission_refused_.fetch_add(1, std::memory_order_relaxed);
+            handle_dead(c);
+            return false;
+        }
+        if (!c->initiated_by_self && !admit_inbound_identity(c, peer, /*authenticated=*/anonymous_)) {
             drops_.fetch_add(1, std::memory_order_relaxed);
             handle_dead(c);
             return false;
@@ -882,7 +1061,8 @@ private:
             // No live existing (or only a fd-less Backoff husk): a fresh live inbound supersedes it.
             if (it != conns_.end()) drop_conn(it->second.get());  // cancels the husk (do_reconnect no-ops)
             if (owned_c) conns_[peer.value] = std::move(owned_c);
-            c->confirmed = true;  // sole connection to this peer — frames may flow
+            c->confirmed = true;
+            c->confirmed_ns = now_ns();  // sole connection to this peer — frames may flow
             mark_open(c);
             pump(c);
             on_confirmed(c);
@@ -891,6 +1071,7 @@ private:
         Conn* existing = it->second.get();
         if (existing == c) {  // the dialer's own conn confirming the peer it dialed — no rival, it wins
             c->confirmed = true;
+            c->confirmed_ns = now_ns();
             mark_open(c);
             pump(c);
             on_confirmed(c);
@@ -904,14 +1085,36 @@ private:
         // the canonical connection deterministically from node ids so data only ever flows over it (needs
         // a two-connection-slot rework + gossiped-endpoint dial-back); once settled, delivery is lossless.
         const bool want_self_initiated = keep_local_dial(self_, peer);
-        Conn* survivor = (c->initiated_by_self == want_self_initiated) ? c : existing;
+        // ADR-071 C7: the election is for a dial RACE (one self-initiated conn, one inbound). When BOTH are
+        // inbound, the peer simply dialed again: a RECONNECT (a phone that changed network while this side
+        // still holds the old, possibly half-open, connection). The fresh one supersedes the old; electing
+        // by node id here kept the dead inbound forever when self < peer and refused the live one.
+        const bool both_inbound = !existing->initiated_by_self && !c->initiated_by_self;
+        // ADR-071 #47 B1: the election is for a simultaneous dial only. An existing connection that has
+        // been confirmed longer than the race window and is rivalled by a NEW connection from the same
+        // peer is a RECONNECT whoever dialled it: electing by id kept a dead PC-dialled connection and
+        // closed every connection from the phone (0/50 both ways). Both ends apply the same rule, so both
+        // keep the new connection and the old one closes on both sides without a redial.
+        const bool existing_aged = existing->confirmed && existing->confirmed_ns != 0 &&
+                                   now_ns() - existing->confirmed_ns >= supersede_window_ns_;
+        // #45: an inbound connection identified by the handshake has PROVED the peer's key, so it always replaces
+        // what we hold for that peer (a spoofed HELLO claim, the old way to displace a connection, is gone). Its
+        // session was already swapped in place by that handshake, so the peer-down hook must NOT fire for it.
+        const bool authed_bind = anonymous_ && !c->initiated_by_self;
+        const bool reconnect = authed_bind || both_inbound || (existing_aged && !faults_.legacy_dial_election);
+        Conn* survivor = reconnect ? c : ((c->initiated_by_self == want_self_initiated) ? c : existing);
         dedup_closed_.fetch_add(1, std::memory_order_relaxed);
         if (survivor == c) {
             // `c` (the new conn) wins: take its ownership into conns_[peer], drop the old existing.
+            const bool tell_down = reconnect && !authed_bind && !faults_.legacy_dial_election && was_open(existing);
             salvage_out(existing);       // recover any unsent frames the loser queued (race window)
             drop_conn_detach(existing);  // remove existing from conns_, close it
+            if (reconnect) reconnects_superseded_.fetch_add(1, std::memory_order_relaxed);
+            // The session negotiated on the superseded connection is stale (the peer dropped its half).
+            if (tell_down && peer_down_hook_) peer_down_hook_(peer);
             if (owned_c) conns_[peer.value] = std::move(owned_c);
             c->confirmed = true;
+            c->confirmed_ns = now_ns();
             mark_open(c);
             pump(c);  // the surviving connection drains the peer queue (incl. salvaged frames)
             on_confirmed(c);
@@ -922,6 +1125,7 @@ private:
         retire_fd(c->fd);
         by_fd_.erase(c->fd);
         existing->confirmed = true;
+        if (existing->confirmed_ns == 0) existing->confirmed_ns = now_ns();
         mark_open(existing);
         pump(existing);  // the surviving connection drains the peer queue
         on_confirmed(existing);
@@ -947,6 +1151,10 @@ private:
         const bool was_identified = c->identified;
         const bool was_established = was_open(c);  // captured before unmark_open() clears it below
         salvage_out(c);  // return unsent whole frames to the peer queue BEFORE the fd/state go away
+        if (was_established && was_identified) {  // #48: handshake frames die with the connection they were for
+            if (const auto qit = outq_.find(peer.value); qit != outq_.end())
+                stale_auth_purged_.fetch_add(qit->second.purge_authenticate(), std::memory_order_relaxed);
+        }
         retire_fd(c->fd);
         by_fd_.erase(c->fd);
         if (was_open(c)) unmark_open(c);
@@ -971,6 +1179,38 @@ private:
             conns_.erase(it);        // give up: forget the connection …
             outq_.erase(peer.value);  // … and dead-letter its queued frames (010)
             discard_relay_fallback_state(peer);  // ADR-048
+        }
+    }
+
+    // ADR-069 N3 (loop thread, posted by the authority's listener on every publish): close every connection
+    // (live or Backoff husk) to a peer the snapshot now denies, with no reconnect, and lift the denial of a
+    // peer it no longer denies, dialling it if its endpoint is known.
+    void admission_sweep() {
+        if (!admission_) return;
+        const auto snap = admission_->current();
+        std::vector<std::uint64_t> victims;
+        for (const auto& [id, c] : conns_) {
+            (void)c;
+            if (snap->lookup(NodeId{id}) == AdmissionVerdict::Deny) victims.push_back(id);
+        }
+        for (const std::uint64_t id : victims) {
+            denied_peers_.insert(id);
+            if (const auto it = conns_.find(id); it != conns_.end()) {
+                Conn* c = it->second.get();
+                const bool was_up = was_open(c);
+                drop_conn(c);
+                if (was_up && peer_down_hook_) peer_down_hook_(NodeId{id});  // the session on it is stale
+            }
+            outq_.erase(id);
+            admission_refused_.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::vector<std::uint64_t> lifted;
+        for (const std::uint64_t id : denied_peers_)
+            if (snap->lookup(NodeId{id}) != AdmissionVerdict::Deny) lifted.push_back(id);
+        for (const std::uint64_t id : lifted) {
+            denied_peers_.erase(id);
+            if (conns_.count(id) == 0 && peers_.count(id) != 0 && reconnect_suppressed_.count(id) == 0)
+                (void)ensure_conn(NodeId{id});
         }
     }
 
@@ -1006,6 +1246,12 @@ private:
         // The Backoff husk may have been superseded by a live inbound (register_identified replaced it)
         // between the timer arming and firing — only reconnect if it is STILL an awaiting-reconnect husk.
         if (it->second->st != St::Backoff) return;
+        if (denied(peer)) {  // ADR-069 N3: the snapshot denies it now; forget it instead of redialling
+            denied_peers_.insert(peer.value);
+            drop_conn(it->second.get());
+            outq_.erase(peer.value);
+            return;
+        }
         if (reconnect_suppressed_.count(peer.value)) {
             conns_.erase(it);
             outq_.erase(peer.value);
@@ -1033,6 +1279,10 @@ private:
         c->initiated_by_self = true;
         c->identified = true;
         build_hello(c->hello);
+        if (anonymous_) {  // #45: a reconnect speaks no HELLO either
+            c->hello_sent = hello_size;
+            c->peer_hello_read = true;
+        }
         by_fd_[c->fd] = c;
         c->interest = EPOLLIN | EPOLLOUT;
         io_.add_fd(c->fd, c->interest, [this, f = c->fd](std::uint32_t ev) { on_conn(f, ev); });
@@ -1388,6 +1638,12 @@ private:
     std::uint64_t max_outbound_control_bytes_ = 256ull << 20;  // C1: per-peer control backlog hard cap
     std::uint32_t max_inbound_per_ip_ = 64;       // identified inbound connections per source IP
     bool strict_peer_addr_binding_ = true;        // a live peer's slot cannot be taken from another IP
+    std::int64_t supersede_window_ns_ = 1'000'000'000;  // B1: older than this ⇒ a new conn is a reconnect
+    std::function<bool(NodeId, NodeId)> accept_relayed_;  // M1: (relay, origin) opt-in for relayed frames
+    TcpTestFaults faults_;
+    AdmissionAuthority* admission_ = nullptr;             // N3 (set_admission)
+    std::uint64_t admission_listener_ = 0;
+    std::unordered_set<std::uint64_t> denied_peers_;      // N3: peers closed because the snapshot denies them
     std::int64_t pending_hello_timeout_ns_ = 5'000'000'000;  // 5s to identify
     std::uint64_t accept_serial_ = 0;
     pal::fd_t listener_ = pal::invalid_fd;
@@ -1397,6 +1653,9 @@ private:
     std::atomic<bool> started_{false};
 
     std::function<void(MessageFrame)> receiver_;  // set before start(); read on the loop thread
+    std::atomic<std::uint64_t> stale_auth_purged_{0};  // #48
+    bool anonymous_ = false;                           // #45 pinned wire
+    std::atomic<std::uint64_t> anon_refused_{0};
     std::function<void(NodeId)> peer_down_hook_;  // set before start(); called on the loop thread
 
     // Connection state — all loop-thread-owned. conns_: identified peers (keyed by NodeId). pending_in_:
@@ -1431,6 +1690,9 @@ private:
     std::atomic<std::uint64_t> outbound_control_drops_{0};  // C1
     std::atomic<std::uint64_t> posted_data_bytes_{0};       // C1: data payload bytes posted, not yet on loop
     std::atomic<std::uint64_t> dedup_closed_{0};
+    std::atomic<std::uint64_t> reconnects_superseded_{0};  // B1
+    std::atomic<std::uint64_t> spoofed_origin_dropped_{0};  // M1
+    std::atomic<std::uint64_t> admission_refused_{0};       // N3
     std::atomic<std::uint64_t> reconnects_{0};
     std::atomic<std::uint64_t> conns_open_{0};
 };

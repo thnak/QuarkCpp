@@ -1,14 +1,14 @@
-// Implements ADR-067 D4 — ticketed enrolment, owned by Quark: the transport-agnostic `Enrollment` state
+// Implements ADR-074 D4 — ticketed enrolment, owned by Quark: the transport-agnostic `Enrollment` state
 // machine on the trust anchor (ticket table, the fixed check order, single-use consumption, attempt and
 // per-source limits, the asynchronous `IssueFn` hand-off to the application's key custodian, verification
 // of what the custodian returns, and an audit record per attempt). 021 §Enrolment. Not on any hot path.
 //
-// QUARK NEVER SIGNS (ADR-067 D1). The CA private key stays in the application's custodian; Quark only
+// QUARK NEVER SIGNS (ADR-074 D1). The CA private key stays in the application's custodian; Quark only
 // decides WHETHER a request may be issued and checks the certificate that comes back. Crypto is behind
 // the verify-only `EnrolCrypto` seam (HMAC-SHA256 compare, CSR proof-of-possession, issued-certificate
 // checks) — the std-only core has no SHA-256; the mbedTLS adapter implements it.
 //
-// CHECK ORDER (fixed, ADR-067 D4): source under its rate limit → ticket exists → unexpired → not consumed
+// CHECK ORDER (fixed, ADR-074 D4): source under its rate limit → ticket exists → unexpired → not consumed
 // → under its attempt limit → issuance capacity → constant-time HMAC → CSR proof-of-possession → CONSUME
 // (single use, atomic) → IssueFn. Every presentation reserves one attempt BEFORE any crypto, so
 // concurrent guesses cannot overshoot the limit; a wrong HMAC or a bad CSR leaves the ticket unconsumed
@@ -62,7 +62,7 @@ using Ticks = std::uint64_t;  // the anchor's own monotonic clock, nanoseconds (
 enum class Role : std::uint8_t { Member, Client };
 
 using TicketId = std::array<std::byte, 16>;
-using TicketSecret = std::array<std::byte, 32>;  // 256 bits from the PAL CSPRNG (ADR-067: >= 128)
+using TicketSecret = std::array<std::byte, 32>;  // 256 bits from the PAL CSPRNG (ADR-074: >= 128)
 using MacTag = std::array<std::byte, 32>;        // HMAC-SHA256
 
 // What the operator hands a joiner out of band, together with the anchor's endpoint, NodeId and CA root
@@ -254,7 +254,7 @@ public:
     [[nodiscard]] result<Ticket> issue_ticket(Role role, Ticks ttl, Ticks now) { return shared_->issue_ticket(role, ttl, now); }
 
     // Withdraw a ticket that has not been used. Returns false for an unknown ticket and for one already
-    // consumed — its certificate is issued (or being issued); revoke that identity instead (ADR-067 D2).
+    // consumed — its certificate is issued (or being issued); revoke that identity instead (ADR-074 D2).
     bool revoke_ticket(const TicketId& id) { return shared_->revoke_ticket(id); }
 
     // Whether any unexpired, unconsumed ticket exists — the transport refuses an enrol hello outright

@@ -36,10 +36,10 @@ enum class FileOpenMode : std::uint8_t {
     switch (mode) {
         case FileOpenMode::kReadWriteCreate:  return ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
         case FileOpenMode::kWriteCreateTrunc: return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        case FileOpenMode::kWriteExisting:    return ::open(path.c_str(), O_WRONLY, 0644);
+        case FileOpenMode::kWriteExisting:    return ::open(path.c_str(), O_WRONLY);
         case FileOpenMode::kWriteCreateAppend:
             return ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        case FileOpenMode::kReadOnly:          return ::open(path.c_str(), O_RDONLY, 0644);
+        case FileOpenMode::kReadOnly:          return ::open(path.c_str(), O_RDONLY);
     }
     return invalid_file;
 }

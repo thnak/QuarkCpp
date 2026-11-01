@@ -8,7 +8,7 @@
 //
 // IDENTITY BINDING: NodeId/ClusterId are bound from the peer's verified leaf certificate's Subject
 // Common Name, formatted `"quark:<cluster_id>:<node_id>"` (decimal; `"quark-client:..."` for the
-// ADR-067 client role, grammar in tls_identity.hpp's parse_quark_cn). A SAN URI is the more
+// ADR-074 client role, grammar in tls_identity.hpp's parse_quark_cn). A SAN URI is the more
 // conventional production choice but requires version-sensitive ASN.1 walking; CN binding is exactly
 // as authenticated (it's inside the signed certificate) and uses a stable, documented mbedTLS API
 // (`mbedtls_x509_name` linked list) — swapping the encoding later does not change this seam's shape.
@@ -96,7 +96,7 @@ private:
     return fp;
 }
 
-// The Subject must carry EXACTLY ONE commonName (ADR-067 D3, detail::single_cn), whose value follows the
+// The Subject must carry EXACTLY ONE commonName (ADR-074 D3, detail::single_cn), whose value follows the
 // identity CN grammar (`parse_quark_cn`, tls_identity.hpp).
 [[nodiscard]] inline bool parse_cn_identity(const mbedtls_x509_crt& crt, NodeId& node, ClusterId& cluster) {
     std::string_view cn;
@@ -187,7 +187,7 @@ private:
             return false;
         }
         // S4: verify against the UNION of current + (still-in-window) previous trust roots. Every root in
-        // each bundle is parsed (a bundle may hold several), exactly as the ADR-067 verifier does.
+        // each bundle is parsed (a bundle may hold several), exactly as the ADR-074 verifier does.
         bool any_root = false;
         if (trust_.current && !trust_.current->ca_chain_der.empty()) {
             if (!detail::parse_der_concat(ca_chain_, trust_.current->ca_chain_der)) {
@@ -207,12 +207,12 @@ private:
             setup_failure_ = "no trust roots available (neither current nor previous)";
             return false;
         }
-        // ADR-067 C5: a node never runs with CA key material — neither a trusted root's key (the "CA cert as
+        // ADR-074 C5: a node never runs with CA key material — neither a trusted root's key (the "CA cert as
         // node cert" shortcut) nor an issuing CA's (a CA-capable own certificate). Refused here, for every
         // handshake; validate_identity_not_root (mbedtls_enrollment.hpp) is the same rule at startup.
         if (detail::key_is_a_root(own_key_, ca_chain_) || detail::key_is_a_root(own_cert_.pk, ca_chain_) ||
             detail::ca_capable(own_cert_)) {
-            setup_failure_ = "own identity is CA key material (ADR-067 C5)";
+            setup_failure_ = "own identity is CA key material (ADR-074 C5)";
             return false;
         }
 
@@ -258,7 +258,7 @@ private:
         if (self->revoked_ && self->revoked_->contains(self->peer_fingerprint_)) {
             *flags |= MBEDTLS_X509_BADCERT_REVOKED;
         }
-        // ADR-067 D1: a node identity is never a CA. A leaf claiming CA:TRUE is refused, so a mis-issued
+        // ADR-074 D1: a node identity is never a CA. A leaf claiming CA:TRUE is refused, so a mis-issued
         // leaf cannot also serve as an intermediate for peer-sent chains.
         if (mbedtls_x509_crt_get_ca_istrue(crt) == 1) *flags |= MBEDTLS_X509_BADCERT_NOT_TRUSTED;
         return 0;

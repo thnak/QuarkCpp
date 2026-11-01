@@ -1,7 +1,7 @@
 // Tests ADR-048 relay side, shape B (issue #14): a node with set_relay_forwarding() forwards transit
 // frames (to != self) byte-for-byte; the admit predicate gates it (fail-closed open-proxy guard); the
 // origin must match the connection's identity; set_relay_via() gives an ordered failover relay list;
-// ADR-067 D3 client ids are refused by the NodeAuthority form and relayed only by explicit opt-in.
+// ADR-074 D3 client ids are refused by the NodeAuthority form and relayed only by explicit opt-in.
 // Topology: spoke A and spoke B each know ONLY relay R (hub-and-spoke); A -> B must cross R.
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +44,8 @@ void secure_via_relay(bool& ok) {
     tr.on_receive([](MessageFrame) {});
     tr.set_allow_insecure_plaintext(true);  // the relay carries only already-sealed end-to-end frames
     tr.set_relay_forwarding(authority);
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "secure: listeners start", ok);
     ta.add_peer(loopback_endpoint(R, tr.listen_port()));
     tb.add_peer(loopback_endpoint(R, tr.listen_port()));
@@ -64,7 +66,7 @@ void secure_via_relay(bool& ok) {
     ta.stop(); tb.stop(); tr.stop();
 }
 
-// ADR-067 D3: the NodeAuthority form never relays for a CLIENT id (even under admit-all); relaying a
+// ADR-074 D3: the NodeAuthority form never relays for a CLIENT id (even under admit-all); relaying a
 // device to its home node is an explicit per-pair opt-in through the predicate form.
 void client_relay_policy(bool& ok) {
     const NodeId C{kClientNodeBit | 31}, B{33};
@@ -76,6 +78,8 @@ void client_relay_policy(bool& ok) {
         net::TcpTransport tb(B, pal::ipv4_loopback, 0);
         Recorder rb;
         tb.on_receive([&](MessageFrame f) { rb(std::move(f)); });
+        // ADR-069 M1: a relay delivers its origin's frames only where the receiver opted in (as tcp_frame_origin_test).
+        if (opt_in) tb.set_accept_relayed_frames([R, C](NodeId relay, NodeId origin) { return relay == R && origin == C; });
         tr.on_receive([](MessageFrame) {});
         if (opt_in)
             tr.set_relay_forwarding([C, B](NodeId origin, NodeId dest) { return origin == C && dest == B; });
@@ -128,6 +132,8 @@ void discovery(bool& ok) {
     tb.on_receive([&](MessageFrame f) { rb(std::move(f)); });
     tr.on_receive([](MessageFrame) {});
     tr.set_relay_forwarding([](NodeId, NodeId) { return true; });
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "discovery: listeners start", ok);
     tr.add_peer(loopback_endpoint(NodeId{28}, tb.listen_port()));
     const Endpoint relay_ep = loopback_endpoint(R, tr.listen_port());
@@ -157,6 +163,8 @@ int main() {
     tr.on_receive([&](MessageFrame f) { rr(std::move(f)); });
     std::atomic<bool> allow{false};
     tr.set_relay_forwarding([&](NodeId, NodeId) { return allow.load(); });
+    // #47 M1: the destinations accept frames relayed by R (a frame whose `from` is not the connection peer).
+    for (net::TcpTransport* d : {&ta, &tb}) d->set_accept_relayed_frames([](NodeId, NodeId) { return true; });
     check(tr.start() && ta.start() && tb.start(), "all three listeners start", ok);
     if (!ok) return 1;
 

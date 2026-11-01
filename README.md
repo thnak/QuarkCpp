@@ -1,7 +1,12 @@
 # Quark Engine
 
-**A high-performance C++23 actor engine for building highly concurrent, distributed systems.**
-The runtime owns optimization; developers express only intent.
+**The network center of [AeroCoWorker](https://github.com/thnak/AeroCoWorker): a C++23 actor-based networking core.**
+
+> **Direction (owner, 2026-10-31, [ADR-067](decisions/ADR-067-direction-aerocoworker-network-center.md)):** Quark no longer aims to be a
+> general-purpose distributed actor engine competing with CAF. It is AeroCoWorker's network center: every machine-to-machine path (node plane,
+> hosted Team and hub, serverless LAN group, phones and devices attaching to their home PC, relays, headless Linux nodes). The actor runtime is
+> kept as internal machinery; features no network use needs are frozen (no new work or promises). The description below is the engine as built,
+> and is kept accurate; read it with that direction in mind.
 
 [![CI](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml/badge.svg)](https://github.com/thnak/QuarkCpp/actions/workflows/ci.yml)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
@@ -317,6 +322,8 @@ CTest gates in [`tests/`](tests/), not noise-sensitive benchmarks; see PERFORMAN
 
 ## Comparing to CAF
 
+> **Historical (ADR-067):** Quark no longer positions itself against CAF; this comparison is kept as the record of its hot-path claims.
+
 [`bench/caf_comparison/`](bench/caf_comparison/) benchmarks Quark head-to-head against
 **CAF** (the C++ Actor Framework), a mature, general-purpose actor toolkit. **The goal of that
 comparison is to sanity-check Quark's hot-path claims against an established alternative, not to
@@ -536,7 +543,12 @@ before a judge picks a winner. The durable records live in [`decisions/`](decisi
 | [ADR-064](decisions/ADR-064-hot-path-division-and-resolve-flat-map.md) | Counter-guided hot-path wins (003/006, #4) | `MessagePool` partition by mask (no `div` per acquire) + flat open-addressing `by_id_`; 1P->1C 4.9 -> 6.3 M msg/s; five other candidates measured and rejected. |
 | [ADR-065](decisions/ADR-065-pool-per-pool-lanes-and-sibling-borrow.md) | `MessagePool` per-pool lanes + sibling-borrow before heap growth (003, #30/#31) | **Accepted** (2026-10-28) — no lane collisions across pools; growth no longer serialises producers behind malloc. |
 | [ADR-066](decisions/ADR-066-dekker-rendezvous-as-seq-cst-operations.md) | Dekker rendezvous as `seq_cst` operations, not standalone fences (001/002/003/015/024) | Every StoreLoad pair is now a `seq_cst` store/RMW + `seq_cst` load: TSan-modelled (GCC `-Wtsan` gone), `dmb ish` removed on AArch64, x86 one locked op for one; litmus 0/50M, relaxed control fires; benches flat. |
-| [ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md) | Trust-anchor-signed revocation, ticketed enrolment, client identity role (020/021, #35/#36/#37) | **Proposed** (2026-10-29) — CA key never in Quark (verify-only seam; pre-signed revocation records; async `IssueFn`); `quark-client:` CN role + NodeId bit 63 (disjoint id spaces) kept out of SWIM/relay/placement; red-team round 1 (12 findings) folded in; tests outstanding. |
+| [ADR-067](decisions/ADR-067-direction-aerocoworker-network-center.md) | Direction: AeroCoWorker's network center, not a general actor engine (owner) | Accepted as direction, no evidence claimed; roadmap #35-#37, #40-#44; Windows and Android first-class; unused features frozen. |
+| [ADR-068](decisions/ADR-068-pinned-key-noise-ik.md) | Pinned-key handshake: Noise IK over libsodium (020, 021; issue #40) | A second handshake mode beside the CA chain, for clusters with no CA: peers are their full Ed25519 key (NodeId derived from it), the application's `PinnedTrust` decides at every handshake, and a responder that cannot authenticate and admit the first message sends **nothing** (no cleartext HELLO in this mode). `Noise_IK_25519_ChaChaPoly_BLAKE2b` written from libsodium primitives and matched to the official cacophony vector byte for byte; replay refused by timestamp; the CA and pinned modes cannot complete with each other. Windows-only runs; CI, sanitizers, and the TcpTransport wiring (no HELLO, sealed headers) are **not** done. |
+| [ADR-069](decisions/ADR-069-application-driven-admission-and-eviction.md) | Application-driven admission snapshots, eviction, authority-only revocation (020 section 1a, 021; issue #41) | **Proposed.** Immutable generation-numbered tri-state snapshot by atomic swap; publish re-answers handshakes and live sessions, discards-and-counts denied inbound, stamps delivered frames; `Evicted` membership event; authority-only revocation switch. Controls fail with each guarantee removed; sanitizers owed. |
+| [ADR-070](decisions/ADR-070-lan-discovery-adapter.md) | LAN discovery adapter: DNS-SD with app-supplied rotating ids (021; issue #42) | Proposed. A std-only adapter over a platform seam (Windows dnsapi behind `QUARK_WITH_DNSSD`, a fake for tests) that advertises and browses an application-supplied rotating instance id and feeds candidates to `TcpTransport::add_peer`; discovery grants nothing, admission stays with `NodeAuthority`. Windows-only runs; real same-machine address resolution did not complete, two-machine resolve, dial by address (#45), Linux and sanitizers are **not** done. |
+| [ADR-071](decisions/ADR-071-android-pal-and-mobile-lifecycle.md) | Android PAL + mobile lifecycle (019/021, #43) | **Proposed** — NDK r28 builds x86-64 and arm64-v8a; epoll only; `suspend`/`resume`/`network_changed` and a bounded-lease mobile member profile; emulator x86-64 only, no device. |
+| [ADR-074](decisions/ADR-074-trust-anchor-signed-revocation-enrolment-client-role.md) | Trust-anchor-signed revocation, ticketed enrolment, client identity role (020/021, #35/#36/#37) | **Proposed** (2026-10-29) — CA key never in Quark (verify-only seam; pre-signed revocation records; async `IssueFn`); `quark-client:` CN role + NodeId bit 63 (disjoint id spaces) kept out of SWIM/relay/placement; red-team round 1 (12 findings) folded in; tests outstanding. |
 
 </details>
 
@@ -570,6 +582,7 @@ adapters that are never linked into a minimal build:
 | Subsystem | Std-only default | Optional adapter (behind a seam) |
 |---|---|---|
 | Transport (010) | TCP + length-prefixed frames; per-OS event loop (epoll/io_uring · kqueue · IOCP) via the PAL | gRPC/QUIC/RDMA |
+| Transport security (020) | none with real crypto (a named dev-only plaintext/`MockCipher` path; crypto is the one deliberate exception) | mbedTLS (CA-chain mTLS, ADR-040) and libsodium (pinned-key Noise IK, ADR-068), each `QUARK_WITH_*`, never linked into the core |
 | Serialization (016) | canonical tagged TLV from one `QUARK_SERIALIZE` per type + negotiated tagless wire fast path | protobuf / FlatBuffers / Cap'n Proto |
 | Membership (010) | in-house SWIM gossip | etcd / Consul |
 | Persistence (012) | `InMemoryStore` (reference) + `FileStore` (append-only WAL + `fdatasync`, crash-durable) — see [PersistenceAdapters.md](PersistenceAdapters.md) | `SqliteStore` / `RocksStore` (opt-in: `QUARK_WITH_SQLITE`/`QUARK_WITH_ROCKSDB`); Postgres/object-store behind the same `Store` seam |

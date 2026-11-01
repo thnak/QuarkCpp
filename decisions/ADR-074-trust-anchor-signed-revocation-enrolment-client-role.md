@@ -1,4 +1,4 @@
-# ADR-067 — Trust-anchor-signed revocation, ticketed enrolment, and the client identity role (020/021; #35, #36, #37)
+# ADR-074 — Trust-anchor-signed revocation, ticketed enrolment, and the client identity role (020/021; #35, #36, #37)
 
 Status: **Proposed** (2026-10-29). Design settled by direct discussion with the owner, then red-teamed
 (round 1, 2026-10-29: 12 findings, all folded in below; see *Red-team round 1*). The tests listed under

@@ -22,7 +22,7 @@
 #include "quark/core/engine_config.hpp"  // SecurityMode (013)
 #include "quark/core/error.hpp"
 #include "quark/core/principal.hpp"  // Principal + attenuation algebra (020 §3)
-#include "quark/core/revocation_registry.hpp"  // validate_revocation_trust (ADR-067 D2)
+#include "quark/core/revocation_registry.hpp"  // validate_revocation_trust (ADR-074 D2)
 #include "quark/core/transport.hpp"  // Transport::is_plaintext() for validate_startup_security
 
 namespace quark {
@@ -43,7 +43,7 @@ namespace quark {
     return {};
 }
 
-// ADR-067 D2: under `Strict`, a cluster authenticated by the mTLS handshake must gossip only anchor-SIGNED
+// ADR-074 D2: under `Strict`, a cluster authenticated by the mTLS handshake must gossip only anchor-SIGNED
 // revocations (`RevocationRegistry::enable_signed`). Unsigned gossip there would let any admitted member
 // revoke a third party, so the combination is a startup Validation failure. Signed records ride a section
 // that SWIM wire v1 cannot carry, so a node pinned to v1 (`SwimMembership::Config::wire_version`) would
@@ -55,9 +55,9 @@ namespace quark {
     if (mode != SecurityMode::Strict || !handshake_enabled) return {};
     if (!registry.signed_mode())
         return fail(errc::validation,
-                    "Strict + mTLS handshake requires anchor-signed revocation gossip (ADR-067 D2)");
+                    "Strict + mTLS handshake requires anchor-signed revocation gossip (ADR-074 D2)");
     if (swim_wire_version < 2)
-        return fail(errc::validation, "signed revocation gossip needs SWIM wire version >= 2 (ADR-067 D2)");
+        return fail(errc::validation, "signed revocation gossip needs SWIM wire version >= 2 (ADR-074 D2)");
     return {};
 }
 

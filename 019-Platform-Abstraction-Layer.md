@@ -188,6 +188,8 @@ deterministic per seed, C6).
 
 The io_uring-vs-epoll choice on Linux is a build option, not a runtime one.
 
+Android (Linux kernel + bionic) reuses the Linux column with epoll only: see "Android target" below.
+
 ### Support matrix (ADR-026, proven — corrects a previously fabricated floor)
 
 - **Linux io_uring backend:** floor kernel **5.1** (covers `io_uring_setup`,
@@ -207,6 +209,85 @@ probe, never `uname()`/runtime detection. Construction (`IoContext::create()`/
 equivalent) must **fail fast** with `std::unexpected` if the compiled-in
 backend's minimum requirement is not met at runtime (proven: C8) — never
 silently degrade per-op.
+
+## Android target (Draft amendment — ADR-071, owner direction ADR-067)
+
+> **Status: Draft.** Written from the build and the measurements in
+> [ADR-071](decisions/ADR-071-android-pal-and-mobile-lifecycle.md); promoted only by that ADR's gates. The
+> emulator evidence is x86-64; **nothing here has run on a physical device or on arm64** (ADR-071 §8).
+
+**What Android is, for the PAL.** Linux kernel + bionic libc. It is NOT a new OS backend: the existing
+Linux backend (`pal/linux_x86_64/`, an **epoll** reactor; the directory name is historical) compiles and runs
+unchanged under the NDK, apart from two bionic fixes (an `open(2)` call that passed a mode without `O_CREAT`;
+see ADR-071 §3). The `android` target therefore adds a *toolchain contract and a lifecycle contract*, not a
+fourth I/O backend.
+
+| Facility | Android |
+|---|---|
+| Event loop | **`epoll` only.** `io_uring` is not selectable and must not be probed at run time. |
+| Monotonic (suspend-counting) | `CLOCK_BOOTTIME` (unchanged; it counts Doze/suspend, so deadlines see a sleep) |
+| Affinity / NUMA | best-effort hint / single node (as Linux without NUMA) |
+| Durable flush | `fdatasync` |
+| CSPRNG | `getrandom` (API 28+, always present at the floor) |
+| ABI tag (016) | its **own** tag, `'A','N','D','R'` (`0x41'4E'44'52`): bionic struct layout is not proven equal to glibc's, so no tagless fast path to a Linux peer until it is (same reasoning as the Windows tag) |
+
+**No `io_uring`.** Android's app seccomp allowlist is `SYSCALLS.TXT − SECCOMP_BLOCKLIST_APP.TXT +
+SECCOMP_ALLOWLIST_APP.TXT`, applied to zygote-spawned processes (header of `SECCOMP_BLOCKLIST_APP.TXT`,
+AOSP `bionic/libc`), and `io_uring_setup/enter/register` appear in none of those files (fetched 2026-10-31,
+branch `main`), so an app process that issues them is killed by `SIGSYS`. This is a **source citation, not an
+on-device app test** (ADR-071 §3 / claim C8 states the experiment that would break it). `adb shell` is not a
+zygote process and does not prove or disprove it (on the emulator `io_uring_setup` answers `EFAULT` there).
+
+**Toolchain (CMake, `cmake/QuarkAndroid.cmake`, included only when `CMAKE_SYSTEM_NAME` is `Android`).**
+
+- NDK **r28 or newer** (clang 19), through the NDK's own `android.toolchain.cmake`.
+- ABIs: **`arm64-v8a` (first-class)** and **`x86_64` (emulator and test)**. 32-bit ABIs are refused at
+  configure time. 16 KiB page-size link flag (`-Wl,-z,max-page-size=16384`) on the shared library.
+- Minimum **API 35** (Android 15, AeroCoWorker's client floor). A lower `ANDROID_PLATFORM` is a configure
+  error, not a silent downgrade.
+- `-fexperimental-library`: NDK r28's libc++ (LLVM 19) ships `std::stop_token`/`stop_source` as experimental.
+  Two further libc++ gaps are bridged in the core, not worked around per call site: `std::atomic<shared_ptr>`
+  (→ `quark::detail::AtomicSharedPtr`, a mutex fallback exactly where the standard feature is absent) and
+  `std::atomic_ref` (→ `quark::detail::load_relaxed`). Both are no-ops on toolchains that have the feature.
+- Artifacts: `libquark_android.so` (C ABI, `include/quark/android/quark_android.h`, loaded by the app's JNI glue;
+  **no JNI types in Quark**) and `quark_mobile_runner` (a native, `adb push`-able test runner).
+
+**Sanitizer and test gates on the NDK (the stated subset).**
+
+| Gate | Android |
+|---|---|
+| Full correctness suite | yes — the whole `tests/` set builds for x86-64; the on-device run is in ADR-071 §6 |
+| ASan + UBSan | yes via the NDK's clang runtime (`-fsanitize=address,undefined`); **not run in ADR-071** (owed) |
+| HWASan | arm64 only; owed, needs a device |
+| TSan | **not available** on Android (no NDK runtime); thread-safety evidence stays on the Linux/Windows TSan legs |
+| Benchmarks / the 023 budgets | not re-baselined; the `AtomicSharedPtr` fallback is unmeasured |
+| Run-time gate on a device | not claimed until a physical device runs the suite |
+
+**Mobile lifecycle contract.** Quark never calls up into Java or Kotlin. The host application owns everything
+the OS makes the application's job: the foreground service, `WifiManager.MulticastLock`, `NsdManager` (a
+discovery adapter, 021 / Q3), Doze and background-execution decisions, and *when* to suspend. It tells the
+node three things, from any thread (`MobileMember`, `include/quark/core/mobile_member.hpp`; C ABI
+`quark_android_node_*`):
+
+- `suspend(reason, lease)` — the process is about to be frozen (`AppBackground`, `Doze`, `NetworkLost`, `Other`).
+  The node announces a graceful, **bounded-lease** suspension to every live peer, then stops probing,
+  gossiping and answering control traffic. The data plane belongs to the app: a frozen process receives
+  nothing, and the transport is its own concern.
+- `resume()` — the process runs again. The node raises its incarnation, forgives the local timers the sleep
+  made meaningless, and tells every peer at once.
+- `network_changed()` — the default network changed (Wi-Fi ↔ cellular, new address). The node drops each live
+  peer connection through the transport's existing reset seam and lets the transport reconnect; frames that
+  were not yet on the wire survive in the per-peer queue; the membership forgives path-dependent state.
+
+The membership half of this is specified in
+[021 §"Mobile member profile"](021-Cluster-Formation-and-Lifecycle.md#mobile-member-profile-adr-071); the
+transport half adds one normative rule to the TCP transport (010): **a fresh inbound connection from an
+identified peer supersedes an existing inbound connection from that peer** (a reconnect), instead of being
+elected away by node id. The id election is for a dial race (one self-initiated, one inbound) only.
+
+**Owed, not claimed:** a physical device; a real Wi-Fi ↔ cellular switch (including the *source-address*
+change, which `set_strict_peer_addr_binding` governs, ADR-071 §5); idle battery cost; multicast on the emulator
+(the app holds the `MulticastLock`); arm64 execution; ASan/UBSan/HWASan runs on the NDK; the Kotlin/JNI side.
 
 ## Simulation backend — how deterministic testing works (014)
 

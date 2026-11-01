@@ -1,4 +1,4 @@
-// Implements ADR-040 / ADR-067 D1/D4 — shared X.509 helpers for the mbedTLS adapters, so the TLS handshake
+// Implements ADR-040 / ADR-074 D1/D4 — shared X.509 helpers for the mbedTLS adapters, so the TLS handshake
 // (mbedtls_handshake.hpp), the revocation verifier (mbedtls_trust_anchor.hpp) and the enrolment checks
 // (mbedtls_enrollment.hpp) parse a trust bundle and a Subject the same way, and therefore trust exactly
 // the same roots and read exactly the same identity.
@@ -34,7 +34,7 @@ namespace quark::adapters::detail {
     return true;
 }
 
-// The value of the Subject's commonName, if there is EXACTLY ONE (ADR-067 D3). mbedtls_x509_name is a
+// The value of the Subject's commonName, if there is EXACTLY ONE (ADR-074 D3). mbedtls_x509_name is a
 // linked list of {oid, val} pairs (asn1.h); every attribute is walked so a second CN is seen wherever it
 // sits. False when there is none or more than one.
 [[nodiscard]] inline bool single_cn(const mbedtls_x509_crt& crt, std::string_view& cn) {
@@ -71,7 +71,7 @@ struct Spki {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
-// ADR-067 D1/C5: a certificate that can act as a CA — basicConstraints CA:TRUE, or keyUsage keyCertSign or
+// ADR-074 D1/C5: a certificate that can act as a CA — basicConstraints CA:TRUE, or keyUsage keyCertSign or
 // cRLSign. Neither a node identity nor an issued enrolment certificate may be one. keyUsage absent means
 // unrestricted, but CA:TRUE is then still required to sign certificates, so absent keyUsage is fine here.
 [[nodiscard]] inline bool ca_capable(const mbedtls_x509_crt& crt) {
@@ -81,7 +81,7 @@ struct Spki {
             mbedtls_x509_crt_check_key_usage(&crt, MBEDTLS_X509_KU_CRL_SIGN) == 0);
 }
 
-// ADR-067 C5: true if `key`'s public key equals the public key of any certificate in `roots` — i.e. the
+// ADR-074 C5: true if `key`'s public key equals the public key of any certificate in `roots` — i.e. the
 // node would be running with a trusted root's private key in process. Fails closed: a key whose SPKI
 // cannot be written counts as a match.
 [[nodiscard]] inline bool key_is_a_root(const mbedtls_pk_context& key, const mbedtls_x509_crt& roots) {

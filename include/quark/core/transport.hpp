@@ -86,6 +86,12 @@ struct MessageFrame {
                                        // anonymous. Stamped ATTENUATED from the sender's inbound context
                                        // at the wire edge; re-established as the ambient on receive.
     PeerAddress source_address{};      // transport-local, never serialized (pre-auth per-IP accounting)
+    std::uint64_t inbound_token = 0;  // #45: transport-local handle of an UNIDENTIFIED inbound connection (pinned wire,
+                                      // no HELLO) the frame arrived on; 0 otherwise. Never serialized.
+    std::uint64_t admission_generation = 0;  // ADR-069: set by SecureTransport on delivery = the admission
+                                             // snapshot generation this frame was admitted under (the peer
+                                             // identity is `from`, authenticated by the session). Never
+                                             // serialized; 0 when no AdmissionAuthority is attached.
 };
 
 // The transport seam (010). Fire-and-forget by contract; ordering/at-most-once are the transport's
@@ -98,6 +104,14 @@ public:
     // Hand `frame` toward node `to`. Fire-and-forget: no delivery result here (a peer-down failure
     // surfaces as an `ask` error / local dead-letter per the 010 delivery table, not a return code).
     virtual void send(NodeId to, MessageFrame frame) = 0;
+
+    // #45 (pinned wire, no HELLO): an inbound connection carries no identity until the handshake above this
+    // transport authenticates its peer. `token` is `MessageFrame::inbound_token`. `identify_inbound` binds that
+    // connection to the AUTHENTICATED `peer` (a connection of that peer already held is superseded: the new one
+    // has proved the same key); `reject_inbound` closes it (silent refusal). Defaults: no-ops (a transport whose
+    // connections are identified by a HELLO never produces a non-zero token).
+    virtual void identify_inbound(std::uint64_t token, NodeId peer) { (void)token; (void)peer; }
+    virtual void reject_inbound(std::uint64_t token) { (void)token; }
 
     // Register the inbound sink for THIS node's transport endpoint. Frames addressed to this node are
     // handed to `cb` (the distributed router's `deliver`).

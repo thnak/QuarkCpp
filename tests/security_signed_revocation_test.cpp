@@ -1,4 +1,4 @@
-// Tests ADR-067 D2 — issuer-authenticated (anchor-signed) revocation: the record format
+// Tests ADR-074 D2 — issuer-authenticated (anchor-signed) revocation: the record format
 // (signed_revocation.hpp), RevocationRegistry's signed mode, the SWIM signed-revocation section
 // (cluster.hpp), and the Strict startup check (security.hpp). Std-only: a MockVerifier stands in for the
 // trust anchor with a keyed toy signature; real ECDSA P-256 is in tests/adapters/mbedtls_handshake_check.cpp.

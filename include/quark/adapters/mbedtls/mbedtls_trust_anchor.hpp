@@ -1,10 +1,10 @@
-// Implements ADR-067 D1/D2 — `MbedtlsTrustAnchorVerifier`, the mbedTLS implementation of the verify-only
+// Implements ADR-074 D1/D2 — `MbedtlsTrustAnchorVerifier`, the mbedTLS implementation of the verify-only
 // `TrustAnchorVerifier` seam (signed_revocation.hpp). It holds NO private key: it verifies an
 // ECDSA-with-SHA-256 signature against the PUBLIC key of a trusted root, selected by `anchor_key_id`
 // (SHA-256 of the root's SubjectPublicKeyInfo DER), from the cluster `TrustStore` — current roots plus
 // the still-in-window previous roots (ADR-040 overlap). A root is a revocation signer only if it is a CA
 // (basicConstraints CA:TRUE, and keyCertSign when keyUsage is present) with an ECDSA P-256 key
-// (ADR-067 D1); any other certificate in a bundle never verifies.
+// (ADR-074 D1); any other certificate in a bundle never verifies.
 //
 // The bundles are parsed with the SAME walker the TLS handshake uses (mbedtls_x509_util.hpp), so both
 // trust exactly the same roots, and the parse is cached per TrustStore generation. All calls are
@@ -111,7 +111,7 @@ private:
             .count();
     }
 
-    // A certificate may sign revocations only if it is a CA with an ECDSA P-256 key (ADR-067 D1).
+    // A certificate may sign revocations only if it is a CA with an ECDSA P-256 key (ADR-074 D1).
     [[nodiscard]] static bool eligible_signer(const mbedtls_x509_crt& c) {
         return mbedtls_x509_crt_get_ca_istrue(&c) == 1 &&
                mbedtls_x509_crt_check_key_usage(&c, MBEDTLS_X509_KU_KEY_CERT_SIGN) == 0 &&

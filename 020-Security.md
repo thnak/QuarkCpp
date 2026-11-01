@@ -77,7 +77,7 @@ Every node has a **cryptographic identity** (a key pair; the public half is its
   [021-Cluster-Formation-and-Lifecycle.md](021-Cluster-Formation-and-Lifecycle.md);
   this spec validates against the anchor, 021 establishes it.
 
-**Identity roles — member and client ([ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed).**
+**Identity roles — member and client ([ADR-074](decisions/ADR-074-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed).**
 A certificate carries one of two roles in its Subject CN: `quark:<cluster>:<node>` is a
 **member**, `quark-client:<cluster>:<node>` is a **client** (a distinct prefix, so an older
 parser refuses a client certificate rather than reading it as a member). The role is also
@@ -97,6 +97,66 @@ This closes the sharpest distributed hole: because placement is *any-node-hosts-
 (010), cluster admission **is** data authorization at the node granularity. A
 rogue node that cannot authenticate cannot be placed onto and therefore cannot
 observe state.
+
+### 1a. Application-driven admission snapshots and authority-only revocation *(Draft amendment, ADR-069, 2026-10-31)*
+
+> **Status: Draft amendment.** Specified here first, implemented in `include/quark/core/admission.hpp`
+> and `secure_transport_admission.hpp`, proven by the tests ADR-069 lists. Not yet Accepted: ADR-069 is
+> Proposed. Consumer: AeroCoWorker RFC 002 section 6e item 4 (gate G10 b), ADR-044 L6b/L6c; issue #41.
+
+`NodeAuthority::admitted(NodeId)` (section 1) is a static yes/no consulted after a handshake. It cannot
+express "the application changed its mind about a connected node", and the gossiped `RevocationRegistry`
+lets *any admitted member* revoke a third party. Both gaps are closed by letting the **application own
+admission as a numbered snapshot**:
+
+- **Snapshot.** An **immutable** `AdmissionSnapshot` with a strictly increasing **generation**, mapping a
+  peer key to a tri-state verdict: **Admit**; **LogExchangeOnly** (only the designated control lane,
+  `FrameKind::Control`, may carry traffic; the question is re-asked when the next generation is
+  published); **Deny**. A key the snapshot does not list is **Deny** (closed world; an empty snapshot
+  admits nobody). `lookup` is a pure read: no lock, no allocation, no call into application state. The
+  authority holds the current snapshot behind an atomic `shared_ptr` swap (the repo's idiom for a
+  cold-written, hot-read pointer). A publish whose generation is not greater than the current one is
+  refused and counted, so a replayed or reordered publish can never re-admit a denied peer.
+- **Never cache a yes.** Every inbound frame, every outbound frame and every handshake completion asks
+  the *current* snapshot. A session records the generation it was last re-answered under for
+  diagnostics only; the verdict is never read from it.
+- **Publish guarantees.** When `publish(g)` returns: (a) a handshake whose answer was read under a
+  generation below *g* has been re-answered, on the **authenticated** identity, before it completes (an
+  in-flight handshake of a now-denied peer is aborted; one racing the swap is denied at completion and
+  no reply is sent); (b) every live session has been re-answered and every now-denied one is closed (the
+  inner connection is told to drop via a close hook; with the handshake disabled, where all sessions
+  share one cipher and recreating one would restart its sequence spaces, the per-frame gate is the
+  closure); (c) a message from a now-denied peer is **discarded and counted, never delivered**, whether
+  it arrives before or after the publish, and a delivery still in progress under the old generation has
+  finished before `publish` returns; (d) every delivered message carries the **generation it was
+  admitted under** (`MessageFrame::admission_generation`, never taken from the wire) and the peer
+  identity (`from`, authenticated by the session). `publish` must not be called from inside a receive
+  callback of a transport that listens to the same authority.
+- **Key.** The snapshot is keyed by `AdmissionKey`, today an alias of `NodeId`. When the transport
+  identity becomes an Ed25519 public key (issue #40) the alias is the one place that changes.
+- **NodeAuthority compatibility.** The snapshot authority *is* a `NodeAuthority`: `admitted(n)` is true
+  only for **Admit**, so `place_admitted` and the relay hook (`TcpTransport::set_relay_forwarding`) see
+  every generation with no further wiring. A relay authorisation ("may relay from X to Y") is that same
+  hook: it is refused when either end is not Admit; the relay holds no per-session state to purge.
+- **Authority-only revocation (per cluster, default off).** When set (`SwimMembership::Config::
+  authority_only_revocation`, and `RevocationRegistry::set_authority_only`), peer-gossiped revocation
+  fingerprints are **ignored and counted** and none are offered for gossip: the snapshot is the only
+  source of denial. This node's own operator revocation (`revoke_locally`) still applies. The default
+  keeps ADR-040 behaviour (any admitted member can gossip a revocation).
+
+- **Frame origin (Draft amendment, ADR-069 "Red-team of the merged changes (#47)", M1).** A frame delivered locally
+  must carry `from` equal to the identity of the connection it arrived on (`TcpTransport` drops and counts any other,
+  `spoofed_origin_dropped()`); a shape-B relay (ADR-048) delivers its origin's frames only where the receiver opted in
+  (`set_accept_relayed_frames`). A handshake this node merely **answered** that fails never erases an existing session;
+  only a renegotiation this side initiated may.
+- **Close path (N3).** `TcpTransport::set_admission(authority)` makes the transport refuse a denied peer at HELLO,
+  close its connection when a snapshot denies it (reporting peer-down), never dial or redial it, and lift that when a
+  later snapshot no longer denies it. `reset_peer_connection` is not a close path for a denied device (it redials).
+
+Residual risks, stated: a receive callback that blocks stalls `publish`; the generation fence is per
+transport, so two transports on one thread publishing concurrently through synchronous loopback can
+deadlock (a test-double shape, not a network one); `publish` is synchronous work proportional to the live
+sessions.
 
 ## 2. Transport security seam
 
@@ -158,9 +218,110 @@ catastrophic vulnerabilities. Therefore:
   the mbedTLS adapter is linked only when `QUARK_WITH_MBEDTLS=ON` — proven by
   a dedicated build-isolation test that scans the default build's core
   library for `mbedtls_`-prefixed symbols (ADR-040).
+- **A second adapter, libsodium (`QUARK_WITH_SODIUM`, issue #40, ADR-068),** carries the
+  pinned-key mode below under the same posture: opt-in, never linked into the core
+  (the isolation test also scans for `sodium_`/`crypto_` symbols), and the
+  cryptographic *primitives* (X25519, ChaCha20-Poly1305, BLAKE2b) are libsodium's.
+  What Quark writes is only the Noise state machine over them, proven against the
+  official test vector, byte for byte. That is a narrower step than "implement
+  crypto" but it is not zero: it is the one place this repo writes protocol glue
+  over a primitive library, it is called out in ADR-068, and it wants an
+  independent audit before it guards anything valuable.
 
 This is the intellectually honest position: minimal-dependency is a principle, not
 a suicide pact, and "don't roll your own crypto" outranks it.
+
+### Pinned-key mode (Noise IK, #40)
+
+A second handshake mode beside the CA chain, for clusters with **no CA**: peers authenticate each other by **public keys
+pinned by the application** (AeroCoWorker's serverless LAN group pins device keys at an in-person pairing). Decision record
+and evidence: [ADR-068](decisions/ADR-068-pinned-key-noise-ik.md). It sits behind the unchanged `HandshakeEngine` seam
+(`handshake.hpp`) as `PinnedHandshakeEngine`; `SecureTransport` drives it exactly as it drives the TLS engine, and the per-lane
+counter/replay envelope carries every frame afterwards.
+
+**Why not TLS with pinned certificates.** An independent red-team showed that TLS cannot hide a device's identity from an
+*active* prober on the LAN: a TLS server answers a ClientHello with its ServerHello before it knows who is asking, and
+its certificate (or a stable fingerprint of it) is the identity. A pattern in which the responder's static key is known to the
+initiator in advance and the responder stays silent until the first message authenticates is what the requirement needs, and
+that is Noise IK.
+
+- **Selection and no downgrade.** The mode is chosen per cluster by which `HandshakeEngineFactory` is installed
+  (`TrustMode::CaChain` = mbedTLS, `TrustMode::PinnedKey` = Noise IK). There is nothing to negotiate. The mode byte is part of
+  the Noise **prologue** (`"quark-pinned-key/v1" || mode`), so a CA-mode peer and a pinned-mode peer never complete a handshake
+  in either direction (checked with real mbedTLS engines: `pinned_crossmode_check`). The prologue separates Noise peers of
+  different modes; a TLS peer's bytes are not Noise at all and are refused on their own, so the cross-mode guarantee rests on
+  both and the test exercises both.
+- **Identity is the full public key.** A peer is its **Ed25519 public key** (32 bytes), never a hash or a truncation; the trust
+  decision compares the full key. Its **NodeId is derived**, never self-claimed: the first 8 bytes (little-endian) of SHA-256 of
+  the public key. Msg1 carries the NodeId and the responder refuses one that is not the derived one, so nobody can claim
+  another key's NodeId. Because the id is 64 bits, the application's key book refuses to admit a second key whose derived id
+  collides with an admitted one (`PinnedKeyBook::admit`); NodeId `0` is "unspecified" and never a valid derived id. **Sign-bit
+  malleability:** Ed25519 keys A and -A (top bit of the last byte flipped) convert to the same X25519 key, so the holder of A's
+  secret can authenticate as -A. Trust compares exact Ed25519 bytes, which is safe only if the book never holds both, so
+  `PinnedKeyBook::admit` refuses a second key with an already-admitted key's X25519 image; an application implementing its own
+  `PinnedTrust` must do the same. The identity that is really authenticated is the X25519 image of the key.
+- **Noise static key = the converted Ed25519 key.** libsodium `crypto_sign_ed25519_pk_to_curve25519` / `_sk_to_curve25519`. The
+  map is one-way (the sign bit is lost), so Msg1 carries the Ed25519 key in its encrypted payload and the responder checks that
+  converting it yields exactly the static key that authenticated the message. **Key-reuse caveat, accepted:** one key does both
+  Ed25519 signatures (the application's) and X25519 DH (the handshake's). The two uses are domain-separated (the handshake never
+  signs; the application never DHes; the prologue carries a Quark label), libsodium supports the conversion, and published
+  analyses of combined use find no break under that separation. It is accepted because a second per-device key would have to be
+  generated, paired, pinned and rotated too, and the consumer's pairing flow pins one key. ADR-068 lists it for audit.
+- **Suite: `Noise_IK_25519_ChaChaPoly_BLAKE2b`** (Noise revision 34). Msg1 `-> e, es, s, ss` (154 bytes: 96 overhead + a 58-byte
+  payload: u16 version, u64 scope/cluster id, u64 initiator NodeId, u64 timestamp, 32-byte Ed25519 key); Msg2 `<- e, ee, se`
+  (58 bytes: 48 overhead + u16 version, u64 responder NodeId). Both are fixed length. The initiator knows (pins) the responder's key
+  in advance.
+- **No cleartext HELLO, no identity before admission (the specified property).** In this mode the TCP `QRK1` HELLO is **not
+  sent**: the information it carries (the version for the ADR-053 window, the NodeId for dial dedup) travels inside the encrypted
+  handshake payloads. A device reveals no stable identifier, scope id or NodeId to anyone who has not proven it is admitted. Msg1
+  and Msg2 are fixed length and carry no identifier in the clear, so two sessions by one initiator share no bytes beyond that
+  (the one non-random bit is the top bit of each ephemeral X25519 public key, always 0: a classifier can recognise the protocol,
+  not a device). **STATUS, honestly: delivered by the handshake bytes and by `PinnedHandshakeEngine`, NOT yet by the shipped
+  transports.** `TcpTransport` still emits its HELLO and `SecureTransport` still puts `from`/`to` (the derived NodeIds) in the
+  clear in every frame header, including the Authenticate frames, and takes the responder's `expected_peer` from that claimed
+  `from`. Over those transports a pinned-mode node therefore still discloses its NodeId to a passive observer and to a prober that
+  sends nothing. Closing that is a transport change (a pinned accept path with no HELLO, identification by the handshake, sealed
+  headers), recorded as the follow-up in ADR-068; until then the property holds for byte-level users of the engine only.
+- **Silent refusal (engine contract: message-oriented).** The responder engine takes exactly one whole 154-byte Msg1 per
+  `advance()`; a byte-stream caller reassembles it (a partial write is the caller's business and gets silence). If Msg1 does not decrypt (a prober without the responder's key), is the wrong length, names the wrong
+  cluster or an out-of-window version, carries a NodeId that is not the derived one, comes from a key the application does not
+  admit (or one in the revocation set), or has a stale or replayed timestamp, the responder sends **nothing** and the connection
+  is closed. An initiator likewise sends nothing to a key the application does not currently admit. What an attacker can still
+  learn: that something accepts TCP on the port, and, by timing, when the connection was closed. **Timing residual (unmeasured):**
+  a Msg1 that authenticates under the responder's static key (built by anyone who holds the responder's public key: a revoked
+  member, a reader of the membership log) is refused only after more work (a second X25519, an AEAD, a key conversion, a book
+  lookup) than random bytes are, so the delay before the close can confirm that "the device with this public key is here". The
+  engine does not equalise it. A refused initiator hears
+  nothing, so its parked handshake ends by the handshake timeout, not by a message.
+- **Replay rule (WireGuard's idea).** Msg1's timestamp must be within `max_clock_skew_ns` of the responder's clock (default 120 s;
+  LAN devices are not clock-synchronised) and strictly greater than the latest timestamp already accepted from that initiator key,
+  kept in a bounded per-responder record (`PinnedReplayGuard`, only admitted keys reach it). The initiator draws timestamps
+  strictly increasing even across a clock step back. **Residuals (checked as documented limits in `pinned_handshake_check`):** (a) the record
+  lives in memory, so after a responder restart (or an eviction) a captured Msg1 inside the skew window is accepted **once**. The
+  replayer cannot derive any key, but `SecureTransport` installs a session for the initiator on the replayer's connection, so the
+  responder believes that peer is up and its traffic to it is lost until the real initiator redials. (b) An initiator's timestamp
+  counter is also in memory: after an initiator restart or a clock step back its handshakes are refused until its clock passes the
+  latest timestamp the responder accepted from it (at most `max_clock_skew_ns` ahead of the responder clock; indefinitely if the
+  skew bound is disabled). (c) Two Msg1s from one initiator arriving out of order refuse the older.
+- **The trust decision is the application's.** `PinnedTrust::admitted(cluster, ed25519_public_key) -> bool` (`core/pinned_key.hpp`):
+  std-only types in the signature, `noexcept`, thread-safe, non-blocking, **consulted fresh at every handshake** by both ends, plus
+  `PinnedKeyDirectory::key_of(cluster, node)` giving the initiator the key it pins. `PinnedKeyBook` is a ready-made mutable
+  allowlist implementing both. Un-admit makes the *next* handshake fail; re-admit makes it succeed.
+- **Session keys.** Noise `Split()` yields the two directional keys; each becomes a Quark envelope key as
+  `HMAC-BLAKE2b(split_key, "quark-pinned/v1 c2s" | "...s2c" || handshake_hash)`, a label domain disjoint from TLS mode's
+  `"quark c2s"`/`"quark s2c"` exporter labels and bound to that very handshake. They key `SodiumAeadChaCha20Poly1305` (the
+  libsodium implementation of the `Aead` seam) inside the unchanged envelope; a pinned-mode build needs libsodium only.
+  Forward secrecy: the transport keys depend on `ee` and `se` with fresh ephemerals, so a later compromise of both long-term keys
+  cannot open a captured session. **Documented limit:** Msg1 is encrypted to the responder's *static* key, so a later compromise of
+  the responder's key reveals which keys dialled it and when (not any session traffic).
+- **`peer_fingerprint` in `HandshakeEngine::Result`** carries the peer's full Ed25519 key in this mode, so the revocation set and
+  `sweep_revocations` (ADR-040) can name a pinned peer by it.
+- **Out of scope (stated, not forgotten).** Re-checking sessions that are *already open* when trust changes is **#41**
+  (application-driven admission and eviction). Discovery is #42, an Android PAL #43, several clusters in one process #44.
+  Also not done in this change, and recorded in ADR-068: making the **TCP framing itself identifier-free**. Today the frame header
+  that `TcpTransport`/`SecureTransport` carry still holds `from`/`to` NodeIds in the clear and `TcpTransport` still emits its HELLO;
+  the pinned handshake bytes are identifier-free and a prober gets nothing, but wiring a pinned-mode connection state machine into
+  `TcpTransport` (no HELLO, identification by the handshake, sealed headers) is the follow-up.
 
 ### Rotation and revocation invariants (ADR-040)
 
@@ -195,7 +356,7 @@ Two invariants follow, load-bearing (each carries its own test):
   cluster-wide one — otherwise one peer's crypto work stalls every other
   peer's traffic.
 
-**Issuer-authenticated revocation ([ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed).**
+**Issuer-authenticated revocation ([ADR-074](decisions/ADR-074-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed).**
 A gossiped revocation is a record signed by the cluster trust anchor (the CA that issues node
 certificates), not a bare fingerprint: `"QUARK-REVOKE-v1\0" ‖ cluster_id ‖ fingerprint ‖
 not_after ‖ issued_at ‖ anchor_key_id ‖ signature` (fixed-length signed portion, ECDSA P-256 with
@@ -231,7 +392,7 @@ boundary — a compromised or buggy peer already admitted to the cluster can sti
 advertise a false capability (e.g. a false `Flag{"gpu"}`). This is the identical
 trust model membership and revocation gossip already operate under; no new gap is
 introduced by capability gossip, and no new mitigation is added for it either.
-(Revocation gossip leaves this trust model under ADR-067: it becomes anchor-signed.)
+(Revocation gossip leaves this trust model under ADR-074: it becomes anchor-signed.)
 
 ## 3. Authorization and principal propagation
 

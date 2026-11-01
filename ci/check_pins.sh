@@ -72,10 +72,12 @@ audit_root() {
     grep -Fq 'cxx: clang++-'"$CLANG_MAJOR" "$root/.github/workflows/ci.yml" ||
         fail "workflow compiler matrix does not match CLANG_MAJOR=$CLANG_MAJOR"
 
-    # 4. The vcpkg baseline and the mbedTLS floor are pinned and consistent.
-    python3 - "$root/vcpkg.json" "$VCPKG_BASELINE" "$MBEDTLS_MIN" <<'PY'
+    # 4. The vcpkg baseline and the mbedTLS / libsodium floors are pinned and consistent.
+    [[ "$SODIUM_MIN" =~ ^[0-9]+(\.[0-9]+){2}$ ]] ||
+        fail "ci/pins.env: SODIUM_MIN must be an exact 3-part version (got '$SODIUM_MIN')"
+    python3 - "$root/vcpkg.json" "$VCPKG_BASELINE" "$MBEDTLS_MIN" "$SODIUM_MIN" <<'PY'
 import json, sys
-path, want_baseline, want_mbedtls = sys.argv[1], sys.argv[2], sys.argv[3]
+path, want_baseline, want_mbedtls, want_sodium = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(path, encoding="utf-8") as f:
     d = json.load(f)
 got = d.get("builtin-baseline", "")
@@ -95,6 +97,18 @@ if floor is None:
     sys.exit("vcpkg.json mbedtls has no version>= floor")
 if ver(floor) < ver(want_mbedtls):
     sys.exit(f"mbedtls {floor} is below the pinned floor {want_mbedtls}")
+sdep = None
+for x in d.get("dependencies", []):
+    if (isinstance(x, str) and x == "libsodium") or (isinstance(x, dict) and x.get("name") == "libsodium"):
+        sdep = x
+        break
+if sdep is None:
+    sys.exit("vcpkg.json does not declare libsodium")
+sfloor = sdep.get("version>=") if isinstance(sdep, dict) else None
+if sfloor is None:
+    sys.exit("vcpkg.json libsodium has no version>= floor")
+if ver(sfloor) < ver(want_sodium):
+    sys.exit(f"libsodium {sfloor} is below the pinned floor {want_sodium}")
 PY
 
     # 5. Exact apt lock. Every entry is `pkg=exact-version` (no wildcard); the known package set is
@@ -114,7 +128,7 @@ PY
             "libc++-${CLANG_MAJOR}-dev"|"libc++abi-${CLANG_MAJOR}-dev"|\
             "libclang-rt-${CLANG_MAJOR}-dev"|\
             git|curl|ca-certificates|python3|gh|wget|gnupg|lsb-release|\
-            software-properties-common) ;;
+            software-properties-common|libsodium-dev) ;;
             *) fail "ci/apt-packages.txt: unlisted package '$pkg'" ;;
         esac
     done < "$root/ci/apt-packages.txt"
@@ -122,7 +136,7 @@ PY
                "libc++-${CLANG_MAJOR}-dev" "libc++abi-${CLANG_MAJOR}-dev" \
                "libclang-rt-${CLANG_MAJOR}-dev" \
                git curl ca-certificates python3 gh wget gnupg lsb-release \
-               software-properties-common; do
+               software-properties-common libsodium-dev; do
         grep -Fq "${pkg}=" "$root/ci/apt-packages.txt" ||
             fail "ci/apt-packages.txt is missing the locked package '$pkg'"
     done
@@ -143,6 +157,12 @@ PY
                 fail "installed $pkg=${got:-missing} != locked $ver"
         done < "$root/ci/apt-packages.txt"
     fi
+
+    # 5b. The libsodium job installs the locked dev package through the one installer.
+    grep -Fq -- '--with-sodium' "$root/.github/workflows/ci.yml" ||
+        fail "ci.yml does not install libsodium through ci/install-deps.sh --with-sodium"
+    grep -Fq 'with_sodium' "$root/ci/install-deps.sh" ||
+        fail "ci/install-deps.sh has no --with-sodium path"
 
     # 6. The Windows job selects the exact MSVC toolset pinned in ci/pins.env.
     grep -Fq 'MSVC_VERSION=$MSVC_VERSION' "$root/.github/workflows/ci.yml" ||
@@ -165,7 +185,7 @@ PY
     grep -Fq "FROM ubuntu:24.04@sha256:$UBUNTU_BASE_DIGEST" "$root/ci/Dockerfile" ||
         fail "ci/Dockerfile base does not match UBUNTU_BASE_DIGEST"
 
-    echo "pin audit: OK (actions SHA-pinned; release runners; LLVM SHA-256 + repo-only; vcpkg/mbedTLS; exact apt lock; MSVC pin; digest-pinned CI image; keyless release signing)"
+    echo "pin audit: OK (actions SHA-pinned; release runners; LLVM SHA-256 + repo-only; vcpkg/mbedTLS/libsodium; exact apt lock; MSVC pin; digest-pinned CI image; keyless release signing)"
 }
 
 self_test() {

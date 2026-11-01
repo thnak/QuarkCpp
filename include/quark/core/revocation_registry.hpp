@@ -3,14 +3,14 @@
 // that are ALREADY open). Mirrors `InProcessMembership`'s publish_locked idiom (membership.hpp): all
 // mutation happens under a mutex, readers get an immutable `shared_ptr` snapshot so a cross-thread
 // read (SecureTransport::sweep_revocations, a handshake engine's factory.create()) never races a
-// concurrent merge. ADR-067 D2 adds the ISSUER-AUTHENTICATED (signed) form; see TRUST AND BOUNDS.
+// concurrent merge. ADR-074 D2 adds the ISSUER-AUTHENTICATED (signed) form; see TRUST AND BOUNDS.
 //
 // UNION-ONLY RATCHET: a fingerprint, once revoked, is NEVER un-revoked by a merge. This is the same
 // terminal-state precedent 021's SwimMembership uses for Dead (§apply_update: "Dead is terminal
 // (rejoin only)") — for the identical reason: an adversary who could "unrevoke" a leaked key by
 // replaying a stale gossip digest would defeat the whole mechanism. There is deliberately no un-revoke
 // API here; reinstating a node means issuing it a FRESH identity (a new fingerprint), not clearing this
-// set. Two removals exist, both ADR-067 D2: `prune_expired` drops a SIGNED entry whose revoked leaf has
+// set. Two removals exist, both ADR-074 D2: `prune_expired` drops a SIGNED entry whose revoked leaf has
 // expired (`not_after` + skew; an expired leaf already fails the handshake, so pruning cannot re-admit
 // it), and `enable_signed` drops UNSIGNED entries that were learned from gossip (a member's unverifiable
 // claim — exactly what signed mode exists to refuse); operator-local revocations are kept.
@@ -22,7 +22,7 @@
 //     and counted (`rejected()`). `protect(fp)` pins THIS node's own fingerprint so a peer cannot sever us.
 //     Locally-originated revocations (operator action) are never refused. `SecurityMode::Strict` refuses
 //     this mode when the mTLS handshake is on (security.hpp validate_revocation_trust).
-//   * SIGNED (ADR-067 D2, after `enable_signed`): a gossiped revocation must be a `SignedRevocation`
+//   * SIGNED (ADR-074 D2, after `enable_signed`): a gossiped revocation must be a `SignedRevocation`
 //     signed by the cluster trust anchor and verified through `TrustAnchorVerifier`, so no member can
 //     revoke a third party. Unsigned gossip is refused (counted in `rejected()`) and local unsigned
 //     revocations stay node-local (`sample()` returns nothing). A signed record is authoritative:
@@ -60,7 +60,7 @@
 
 namespace quark {
 
-// ADR-067 D2: the bounds of signed mode (see TRUST AND BOUNDS above).
+// ADR-074 D2: the bounds of signed mode (see TRUST AND BOUNDS above).
 struct SignedRevocationLimits {
     std::size_t max_signed = 4096;              // signed entries held
     std::size_t max_verifies_per_merge = 8;     // signature checks one gossip merge may spend
@@ -89,6 +89,19 @@ public:
         return rejected_;
     }
 
+    // ADR-069 / 020 §1a authority-only mode: peer-gossiped revocations are IGNORED (counted in
+    // `ignored_gossip()`, never merged) and nothing is offered to `sample()` for gossip, because the
+    // application's admission snapshot is the only source of denial. `revoke_locally` (this node's own
+    // operator) still works. Default off: ADR-040 behaviour (any admitted member can gossip a revocation).
+    void set_authority_only(bool on) {
+        std::lock_guard<std::mutex> g(mu_);
+        authority_only_ = on;
+    }
+    [[nodiscard]] std::uint64_t ignored_gossip() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return ignored_gossip_;
+    }
+
     // Merge a peer's gossiped revocation set into ours (union). Returns true iff this added at least
     // one NEW fingerprint — callers (e.g. a future gossip-priority policy) can use this to decide
     // whether the change is worth re-announcing sooner. In signed mode every entry is refused.
@@ -97,6 +110,10 @@ public:
         std::lock_guard<std::mutex> g(mu_);
         if (verifier_) {
             rejected_ += incoming.size();
+            return false;
+        }
+        if (authority_only_) {
+            ignored_gossip_ += incoming.size();
             return false;
         }
         bool changed = false;
@@ -138,7 +155,7 @@ public:
     [[nodiscard]] std::vector<Fingerprint> sample(std::size_t max) const {
         std::lock_guard<std::mutex> g(mu_);
         std::vector<Fingerprint> out;
-        if (verifier_) return out;
+        if (verifier_ || authority_only_) return out;
         for (const auto* set : {&local_, &gossiped_})
             for (const Fingerprint& fp : *set) {
                 if (out.size() >= max) return out;
@@ -154,7 +171,7 @@ public:
         return snapshot_;
     }
 
-    // ---- ADR-067 D2: issuer-authenticated revocation -------------------------------------------
+    // ---- ADR-074 D2: issuer-authenticated revocation -------------------------------------------
 
     // Switch to SIGNED mode, once: from now on gossip must carry anchor-signed records for `cluster`,
     // verified by `verifier`. Unsigned entries previously learned FROM GOSSIP are dropped (a member's
@@ -445,6 +462,8 @@ private:
     std::uint64_t signed_cap_refused_ = 0;
     std::uint64_t signed_expired_ = 0;
     std::uint64_t signed_deferred_ = 0;
+    bool authority_only_ = false;               // ADR-069 / 020 §1a: gossip is ignored, the snapshot decides
+    std::uint64_t ignored_gossip_ = 0;
     std::shared_ptr<const std::unordered_set<Fingerprint>> snapshot_;
 };
 

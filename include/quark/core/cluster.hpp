@@ -52,6 +52,8 @@
 //     in for a real network partition (a partial partition that exercises indirect-ping); a real
 //     partition is observed by the 019 PAL socket layer, not injected here.
 // ============================================================================================
+// ADR-071 / ADR-069 "Red-team of the merged changes (#47)": leases ignore every second-hand Suspect/Dead while held
+// (M2), end on tombstone/eviction/Join (M3), and a suspended node still applies a pending eviction (N2).
 #pragma once
 
 #include <algorithm>
@@ -74,6 +76,8 @@
 
 #include "quark/core/ids.hpp"
 #include "quark/core/membership.hpp"
+#include "quark/core/admission.hpp"  // ADR-069: application-driven eviction
+#include "quark/core/mobile_lease.hpp"  // ADR-071: suspension leases for mobile members
 #include "quark/core/tls_identity.hpp"  // Fingerprint — ADR-040 Phase 5 revocation-gossip piggyback
 #include "quark/core/transport.hpp"
 #include "quark/detail/hash.hpp"
@@ -127,7 +131,7 @@ private:
 // ============================================================================================
 
 // From `self`'s vantage: keep the connection I initiated to `peer` (true) or keep the one the peer
-// initiated to me (false)? Between a member and a CLIENT (ADR-067 D3) the client's dial survives — a
+// initiated to me (false)? Between a member and a CLIENT (ADR-074 D3) the client's dial survives — a
 // member never dials a client. Between two peers of the same role: true iff I am the lower id. Both
 // ends compute complementary answers in every case. `self != peer` by construction (no self-dial).
 [[nodiscard]] constexpr bool keep_local_dial(NodeId self, NodeId peer) noexcept {
@@ -172,6 +176,11 @@ enum class ControlKind : std::uint8_t {
     JoinAck = 7,     // seed → joiner: admitted; snapshot rides the `updates` digest
     JoinReject = 8,  // seed → joiner: cluster-id mismatch, refused (§1 accidental-merge guard)
     Congested = 9,   // ADR-046: edge-triggered cross-node mailbox backpressure signal
+    // ADR-071: a member announces a GRACEFUL SUSPEND (phone backgrounded / Doze). `seq` = the requested
+    // lease in ns (a relative duration, so no clock skew travels; the receiver clamps it), and
+    // `subject_incarnation` = the SuspendReason. Additive: an N-1 node ignores the unknown kind (its
+    // switch has no case) and merely treats the frame as first-hand liveness evidence.
+    Suspend = 10,
 };
 
 // One gossiped member fact: node, incarnation, status. Higher incarnation wins on merge; a node
@@ -217,7 +226,7 @@ struct MailboxPressureEntry {
 // legitimate frame from a node configured with a larger budget is never itself rejected.
 inline constexpr std::size_t kMaxDecodedCapabilityBytes = 65536;
 
-// ADR-067 D2 bounds on the signed-revocation section, checked before any allocation.
+// ADR-074 D2 bounds on the signed-revocation section, checked before any allocation.
 inline constexpr std::size_t kMaxSignedRevocationsPerFrame = 64;
 inline constexpr std::size_t kMaxSignedRevocationBlobBytes = 256;
 
@@ -235,7 +244,7 @@ struct ControlMsg {
     // SwimMembership moves these as opaque 32-byte blobs (set_revocation_gossip); it does not interpret
     // them — that stays 020/RevocationRegistry's job.
     std::vector<Fingerprint> revocations;
-    // ADR-067 D2: anchor-SIGNED revocation records, opaque wire blobs (RevocationRegistry encodes and
+    // ADR-074 D2: anchor-SIGNED revocation records, opaque wire blobs (RevocationRegistry encodes and
     // verifies them; SwimMembership only carries them, via set_signed_revocation_gossip). Encoded as a
     // section AFTER the ADR-053 version trailer, which every v2 decoder stops at, so an un-upgraded node
     // ignores it and keeps decoding the rest of the frame (membership gossip stays mixed-version safe).
@@ -341,7 +350,7 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
     }
     put_u64(b, static_cast<std::uint64_t>(m.congestion_remaining_ns));
     if (m.wire_version != 1) put_u8(b, m.wire_version);  // ADR-053 trailer (v1 stays byte-identical)
-    // ADR-067 D2: the signed-revocation section rides AFTER the trailer (only when one is emitted), so a
+    // ADR-074 D2: the signed-revocation section rides AFTER the trailer (only when one is emitted), so a
     // decoder that stops at the trailer never sees it; an empty section is not emitted at all.
     if (m.wire_version != 1 && !m.signed_revocations.empty()) {
         std::vector<const std::vector<std::byte>*> kept;
@@ -413,7 +422,7 @@ inline std::vector<std::byte> encode_control(const ControlMsg& m) {
     out.congestion_remaining_ns = static_cast<std::int64_t>(r.u64());
     const bool has_trailer = r.ok && r.p < r.end;
     out.wire_version = has_trailer ? r.u8() : std::uint8_t{1};  // absent trailer == v1
-    // ADR-067 D2 signed-revocation section (after the trailer; absent on older senders). Bounded before
+    // ADR-074 D2 signed-revocation section (after the trailer; absent on older senders). Bounded before
     // allocating; a malformed section fails the frame like any other malformed field.
     out.signed_revocations.clear();
     if (has_trailer && r.ok && r.p < r.end) {
@@ -546,7 +555,7 @@ public:
         std::uint32_t gossip_fanout = 3;                     // peers a gossip round targets
         std::uint32_t max_gossip_updates = 32;               // bounded piggyback digest
         std::uint64_t max_capability_gossip_bytes = 4096;    // ADR-045: bounded capability piggyback
-        std::uint32_t max_signed_revocation_gossip = 8;      // ADR-067 D2: signed records per frame
+        std::uint32_t max_signed_revocation_gossip = 8;      // ADR-074 D2: signed records per frame
         std::uint64_t seed = 0;                              // deterministic peer/fanout selection
         // ADR-048 relay correlation secret. 0 ⇒ a fresh random secret per SwimMembership instance.
         // The token must NOT be derivable from the public seed + NodeId (the old derivation
@@ -582,6 +591,21 @@ public:
         std::int64_t unverified_ttl_ns = 30'000'000'000;
         // ADR-053: the wire version this node speaks (default = current). Tests/rolling upgrades only.
         std::uint8_t wire_version = kSwimWireVersion;
+        // ADR-069 / 020 §1a: peer-gossiped revocations are IGNORED (counted, never merged, never sampled
+        // out) and the application's admission snapshot is the only source of denial. Default false keeps
+        // the ADR-040 behaviour (any admitted member can gossip a revocation).
+        bool authority_only_revocation = false;
+        // ADR-071: receiver-side policy for peers' graceful-suspend announcements (lease cap, table cap)
+        // and the default lease this node announces for itself.
+        MobileProfile mobile{};
+        // Test-only CONTROLS for ADR-071 "Red-team of the merged changes (#47)": each restores one pre-fix
+        // behaviour so a test can show the old failure. Never set in production code.
+        struct TestFaults {
+            bool incarnation_gated_suppression = false;  // M2: only Suspect/Dead at or below the lease incarnation is dropped
+            bool keep_lease_on_tombstone = false;        // M3: a tombstone / eviction leaves the lease behind
+            bool join_keeps_lease = false;               // M3: a Join does not clear the lease
+            bool defer_eviction_while_suspended = false; // N2: no eviction check while this node is suspended
+        } test_faults{};
     };
 
     // A graceful leave raises the incarnation by this band, so a Left outranks every Alive/Suspect the
@@ -611,6 +635,37 @@ public:
 
     SwimMembership(const SwimMembership&) = delete;
     SwimMembership& operator=(const SwimMembership&) = delete;
+    ~SwimMembership() {
+        if (admission_) admission_->remove_listener(admission_listener_);
+    }
+
+    // --- ADR-069 (020 §1a, 021 §"Application-driven eviction") --------------------------------------
+    // Bind the application's admission authority (cold setup; must outlive this object). A published
+    // generation marks eviction pending (thread-safe flag); the driving thread evicts every LIVE member
+    // the snapshot denies at its next tick()/inbound frame/apply_admission(): tombstone (out of view() and
+    // placement), one `Evicted` membership event per node, and from then on apply_update refuses any
+    // Alive/Suspect update for a denied node (so it cannot re-enter by gossip, join or probe) until a later
+    // snapshot admits it - after which it rejoins by the ordinary higher-incarnation rule.
+    void set_admission(AdmissionAuthority& a) {
+        if (admission_) admission_->remove_listener(admission_listener_);
+        admission_ = &a;
+        admission_listener_ = a.add_listener(
+            [this](const AdmissionSnapshot&) { admission_dirty_.store(true, std::memory_order_release); });
+        admission_dirty_.store(true, std::memory_order_release);
+    }
+    // Driving thread: evict now (what tick() does implicitly); events are delivered before it returns.
+    void apply_admission() {
+        evict_denied();
+        flush_events();
+    }
+    [[nodiscard]] std::uint64_t evictions() const noexcept { return evictions_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t admission_refusals() const noexcept {
+        return admission_refusals_.load(std::memory_order_relaxed);
+    }
+    // Revocation fingerprints dropped because `authority_only_revocation` is set.
+    [[nodiscard]] std::uint64_t gossip_revocations_ignored() const noexcept {
+        return gossip_revocations_ignored_.load(std::memory_order_relaxed);
+    }
 
     // --- 010 Membership interface -------------------------------------------------------------
     [[nodiscard]] NodeId self() const noexcept override { return self_; }
@@ -656,7 +711,7 @@ public:
         revocation_merge_ = std::move(merge);
     }
 
-    // ADR-067 D2: the same piggyback for anchor-SIGNED revocation records, as opaque blobs (wire them to
+    // ADR-074 D2: the same piggyback for anchor-SIGNED revocation records, as opaque blobs (wire them to
     // RevocationRegistry::sample_signed / merge_signed). Bounded by Config::max_signed_revocation_gossip
     // per frame; SwimMembership neither decodes nor verifies them.
     using SignedRevocationPullFn = std::function<std::vector<std::vector<std::byte>>(std::size_t max)>;
@@ -725,6 +780,65 @@ public:
     void set_online(bool on) noexcept { online_ = on; }
     [[nodiscard]] bool online() const noexcept { return online_; }
 
+    // --- ADR-071 mobile lifecycle (host-called; Quark never calls up into Java/Kotlin) ------------------
+    // SELF side. The host app calls suspend() when the process is about to be frozen (Activity stopped,
+    // Doze, network lost): this node tells every live peer, once, that it is going quiet for at most
+    // `lease_ns` (0 = Config::mobile.default_lease_ns), then stops probing, gossiping and answering until
+    // resume(). Best-effort by design: a phone cannot wait for acks while the OS freezes it, and a peer that
+    // missed the announcement simply treats the silence as any other (resume() then refutes at a higher
+    // incarnation). A self-left or offline node ignores the call.
+    void suspend(SuspendReason why = SuspendReason::AppBackground, std::int64_t lease_ns = 0) {
+        if (suspended_self_ || self_left_ || !online_) return;
+        if (lease_ns <= 0) lease_ns = cfg_.mobile.default_lease_ns;
+        for (const NodeId peer : live_peers_excluding(self_)) {
+            ControlMsg m;
+            m.kind = ControlKind::Suspend;
+            m.seq = static_cast<std::uint64_t>(lease_ns);
+            m.subject_incarnation = static_cast<std::uint64_t>(why);
+            send_control(peer, m);
+        }
+        suspended_self_ = true;
+    }
+    // The process is running again. The suspension is lifted, the incarnation is raised (so peers can tell
+    // a post-resume frame from a pre-suspend straggler, and a Suspect/Dead the peers reached meanwhile is
+    // refuted), local time-based state that the sleep made meaningless is forgiven (the boot clock counted
+    // the sleep: an in-flight probe is void, a held Suspect gets a fresh suspicion window), and every live
+    // peer is told at once with a Gossip frame, so the rejoin is immediate, not "next gossip round".
+    void resume() {
+        if (!suspended_self_) return;
+        suspended_self_ = false;
+        // ADR-071 #47 N2: apply the CURRENT admission snapshot before any gossip leaves, so a peer denied
+        // while we slept is evicted first and never receives our rejoin frame.
+        if (!cfg_.test_faults.defer_eviction_while_suspended) evict_denied();
+        const std::int64_t now = now_ns();
+        Member& me = members_[self_.value];
+        self_incarnation_ += 1;
+        me.incarnation = self_incarnation_;
+        forgive_local_state(now);
+        for (const NodeId peer : live_peers_excluding(self_)) {
+            ControlMsg g;
+            g.kind = ControlKind::Gossip;
+            send_control(peer, g);
+        }
+        flush_events();
+    }
+    // The device's network changed (Wi-Fi <-> cellular, new address). The transport reconnect is the host's
+    // (MobileMember calls Transport::reset_peer_connection per peer); the membership's part is the same
+    // forgiveness as resume(): a probe that was in flight on the dead path says nothing about the peer,
+    // and any Suspect this node reached because OUR path was down gets a fresh window.
+    void network_changed() {
+        if (suspended_self_ || !online_) return;
+        forgive_local_state(now_ns());
+        ++network_changes_;
+    }
+    [[nodiscard]] bool self_suspended() const noexcept { return suspended_self_; }
+    // PEER side: do we currently hold a suspension lease for `n`? (health(n).suspended is the same fact.)
+    [[nodiscard]] bool is_suspended(NodeId n) const { return suspended_leases_.contains(n.value); }
+    [[nodiscard]] std::size_t suspended_count() const noexcept { return suspended_leases_.size(); }
+    [[nodiscard]] std::uint64_t network_changes() const noexcept { return network_changes_; }
+    // Gossiped Suspect/Dead accusations ignored because we hold the accused's own lease (ADR-071 C1).
+    [[nodiscard]] std::uint64_t suspicions_suppressed() const noexcept { return suspicions_suppressed_; }
+
     // --- Join (021 §1/§3). Admit `joiner` iff its presented cluster id matches (accidental-merge
     // guard) — the in-process form of the join gate the 020 AUTHENTICATE step precedes. Returns true
     // and advances the epoch on admission; false on cluster-id mismatch. Unit-testable directly. Uses
@@ -732,7 +846,7 @@ public:
     // works (ADR-048). -----------------------------------------------------------------------------
     [[nodiscard]] bool admit(NodeId joiner, ClusterId presented) {
         if (presented != cfg_.cluster_id) return false;  // §1 reject: wrong cluster
-        if (is_client_node(joiner)) return false;         // ADR-067 D3: a client is never a member
+        if (is_client_node(joiner)) return false;         // ADR-074 D3: a client is never a member
         std::uint64_t inc = 0;
         if (auto it = members_.find(joiner.value); it != members_.end() && is_tomb(it->second.status))
             inc = it->second.incarnation + 1;
@@ -776,7 +890,14 @@ public:
     // ally. NO sleeping, NO wall-clock wait. ------------------------------------------------------
     void tick() {
         if (!online_) return;
+        if (suspended_self_) {
+            // A suspended process does not run the protocol (ADR-071), but eviction is local state, not
+            // traffic: a snapshot published while we sleep is applied now, not at some later resume (#47 N2).
+            if (!cfg_.test_faults.defer_eviction_while_suspended) flush_events();
+            return;
+        }
         const std::int64_t now = now_ns();
+        expire_suspend_leases(now);  // ADR-071: a lapsed lease becomes an ordinary Suspect -> Dead path
         reap_suspects(now);   // Suspect → Dead once the suspicion timeout lapses with no refutation
         reap_tombstones(now);  // erase tombstones older than tombstone_ttl_ns
         reap_unverified(now);  // P2: drop gossip-only members that never answered
@@ -806,6 +927,7 @@ public:
             h.incarnation = it->second.incarnation;
             h.protocol_version = it->second.wire_version;
             h.verified = it->second.verified;
+            h.suspended = suspended_leases_.contains(n.value);
             found = true;
         }
         if (const auto r = refusals_.find(n.value); r != refusals_.end()) {
@@ -857,7 +979,7 @@ public:
     [[nodiscard]] std::uint64_t control_sheds() const noexcept {
         return control_sheds_.load(std::memory_order_relaxed);
     }
-    // ADR-067 D3: Control frames from a CLIENT identity, dropped undecoded (a client is never a member).
+    // ADR-074 D3: Control frames from a CLIENT identity, dropped undecoded (a client is never a member).
     [[nodiscard]] std::uint64_t client_control_drops() const noexcept {
         return client_control_drops_.load(std::memory_order_relaxed);
     }
@@ -886,6 +1008,7 @@ private:
         std::int64_t first_seen_ns = 0;  // P2: start of the unverified TTL
         std::uint8_t wire_version = 0;   // ADR-053: last wire version heard directly (0 = never)
         std::uint8_t reported = 0;       // last state shown to subscribers: 0 none, 1 live, 2 Dead, 3 Left
+        std::uint64_t lease_expired_inc = 0;  // ADR-071: incarnation a suspend lease lapsed at (0 = never)
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -937,7 +1060,8 @@ private:
         m.from_incarnation = self_incarnation_;
         m.wire_version = cfg_.wire_version;
         fill_digest(to, m.updates);
-        if (revocation_pull_) m.revocations = revocation_pull_(cfg_.max_gossip_updates);
+        if (revocation_pull_ && !cfg_.authority_only_revocation)
+            m.revocations = revocation_pull_(cfg_.max_gossip_updates);
         if (signed_revocation_pull_)
             m.signed_revocations = signed_revocation_pull_(
                 std::min<std::size_t>(cfg_.max_signed_revocation_gossip, kMaxSignedRevocationsPerFrame));
@@ -1053,11 +1177,15 @@ private:
             if (data_sink_) data_sink_(std::move(f));  // 010 data plane, untouched
             return;
         }
-        if (is_client_node(f.from)) {  // ADR-067 D3: a client never speaks SWIM; never decode its control
+        if (is_client_node(f.from)) {  // ADR-074 D3: a client never speaks SWIM; never decode its control
             client_control_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (!online_) return;  // crashed node ignores control (stops acking)
+        if (!online_) return;  // a crashed node ignores control (stops acking)
+        if (suspended_self_) {  // a suspended node ignores control too, but still applies a pending eviction (#47 N2)
+            if (!cfg_.test_faults.defer_eviction_while_suspended) flush_events();
+            return;
+        }
         // P2: a fixed, per-sender Control-frame budget before decode/handle. Gossip and probe traffic
         // is far below this; a flood is shed here rather than driving republish/probe work.
         if (!admit_control(f.from, now_ns())) {
@@ -1144,6 +1272,8 @@ private:
                 if (auto it = members_.find(m.from.value); it != members_.end()) {
                     it->second.last_direct_ns = now;
                     apply_update(m.from, m.from_incarnation, MemberStatus::Alive, Src::Direct, now);
+                    // ADR-071: any non-Suspend frame from a leased member at a higher incarnation = resumed.
+                    if (m.kind != ControlKind::Suspend) on_leased_peer_spoke(m);
                 }
             }
             for (const MemberUpdate& u : m.updates) {  // may trigger self-refutation
@@ -1156,7 +1286,12 @@ private:
                 apply_update(NodeId{u.node}, u.incarnation, static_cast<MemberStatus>(u.status),
                              Src::Gossip, now);
             }
-            if (revocation_merge_ && !m.revocations.empty()) revocation_merge_(m.revocations);
+            if (revocation_merge_ && !m.revocations.empty()) {
+                if (cfg_.authority_only_revocation)  // ADR-069: the snapshot is the only source of denial
+                    gossip_revocations_ignored_.fetch_add(m.revocations.size(), std::memory_order_relaxed);
+                else
+                    revocation_merge_(m.revocations);
+            }
             if (signed_revocation_merge_ && !m.signed_revocations.empty())
                 signed_revocation_merge_(m.signed_revocations);
             // C5: capability / pressure entries are keyed by node ids the (authenticated) sender
@@ -1241,6 +1376,9 @@ private:
                         it != members_.end() && is_tomb(it->second.status))
                         inc = std::max(inc, it->second.incarnation + 1);
                     apply_update(m.subject, inc, MemberStatus::Alive, Src::Join, now);  // epoch++
+                    // ADR-071 #47 M3: a Join is first-hand proof of life of a (possibly restarted) process;
+                    // a lease granted to its previous incarnation does not cover it.
+                    if (!cfg_.test_faults.join_keeps_lease) clear_lease_on_proof_of_life(m.from);
                     reply.kind = ControlKind::JoinAck;  // snapshot rides fill_digest()
                     reply.subject_incarnation = incarnation_of(m.subject);
                 }
@@ -1262,6 +1400,9 @@ private:
             }
             case ControlKind::JoinReject:
                 break;  // handled above (ADR-053); a cluster-mismatch reject never reaches here
+            case ControlKind::Suspend:
+                on_suspend_announced(m, now);  // ADR-071
+                break;
             case ControlKind::Congested: {
                 // C1 epoch gen-gate (proven): a stale pre-restart signal never advances the throttle —
                 // mirrors apply_update's Alive-branch precedence (strictly-not-older incarnation wins).
@@ -1274,6 +1415,82 @@ private:
         }
     }
 
+    // --- ADR-071 mobile-member internals ---------------------------------------------------------------
+    // A peer announced a graceful suspend. The sender is authenticated (handle_control checked m.from), so
+    // the announcement speaks only for ITSELF. Ignored unless the sender is a known, live, first-hand-
+    // verified member and the announcement is not stale (incarnation below what we hold).
+    void on_suspend_announced(const ControlMsg& m, std::int64_t now) {
+        const auto it = members_.find(m.from.value);
+        if (it == members_.end() || m.from == self_) return;
+        Member& cur = it->second;
+        if (is_tomb(cur.status) || !cur.verified) return;
+        if (m.from_incarnation < cur.incarnation) return;  // stale replay of an older suspend
+        // A lease that lapsed is not renewable at the same incarnation: a member that never answered cannot
+        // keep itself alive by re-announcing. It must first prove liveness (refute at a higher incarnation).
+        if (cur.lease_expired_inc != 0 && m.from_incarnation <= cur.lease_expired_inc) return;
+        const auto reason = static_cast<SuspendReason>(
+            std::min<std::uint64_t>(m.subject_incarnation, static_cast<std::uint64_t>(SuspendReason::Other)));
+        const bool was_leased = suspended_leases_.contains(m.from.value);
+        const std::int64_t asked = static_cast<std::int64_t>(
+            std::min<std::uint64_t>(m.seq, static_cast<std::uint64_t>(cfg_.mobile.max_lease_ns)));
+        if (!suspended_leases_.grant(m.from.value, m.from_incarnation, asked, reason, now, cfg_.mobile))
+            return;  // zero lease or table full: treat the silence like any other
+        if (cur.status == MemberStatus::Suspect) {  // we had started to doubt it; its own word outranks that
+            cur.status = MemberStatus::Alive;
+            cur.verify_pending = false;
+            set_tx(cur, piggyback_count());
+            note_transition(m.from, cur, MemberStatus::Suspect);  // Recovered
+        }
+        if (probe_.active && probe_.target == m.from) probe_.active = false;  // do not escalate on silence
+        if (!was_leased) push_event(MembershipEventKind::Suspended, m.from, cur);
+    }
+
+    // Drop the lease for `n` (it spoke first-hand through a Join, or it left the live set). Emits Resumed
+    // only if a lease was held and the member is still live and admitted (never for a tombstone).
+    void clear_lease_on_proof_of_life(NodeId n) {
+        if (!suspended_leases_.contains(n.value)) return;
+        suspended_leases_.clear(n.value);
+        const auto it = members_.find(n.value);
+        if (it != members_.end() && !is_tomb(it->second.status)) push_event(MembershipEventKind::Resumed, n, it->second);
+    }
+
+    // A first-hand frame from a leased member at a HIGHER incarnation than its suspend: it is back.
+    void on_leased_peer_spoke(const ControlMsg& m) {
+        const SuspendLeases::Entry* e = suspended_leases_.find(m.from.value);
+        if (!e || m.from_incarnation <= e->incarnation) return;  // pre-suspend straggler: keep the lease
+        suspended_leases_.clear(m.from.value);
+        if (const auto it = members_.find(m.from.value); it != members_.end())
+            push_event(MembershipEventKind::Resumed, m.from, it->second);
+    }
+
+    // Lapsed leases: the member never resumed within the bound. Hand it to the ordinary failure path:
+    // Suspect now (a full suspicion window to refute), Dead if it stays silent. No zombie (ADR-071 C2).
+    void expire_suspend_leases(std::int64_t now) {
+        if (suspended_leases_.size() == 0) return;
+        for (const std::uint64_t id : suspended_leases_.expire(now)) {
+            const auto it = members_.find(id);
+            if (it == members_.end() || is_tomb(it->second.status)) continue;
+            it->second.lease_expired_inc = it->second.incarnation;
+            apply_update(NodeId{id}, it->second.incarnation, MemberStatus::Suspect, Src::Local, now);
+        }
+    }
+
+    // After a sleep or a path change our timers describe a world that no longer exists.
+    void forgive_local_state(std::int64_t now) {
+        probe_ = Probe{};
+        for (auto& [id, m] : members_)
+            if (m.status == MemberStatus::Suspect && id != self_.value)
+                m.suspect_deadline_ns = now + cfg_.suspicion_timeout_ns;
+    }
+
+    // Live peers that are awake: the targets of gossip fan-out and relay selection (a leased member is
+    // asleep by its own announcement; sending to it only wastes the budget).
+    [[nodiscard]] std::vector<NodeId> awake_peers_excluding(NodeId excl) const {
+        std::vector<NodeId> v = live_peers_excluding(excl);
+        std::erase_if(v, [&](NodeId n) { return suspended_leases_.contains(n.value); });
+        return v;
+    }
+
     // --- probe FSM ----------------------------------------------------------------------------
     void drive_probe(std::int64_t now) {
         if (!probe_.active) return;
@@ -1282,7 +1499,8 @@ private:
             return;
         }
         // Target tombstoned or erased meanwhile: abandon (a Suspect here would re-create it).
-        if (auto it = members_.find(probe_.target.value); it == members_.end() || is_tomb(it->second.status)) {
+        if (auto it = members_.find(probe_.target.value);
+            it == members_.end() || is_tomb(it->second.status) || suspended_leases_.contains(probe_.target.value)) {
             probe_.active = false;
             return;
         }
@@ -1324,7 +1542,7 @@ private:
     void send_indirect(NodeId target, std::uint64_t seq, std::int64_t /*now*/) {
         std::uint32_t sent = 0;
         std::uint64_t r = mix(self_.value, seq, 0x51D3);
-        std::vector<NodeId> relays = live_peers_excluding(target);
+        std::vector<NodeId> relays = awake_peers_excluding(target);
         for (std::uint32_t i = 0; i < relays.size() && sent < cfg_.indirect_k; ++i) {
             const NodeId relay = relays[(r + i) % relays.size()];
             ControlMsg req;
@@ -1381,7 +1599,7 @@ private:
     }
 
     void gossip_round(std::int64_t now) {
-        std::vector<NodeId> peers = live_peers_excluding(self_);
+        std::vector<NodeId> peers = awake_peers_excluding(self_);
         if (peers.empty()) return;
         std::uint64_t r = mix(self_.value, static_cast<std::uint64_t>(now), 0xF00D);
         for (std::uint32_t i = 0; i < peers.size() && i < cfg_.gossip_fanout; ++i) {
@@ -1434,9 +1652,14 @@ private:
     //   * a Left is authoritative and is never refuted by its own node.
     void apply_update(NodeId node, std::uint64_t inc, MemberStatus st, Src src, std::int64_t now) {
         if (static_cast<std::uint8_t>(st) > static_cast<std::uint8_t>(MemberStatus::Left)) return;  // wire range
-        // ADR-067 D3: the single membership choke point refuses CLIENT ids however they are named
+        // ADR-074 D3: the single membership choke point refuses CLIENT ids however they are named
         // (Join, gossip update, join snapshot, PingReq subject) — a client never becomes a member.
         if (is_client_node(node)) return;
+        if (admission_ && node != self_ && st != MemberStatus::Dead && st != MemberStatus::Left &&
+            admission_->verdict(node) == AdmissionVerdict::Deny) {
+            admission_refusals_.fetch_add(1, std::memory_order_relaxed);  // ADR-069: a denied node stays out
+            return;
+        }
         if (node == self_) {
             if (self_left_ || st == MemberStatus::Left) return;  // a departure is never refuted
             if (st != MemberStatus::Alive && inc >= self_incarnation_) {
@@ -1446,6 +1669,21 @@ private:
                 me.status = MemberStatus::Alive;
             }
             return;  // we never mark ourselves Suspect/Dead
+        }
+
+        // ADR-071 C1: we hold this member's own lease. A second-hand Suspect/Dead at or below the
+        // incarnation it suspended at is a peer that never heard the announcement; the member's word
+        // outranks it. (A LOCAL accusation cannot occur: leased members are not probed.)
+        // #47 M2: while the lease is held EVERY second-hand Suspect/Dead about the member is dropped, at any
+        // incarnation: an incarnation above the lease's is just a peer (possibly a log-only one) claiming a
+        // number the member never used. The member itself ends the lease by speaking first-hand at a
+        // higher incarnation (on_leased_peer_spoke), a Join, or the lease lapsing.
+        if ((st == MemberStatus::Suspect || st == MemberStatus::Dead) && src != Src::Local) {
+            if (const SuspendLeases::Entry* le = suspended_leases_.find(node.value);
+                le && (!cfg_.test_faults.incarnation_gated_suppression || inc <= le->incarnation)) {
+                ++suspicions_suppressed_;
+                return;
+            }
         }
 
         auto it = members_.find(node.value);
@@ -1559,7 +1797,8 @@ private:
         const std::uint8_t tx = piggyback_count();
         std::vector<std::uint64_t> died;
         for (auto& [id, m] : members_) {
-            if (m.status == MemberStatus::Suspect && now >= m.suspect_deadline_ns) {
+            if (m.status == MemberStatus::Suspect && now >= m.suspect_deadline_ns &&
+                (cfg_.test_faults.incarnation_gated_suppression || !suspended_leases_.contains(id))) {  // #47 M2
                 died.push_back(id);
                 m.status = MemberStatus::Dead;
                 m.death_ns = now;
@@ -1680,7 +1919,8 @@ private:
             while (probe_order_idx_ < probe_order_.size()) {
                 const NodeId n = probe_order_[probe_order_idx_++];
                 const auto it = members_.find(n.value);
-                if (it != members_.end() && !is_tomb(it->second.status)) return n;
+                if (it != members_.end() && !is_tomb(it->second.status) && !suspended_leases_.contains(n.value))
+                    return n;  // ADR-071: a leased (suspended) member is not probed
             }
         }
         return std::nullopt;
@@ -1719,9 +1959,12 @@ private:
     void note_transition(NodeId node, Member& m, MemberStatus prev) {
         using K = MembershipEventKind;
         if (is_tomb(m.status)) {
+            // ADR-071 #47 M3 / ADR-069 C11: a tombstoned (dead, left or evicted) member holds no lease. A
+            // lease left behind shielded a re-admitted, restarted process and let a denied one raise Resumed.
+            if (!cfg_.test_faults.keep_lease_on_tombstone) suspended_leases_.clear(node.value);
             if (m.reported != 0 && m.reported != static_cast<std::uint8_t>(m.status)) {
                 m.reported = static_cast<std::uint8_t>(m.status);
-                push_event(m.status == MemberStatus::Left ? K::Left : K::Dead, node, m);
+                push_event(m.status == MemberStatus::Left ? K::Left : evicting_ ? K::Evicted : K::Dead, node, m);
             }
             return;
         }
@@ -1759,8 +2002,26 @@ private:
         pending_events_.push_back(e);
     }
 
+    // ADR-069: tombstone every live member the current snapshot denies; the Evicted event is queued by
+    // note_transition (evicting_ switches Dead -> Evicted) and delivered by the caller's flush_events().
+    void evict_denied() {
+        if (!admission_) return;
+        const auto snap = admission_->current();
+        std::vector<NodeId> victims;
+        for (const auto& [id, m] : members_)
+            if (id != self_.value && !is_tomb(m.status) && snap->lookup(NodeId{id}) == AdmissionVerdict::Deny)
+                victims.push_back(NodeId{id});
+        for (NodeId v : victims) {
+            evicting_ = true;
+            apply_update(v, incarnation_of(v), MemberStatus::Dead, Src::Local, now_ns());
+            evicting_ = false;
+            evictions_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     void flush_events() {
         if (flushing_) return;  // a callback re-entered us: the outer loop drains what it queued
+        if (admission_dirty_.exchange(false, std::memory_order_acq_rel)) evict_denied();
         std::vector<ExtRefusal> ext;
         {
             std::lock_guard<std::mutex> g(ext_mu_);
@@ -1792,6 +2053,7 @@ private:
     std::vector<MembershipEventSink> sinks_;
     std::vector<MembershipEvent> pending_events_;
     bool flushing_ = false;
+    bool evicting_ = false;  // ADR-069: the tombstone being written is an eviction (event kind Evicted)
     std::unordered_map<std::uint64_t, Refusal> refusals_;  // protocol-thread owned, bounded
     NodeId ctx_from_{};                                    // sender of the frame being handled
     std::uint8_t ctx_version_ = 0;
@@ -1841,6 +2103,11 @@ private:
     std::function<void(MessageFrame)> data_sink_;
     std::function<bool(NodeId)> link_reachable_;
     bool online_ = true;
+    // ADR-071 mobile lifecycle state (driving thread only).
+    SuspendLeases suspended_leases_;          // peers that announced a graceful suspend (receiver-side)
+    bool suspended_self_ = false;             // this node called suspend() and has not resume()d
+    std::uint64_t network_changes_ = 0;
+    std::uint64_t suspicions_suppressed_ = 0;
 
     RevocationPullFn revocation_pull_;
     RevocationMergeFn revocation_merge_;
@@ -1867,6 +2134,13 @@ private:
     std::atomic<std::uint64_t> client_control_drops_{0};
     std::atomic<std::uint64_t> gossip_rejected_{0};
     std::uint64_t epoch_ = 0;
+    // ADR-069. Declared last among the members the listener touches; the destructor detaches it first.
+    AdmissionAuthority* admission_ = nullptr;
+    std::uint64_t admission_listener_ = 0;
+    std::atomic<bool> admission_dirty_{false};
+    std::atomic<std::uint64_t> evictions_{0};
+    std::atomic<std::uint64_t> admission_refusals_{0};
+    std::atomic<std::uint64_t> gossip_revocations_ignored_{0};
 };
 
 }  // namespace quark

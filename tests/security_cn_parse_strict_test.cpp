@@ -1,4 +1,4 @@
-// Tests ADR-067 D3 — the identity CN grammar (`parse_quark_cn`, tls_identity.hpp) and the NodeId client
+// Tests ADR-074 D3 — the identity CN grammar (`parse_quark_cn`, tls_identity.hpp) and the NodeId client
 // bit (`kClientNodeBit`, ids.hpp). Std-only: the mbedTLS adapter's single-CN and CA-leaf checks are in
 // tests/adapters/mbedtls_handshake_check.cpp.
 //
@@ -31,7 +31,7 @@ bool parses(std::string_view cn) {
     return parse_quark_cn(cn, c, n);
 }
 
-// The pre-ADR-067 member-only grammar (prefix compare, then "<cluster>:<node>"), reproduced to show an
+// The pre-ADR-074 member-only grammar (prefix compare, then "<cluster>:<node>"), reproduced to show an
 // un-upgraded node's prefix check cannot accept a client CN, whatever follows the prefix.
 bool legacy_prefix_accepts(std::string_view cn) {
     constexpr std::string_view kPrefix = "quark:";

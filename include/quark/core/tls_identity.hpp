@@ -1,5 +1,5 @@
 // Implements ADR-040 — the core, DELIBERATELY mbedTLS-ignorant DTOs for a node's TLS identity and
-// its cluster trust roots; ADR-067 D3 — the identity CN grammar (member / client role). Parsing these DER blobs into `mbedtls_x509_crt`/`mbedtls_pk_context` happens
+// its cluster trust roots; ADR-074 D3 — the identity CN grammar (member / client role). Parsing these DER blobs into `mbedtls_x509_crt`/`mbedtls_pk_context` happens
 // only in the adapter (include/quark/adapters/mbedtls/); the core stays std-only per 020's "honest
 // exception" (crypto is an opt-in adapter, never a core dependency) and CONVENTIONS.md's seam rule.
 //
@@ -47,7 +47,7 @@ struct TrustedRoots {
 using IdentityMaterial = OverlappedMaterial<TlsIdentity>;
 using TrustStore = OverlappedMaterial<TrustedRoots>;
 
-// ADR-067 D3: the two identity CN forms. A distinct client prefix (not a suffix) so a parser that only
+// ADR-074 D3: the two identity CN forms. A distinct client prefix (not a suffix) so a parser that only
 // knows `quark:` refuses a client certificate instead of reading it as a member.
 inline constexpr std::string_view kMemberCnPrefix = "quark:";
 inline constexpr std::string_view kClientCnPrefix = "quark-client:";
@@ -88,7 +88,7 @@ namespace detail {
 }
 
 // The one canonical CN for (cluster, node): the role prefix follows the NodeId's client bit. The inverse
-// of parse_quark_cn — enrolment (ADR-067 D4) requires an issued certificate's CN to equal it byte for byte.
+// of parse_quark_cn — enrolment (ADR-074 D4) requires an issued certificate's CN to equal it byte for byte.
 [[nodiscard]] inline std::string format_quark_cn(ClusterId cluster, NodeId node) {
     std::string cn(is_client_node(node) ? kClientCnPrefix : kMemberCnPrefix);
     cn += std::to_string(cluster.value);

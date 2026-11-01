@@ -91,7 +91,7 @@ its shape is a provisioning choice behind 020's existing `NodeAuthority` seam �
   node's `NodeId` and the cluster id it claims — a mismatch on either is
   rejected before any session exists, not discovered after.
 
-### Enrolment — from a join code to a certificate ([ADR-067](decisions/ADR-067-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed)
+### Enrolment — from a join code to a certificate ([ADR-074](decisions/ADR-074-trust-anchor-signed-revocation-enrolment-client-role.md), Proposed)
 
 With a cluster CA, a new node must obtain a certificate before it can AUTHENTICATE. Quark owns
 that step as a transport-agnostic `Enrollment` state machine on the **anchor** node; the CA
@@ -177,6 +177,41 @@ struct Discovery {
   running cluster. This is the property that keeps the system coordinator-free
   (010) while still bootstrappable.
 
+### LAN discovery adapter (DNS-SD) — Draft amendment (ADR-070, issue #42)
+
+> **Amended 2026-11-01** (AeroCoWorker ADR-044 R16): one id per device, exact match, two accept lists; prefix matching removed.
+>
+> **Status: Draft.** Owner of the evidence: [ADR-070](decisions/ADR-070-lan-discovery-adapter.md) (Proposed). It adds an adapter
+> behind the `Discovery` seam above; it changes nothing in the core, SWIM, or the handshake.
+
+A node on a local network with no configured address finds peers by DNS-SD/mDNS. This is an **adapter outside the core** (as the
+adapter list above says), in `include/quark/net/lan_discovery.hpp`.
+
+- **Discovery grants nothing.** The adapter yields a `DiscoveredPeer` (address, port, the instance id the peer advertised). It
+  carries no `NodeId` and no trust. It may only feed the normal connection path (`lan_discovery_feed.hpp` teaches
+  `TcpTransport::add_peer`); the handshake and `NodeAuthority` admission still decide whether the peer is a member.
+- **The advertisement carries only what the application supplies:** the service type, one opaque instance id (encoded as RFC 4648
+  base32, lowercase, no padding, into the DNS-SD instance label, at most 36 bytes), a host label, the listening port, and TXT pairs
+  only if the application supplied them. Quark derives nothing from a host name, user name, node id or product, and hard-codes no
+  service type. Nothing is advertised if the application supplies no id or no host label.
+- **Rotation is the application's.** The application supplies a `WindowProvider` returning the id to advertise, the ids to accept
+  (current and previous window), and the host label for that window; it signals a boundary (`window_boundary`) and the adapter
+  re-reads the provider and re-advertises. The adapter owns neither the clock nor any key. **Each device advertises its own id**
+  (no shared group prefix, no suffix), and the window carries two lists: `accept_ids` (the exact ids of the other active devices,
+  current window) and `accept_previous_ids` (previous window). Browsing accepts a sighting only when its decoded label bytes
+  **equal** an id in either list; there is no prefix matching. `previous_window` is true iff the match came from
+  `accept_previous_ids` (current wins if an id is in both). Distinct ids avoid the mDNS instance-name collision that a shared id
+  causes (ADR-070 F1, resolved by ADR-044 R16).
+- **Runtime control, per scope.** `open_scope` / `start_advertising` / `stop_advertising` / `start_browsing` / `stop_browsing` /
+  `close_scope`; several scopes may advertise at once with different ids and service types. Destroying the adapter withdraws every advert.
+- **Platform seam.** The OS calls sit behind `DnsSdPlatform` (`register_service`, `deregister_service`, `browse`, `stop_browse`), which
+  the application may implement itself (AeroCoWorker routes OS authority through its own HAL). Quark ships an in-memory fake and, behind
+  the opt-in `QUARK_WITH_DNSSD`, a Windows implementation over dnsapi. **Linux (Avahi) is out of scope**; there the application supplies its own platform.
+- **Client isolation is not detectable passively.** `visibility()` returns `Unknown`. No probing or scanning is performed to tell
+  "no peers visible" from "no peers present"; that distinction is owed (ADR-070 section 5).
+- **Known leaks, stated rather than hidden:** the SRV record carries the listening port; the A record carries the advertised IPv4
+  address; a platform that forces a stable host name makes that name a stable identifier (the host label must therefore rotate with the window).
+
 ### Establishment: lazy, not full mesh (self-debate)
 
 - **Eager full mesh.** Every node dials every other at join → *predictable
@@ -201,12 +236,44 @@ round-trip:
 > lower `NodeId`** is kept and the other is closed. Both ends compute the same
 > winner from ids alone.
 
+> **Reconnect supersedes (Draft amendment, ADR-071 "Red-team of the merged changes (#47)", B1).** The
+> election above is for a *simultaneous dial*. A **new** connection from an already-identified peer whose existing
+> connection has been confirmed for longer than a short **race window** (default 1 s) is a **reconnect** (the peer
+> changed network, restarted, or the old socket is half-open): it supersedes the old one **whichever side dialled**,
+> and the superseded connection reports peer-down to the layer above (so `SecureTransport` drops the session
+> negotiated on it). Both ends apply the same rule, so both keep the new connection and the old one closes on both
+> without a redial. Younger than the window the pair is a genuine race and the election decides. A new connection
+> inside the window is refused, retries with backoff, and is let in once the window has passed (bounded:
+> about six attempts at the default).
+
 The AEAD handshake (020) rides the surviving connection; the loser is dropped
 before any application frame flows, so dedup costs nothing steady-state.
 Certificate rotation (see below) also reuses this same reconnect/backoff
 machinery on a failed renegotiation, rather than inventing a parallel rekey
 protocol or a new glare-breaking rule — connection establishment already
 handles this class of race.
+
+### HELLO and dial dedup in pinned-key mode (#40, ADR-068)
+
+In CA mode the dialer sends a cleartext HELLO (`QRK1`, version, u64 NodeId) before anything else and the dedup rule above reads the
+NodeId from it. In pinned-key mode that would hand a stable identifier to every prober, so **the HELLO is not sent** (020
+"Pinned-key mode"). What it carried travels inside the encrypted Noise payloads instead:
+
+- the **version** (checked against the same +-1 window as ADR-053, a refusal being silent, not a `VersionRefused` message) is in
+  Msg1 and Msg2;
+- the **NodeId** is **derived from the Ed25519 key** (first 8 bytes of SHA-256), so it is not a claim at all: Msg1 and Msg2 carry
+  it, the receiver refuses one that is not the derived id, and the application's pinned key for a dialled peer must derive the
+  NodeId being dialled.
+
+Dial dedup keeps its rule unchanged ("the connection initiated by the lower `NodeId` is kept") but now applies it **after** the
+handshake: each side learns the peer's NodeId only once Msg1 (responder) or Msg2 (initiator) has authenticated, and an
+unauthenticated connection has no NodeId to dedup on, so it holds no peer slot. The glare-free client/server role
+(`local_is_client`: lower NodeId initiates) is unchanged, so with `SecureTransport` driving the engine only one handshake runs per
+pair.
+
+**Status:** the engine and its `SecureTransport` composition are implemented and tested; the `TcpTransport` side (an accept path that
+identifies a connection by the handshake instead of a HELLO, per-IP pre-auth caps keyed on the socket rather than a claimed id, and
+sealed frame headers so `from`/`to` are not in the clear) is **not** built. See ADR-068 "What remains unproven".
 
 ### Certificate rotation and revocation on a live cluster
 
@@ -235,6 +302,31 @@ distinct triggers:
 Neither path requires a coordinated cluster-wide restart or a cluster-wide
 barrier — both are purely gossip/local-sweep driven, one node and one session
 at a time.
+
+### Application-driven eviction *(Draft amendment, ADR-069, 2026-10-31)*
+
+> **Status: Draft amendment**, with 020 section 1a (the snapshot semantics live there). Issue #41.
+
+When the application's admission snapshot (020 section 1a) denies a node that is a **live** member, this
+node **evicts** it:
+
+- its sessions are closed (020 section 1a b) and no relay forwards to or from it;
+- it is tombstoned in the roster, so it leaves `view()` and `placement_view()` and the epoch advances;
+- one **`Evicted`** membership event (issue #21) is reported, on every node that observes the
+  generation, distinct from `Dead` (a failure) and `Left` (a graceful departure); the event carries the
+  post-eviction epoch;
+- **re-admission is refused** while the snapshot denies the node: every Alive or Suspect update for it
+  (gossip, direct ack, join) is dropped and counted (`admission_refusals`). A later snapshot that admits it
+  lets it rejoin by the ordinary higher-incarnation rule, with a fresh `Joined` event.
+
+A node that is itself **suspended** (ADR-071) still applies a pending eviction, at its next `tick()`/inbound
+frame and again at the start of `resume()` before any gossip leaves (#47, N2): eviction is local state, not traffic.
+
+A published generation marks eviction pending with a thread-safe flag; the membership's driving thread
+performs it at its next `tick()`, inbound frame or `apply_admission()` (at most one protocol tick of
+latency, the same contract as the other externally queued reports). Each node decides from its own
+snapshot: eviction is **not gossiped**, so one node cannot evict another's peers. A node whose snapshot
+still admits the peer keeps it.
 
 ### Liveness and teardown
 
@@ -269,7 +361,7 @@ A new node does not appear in placement the instant its process starts:
                                           snap)
 ```
 
-- A node without a certificate runs **ENROL** (§1, ADR-067, Proposed) before CONNECT. A
+- A node without a certificate runs **ENROL** (§1, ADR-074, Proposed) before CONNECT. A
   **client**-role identity (020 §1) stops at AUTHENTICATE: it never SYNCs, ANNOUNCEs or becomes a
   MEMBER.
 - Placement (010) **recomputes only at ANNOUNCE**, once the node can actually host
@@ -451,6 +543,51 @@ A future relay-discovery ADR should only need to address these three items —
 the fallback-threshold mechanism itself (`resolve_dial_endpoint()`, the fenced
 relay↔direct cutover) is settled and should not be re-litigated.
 
+### Mobile member profile (ADR-071)
+
+> **Status: Draft** — see [ADR-071](decisions/ADR-071-android-pal-and-mobile-lifecycle.md) for the claims, the
+> experiments that break them, and what is owed. Lifecycle contract: [019 §"Android target"](019-Platform-Abstraction-Layer.md).
+
+A phone is a full member that is *often absent on purpose*: the OS freezes the app. Plain SWIM reads that
+silence as a failure, so every backgrounding would raise suspicion and, after the suspicion window, declare the
+phone dead and re-place its actors. The profile makes a **planned** absence distinguishable from a crash, with
+no new membership *state* and no new failure detector:
+
+- **Announce (`ControlKind::Suspend = 10`).** Before going quiet, the member sends one control frame to each
+  live peer: `seq` = the lease it asks for (a relative duration in ns; no clock skew travels), `subject_incarnation`
+  = a reason code. It speaks only for itself (`from` is the authenticated sender, as for Left). Best-effort: it
+  cannot wait for acks while the OS freezes it.
+- **The receiver holds a lease, and the receiver bounds it.** A peer that accepts the announcement records
+  "do not probe, suspect or kill this member until `now + min(asked, max_lease_ns)`" (`MobileProfile`,
+  default cap 15 min, default self-announced lease 10 min) and caps how many leases it holds (`max_suspended`,
+  64). A request of zero, beyond the table cap, from an unknown or unverified member, or at an incarnation
+  below what the receiver holds (a replay) is ignored — the silence is then treated like any other.
+- **While leased:** the member is not probed, not chosen as an indirect-ping relay, not a gossip fan-out
+  target; its status stays **Alive** (`NodeHealth::suspended == true`, events `Suspended` / `Resumed`); a
+  second-hand Suspect/Dead about it is ignored **at any incarnation** while the lease is held (counted in
+  `suspicions_suppressed()`; ADR-071 "Red-team of the merged changes (#47)", M2: an incarnation above the lease's is just
+  a peer claiming a number the member never used), and `reap_suspects` skips it, so one peer that missed the announcement
+  (or lies) cannot drag the others along. It stays
+  in `view()` and placement for the lease: that is the point, nothing re-places.
+- **Resume = rejoin without churn.** `resume()` raises the member's incarnation and sends a Gossip frame to
+  every live peer at once. Any non-Suspend frame from a leased member at a *higher* incarnation clears the
+  lease on arrival (a pre-suspend straggler does not). The resumed node also forgives its own timers: the
+  in-flight probe is voided and any Suspect it held gets a fresh suspicion window (the boot clock counted the
+  sleep, so every deadline would otherwise read as expired).
+- **A lease ends with the member's liveness or standing (#47, M3).** It is cleared when the member is tombstoned
+  (Dead, Left or **Evicted**), erased, or **Joins** (first-hand proof of life of a possibly restarted process: the
+  previous process's lease does not cover it). An evicted member therefore holds no lease and raises no `Resumed` while
+  the snapshot denies it.
+- **No zombie.** When the lease lapses without a resume, the receiver moves the member to **Suspect** (a full
+  suspicion window to refute) and the ordinary path ends in Dead and removal. A peer that never heard the
+  announcement behaves as plain SWIM; the member heals on resume by refuting at its higher incarnation
+  (R3: strictly higher beats a tombstone).
+- **Wire compatibility.** Additive. An N-1 node has no `case` for the new kind and ignores it, treating the frame
+  as first-hand liveness evidence; it simply gets no benefit (it suspects the silent phone as before). The SWIM
+  wire version is not bumped.
+- **Not in this profile:** discovery on Android (Q3), the foreground service and Doze policy (the app), and
+  the connection-level handling of an address change (010's transport rule, 019 §"Android target").
+
 ### Anti-flap — damping churn (self-debate)
 
 - **React to every membership event immediately.** Fast convergence, but a flapping
@@ -497,10 +634,10 @@ the roll:
   indistinguishable from v1; from v2 on the gate is real. A change an N-1 node cannot parse must bump
   the version AND shrink the window via a new ADR. A refused peer behaves as partitioned (its gossip is
   never absorbed) — not an in-band negotiation.
-- **Revocation gossip across ADR-067 is not guaranteed mid-roll** (Proposed). Old nodes gossip bare
+- **Revocation gossip across ADR-074 is not guaranteed mid-roll** (Proposed). Old nodes gossip bare
   fingerprints, which upgraded nodes refuse; upgraded nodes gossip signed records, which old nodes
   cannot use. Until the roll completes, operators revoke locally on every node; signed gossip is
-  relied on only once every node runs ADR-067.
+  relied on only once every node runs ADR-074.
 
 The stabilization window above also means the brief per-node absence during its
 restart does not thrash placement across the rest of the cluster.

@@ -190,7 +190,9 @@ int main() {
     QueuedTransport n1_inner(fabric, n1), n2_inner(fabric, n2);
     MockCipher unused_cipher(0);
     SecureTransport n1_secure(n1_inner, unused_cipher, n1);
+    n1_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
     SecureTransport n2_secure(n2_inner, unused_cipher, n2);
+    n2_secure.set_min_renegotiate_interval(0);  // #48: these tests rekey immediately
     IdentityMaterial identity1(identity_blob), identity2(identity_blob);
     TrustStore trust1(trust_blob), trust2(trust_blob);
     MockHandshakeFactory factory1, factory2;

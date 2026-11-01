@@ -44,6 +44,7 @@ detected, how to bump it, and what is deliberately left to the runner platform.
 | apt package lock | `ci/apt-packages.txt` | exact `pkg=version`; installed version must match |
 | vcpkg baseline | `VCPKG_BASELINE` | must equal `vcpkg.json` `builtin-baseline` |
 | mbedTLS floor | `MBEDTLS_MIN` | `vcpkg.json` `version>=` must be ≥ the floor |
+| libsodium floor | `SODIUM_MIN` | `vcpkg.json` `version>=` must be ≥ the floor; `libsodium-dev` is exact-locked in `ci/apt-packages.txt` and installed only by `ci/install-deps.sh --with-sodium` (issue #40, ADR-068) |
 | Release signer | `COSIGN_VERSION` + pinned Action SHA | `release.yml` must match; verify before publish |
 
 The single toolchain installer is `ci/install-deps.sh`. The single workflow pin source is

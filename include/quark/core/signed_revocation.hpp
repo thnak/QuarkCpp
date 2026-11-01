@@ -1,12 +1,12 @@
-// Implements ADR-067 D1/D2 — the issuer-authenticated revocation RECORD and the verify-only trust-anchor
+// Implements ADR-074 D1/D2 — the issuer-authenticated revocation RECORD and the verify-only trust-anchor
 // seam (020 §"Rotation and revocation invariants"). Std-only: the signature check itself is an adapter
 // (include/quark/adapters/mbedtls/mbedtls_trust_anchor.hpp); the core never holds a signing key and
-// contains no signing primitive (ADR-067 C5).
+// contains no signing primitive (ADR-074 C5).
 //
 // A record is signed by the cluster trust anchor (the CA root key that issues node certificates) over a
 // FIXED-LENGTH, fixed-layout message whose first 16 bytes are an ASCII domain-separation prefix — it can
 // never begin a DER SEQUENCE (0x30), so a revocation signature is never a valid certificate signature and
-// vice versa (ADR-067 C2). Records are identified by `fingerprint`, never by their bytes: ECDSA is
+// vice versa (ADR-074 C2). Records are identified by `fingerprint`, never by their bytes: ECDSA is
 // malleable, so two valid encodings of one revocation are one revocation. Replay is harmless (the
 // registry is a union-only ratchet), so the record has no nonce and `issued_at` is never a validity gate.
 #pragma once
@@ -102,7 +102,7 @@ inline void put_le64(std::byte* p, std::uint64_t v) noexcept {
     return true;
 }
 
-// The verify-only trust-anchor seam (ADR-067 D1). `verify` is true iff `anchor_key_id` names a CURRENTLY
+// The verify-only trust-anchor seam (ADR-074 D1). `verify` is true iff `anchor_key_id` names a CURRENTLY
 // trusted root (current, or previous still inside its ADR-040 overlap window) AND `signature` is a valid
 // ECDSA-with-SHA-256 signature by that root over `message`. Implementations must be safe to call from any
 // thread; it is a cold path (one call per never-seen fingerprint).

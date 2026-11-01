@@ -1,4 +1,4 @@
-// Tests ADR-067 D4 — the `Enrollment` state machine (enrollment.hpp), std-only. A MockCrypto stands in
+// Tests ADR-074 D4 — the `Enrollment` state machine (enrollment.hpp), std-only. A MockCrypto stands in
 // for the verify-only seam (keyed toy MAC, toy CSR and certificate encodings); real HMAC/X.509 checks
 // belong to the mbedTLS adapter.
 //

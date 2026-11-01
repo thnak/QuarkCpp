@@ -1,7 +1,7 @@
-// Conformance check for ADR-067 D4 (and C5) over REAL crypto: `MbedtlsEnrolCrypto` (enrollment.hpp's
+// Conformance check for ADR-074 D4 (and C5) over REAL crypto: `MbedtlsEnrolCrypto` (enrollment.hpp's
 // EnrolCrypto seam), the joiner's key/CSR/MAC helpers and `validate_identity_not_root`
 // (mbedtls_enrollment.hpp). A test PKI is generated on the fly; the application's custodian — the only
-// signer, which Quark never is (ADR-067 D1) — is simulated HERE, in the test, from the IssueRequest alone
+// signer, which Quark never is (ADR-074 D1) — is simulated HERE, in the test, from the IssueRequest alone
 // (the SPKI, never the CSR). Proves: HMAC compare; CSR proof-of-possession (tampered, truncated, trailing,
 // non-P-256, non-SHA-256 refused); every issued-certificate rule (CN exact and single, SPKI, not
 // CA-capable, validity bounds, chains only to a CONFIGURED root by signature not name, intermediates

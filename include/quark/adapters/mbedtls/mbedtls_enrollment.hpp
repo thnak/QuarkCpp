@@ -1,16 +1,16 @@
-// Implements ADR-067 D4 (and C5) — the mbedTLS side of ticketed enrolment (021 §Enrolment):
+// Implements ADR-074 D4 (and C5) — the mbedTLS side of ticketed enrolment (021 §Enrolment):
 //   * `MbedtlsEnrolCrypto`, the anchor's implementation of the verify-only `enrol::EnrolCrypto` seam
 //     (enrollment.hpp): constant-time HMAC-SHA256, CSR proof-of-possession, and the checks on the
 //     certificate the application's custodian returns;
 //   * the joiner's half: generating its identity key, the CSR, and the ticket MAC;
 //   * `validate_identity_not_root`, the C5 startup check (a node never runs with a root's private key).
 //
-// NOTHING HERE SIGNS A CERTIFICATE (ADR-067 D1). The only private key this file touches is the joiner's
+// NOTHING HERE SIGNS A CERTIFICATE (ADR-074 D1). The only private key this file touches is the joiner's
 // own identity key, which signs its own CSR. Every certificate check is against the anchor's CONFIGURED
 // TrustStore (current roots plus the still-in-window previous ones, ADR-040), parsed with the same walker
 // the handshake uses (mbedtls_x509_util.hpp).
 //
-// Keys are ECDSA P-256 only, the curve the cluster's roots use (ADR-067 D1): a CSR for any other key is
+// Keys are ECDSA P-256 only, the curve the cluster's roots use (ADR-074 D1): a CSR for any other key is
 // refused. Cold path; every call parses what it needs and keeps no shared mbedTLS state (the only shared
 // object is the TrustStore, whose snapshot() is itself thread-safe), so `MbedtlsEnrolCrypto` is thread-safe.
 #pragma once
@@ -230,7 +230,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------------
-// ADR-067 C5 at startup: refuse a node identity that is CA key material — its private key or certificate
+// ADR-074 C5 at startup: refuse a node identity that is CA key material — its private key or certificate
 // key equal to the key of any root in `trust` (current and still-in-window previous), or a CA-capable
 // certificate (an issuing intermediate's). MbedtlsHandshakeEngine applies the same rule to every handshake.
 // ---------------------------------------------------------------------------------------------------
@@ -238,23 +238,23 @@ private:
     detail::Pk key;
     detail::Crt cert, roots;
     if (!detail::parse_private_key(key.v, own.private_key_der))
-        return fail(errc::validation, "own identity private key does not parse (ADR-067 C5)");
+        return fail(errc::validation, "own identity private key does not parse (ADR-074 C5)");
     if (mbedtls_x509_crt_parse_der(&cert.v, detail::uchars(own.cert_chain_der), own.cert_chain_der.size()) != 0)
-        return fail(errc::validation, "own identity certificate does not parse (ADR-067 C5)");
+        return fail(errc::validation, "own identity certificate does not parse (ADR-074 C5)");
     for (const TrustedRoots* bundle : {trust.current.get(), trust.previous.get()}) {
         if (bundle == nullptr || bundle->ca_chain_der.empty()) continue;
         if (!detail::parse_der_concat(roots.v, bundle->ca_chain_der))
-            return fail(errc::validation, "trust roots do not parse (ADR-067 C5)");
+            return fail(errc::validation, "trust roots do not parse (ADR-074 C5)");
     }
-    if (roots.v.raw.len == 0) return fail(errc::validation, "no trust roots configured (ADR-067 C5)");
+    if (roots.v.raw.len == 0) return fail(errc::validation, "no trust roots configured (ADR-074 C5)");
     if (detail::key_is_a_root(key.v, roots.v) || detail::key_is_a_root(cert.v.pk, roots.v) || detail::ca_capable(cert.v))
         return fail(errc::validation, "own identity is CA key material: a CA key must never be in a Quark process "
-                                      "(ADR-067 C5)");
+                                      "(ADR-074 C5)");
     return {};
 }
 
 // ---------------------------------------------------------------------------------------------------
-// The joiner's half (ADR-067 D4). The joiner keeps its key; only the CSR and the MAC are sent.
+// The joiner's half (ADR-074 D4). The joiner keeps its key; only the CSR and the MAC are sent.
 // ---------------------------------------------------------------------------------------------------
 
 // A fresh ECDSA P-256 identity key, DER as mbedtls_pk_write_key_der writes it (SEC1 ECPrivateKey; what
@@ -282,7 +282,7 @@ private:
 [[nodiscard]] inline result<std::vector<std::byte>> make_enrol_csr(std::span<const std::byte> key_der) {
     detail::Pk pk;
     if (!detail::parse_private_key(pk.v, key_der)) return fail(errc::validation, "identity key does not parse");
-    if (!detail::is_p256(pk.v)) return fail(errc::validation, "identity key is not ECDSA P-256 (ADR-067 D1)");
+    if (!detail::is_p256(pk.v)) return fail(errc::validation, "identity key is not ECDSA P-256 (ADR-074 D1)");
     mbedtls_x509write_csr w;
     mbedtls_x509write_csr_init(&w);
     mbedtls_x509write_csr_set_key(&w, &pk.v);

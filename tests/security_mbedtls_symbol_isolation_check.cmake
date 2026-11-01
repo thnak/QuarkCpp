@@ -20,14 +20,21 @@ if(NOT _quark_dumpbin_rc EQUAL 0)
 endif()
 
 string(TOLOWER "${_quark_dumpbin_out}" _quark_dumpbin_out_lower)
-string(FIND "${_quark_dumpbin_out_lower}" "mbedtls_" _quark_hit)
-if(NOT _quark_hit EQUAL -1)
-    message(FATAL_ERROR
-        "security_mbedtls_symbol_isolation: FOUND an mbedtls_-prefixed symbol in the DEFAULT "
-        "(QUARK_WITH_MBEDTLS=OFF) build of ${TARGET_LIB} -- the core is no longer isolated from the "
-        "optional mTLS adapter (ADR-040). Check for an accidental #include of "
-        "quark/adapters/mbedtls/*.hpp from a CORE header, or a link-order mistake pulling "
-        "quark_security_mbedtls into the default `quark` target.")
+# SYMBOL_PREFIXES (a |- or ;-list, default just "mbedtls_"): every one must be ABSENT. The sodium variant passes
+# "sodium_|crypto_" (issue #40 / ADR-068: libsodium's public symbols are sodium_* and crypto_*).
+if(NOT DEFINED SYMBOL_PREFIXES)
+    set(SYMBOL_PREFIXES "mbedtls_")
 endif()
+string(REPLACE "|" ";" SYMBOL_PREFIXES "${SYMBOL_PREFIXES}")  # '|' survives add_test quoting; ';' does not
+foreach(_prefix IN LISTS SYMBOL_PREFIXES)
+    string(FIND "${_quark_dumpbin_out_lower}" "${_prefix}" _quark_hit)
+    if(NOT _quark_hit EQUAL -1)
+        message(FATAL_ERROR
+            "security_symbol_isolation: FOUND a ${_prefix}-prefixed symbol in the core static library ${TARGET_LIB} -- "
+            "the core is no longer isolated from the optional security adapters (ADR-040 / ADR-068). Check for an "
+            "accidental #include of quark/adapters/mbedtls/*.hpp or quark/adapters/sodium/*.hpp from a CORE header, or a "
+            "link-order mistake pulling a security adapter into the default `quark` target.")
+    endif()
+endforeach()
 
-message(STATUS "security_mbedtls_symbol_isolation: OK -- 0 mbedtls_ symbols in ${TARGET_LIB}")
+message(STATUS "security_symbol_isolation: OK -- 0 symbols with prefixes [${SYMBOL_PREFIXES}] in ${TARGET_LIB}")

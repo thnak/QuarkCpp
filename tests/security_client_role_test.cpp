@@ -1,4 +1,4 @@
-// Tests ADR-067 D3 — the CLIENT identity role (NodeId bit 63, `quark-client:` CN) is authenticated but
+// Tests ADR-074 D3 — the CLIENT identity role (NodeId bit 63, `quark-client:` CN) is authenticated but
 // is never a member. Std-only (mock handshake, loopback SWIM); the TCP relay half is in
 // tcp_relay_forwarding_test.cpp and the real-certificate half in tests/adapters/mbedtls_handshake_check.cpp.
 //
