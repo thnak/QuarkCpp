@@ -132,7 +132,7 @@ endif()
 if(QUARK_BUILD_TESTS AND QUARK_WITH_SODIUM)
   find_package(Threads REQUIRED)
   foreach(_chk noise_ik_vectors_check sodium_aead_check pinned_handshake_check pinned_privacy_check
-               pinned_secure_transport_check pinned_tcp_check)
+               pinned_secure_transport_check pinned_tcp_check pinned_flood_check)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/${_chk}.cpp")
       add_executable(${_chk} tests/adapters/${_chk}.cpp)
       target_include_directories(${_chk} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

@@ -459,6 +459,13 @@ public:
     [[nodiscard]] std::uint64_t frames_received() const noexcept { return frames_received_.load(); }
     [[nodiscard]] std::uint64_t frames_sent() const noexcept { return frames_sent_.load(); }
     [[nodiscard]] std::uint64_t drops() const noexcept { return drops_.load(); }
+    // Never-identified inbound connections currently held (the pre-auth pending set), measured on the loop thread.
+    // Blocks briefly; call only while the transport is running (issue #49 flood check).
+    [[nodiscard]] std::uint64_t pending_inbound_count() {
+        std::uint64_t r = 0;
+        run_on_loop_sync([&] { r = pending_in_.size(); });
+        return r;
+    }
     [[nodiscard]] std::uint64_t outbound_data_drops() const noexcept { return outbound_data_drops_.load(); }
     [[nodiscard]] std::uint64_t outbound_control_drops() const noexcept { return outbound_control_drops_.load(); }
     // Total bytes queued across all peers (both lanes), measured on the loop thread. Blocks briefly.
@@ -992,8 +999,13 @@ private:
                 return;
             }
             if (!ok) {  // protocol error on the stream (oversized/malformed) ⇒ untrustworthy, drop
-                if (auto it = conns_.find(c->peer.value); it != conns_.end() && it->second.get() == c)
-                    handle_dead(c);
+                // A never-identified (pending, anonymous) inbound lives in pending_in_, not conns_: it must be dropped
+                // too, or garbage on a pinned listener would hold its slot until the pending timeout (issue #49).
+                const auto it = conns_.find(c->peer.value);
+                const bool registered = it != conns_.end() && it->second.get() == c;
+                const auto pit = pending_in_.find(c->fd);
+                const bool pending = pit != pending_in_.end() && pit->second.get() == c;
+                if (registered || pending) handle_dead(c);
                 return;
             }
         }
