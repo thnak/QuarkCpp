@@ -252,13 +252,13 @@ jobs:
 
   # Issue #40 / ADR-068: the opt-in libsodium pinned-key adapter (Noise IK). One Linux leg: it builds with QUARK_WITH_SODIUM=ON
   # and runs the adapter checks (official Noise test vector, handshake, privacy on real sockets, SecureTransport composition)
-  # plus the core symbol-isolation proof. UNRUN at the time it was written: CI cannot be executed locally; the cross-mode check
-  # (needs mbedTLS too) is not built here. Informational until its first green run (continue-on-error).
+  # plus the core symbol-isolation proof (nm variant + its control) and the per-IP pre-auth flood. BLOCKING since issue #49: the
+  # same stack ran clean on thnak-server (libsodium 1.0.18 from source, GCC 15 / Clang 21 ASan+UBSan, TSan) before this gate was
+  # made required (ADR-068..073 evidence). The cross-mode check (needs mbedTLS too) is not built here.
   test-pinned-sodium:
-    name: test-pinned-sodium (gcc-release, informational, unrun)
+    name: test-pinned-sodium (gcc-release)
     needs: supply-chain
     runs-on: ubuntu-24.04
-    continue-on-error: true
     container:
       image: ghcr.io/thnak/quark-ci@sha256:13686cb105f4d2650dd83c469945f85d2ca603a3b674c7799499098d370bcebe
       credentials:
@@ -274,13 +274,13 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build-sodium -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 \
-            -DQUARK_WITH_SODIUM=ON -DQUARK_BUILD_BENCH=OFF
+            -DQUARK_WITH_SODIUM=ON -DQUARK_BUILD_BENCH=OFF             -DQUARK_SODIUM_INCLUDE_DIR=/usr/include -DQUARK_SODIUM_LIBRARY=/usr/lib/x86_64-linux-gnu/libsodium.a
 
       - name: Build
         run: cmake --build build-sodium -j 2
 
       - name: Test (adapter checks)
-        run: ctest --test-dir build-sodium -R "noise_ik|sodium_aead|pinned_" -j 2 --output-on-failure --timeout 600
+        run: ctest --test-dir build-sodium -R "noise_ik|sodium_aead|pinned_|security_sodium" -j 2 --output-on-failure --timeout 600
 
   test-windows:
     name: test-windows (${{ matrix.config.name }})
