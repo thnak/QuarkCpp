@@ -134,7 +134,7 @@ void run_once(bool control) {
     check(wait_until([&] { return on_loop(tA, [&] { return swimA.is_suspended(B); }); }, 5000), "P2: A holds B's lease");
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // long past suspicion + ack timeouts
     std::printf("P2: Suspended=%d Suspect=%d Dead=%d lease=%d\n", evA.suspended.load(), evA.suspect.load(), evA.dead.load(),
-                (int)on_loop(tA, [&] { return swimA.is_suspended(B); }));
+                static_cast<int>(on_loop(tA, [&] { return swimA.is_suspended(B); })));
     check(evA.suspended.load() == 1 && evA.suspect.load() == suspect0 && evA.dead.load() == dead0,
           "P2: one Suspended event, no new Suspect/Dead while leased");
 
@@ -155,11 +155,12 @@ void run_once(bool control) {
     const bool lease = on_loop(tA, [&] { return swimA.is_suspended(B); });
     std::printf("P3: Evicted=%d in_view=%d lease=%d Resumed=%d sessions_closed(+)=%llu session=%d conn_open_samples=%llu/%llu "
                 "A.reconnects(+)=%llu A.refused=%llu\n",
-                evA.evicted.load(), (int)in_view, (int)lease, evA.resumed.load(),
-                (unsigned long long)(sA.admission_stats().sessions_closed - closed0),
-                (int)sA.session_admission_generation(B).has_value(), (unsigned long long)open_samples,
-                (unsigned long long)samples, (unsigned long long)(tA.reconnects() - r0),
-                (unsigned long long)tA.admission_refused());
+                evA.evicted.load(), static_cast<int>(in_view), static_cast<int>(lease), evA.resumed.load(),
+                static_cast<unsigned long long>(sA.admission_stats().sessions_closed - closed0),
+                static_cast<int>(sA.session_admission_generation(B).has_value()),
+                static_cast<unsigned long long>(open_samples), static_cast<unsigned long long>(samples),
+                static_cast<unsigned long long>(tA.reconnects() - r0),
+                static_cast<unsigned long long>(tA.admission_refused()));
     if (!control) {
         check(evA.evicted.load() == 1, "P3: still exactly one Evicted");
         check(!in_view, "P3: B is out of A's view");
@@ -182,7 +183,7 @@ void run_once(bool control) {
                 return a_has_b();
             },
             15000);
-        std::printf("P4: re-admitted: in_view=%d Joined=%d\n", (int)back, evA.joined.load());
+        std::printf("P4: re-admitted: in_view=%d Joined=%d\n", static_cast<int>(back), evA.joined.load());
         check(back, "P4: a later admitting snapshot lets B back in");
         check(evA.joined.load() >= 2, "P4: a fresh Joined event");
     }

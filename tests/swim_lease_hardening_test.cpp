@@ -180,13 +180,13 @@ int main() {
         bool held = false;
         std::uint64_t sup = 0;
         const bool killed = t1_forged(none, status, +1, held, sup);
-        std::printf("T1 %s at lease inc +1: phone killed=%d lease_held=%d suppressed=%llu\n", name, (int)killed, (int)held,
-                    (unsigned long long)sup);
+        std::printf("T1 %s at lease inc +1: phone killed=%d lease_held=%d suppressed=%llu\n", name,
+                    static_cast<int>(killed), static_cast<int>(held), static_cast<unsigned long long>(sup));
         check(!killed && held && sup > 0, "T1: second-hand Suspect/Dead at lease incarnation +1 is ignored while leased");
         Faults old{};
         old.incarnation_gated_suppression = true;
         const bool killed_old = t1_forged(old, status, +1, held, sup);
-        std::printf("T1 CONTROL %s +1 (old gating): phone killed=%d\n", name, (int)killed_old);
+        std::printf("T1 CONTROL %s +1 (old gating): phone killed=%d\n", name, static_cast<int>(killed_old));
         check(killed_old, "T1 control: the old incarnation-gated suppression lets +1 kill the phone");
         const bool killed_zero = t1_forged(old, status, 0, held, sup);
         check(!killed_zero, "T1 control: +0 was always suppressed");
@@ -200,7 +200,7 @@ int main() {
         old.keep_lease_on_tombstone = true;
         const std::int64_t ctl = restart_then_crash(old, false);
         std::printf("T2 restart within lease, crash: first Suspect at +%lld ms (fixed), +%lld ms (CONTROL old)\n",
-                    (long long)fixed, (long long)ctl);
+                    static_cast<long long>(fixed), static_cast<long long>(ctl));
         check(fixed > 0 && fixed < 2000, "T2: a crash after a restart is suspected on the normal timeout");
         check(ctl > 60000, "T2 control: the previous process's lease shielded the restart");
     }
@@ -219,8 +219,8 @@ int main() {
         const std::int64_t b = restart_then_crash(join_only_fix, true);
         const std::int64_t ctl = restart_then_crash(old, true);
         std::printf("T3 evict/reap/re-admit/restart: first Suspect at +%lld (both fixes), +%lld (tombstone fix only), "
-                    "+%lld (Join fix only), +%lld ms (CONTROL old)\n", (long long)both, (long long)a, (long long)b,
-                    (long long)ctl);
+                    "+%lld (Join fix only), +%lld ms (CONTROL old)\n", static_cast<long long>(both),
+                    static_cast<long long>(a), static_cast<long long>(b), static_cast<long long>(ctl));
         check(both > 0 && both < 2000, "T3: both fixes: normal detection");
         check(a > 0 && a < 2000, "T3: the tombstone fix alone suffices");
         check(b > 0 && b < 2000, "T3: the Join fix alone suffices");
@@ -246,7 +246,8 @@ int main() {
         w.deliver_now();
         const int resumed = w.ev[1].count(MembershipEventKind::Resumed, kPhone);
         std::printf("T4%s: after eviction is_suspended=%d health.suspended=%d suspended_count=%zu; after resume Resumed=%d\n",
-                    old ? " CONTROL (old)" : "", (int)suspended, (int)hs, w.sim.s(1).suspended_count(), resumed);
+                    old ? " CONTROL (old)" : "", static_cast<int>(suspended), static_cast<int>(hs),
+                    w.sim.s(1).suspended_count(), resumed);
         if (!old) {
             check(!suspended && !hs && w.sim.s(1).suspended_count() == 0, "T4: an evicted member holds no lease");
             check(resumed == 0, "T4: no Resumed while the snapshot denies the member");
@@ -278,7 +279,7 @@ int main() {
         phone.resume();
         w.deliver_now();
         std::printf("T5%s: evictions while suspended=%llu; frames to denied node 2 at resume=%d\n",
-                    old ? " CONTROL (old)" : "", (unsigned long long)ev_while, to_denied);
+                    old ? " CONTROL (old)" : "", static_cast<unsigned long long>(ev_while), to_denied);
         if (!old) {
             check(ev_while == 1 && !w.sim.s(kPhone).view().contains(NodeId{2}), "T5: eviction applied while suspended");
             check(to_denied == 0, "T5: resume() sends nothing to the denied peer");

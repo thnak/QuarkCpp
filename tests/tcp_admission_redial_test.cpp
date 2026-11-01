@@ -71,9 +71,10 @@ void run(bool transport_admission) {
     std::printf("%s: 3 s after deny: node 2 connections_open>0 in %llu/%llu samples, reconnects(+)=%llu, delivered(+)=%llu, "
                 "refused_by_transport=%llu\n",
                 transport_admission ? "T1 transport admission" : "T3 CONTROL (reset close path)",
-                (unsigned long long)open_samples, (unsigned long long)samples,
-                (unsigned long long)(t2.reconnects() - r0), (unsigned long long)(at2.count() - g0),
-                (unsigned long long)t2.admission_refused());
+                static_cast<unsigned long long>(open_samples), static_cast<unsigned long long>(samples),
+                static_cast<unsigned long long>(t2.reconnects() - r0),
+                static_cast<unsigned long long>(at2.count() - g0),
+                static_cast<unsigned long long>(t2.admission_refused()));
     if (transport_admission) {
         check(open_samples == 0, "T1: node 2 holds no connection to the denied device");
         check(t2.reconnects() == r0, "T1: node 2 never redials it");
@@ -87,8 +88,8 @@ void run(bool transport_admission) {
             std::this_thread::sleep_for(std::chrono::milliseconds(12));
             back = at2.count() > g0 + 3;
         }
-        std::printf("T2 re-admitted: traffic resumed=%d (delivered +%llu)\n", (int)back,
-                    (unsigned long long)(at2.count() - g0));
+        std::printf("T2 re-admitted: traffic resumed=%d (delivered +%llu)\n", static_cast<int>(back),
+                    static_cast<unsigned long long>(at2.count() - g0));
         check(back, "T2: a later admitting snapshot restores traffic");
         // and node 2 can talk to node 1 again too
         const std::uint64_t h0 = at1.count();
