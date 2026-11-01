@@ -58,6 +58,9 @@ enum class FrameKind : std::uint8_t {
     Control = 1,
     Authenticate = 2,
     Schema = 3,  // F17: authenticated post-handshake schema advertisement (SecureTransport only)
+    DialHint = 4,  // TcpTransport-internal (#65): the acceptor's one-shot dial-settle hint. Consumed by the
+                   // transport itself, NEVER delivered to the 010 router; plaintext HELLO wire only (the
+                   // anonymous/pinned wire sends no HELLO, so it never emits or accepts one).
 };
 
 // The wire unit handed to a Transport. Owns its serialized bytes; movable. The header is everything

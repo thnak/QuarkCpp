@@ -39,7 +39,9 @@ struct Refusals {
 
 int main() {
     bool ok = true;
-    check(net::hello_version == 1, "the current hello version is unchanged (byte-compatible)", ok);
+    // ADR-076 (#65): version 2 advertises the DialHint settle capability; the 14-byte LAYOUT is unchanged,
+    // and the ±1 window accepts v1 <-> v2 both ways (a v2 node never sends a hint to a v1 peer).
+    check(net::hello_version == 2, "the current hello version advertises the DialHint capability", ok);
     check(net::hello_size == 14, "the hello layout is unchanged", ok);
 
     const NodeId A{1}, B{2}, C{3};

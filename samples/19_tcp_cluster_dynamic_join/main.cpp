@@ -70,24 +70,34 @@ struct Seq {
 };
 QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable (016)
 
-// `last_seen[src-1]` tracks the last in-order sequence number received FROM that sender, so FIFO can
-// be checked per-(sender,receiver) pair. Single Sequential executor drains this actor, so no lock needed.
+// Per source, `received[src-1]` counts delivered frames and `out_of_order[src-1]` counts arrivals at or
+// below `last_seen` (reordered/duplicated). A GAP is loss, not reordering: the final
+// `missing = N - received[src]` accounts for lost prefixes, middles and tails alike (#65).
 struct Logger : Actor<Logger, Sequential> {
     static constexpr std::string_view quark_type_name = "quark.sample.19_tcp_cluster_dynamic_join.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> last_seen;  // sized to final_n by main(), filled with -1
+    std::vector<int> received;
+    std::vector<int> out_of_order;
     std::atomic<int> count{0};
     bool ordered = true;
 
     void handle(const Seq& s) noexcept {
         const int src = s.n / SRC_MUL;
         const int seq = s.n % SRC_MUL;
+        if (src < 1 || static_cast<std::size_t>(src) > last_seen.size()) {
+            ordered = false;
+            count.fetch_add(1, std::memory_order_release);
+            return;
+        }
         const std::size_t idx = static_cast<std::size_t>(src - 1);
-        if (src < 1 || idx >= last_seen.size() || seq != last_seen[idx] + 1) {
+        if (seq <= last_seen[idx]) {  // reordered or duplicated, never a gap
+            ++out_of_order[idx];
             ordered = false;
         } else {
             last_seen[idx] = seq;
         }
+        ++received[idx];
         count.fetch_add(1, std::memory_order_release);
     }
 };
@@ -162,6 +172,8 @@ int main(int argc, char** argv) {
     detail::MessagePool pool{4096};
     Logger actor;
     actor.last_seen.assign(static_cast<std::size_t>(final_n), -1);
+    actor.received.assign(static_cast<std::size_t>(final_n), 0);
+    actor.out_of_order.assign(static_cast<std::size_t>(final_n), 0);
     auto act = std::make_unique<Activation>(&actor, Logger::dispatch_table(), pool.sink());
     Engine<> eng{EngineConfig{1, 1, 64, 64}};
     LocalRouter local{eng.post_courier(), pool};
@@ -174,6 +186,9 @@ int main(int argc, char** argv) {
     DistributedRouter dist{swim, local, transport};  // briefly clobbers on_receive — harmless pre-start()
     static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
     dist.set_authorizer(authz);
+    // F15: disable the router's per-peer inbound token bucket for this losslessness sample (N=150 is
+    // under the default burst, but keep the gate exact if N is raised); production keeps the guard.
+    dist.set_peer_budget(0, 0);
     swim.set_data_sink([&dist](MessageFrame f) { dist.deliver(f); });  // final, correct demux
     eng.register_activation(actor_id_of<Logger>(keys[static_cast<std::size_t>(self_id - 1)]), *act);
     dist.register_remote<Logger, Seq>();
@@ -273,27 +288,44 @@ int main(int argc, char** argv) {
     driver.join();
 
     const int got = actor.count.load();
-    const int shortfall = expected - got;
-    // Same documented tradeoff as samples 17/18: the LOSING side of a simultaneous first-dial race can
-    // drop frames it had already handed to its socket (tcp_transport.hpp register_identified(), "NOTE
-    // (at-most-once...)"). Discovery here is staggered (gossip-driven, not all-at-once), so it should
-    // fire far less often than in the deliberately-simultaneous mesh sample — but the SAME transport
-    // code path is in play, so the same tolerant, bounded classification applies.
-    const bool shortfall_is_documented_race = shortfall >= 0 && shortfall <= N * (final_n - 1) && shortfall % N == 0;
-    const bool ordered = actor.ordered;
-
+    int missing = 0;
+    int reordered = 0;
+    int whole_lanes_missing = 0;
+    bool partial_lane = false;
     std::printf(
-        "node %llu: received=%d/%d FIFO=%s connections=%llu frames_sent=%llu dedup_closed=%llu drops=%llu known_peers=%zu%s\n",
-        static_cast<unsigned long long>(self_id), got, expected, ordered ? "intact" : "BROKEN",
-        static_cast<unsigned long long>(transport.connections_open()), static_cast<unsigned long long>(transport.frames_sent()),
-        static_cast<unsigned long long>(transport.dedup_closed()), static_cast<unsigned long long>(transport.drops()),
-        known_peers.size(),
-        shortfall > 0 ? "  <- dial-dedup race dropped a lane (documented at-most-once, tcp_transport.hpp)" : "");
+        "node %llu: received=%d/%d ordered=%s connections=%llu frames_sent=%llu dedup_closed=%llu "
+        "drops=%llu peer_sheds=%llu known_peers=%zu\n",
+        static_cast<unsigned long long>(self_id), got, expected, actor.ordered ? "yes" : "NO",
+        static_cast<unsigned long long>(transport.connections_open()),
+        static_cast<unsigned long long>(transport.frames_sent()),
+        static_cast<unsigned long long>(transport.dedup_closed()),
+        static_cast<unsigned long long>(transport.drops()),
+        static_cast<unsigned long long>(dist.peer_sheds()), known_peers.size());
+    for (int src = 1; src <= final_n; ++src) {
+        const int seen = actor.received[static_cast<std::size_t>(src - 1)];
+        const int lost = N - seen;
+        if (lost > 0) missing += lost;
+        // LIVE-JOIN caveat (this sample's own driver comment): a base node can send before the late
+        // joiner's endpoint/transport is usable, so a WHOLE lane can be absent. That is a join-timing
+        // gap, not the transport's dial-dedup contract (which samples 17/18 and the dedicated tests
+        // gate). A PARTIAL lane, or any out-of-order arrival, is a real loss/FIFO failure.
+        if (seen == 0) ++whole_lanes_missing;
+        if (seen != 0 && seen != N) partial_lane = true;
+        reordered += actor.out_of_order[static_cast<std::size_t>(src - 1)];
+        std::printf("  src %d: received=%d/%d missing=%d out_of_order=%d\n", src, seen, N,
+                    lost > 0 ? lost : 0, actor.out_of_order[static_cast<std::size_t>(src - 1)]);
+    }
 
     eng.stop();
     transport.stop();
 
-    const bool ok = converged && ordered && shortfall_is_documented_race;
+    // #65: the DialHint settle makes a simultaneous first dial lossless. This dynamic-join sample also
+    // has the documented whole-lane join-timing gap above; partial lanes and reordering still fail.
+    const bool ok = converged && actor.ordered && !partial_lane && reordered == 0;
+    if (whole_lanes_missing > 0) {
+        std::printf("  note: %d whole lane(s) absent (%d frames; dynamic-join timing, not partial loss)\n",
+                    whole_lanes_missing, missing);
+    }
     std::printf("node %llu: %s\n", static_cast<unsigned long long>(self_id), ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }

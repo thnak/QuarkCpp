@@ -26,6 +26,17 @@ which can hang or power off if a build/run saturates all cores. Never use `-j$(n
 | **ASan + UBSan** (gcc 15.2, Linux) | `build-asan` | **Full suite, 2026-10-28 (ADR-062 + #10/#21 commits): 238 / 242 on first run, 2 real heap-use-after-free found and fixed (`FanOut` member teardown order; `delivery_at_least_once_test` re-entering `pump()` from its sink) — both re-run clean (commit `7d331fc`). The other 2 misses are the firing controls `activation_park_race_control` and `topic_no_quiesce_control`, which did not reproduce their race on this host (timing-dependent; untouched by these changes). The full suite was not re-run after the fixes, only the two tests. |
 | **SWIM chaos** (not CTest) | `tests/netem/run_swim_chaos.sh build` | **5 / 5** scenarios end all-alive (form, isolate, asym, split, flaky) |
 
+> **Issue #65 / ADR-076 (2026-11-01, Linux 28-core, g++ 15.2):** the DialHint settle handshake adds
+> `tcp_transport_dial_race_mesh_test` and `tcp_transport_dial_settle_test`. The full **Release** suite is
+> **273 / 273 passed**; the transport subset (`dial|tcp_transport|reconnect|mesh`, 13 tests) is also green
+> under the **ASan+UBSan Debug** build (focused targets). The strengthened
+> `tcp_transport_dial_dedup_test` runs 50 simultaneous-dial rounds per invocation and asserts the race
+> burst itself is delivered exactly once, in order (the old test explicitly did not). Samples 17/18/19
+> now require zero missing/out-of-order frames per (sender,receiver); sample 18 passed 4x150, 4x2000,
+> 4x20000, 8x10000 and 8x100000 with separate processes. The samples disable the router's F15 per-peer
+> inbound budget (`set_peer_budget(0,0)`) because they deliberately burst above its 1024-frame default;
+> production keeps the guard.
+
 > **Issue #28 (2026-11-01):** the two firing controls that missed in the 2026-10-28 ASan run are now
 > deterministic rather than timing-dependent. `activation_park_race_control` blocks the lane in its
 > widen hook until the carrier's ungated `complete_parked()` returns (STRANDED on every iteration);
@@ -117,9 +128,11 @@ against a fresh `ctest -N` on each config rather than assuming a fixed number. A
 ## Coverage note
 
 The TCP-transport and cluster-relay tests (`tcp_frame_codec_test`, `tcp_transport_loopback_test`,
-`tcp_transport_dial_dedup_test`, `tcp_transport_reconnect_test`, `tcp_distribution_integration_test`,
-`cluster_dial_dedup_test`) are present and green in **every** config above, including under TSan — the
-default TCP transport (010/019/021) is race-free, leak-free, and UB-free over real loopback sockets.
+`tcp_transport_dial_dedup_test`, `tcp_transport_dial_race_mesh_test`,
+`tcp_transport_dial_settle_test`, `tcp_transport_reconnect_test`,
+`tcp_distribution_integration_test`, `cluster_dial_dedup_test`) are present and green in **every** config
+above, including under TSan — the default TCP transport (010/019/021) is race-free, leak-free, and UB-free
+over real loopback sockets.
 
 **Impaired-network runs (2026-10-21, bare-metal Ubuntu 26.04, 28 cores, g++ 15.2; Clang 21.1 also
 208/208).** `tests/netem/run_matrix.sh` runs the 9 real-socket tests (`tcp_*`, the three

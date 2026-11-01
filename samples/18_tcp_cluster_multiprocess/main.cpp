@@ -59,25 +59,36 @@ struct Seq {
 };
 QUARK_SERIALIZE(Seq, (1, n))  // remotely-received messages MUST be serializable (016)
 
-// `last_seen[src-1]` tracks the last in-order sequence number received FROM that sender, so FIFO can
-// be checked per-(sender,receiver) pair even with every OTHER process's traffic interleaved on this
-// Logger. Single Sequential executor drains this actor, so no lock is needed.
+// Per source, `received[src-1]` counts the frames actually delivered and `out_of_order[src-1]` counts
+// arrivals at or below `last_seen` (reordered/duplicated). A GAP (seq > last_seen+1) is LOSS, not
+// reordering: the final `missing = N - received[src]` covers lost prefixes, middles and tails alike,
+// so the old `seq != last_seen+1` check (which called a lost prefix "FIFO broken") is split correctly.
+// Single Sequential executor drains this actor, so no lock is needed.
 struct Logger : Actor<Logger, Sequential> {
     static constexpr std::string_view quark_type_name = "quark.sample.18_tcp_cluster_multiprocess.Logger";
     using protocol = Protocol<Seq>;
     std::vector<int> last_seen;  // sized to num_nodes by main(), filled with -1
+    std::vector<int> received;
+    std::vector<int> out_of_order;
     std::atomic<int> count{0};
     bool ordered = true;
 
     void handle(const Seq& s) noexcept {
         const int src = s.n / SRC_MUL;
         const int seq = s.n % SRC_MUL;
+        if (src < 1 || static_cast<std::size_t>(src) > last_seen.size()) {
+            ordered = false;
+            count.fetch_add(1, std::memory_order_release);
+            return;
+        }
         const std::size_t idx = static_cast<std::size_t>(src - 1);
-        if (src < 1 || idx >= last_seen.size() || seq != last_seen[idx] + 1) {
+        if (seq <= last_seen[idx]) {  // reordered or duplicated, never a gap
+            ++out_of_order[idx];
             ordered = false;
         } else {
             last_seen[idx] = seq;
         }
+        ++received[idx];
         count.fetch_add(1, std::memory_order_release);
     }
 };
@@ -104,6 +115,14 @@ int main(int argc, char** argv) {
     const int num_nodes = argc > 2 ? std::atoi(argv[2]) : 4;
     const int N = argc > 3 ? std::atoi(argv[3]) : 150;
     const int base_port = argc > 4 ? std::atoi(argv[4]) : 21000;
+
+    // A SHARED ABSOLUTE settle window, started at PROCESS START (not after the send loop). Every process
+    // is launched together, so an absolute deadline keeps their sockets open for the same span even when
+    // the send loops (num_nodes * N tells each) take different times. A per-process deadline started after
+    // the send loop lets a faster peer stop() and exit while a slower one still has a lane queued; that
+    // early exit closes the socket and is then indistinguishable from message loss.
+    const int settle_budget_ms = 8000 + (num_nodes * N) / 25;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settle_budget_ms);
     if (self_id < 1 || static_cast<int>(self_id) > num_nodes || num_nodes < 1) {
         std::fprintf(stderr, "self_node_id must be in [1, num_nodes]\n");
         return 2;
@@ -136,6 +155,8 @@ int main(int argc, char** argv) {
     detail::MessagePool pool{4096};
     Logger actor;
     actor.last_seen.assign(static_cast<std::size_t>(num_nodes), -1);
+    actor.received.assign(static_cast<std::size_t>(num_nodes), 0);
+    actor.out_of_order.assign(static_cast<std::size_t>(num_nodes), 0);
     auto act = std::make_unique<Activation>(&actor, Logger::dispatch_table(), pool.sink());
     Engine<> eng{EngineConfig{1, 1, 64, 64}};
     LocalRouter local{eng.post_courier(), pool};
@@ -147,6 +168,11 @@ int main(int argc, char** argv) {
     auto dist = std::make_unique<DistributedRouter>(membership, local, transport);
     static const AllowAllAuthorizer authz;  // explicit opt-in: deny-by-default wire policy
     dist->set_authorizer(authz);
+    // F15: the router's per-peer inbound token bucket (default 4096 frames/s, burst 1024) is a
+    // production overload guard. This sample sends an N-frame burst per lane and is a losslessness
+    // gate, so disable it here; a real deployment keeps it (or raises both numbers to its measured
+    // data-plane rate) and accepts shedding as the documented overload behavior.
+    dist->set_peer_budget(0, 0);
     dist->register_remote<Logger, Seq>();  // decode+post inbound (Logger,Seq)
 
     if (!transport.start()) {
@@ -174,16 +200,10 @@ int main(int argc, char** argv) {
 
     const int expected = num_nodes * N;
 
-    // A SHARED settle window, not "stop as soon as I personally succeed": every process was launched
-    // at roughly the same wall-clock moment (run_cluster.sh), so holding this deadline in common keeps
-    // every node's socket open for the same span. Without this, a node with no message loss can finish
-    // in milliseconds, stop() its transport, and exit its OS process while a slower peer (still
-    // retrying a dial, or working through the documented dedup-race backoff) is mid-flight — and that
-    // early exit closes the socket out from under the slower peer, turning ordinary convergence lag
-    // into artificial connection loss or a genuinely torn mid-stream frame (a different, worse failure
-    // than the single documented one-lane loss).
-    constexpr int settle_budget_ms = 8000;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settle_budget_ms);
+    // The window is absolute and shared (started in main's prologue above): no process stops early. It
+    // must cover connection convergence under a heavy first burst (one slow pair can take seconds of
+    // reconnect backoff), not just the engine's drain rate, so it scales with the expected inbound volume
+    // (num_nodes * N) at a conservative 25k frames/ms, with the 8 s floor the small matrices need.
     auto remaining_ms = [&] {
         const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         return rem > 0 ? static_cast<int>(rem) : 0;
@@ -197,25 +217,38 @@ int main(int argc, char** argv) {
     if (const int rem = remaining_ms(); rem > 0) std::this_thread::sleep_for(std::chrono::milliseconds(rem));
 
     const int got = actor.count.load();
-    const int shortfall = expected - got;
-    // Same documented tradeoff as sample 17: the LOSING side of a simultaneous first-dial race can
-    // drop frames it had already handed to its socket (tcp_transport.hpp register_identified(), "NOTE
-    // (at-most-once...)") — always one sender's WHOLE lane, never a partial/torn frame. Anything else
-    // (a non-lane-sized shortfall, or a broken FIFO order) is a real, different bug.
-    const bool shortfall_is_documented_race = shortfall >= 0 && shortfall <= N * (num_nodes - 1) && shortfall % N == 0;
-    const bool ordered = actor.ordered;
-
-    std::printf(
-        "node %llu: received=%d/%d FIFO=%s connections=%llu/%d frames_sent=%llu dedup_closed=%llu%s\n",
-        static_cast<unsigned long long>(self_id), got, expected, ordered ? "intact" : "BROKEN",
-        static_cast<unsigned long long>(transport.connections_open()), num_nodes - 1,
-        static_cast<unsigned long long>(transport.frames_sent()), static_cast<unsigned long long>(transport.dedup_closed()),
-        shortfall > 0 ? "  <- dial-dedup race dropped a lane (documented at-most-once, tcp_transport.hpp)" : "");
+    int missing = 0;
+    int reordered = 0;
+    std::printf("node %llu: received=%d/%d ordered=%s connections=%llu/%d frames_sent=%llu "
+                "transport_rx=%llu drops=%llu peer_sheds=%llu hints=%llu/%llu deferred=%llu "
+                "timeouts=%llu dedup_closed=%llu\n",
+                static_cast<unsigned long long>(self_id), got, expected,
+                actor.ordered ? "yes" : "NO",
+                static_cast<unsigned long long>(transport.connections_open()), num_nodes - 1,
+                static_cast<unsigned long long>(transport.frames_sent()),
+                static_cast<unsigned long long>(transport.frames_received()),
+                static_cast<unsigned long long>(transport.drops()),
+                static_cast<unsigned long long>(dist->peer_sheds()),
+                static_cast<unsigned long long>(transport.dial_hints_sent()),
+                static_cast<unsigned long long>(transport.dial_hints_received()),
+                static_cast<unsigned long long>(transport.settle_deferred()),
+                static_cast<unsigned long long>(transport.settle_timeouts()),
+                static_cast<unsigned long long>(transport.dedup_closed()));
+    for (int src = 1; src <= num_nodes; ++src) {
+        const int lost = N - actor.received[static_cast<std::size_t>(src - 1)];
+        if (lost > 0) missing += lost;
+        reordered += actor.out_of_order[static_cast<std::size_t>(src - 1)];
+        std::printf("  src %d: received=%d/%d missing=%d out_of_order=%d\n", src,
+                    actor.received[static_cast<std::size_t>(src - 1)], N, lost > 0 ? lost : 0,
+                    actor.out_of_order[static_cast<std::size_t>(src - 1)]);
+    }
 
     eng.stop();
     transport.stop();
 
-    const bool ok = ordered && shortfall_is_documented_race && conn_ok;
+    // #65: after the DialHint settle, a simultaneous first dial must be LOSSLESS. A gap is loss; an
+    // arrival at or below last_seen is reordering/duplication. Both are failures now.
+    const bool ok = conn_ok && actor.ordered && missing == 0 && reordered == 0;
     std::printf("node %llu: %s\n", static_cast<unsigned long long>(self_id), ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
 }
