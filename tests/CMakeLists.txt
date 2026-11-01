@@ -84,10 +84,11 @@ endif()
 # ADR-015 park()-vs-complete_parked() lost-wakeup CONTROL (red-teamed): -DQUARK_ACTIVATION_PARK_NO_GATE
 # reverts Activation::complete_parked() to the pre-fix shape (no acquire-gate before touching the
 # plain parked_frame_/parked_desc_ members) and lets drain_step()'s suspend tail call a test-provided
-# hook to deterministically widen the window between the plain writes and exec_.park() (redteam's
-# injected-delay technique). The control MUST reproduce a permanent-stranding lost re-admit (and
-# confirm it is truly permanent) at least once — the binary returns 0 iff it does, same convention as
-# sched_no_lost_wakeup_control above.
+# hook between the plain writes and exec_.park(). The hook BLOCKS the lane until the carrier's ungated
+# complete_parked() has returned, so the lost re-admit/stranding is reproduced deterministically on
+# every iteration — no dependence on thread-startup timing or iteration count (issue #28). The control
+# MUST strand on every iteration (and confirm it is truly permanent); the binary returns 0 iff it does,
+# same convention as sched_no_lost_wakeup_control above.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/activation_park_race_test.cpp")
   add_executable(activation_park_race_control activation_park_race_test.cpp)
   target_link_libraries(activation_park_race_control PRIVATE quark::quark quark_warnings Threads::Threads)
@@ -234,12 +235,16 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stream_drain_rmw_test.cpp" AND NOT QUARK_
 endif()
 
 # 006 §Publish/Subscribe — ADR-019 GATE 6 bounded-quiescence FIRING CONTROL. -DQUARK_TOPIC_NO_QUIESCE
-# drops the `wait in_flight==0` barrier in Topic::unsubscribe, so the churn thread destroys an inbox a
-# publisher still references (it loaded the pre-unsubscribe snapshot) -> heap-use-after-free. Wired
-# ONLY under ASAN (where the freed-memory access reliably traps); WILL_FAIL means a non-zero exit (the
-# trap) == the control firing. In a plain build the UAF may not crash, so the control has value only
-# with ASan. The POSITIVE topic_subscribe_race_test (barrier present) is auto-discovered and runs under
-# every build + sanitizer.
+# drops the `wait in_flight==0` barrier in Topic::unsubscribe, so the caller frees an inbox a publisher
+# still references (it loaded the pre-unsubscribe snapshot) -> heap-use-after-free. Wired ONLY under
+# ASAN (where the freed-memory access reliably traps); WILL_FAIL means a non-zero exit (the trap) ==
+# the control firing. In a plain build the UAF may not crash, so the control has value only with ASan.
+# The control is DETERMINISTIC (issue #28): a test-only hook in Topic::publish parks the publisher in
+# the unprotected window until the inbox is freed, so it does not depend on thread-startup timing or on
+# hitting the window by luck across many churn rounds. If it ever fails to fire, the binary exits 0
+# and WILL_FAIL reports the control as FAILED — a control that cannot fire is itself a failing signal.
+# The POSITIVE topic_subscribe_race_test (barrier present) is auto-discovered and runs under every
+# build + sanitizer.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/topic_subscribe_race_test.cpp" AND QUARK_SANITIZE MATCHES "address")
   add_executable(topic_no_quiesce_control topic_subscribe_race_test.cpp)
   target_link_libraries(topic_no_quiesce_control PRIVATE quark::quark quark_warnings Threads::Threads)

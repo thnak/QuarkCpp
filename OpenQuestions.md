@@ -390,7 +390,11 @@ should be resolved before any spec is promoted from *Draft* to *Accepted*.
   comment in `activation.hpp` for the full reasoning). Proven with a permanent test + its
   disable-the-fix control (`tests/activation_park_race_test.cpp` /
   `activation_park_race_control`): 0/600 stuck fixed vs. 600/600 stuck reverted, full suite green
-  under the default config and ASan+UBSan. **Residual:** TSan unavailable on the proving host
+  under the default config and ASan+UBSan. The control's window is widened by a deterministic
+  lane/carrier handshake rather than an injected sleep (issue #28): the fixed delay raced
+  `std::thread` startup and sometimes produced STUCK=0 on the Linux ASan host; the handshake holds
+  the lane until the ungated `complete_parked()` has returned, so the control strands on every
+  iteration. **Residual:** TSan unavailable on the proving host
   (confirmed, not assumed) — a TSan re-run on Linux CI is recommended before any `blocking<>`/
   `fiber<>` adapter is built on this seam; see [ADR-015](decisions/ADR-015-actor-execution-vehicle-passive-stackless-vs-fibers.md)'s
   residual risk #7 for the full record.
@@ -706,13 +710,17 @@ Each drafted spec ends with its own *Open questions* section; the notable ones:
   closing — one helper so the order cannot regress. Exercised by the existing real-socket
   churn tests (`tcp_transport_dial_dedup_test`, `tcp_transport_reconnect_test`); a dedicated
   TSan test that churns connections while accepting is still worth adding.
-- **ADR-019 test teeth** — **`topic_no_quiesce_control` is too weak on a large host (found
-  2026-10-22).** This ASan-only negative control removes the subscribe/quiesce barrier and
-  must be caught by ASan (`WILL_FAIL`). On a 28-core bare-metal Ubuntu box (g++ 15.2,
-  ASan+UBSan Debug) the race fired in only **1 of 20** runs, so the suite reports it as a
-  failure about 95% of the time, and when it does pass it proves little. The positive
-  `topic_subscribe_race_test` is unaffected. The control needs a deterministic way to force
-  the race (e.g. a test-only yield/hook inside the unprotected window), not more iterations.
+- **ADR-019 test teeth** — **`topic_no_quiesce_control` was too weak on a large host (found
+  2026-10-22; resolved 2026-11-01, issue #28).** This ASan-only negative control removes the
+  subscribe/quiesce barrier and must be caught by ASan (`WILL_FAIL`). On a 28-core bare-metal
+  Ubuntu box (g++ 15.2, ASan+UBSan Debug) the race fired in only **1 of 20** runs, so the suite
+  reported it as a failure about 95% of the time, and when it did pass it proved nothing. Fixed
+  with the deterministic hook now in `Topic::publish()` (compiled only under
+  `-DQUARK_TOPIC_NO_QUIESCE`): the publisher parks after the active check and per-enqueue retain
+  but before the inbox push, so the churn thread can always unsubscribe (no barrier) and free the
+  inbox underneath it. The ASan trap is now guaranteed; if it ever fails to fire the process exits
+  0, which `WILL_FAIL` reports as FAILED — so "the control cannot fire" is itself a failing
+  signal. The positive `topic_subscribe_race_test` is unaffected.
 - **ADR-046 test** — **`tcp_transport_control_priority_test` is flaky under TSan (found
   2026-10-22).** Not a data race: the check that the control frame arrives before index 375
   of 500 fails because TSan changes how much backlog builds up on the sender, so the frame

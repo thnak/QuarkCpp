@@ -56,6 +56,16 @@
 
 namespace quark {
 
+#ifdef QUARK_TOPIC_NO_QUIESCE
+// CONTROL-only seam (tests/topic_subscribe_race_test.cpp's `topic_no_quiesce_control` target):
+// publish() calls this for each subscriber it has decided to deliver to — AFTER the active check and
+// the per-enqueue retain, BEFORE the push. The control test blocks here until the churn thread has
+// unsubscribed and DESTROYED that inbox, so the push below is a guaranteed heap-use-after-free
+// instead of a timing-luck race (issue #28). Declared (not defined) here; the test TU defines it.
+// Does not exist at all outside a -DQUARK_TOPIC_NO_QUIESCE control build (zero cost normally).
+void quark_topic_no_quiesce_test_hook(const void* inbox);
+#endif
+
 // The result of one publish (ADR-019 §006: PublishReceipt). All best-effort counts; the publisher
 // reads them to observe fan-out, never to retry (retry would reintroduce a stall — 017).
 struct PublishReceipt {
@@ -350,6 +360,9 @@ public:
             for (const Sub& s : *snap) {
                 if (!s.active->load(std::memory_order_acquire)) continue;  // just-unsubscribed -> skip
                 pl->retain();  // rc++ for this enqueue, BEFORE the push publishes it
+#ifdef QUARK_TOPIC_NO_QUIESCE
+                quark_topic_no_quiesce_test_hook(s.inbox);  // CONTROL-only widen — see declaration above
+#endif
                 if (s.inbox->try_push(BroadcastEnvelope<M>{pl, id})) {
                     ++r.delivered;
                 } else {

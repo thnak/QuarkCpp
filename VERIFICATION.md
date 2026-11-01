@@ -26,6 +26,19 @@ which can hang or power off if a build/run saturates all cores. Never use `-j$(n
 | **ASan + UBSan** (gcc 15.2, Linux) | `build-asan` | **Full suite, 2026-10-28 (ADR-062 + #10/#21 commits): 238 / 242 on first run, 2 real heap-use-after-free found and fixed (`FanOut` member teardown order; `delivery_at_least_once_test` re-entering `pump()` from its sink) — both re-run clean (commit `7d331fc`). The other 2 misses are the firing controls `activation_park_race_control` and `topic_no_quiesce_control`, which did not reproduce their race on this host (timing-dependent; untouched by these changes). The full suite was not re-run after the fixes, only the two tests. |
 | **SWIM chaos** (not CTest) | `tests/netem/run_swim_chaos.sh build` | **5 / 5** scenarios end all-alive (form, isolate, asym, split, flaky) |
 
+> **Issue #28 (2026-11-01):** the two firing controls that missed in the 2026-10-28 ASan run are now
+> deterministic rather than timing-dependent. `activation_park_race_control` blocks the lane in its
+> widen hook until the carrier's ungated `complete_parked()` returns (STRANDED on every iteration);
+> `topic_no_quiesce_control` parks a publisher inside `Topic::publish()` until the churn thread has
+> freed the inbox, so the ASan trap is guaranteed. Neither depends on iteration count or
+> thread-startup latency, and a control that cannot fire now exits 0, which `WILL_FAIL` reports as
+> FAILED. Verified on the Linux dev host (`g++ 15.2`, ASan+UBSan Debug) and the Windows MSVC ASan
+> leg. Pre-fix reproduction on the dev host: `activation_park_race_control` reported STUCK=0/3000
+> (exit 1; an earlier run managed STUCK=1, which is the timing dependence this fixes) and
+> `topic_no_quiesce_control` exited 0 — no trap — on 3/3 runs. Post-fix: all four targets pass via
+> CTest; `activation_park_race_control` reports STUCK=3000/3000 on 3/3 runs and
+> `topic_no_quiesce_control` traps (heap-use-after-free) on 5/5 runs.
+
 Release is the full gate — it is the only config where every allocation-counting probe and every
 store-buffer litmus control is meaningful, so it runs the complete set. The sanitizer configs run a
 *different-sized* set **by design**: a fixed, principled set of tests is excluded because sanitizer
@@ -70,7 +83,7 @@ allocation probe is caught automatically instead of silently breaking the TSan l
 |---|---|---|
 | `stream_close_out_dekker_control` | excluded | Pure store-buffer-reorder litmus (NO_FENCE variant). ASan's shadow-memory checks perturb instruction scheduling enough to drain the store buffer before the racing load, so the reorder cannot manifest — the control can't produce its intended FIRE. Verified in the gcc/clang builds instead. |
 | `stream_drain_zero_rmw` | excluded | An `objdump`-based zero-cross-core-RMW proof (disassemble and grep for `lock`/`cmpxchg`/`xadd`); sanitizer instrumentation injects its own `lock`-prefixed ops, so the check is meaningless under any sanitizer. Verified in Release. |
-| `topic_no_quiesce_control` | **added (ASan-only)** | ADR-019 GATE 6 bounded-quiescence firing control: `-DQUARK_TOPIC_NO_QUIESCE` drops the `wait in_flight==0` barrier in `Topic::unsubscribe`, so a churn thread frees an inbox a publisher still references → heap-use-after-free. Wired **only** under ASan, where the freed-memory access reliably traps (`WILL_FAIL` — a non-zero exit *is* the pass). The positive `topic_subscribe_race_test` (barrier present) runs in every config and stays clean. |
+| `topic_no_quiesce_control` | **added (ASan-only)** | ADR-019 GATE 6 bounded-quiescence firing control: `-DQUARK_TOPIC_NO_QUIESCE` drops the `wait in_flight==0` barrier in `Topic::unsubscribe`, so a churn thread frees an inbox a publisher still references → heap-use-after-free. Wired **only** under ASan, where the freed-memory access reliably traps (`WILL_FAIL` — a non-zero exit *is* the pass). Deterministic as of issue #28: a test-only hook parks the publisher after its active check but before the inbox push, so the trap no longer depends on timing luck. The positive `topic_subscribe_race_test` (barrier present) runs in every config and stays clean. |
 
 ### TSan: 153 → 137 (−16)
 
