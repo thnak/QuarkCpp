@@ -28,14 +28,25 @@ which can hang or power off if a build/run saturates all cores. Never use `-j$(n
 
 > **Issue #65 / ADR-076 (2026-11-01, Linux 28-core, g++ 15.2):** the DialHint settle handshake adds
 > `tcp_transport_dial_race_mesh_test` and `tcp_transport_dial_settle_test`. The full **Release** suite is
-> **273 / 273 passed**; the transport subset (`dial|tcp_transport|reconnect|mesh`, 13 tests) is also green
-> under the **ASan+UBSan Debug** build (focused targets). The strengthened
-> `tcp_transport_dial_dedup_test` runs 50 simultaneous-dial rounds per invocation and asserts the race
-> burst itself is delivered exactly once, in order (the old test explicitly did not). Samples 17/18/19
-> now require zero missing/out-of-order frames per (sender,receiver); sample 18 passed 4x150, 4x2000,
-> 4x20000, 8x10000 and 8x100000 with separate processes. The samples disable the router's F15 per-peer
-> inbound budget (`set_peer_budget(0,0)`) because they deliberately burst above its 1024-frame default;
-> production keeps the guard.
+> **276 / 276 passed** (273 before ADR-077/078's three new tests); the transport subset
+> (`dial|tcp_transport|reconnect|mesh`, 13 tests) is also green under the **ASan+UBSan Debug** build
+> (focused targets). The strengthened `tcp_transport_dial_dedup_test` runs 50 simultaneous-dial rounds per
+> invocation and asserts the race burst itself is delivered exactly once, in order (the old test
+> explicitly did not). Samples 17/18/19 now require zero missing/out-of-order frames per
+> (sender,receiver); sample 18 passed 4x150, 4x2000, 4x20000, 8x10000 and 8x100000 with separate processes.
+> The samples disable the router's F15 per-peer inbound budget (`set_peer_budget(0,0)`) because they
+> deliberately burst above its 1024-frame default; production keeps the guard.
+
+> **Hot-path phase 1 / ADR-077 + ADR-078 (2026-11-01, same 28-core host):** `MessagePool`'s magazine hit
+> path now keys on the never-reused pool serial (skipping the per-acquire weak_ptr identity check; the
+> cold rebind keeps it), and the producer wake edge uses a seq_cst load fast path instead of a failed
+> locked CAS. New tests: `message_pool_cache_serial_test` (9 pools > the 8-slot TLS table, destroy/recreate,
+> multi-partition reclaim), `exec_state_wake_load_dekker_test` (**0 lost / 50M**; its relaxed control
+> fires), plus deterministic `notify_enqueued_fast` coverage. 14-lane stress A/B, 5 interleaved reps,
+> 300M-message quantum: **25.19 → 26.80 M msg/s median (+6.4%)**, enqueue p50 **280 → 212 ns (−24%)**,
+> p99 9,143 → 9,535 ns (+4.3%), zero loss/dup. 60 s soak at 2B cap: **1,458,333,696 / 1,458,333,696**
+> delivered, zero loss/dup. `mailbox_pool_partition_bench` presized P1/P2/P3 7.03/6.97/7.30 →
+> 7.67/7.36/7.48 M msg/s.
 
 > **Issue #28 (2026-11-01):** the two firing controls that missed in the 2026-10-28 ASan run are now
 > deterministic rather than timing-dependent. `activation_park_race_control` blocks the lane in its

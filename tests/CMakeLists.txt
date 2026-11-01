@@ -238,6 +238,18 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/activation_deactivate_close_out_dekker_te
   set_tests_properties(activation_deactivate_close_out_dekker_control PROPERTIES RUN_SERIAL TRUE)
 endif()
 
+# ADR-077 CONTROL: -DQUARK_EXEC_WAKE_LOAD_NO_FENCE downgrades the wake-load litmus's seq_cst store/load
+# pair to relaxed, so the producer's state read and the consumer's mailbox probe can BOTH miss (lost>0).
+# Same x86-64 / no-sanitizer / RUN_SERIAL rationale as the two close-out litmus controls above.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/exec_state_wake_load_dekker_test.cpp" AND NOT QUARK_SANITIZE
+   AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64"))
+  add_executable(exec_state_wake_load_dekker_control exec_state_wake_load_dekker_test.cpp)
+  target_link_libraries(exec_state_wake_load_dekker_control PRIVATE quark::quark quark_warnings Threads::Threads)
+  target_compile_definitions(exec_state_wake_load_dekker_control PRIVATE QUARK_EXEC_WAKE_LOAD_NO_FENCE)
+  add_test(NAME exec_state_wake_load_dekker_control COMMAND exec_state_wake_load_dekker_control)
+  set_tests_properties(exec_state_wake_load_dekker_control PROPERTIES RUN_SERIAL TRUE)
+endif()
+
 # 024-Streaming §0-cross-core-RMW-on-drain — objdump proof (ADR-005 S1 method). Disassemble the
 # `quark_stream_drain_probe` symbol and grep for lock/cmpxchg/xadd/xchg-mem/mfence. Gated to
 # NON-sanitizer builds (ASan/TSan/UBSan instrumentation injects lock ops that are not the drain's).

@@ -115,6 +115,11 @@ inline std::atomic<std::uint64_t> g_next_pool_serial{1};
 struct PoolLaneSlot {
     std::uint64_t serial = 0;
     std::uint32_t lane = 0;
+    // Fast acquire path: the calling partition and its TLS magazine. Only valid while `serial` matches
+    // (pool serials are never reused); `cache->bound` is re-checked because the 64-slot LocalCacheTable
+    // can evict this magazine to another partition on a hash collision.
+    void* partition = nullptr;
+    void* cache = nullptr;
 };
 inline thread_local PoolLaneSlot t_pool_lane_slots[8];
 
@@ -154,9 +159,12 @@ public:
     // partition's mutex-guarded free list only when the magazine is empty (ADR-037). Grows cold if
     // the partition is genuinely exhausted (pre-size to avoid it) — same cold-miss contract as before.
     [[nodiscard]] Slot acquire(void (*destroy)(void*) noexcept) noexcept {
-        const std::size_t pi = my_partition();
+        // #perf: one TLS lane-slot lookup, then the magazine pointer is cached per (thread, pool,
+        // partition). The weak_ptr/owner_before liveness check runs only on a cold rebind.
+        PoolLaneSlot& sl = lane_slot();
+        const std::size_t pi = num_partitions_ == 1 ? 0 : partition_index(sl.lane);
         Partition& p = *partitions_[pi];
-        LocalCache& lc = local_cache_for(p);
+        LocalCache& lc = cache_for_acquire(sl, p);
         if (lc.count == 0) refill(lc, p, pi);
         Descriptor* d = lc.cells[--lc.count];
         Cell* c = cell_of(d);
@@ -176,7 +184,7 @@ public:
         c->destroy = nullptr;
         d->release();  // bump generation, reset to Queued (003 §Cancellation)
         Partition* p = c->home;  // stamped once at grow_one, immutable after
-        LocalCache& lc = local_cache_for(*p);
+        LocalCache& lc = local_cache_for(*p, serial_);
         if (lc.count == LocalCache::kCap) flush_partial(lc);
         lc.cells[lc.count++] = d;
     }
@@ -252,6 +260,7 @@ private:
     struct alignas(quark::cache_line_size) LocalCache {
         Partition* bound = nullptr;
         std::weak_ptr<Partition> bound_token;  // generation-safe identity of `bound`; lock() pins it
+        std::uint64_t serial = 0;               // owning pool's never-reused serial (hot-hit guard)
         std::uint32_t count = 0;
         static constexpr std::uint32_t kCap = 64;
         static constexpr std::uint32_t kRefillBatch = 32;
@@ -309,19 +318,18 @@ private:
         return static_cast<std::uint32_t>(h >> (64 - 6));  // 6 bits -> 64 slots
     }
 
-    static LocalCache& local_cache_for(Partition& p) noexcept {
+    // Hot hit: the same live pool (serial is never reused) and the same partition. This skips the two
+    // weak_ptr owner_before comparisons that used to run on EVERY acquire/reclaim. A cold rebind still
+    // does the full generation-safe identity check (issue #15): a freed-and-recycled Partition* at the
+    // same address cannot match because the new pool's serial differs (and its control block differs).
+    static LocalCache& local_cache_for(Partition& p, std::uint64_t pool_serial) noexcept {
         LocalCache& lc = t_cache_mag.slots[slot_for(&p)];
-        // Slot match requires BOTH the raw pointer AND live-token agreement (owner_before, control-
-        // block identity) against the partition's own control block — closes the address-reuse attack: a freed-and-
-        // recycled Partition* at the same address can never satisfy this check because its token's
-        // control block differs from the stale lc.bound_token's.
-        bool same = (lc.bound == &p) && !lc.bound_token.owner_before(p.self) && !p.self.owner_before(lc.bound_token);
-        if (!same) {
-            if (lc.bound != nullptr && lc.count != 0) LocalCacheTable::flush_all_locked(lc);
-            lc.bound = &p;
-            lc.bound_token = p.self;
-            lc.count = 0;
-        }
+        if (lc.serial == pool_serial && lc.bound == &p) return lc;
+        if (lc.bound != nullptr && lc.count != 0) LocalCacheTable::flush_all_locked(lc);
+        lc.bound = &p;
+        lc.bound_token = p.self;
+        lc.serial = pool_serial;
+        lc.count = 0;
         return lc;
     }
 
@@ -385,13 +393,33 @@ private:
         return lane_mask_ != kNoMask ? (lane & lane_mask_) : (lane % num_partitions_);
     }
 
-    [[nodiscard]] std::size_t my_partition() const noexcept {
+    [[nodiscard]] PoolLaneSlot& lane_slot() const noexcept {
         PoolLaneSlot& sl = t_pool_lane_slots[serial_ & 7];
         if (sl.serial != serial_) {
             sl.serial = serial_;
             sl.lane = next_lane_.fetch_add(1, std::memory_order_relaxed);
+            sl.partition = nullptr;
+            sl.cache = nullptr;
         }
-        return partition_index(sl.lane);
+        return sl;
+    }
+
+    [[nodiscard]] std::size_t my_partition() const noexcept {
+        return partition_index(lane_slot().lane);
+    }
+
+    // The acquire-side magazine fast path. `lane_slot()` has already established that `sl` belongs to
+    // this pool; `cached->bound` + `cached->serial` re-validate that the 64-slot table did not evict
+    // the magazine to another partition/pool in the meantime.
+    [[nodiscard]] LocalCache& cache_for_acquire(PoolLaneSlot& sl, Partition& p) noexcept {
+        auto* cached_part = static_cast<Partition*>(sl.partition);
+        auto* cached = static_cast<LocalCache*>(sl.cache);
+        if (cached_part == &p && cached != nullptr && cached->bound == &p && cached->serial == serial_)
+            return *cached;
+        LocalCache& lc = local_cache_for(p, serial_);
+        sl.partition = &p;
+        sl.cache = &lc;
+        return lc;
     }
 
     std::size_t num_partitions_;

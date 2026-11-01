@@ -505,18 +505,14 @@ public:
     Activation& operator=(Activation&&) = delete;
 
     // ---- Producer / wake seam (002) ------------------------------------------------------
-    // ADR-028 Phase 2: the wake-edge CAS, extended with the Dormant→Scheduled fallback. The Idle CAS
-    // already fails cleanly (returns false, no side effect) when the state is anything else, so
-    // trying it first costs the ordinary Idle producer NOTHING extra — the Dormant check/CAS below
-    // only runs on that (cold) miss. This is NOT a new ordering: the seq_cst enqueue exchange and the
-    // seq_cst CAS (success AND failure, ADR-066) already order the enqueue before both CAS attempts in
-    // S, so an evicted activation that races a real message in is re-admitted exactly like the
-    // close-out abort race is aborted — reusing the Phase 1 Dekker rendezvous, never re-deriving it.
+    // ADR-077: the wake edge uses ExecStateCell::notify_enqueued_fast() — a seq_cst load fast path that
+    // returns false (no locked RMW) when the actor is already Scheduled/Running/Parked/Retired, plus the
+    // existing Idle CAS and Dormant→Scheduled readmit. The seq_cst load is the no-transition half of
+    // ADR-066's rendezvous; the Idle CAS failure re-checks Dormant, so the load/CAS race window is
+    // covered exactly as before. This also drops the extra `state() == Dormant` load every producer
+    // used to pay after a failed CAS.
     QUARK_ALWAYS_INLINE bool wake_after_enqueue() noexcept {
-        bool wake = exec_.notify_enqueued();
-        if (!wake && QUARK_UNLIKELY(exec_.state() == ExecState::Dormant))
-            wake = exec_.readmit_from_dormant();
-        return wake;
+        return exec_.notify_enqueued_fast();
     }
 
     QUARK_ALWAYS_INLINE bool post(Descriptor* d) noexcept {
@@ -1099,14 +1095,14 @@ private:
     // ---- Activation-scoped bounded post-drain linger core (ADR-036) -----------------------
     // Called ONLY from the plain sequential drain_step()'s Empty arm. Re-polls THIS activation's
     // OWN mailbox up to `linger_spin_limit_` times, pal::cpu_relax()-paced. `exec_` is NEVER
-    // touched here — no store, no CAS — so a racing producer's wake_after_enqueue() CAS (which
-    // expects Idle) fails cheaply and silently: no exec-state transition, no run-queue enqueue, no
-    // `activations` metric increment (that fires only on the Idle/Dormant->Scheduled CAS edge
-    // inside post()/notify_enqueued(), which never succeeds while exec_ stays Running) — the
-    // message is picked up by THIS re-poll instead, and `r` is overwritten in place so the caller
-    // dispatches that exact result with no second try_dequeue() (ADR-036 fix #1: the linger/
-    // dispatch hand-off — the naive "continue back to the top of the loop" implementation would
-    // drop or duplicate the message this function already popped).
+    // touched here — no store, no CAS — so a racing producer's wake_after_enqueue() fast path
+    // (ADR-077) reads Running and returns false: no exec-state transition, no run-queue enqueue, no
+    // `activations` metric increment (that fires only on the Idle/Dormant->Scheduled edge inside
+    // post()/notify_enqueued_fast(), which never succeeds while exec_ stays Running) — the message is
+    // picked up by THIS re-poll instead, and `r` is overwritten in place so the caller dispatches that
+    // exact result with no second try_dequeue() (ADR-036 fix #1: the linger/dispatch hand-off — the
+    // naive "continue back to the top of the loop" implementation would drop or duplicate the message
+    // this function already popped).
     // ---- ADR-036 revision: adaptive evidence-scaled linger ---------------------------------
     // `linger_evidence_` (0..kLingerEvidenceMax) is a lane-only, decayed running signal of "did
     // lingering recently pay off" — bumped when a re-poll finds a message OR when a drain_step()
