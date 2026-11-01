@@ -5,6 +5,12 @@ admission" on the shipped TCP transports.** Owner decision 2026-10-31 (Noise + l
 Spec: 020 "Pinned-key mode (Noise IK, #40)", 021 "HELLO and dial dedup in pinned-key mode". Consumer: AeroCoWorker RFC 002 section 6e
 red-team findings B2 (no identity before admission) and B3 (identity is the full public key).
 
+> **Update 2026-11-01.** [ADR-072](ADR-072-pinned-wire-no-hello.md) (#45) delivered follow-up 1 on `TcpTransport`. On the pinned wire there is
+> no HELLO, the peer is identified by the handshake, and direct frame headers carry no NodeId. The "NOT DONE" row and the first residual
+> below describe the state before it. One part is still open: sealing the remaining header fields (#52). The other open items (#49 Linux and
+> TSan, #50 fuzzing, #51 differential test and audit, #53 restart replay and clock lock-out, #56 timing) are listed in AeroCoWorker's
+> [network security assessment](https://github.com/thnak/AeroCoWorker/blob/master/docs/design/network-security-assessment.md).
+
 ## What was and was not verified (read this first)
 
 | Claim | Evidence | Status |

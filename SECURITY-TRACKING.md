@@ -1,7 +1,7 @@
 # Security Remediation Tracking
 
 **Source:** `SECURITY-FINDINGS.md` (live plaintext + real-mTLS bank cluster attack pass)  
-**Updated:** 2026-10-25 (pass 8: digest-pinned Linux CI image; F1/P4/P5)  
+**Updated:** 2026-11-01 (pinned-key stack section added); pass 8 on 2026-10-25 (digest-pinned Linux CI image; F1/P4/P5)  
 **Status key:** `[x]` fixed & verified · `[~]` mitigation in place, follow-up open · `[ ]` open
 
 Verified baseline: **21/21 affected CTest suites pass** on `thnak-server` (real mbedTLS 3.6.5,
@@ -16,6 +16,28 @@ signing; pass 8 pins the Linux base and CI image by digest.
 ---
 
 ## Open / follow-up backlog
+
+### Pinned-key stack (ADR-068..073, AeroCoWorker's network center): open security work
+
+This file's passes 1-8 cover the mTLS-era bank cluster. The pinned-key stack AeroCoWorker uses was added later. Its threat model, risk
+matrix and test cases are in AeroCoWorker's [network security assessment](https://github.com/thnak/AeroCoWorker/blob/master/docs/design/network-security-assessment.md) (2026-11-01). The Quark-side items:
+
+- [ ] #49 Linux GCC/Clang with ASan/UBSan, and TSan, for ADR-068..073; make `test-pinned-sodium` blocking; re-run the per-IP flood on the
+  pinned wire (assessment M2).
+- [ ] #50 fuzz Noise Msg1/Msg2, the anonymous Authenticate frame and the discovery labels (M3).
+- [ ] #51 differential test of the Noise IK glue against a second implementation, then an external review (M6).
+- [ ] #52 seal `target`, `msg_type`, `principal` and `deadline` in direct frames (M7).
+- [ ] #53 Msg1 replay after a restart, and lock-out after a clock step back (M8).
+- [ ] #54 gossip-subject authentication (N4) and lease cycling (M12).
+- [ ] #55 relay on the pinned wire (M14).
+- [ ] #56 measure the handshake timing oracle (M17).
+- [ ] #57 dial a discovered endpoint by address (ADR-070 F3).
+- [ ] #58 reconnect from a new source address (ADR-071 §5).
+- [ ] #35, #36 and #37: issuer-authenticated revocation, certificate mode hidden from probers, and device attach with an expiry
+  (M15, M16).
+
+**Operating rule until these close:** AeroCoWorker's HAL forces the pinned wire, strict mode and authority-only revocation on every scope,
+and refuses to start otherwise (AeroCoWorker RFC 002 §6e item 10).
 
 ### P0 — do not operate a plaintext cluster until this is closed
 

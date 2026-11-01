@@ -139,7 +139,7 @@ connection they were meant for; purging queued `Authenticate` frames when their 
 therefore runs over bare `TcpTransport`s (the session layer is covered once, in the composition test, which passed every run); the
 reflection itself is not tested and its exact trigger was not pinned down (`handshakes_timed_out` was 0, so it is not the 5 s re-issue).
 
-**Residuals (not fixed here).** **N1**: a HELLO claim still displaces a live connection from the same source IP (DoS only; payloads stay sealed
+**Residuals (not fixed here).** *(Update 2026-11-01: N1 is closed on the pinned wire by ADR-072, test T5; it remains only on the HELLO wire.)* **N1**: a HELLO claim still displaces a live connection from the same source IP (DoS only; payloads stay sealed
 under `SecureTransport`); closed only by the pinned accept path (#45, ADR-068 follow-up 1). #46's frame-identity concern is closed by the origin
 check, its HELLO-claim concern is not. `TcpTransport::set_admission` answers on the CLAIMED HELLO id; the authenticated check remains the handshake's
 (`Result::peer_node_id`). A denied peer that is only a relay target is not refused as a dial target by shape-B routing through another node.

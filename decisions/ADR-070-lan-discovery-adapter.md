@@ -59,6 +59,8 @@ mDNS-style name conflicts, goodbyes, isolation knob), `lan_discovery_feed.hpp` (
 - **F2: the host name.** Windows `DnsServiceRegister` requires a host name; the adapter passes the application-supplied label
   (+ `.local`) and fails to advertise without one. If an application passes a stable label, that label is a stable identifier on the
   wire and defeats rotation. A platform that forces the machine's own name leaks that name in the A/SRV records. Not preventable in Quark.
+- *(Update 2026-11-01: F3 is unblocked by ADR-072, which identifies the peer by the handshake. Dialling a discovered endpoint by address is
+  not built yet: #57.)*
 - **F3: no NodeId before the handshake.** `TcpTransport` dials by `NodeId`; a discovered endpoint has none. The feed takes an
   application `NodeResolver` (tests map port to node as a stand-in). A true dial-by-address needs the pinned-key handshake (#40) so the
   answering node's identity is learned from the handshake. **Owed.**

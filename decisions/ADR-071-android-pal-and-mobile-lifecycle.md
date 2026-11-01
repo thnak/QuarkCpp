@@ -210,6 +210,7 @@ samples, 0 redials, 8 dials refused at HELLO), no `Resumed` while denied; a late
 (old wiring: reset close hook, lease kept on tombstone): lease still held, a connection open in 130/150 samples, 1 redial.
 
 **Residuals recorded, not fixed.**
+- *(Update 2026-11-01: N1 is closed on the pinned wire by ADR-072 T5. The source-address change below is still untested: #58.)*
 - **N1** HELLO-claim displacement (the `Inbound replaces inbound` path and, now, the aged supersede): a same-IP host that claims an admitted
   identity can displace its connection. DoS only, payloads stay sealed. Closed only by #45 (identify by handshake, dedup after it). Tracked in #46.
 - **N4** a log-only peer can keep a crashed admitted member Alive by gossiping Alive at rising incarnations. This is pre-existing SWIM behaviour
