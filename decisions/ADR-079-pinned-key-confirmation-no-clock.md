@@ -1,7 +1,6 @@
 # ADR-079 — Pinned wire: a new session counts only after the initiator proves its keys, and Msg1 freshness stops depending on the clock (issue #53)
 
-Status: **Proposed, rev. 3** (2026-11-02). Design only. Rev. 1 and rev. 2 were each red-teamed the same day (round 1: 9 findings, two P0; round 2: 6 P1 and 3 P2, verdict
-"needs rev. 3"); rev. 3 answers both rounds and has NOT been red-teamed again. Proof outstanding (*Evidence required*). Amends ADR-068 (replay rule, H10 limits, red-team
+Status: **Proposed, rev. 4** (2026-11-02). Design only. Rev. 1, 2 and 3 were each red-teamed the same day (round 1: 9 findings, two P0; round 2: 6 P1 and 3 P2; round 3: no P0, 4 P1 and 5 P2, verdict "needs rev. 4"); rev. 4 answers all three rounds and has NOT been red-teamed again. Proof outstanding (*Evidence required*). Amends ADR-068 (replay rule, H10 limits, red-team
 items 4 and 5) and ADR-072 item 4 (a handshake-identified connection supersedes). Consumer: AeroCoWorker network security assessment M8 (R12, TH-05, TH-06, SEC-05, SEC-06),
 RFC 002 section 6e. Wire: Msg1 and Msg2 keep their sizes (154 and 58 bytes); one Msg1 field changes meaning; the Noise prologue label becomes `quark-pinned-key/v2`.
 
@@ -44,11 +43,16 @@ initiator-to-responder key confirms the provisional result; the empty `Confirm` 
 counts against the bound in T1.
 
 **Promotion** (responder, on the I/O thread, in this order; any failed step closes the connection and installs nothing):
-1. refuse if a provisional or promoted result for the same peer with a HIGHER token has already been promoted (record `last_promoted_token[peer]`): a delayed `Confirm` of an
-   older connection cannot displace a newer one;
-2. re-check the revocation fingerprint set (`revoked_snapshot_`) AND the admission snapshot, whether or not `admission_.enabled()`, and run `close_hook_`;
-3. BIND the connection (`identify_inbound`) first, and only if it is still alive install the session under the peer, then send the schema frame. (Bind-then-install: a connection that
-   died in between never swaps live keys.)
+1. refuse if a result for the same peer with a HIGHER token has already been PROMOTED. `last_promoted_token[peer]` is written ONLY at promotion, never when a provisional result is
+   created (a replayer's provisional connection has a higher token than the genuine pending one and must not lock it out: round 3, P1-1). A delayed `Confirm` of an older connection
+   cannot displace a newer PROMOTED one. The entry is erased when the connection it records is closed (T3) and when the key is revoked or removed (sweeps);
+2. re-check the revocation fingerprint set (`revoked_snapshot_`) AND the admission snapshot's decision for the peer, whether or not `admission_.enabled()` (a pure read of the snapshot:
+   it does NOT re-run `handshake_admission_addr_` or any per-IP accounting, which belong to the bind), and run `close_hook_`;
+3. BIND the connection first with the synchronous `bool Transport::bind_inbound(token, peer)` (a new seam: `identify_inbound` is `void`, posted, and ignores `register_identified`'s
+   result, so it cannot express this). `bind_inbound` runs on the I/O thread and returns false when the connection is gone or the bind is refused (`max_inbound_per_ip_`, admission, dedup
+   loser): then the connection is closed and NOTHING is installed. Only on true is the session installed under the peer and the schema frame sent. (Bind-then-install: a connection that
+   died or was refused in between never swaps live keys.) The installed session is built from the provisional state itself (its keys AND its receive counter), moved, not re-derived: the
+   `Confirm` that confirmed it has already advanced the counter, so a re-delivered copy of it is refused (round 3, P2-4).
 `sweep_revocations` and `on_admission_published` also iterate the provisional store and drop entries whose peer is now revoked or denied. This promotion is the supersede.
 
 **Transport changes this needs:**
@@ -57,6 +61,11 @@ counts against the bound in T1.
   and `SecureTransport` accepts only a frame that opens under the provisional key; everything else is dropped. The bound counts frames that FAIL to open (default 8) and the pre-auth
   byte bound is enforced in `FrameStream` as a length-prefix check: an unpromoted inbound connection accepts `max_body` 512 bytes, not the 4 MB default. Frames that follow the
   confirming frame in the SAME read chunk are processed as identified-peer frames: promotion on the I/O thread applies synchronously (no posted bind between frames of one chunk).
+  `FrameStream` re-reads `max_body` for EACH frame and promotion raises it (512 B to the transport's cap) synchronously, before the next frame of the chunk is decoded, so a large
+  frame written right behind the `Confirm` is not killed by the pre-auth bound (round 3, P1-4).
+  On a provisional connection EVERY non-opening frame is dropped and counted as failing: an `Authenticate`-kind frame never reaches `handle_authenticate_frame`, so the tentative `from`
+  never opens the rekey path (which is safe on master only because an anonymous opener must carry `from == 0`; round 3, P1-3); provisional frames never feed `last_rx`, keepalive
+  or `conns_[X]`.
 - **T2.** `Transport::send_to_inbound(token, frame)` (default: not supported). `TcpTransport` implements it for a pending inbound connection with a write path that pumps this Msg2
   (today `on_conn` pumps nothing until the hello progresses). Msg2 uses it, not the NodeId route, because binding is the supersede.
 - **T3.** `Transport` reports an inbound token's close (`handle_dead` of a pending connection included) so the provisional entry is erased.
@@ -82,9 +91,17 @@ shipped (its ADRs are all Proposed), so there is no migration.
 Consequences: SEC-06 holds by construction and NTP spoofing no longer matters to the handshake. A capture can be replayed again after a responder restart AND after the key's own
 ring rotates (32 handshakes or rekeys by that key); each replay gets Msg2 and a provisional entry that D1 makes harmless. Rev. 2's statement "once per capture per boot" was wrong and is withdrawn.
 
+**A cheap global filter in front (round 3, P2-3).** A replay now costs the responder the full Msg2 path (about 4 DH) where the old guard fired at about 2, and a connect-replay-close loop
+frees the pending slot each time, so the pending caps do not bound CPU. Before ANY DH the responder checks the first 32 bytes of Msg1 against a small global recent-`e` set (4096
+entries, FIFO): a hit gets zero bytes. It is only a cost filter, not a security rule (the per-key ring and D1 carry the safety; eviction by member churn only costs the replayer's DH).
+The remaining cost (a replay with an `e` outside the set) is MEASURED against master and against a one-DH junk baseline and reported, not gated (Evidence).
+
 ### D3 — Controls kept as options (tests only)
-`PinnedOptions::key_confirmation = false` restores install-at-Msg1; `PinnedOptions::legacy_timestamp_rule = true` restores the timestamp, skew and monotonic rule, the timestamp in Msg1
-and the v1 label. Both exist only to run the failing control of each claim, like `replay_guard` and `check_role_bit` today, and are refused outside `QUARK_ALLOW_INSECURE` builds.
+Every claim's failing control is an insecure-build fault flag in `PinnedTestFaults` (like `replay_guard` and `check_role_bit` today), refused outside `QUARK_ALLOW_INSECURE` builds:
+`key_confirmation=false` (install at Msg1, C1/C4/C5), `legacy_timestamp_rule=true` (timestamp, skew, monotonic rule, v1 label; C2), `global_ring` (C9), `label_v1` with `version_window` 1 (C10),
+`preauth_bound_per_chunk` (C11), `skip_promotion_recheck` (C12), `record_token_at_provisional` (C13 and C13b), `skip_bind_check` (C14, C14b), `unbounded_preauth` (C15),
+`lift_max_body_async` (C17), `provisional_reaches_rekey` (C16), `no_global_filter` (C18). A CI step flips each flag in turn and requires its claim's test to FAIL (round 3, P2-1).
+C7 (privacy) and C8 (rekey regression) are regression tests, not mechanism claims, and have no control.
 
 ## Claims (each proven by a test with a failing control; `tests/adapters/pinned_confirmation_check.cpp`, real TCP + SecureTransport + Noise IK)
 - **C1 (SEC-05).** Capture a genuine Msg1, restart the responder, replay it on a new connection: the replayer receives at most Msg2 (58 B) and nothing else for 6 s; the genuine
@@ -93,8 +110,7 @@ and the v1 label. Both exist only to run the failing control of each claim, like
 - **C2 (SEC-06).** An initiator whose clock is set back 10 minutes (injected clock, new process) connects on the first attempt and delivers 50/50. CONTROL: `legacy_timestamp_rule = true`
   refuses it for the whole step-back.
 - **C3 (replay in a boot).** The same Msg1 sent twice to a running responder: the second gets zero bytes. CONTROL: dedup disabled accepts it.
-- **C4 (no supersede before proof).** A live session for X, then a replay of an old Msg1 of X on a new connection after a responder restart: the live session is not closed or displaced
-  and keeps delivering; the replayer's connection never receives an application frame; Msg2 does reach the replayer (T2). CONTROL: `key_confirmation = false` displaces it.
+- **C4 (no supersede before proof).** X connects (a capture A of its Msg1 is taken), the responder restarts, X reconnects (connection B, a live session). Replay capture A on a new connection: B's session is not closed or displaced, `has_session` stays true, and the replay never gets a session. CONTROL: `key_confirmation = false` displaces B at Msg1. (Rev. 3 replayed after a restart with no live session to displace, so it passed vacuously.)
 - **C5 (genuine reconnect supersedes).** A genuine reconnect supersedes at promotion, no duplicate, one reconnect counted: `pinned_tcp_check` T6 passes with only the adaptations T1-T3 require.
 - **C6 (stockpile).** 50 DISTINCT captured Msg1s of X replayed after a restart, a genuine connect raced against them: the genuine one confirms; live provisional entries never exceed the
   pending caps; memory returns to baseline within the provisional timeout. **C6b:** X performs 33 handshakes, then capture #1 is replayed: it IS accepted (provisional) and is harmless
@@ -114,6 +130,18 @@ and the v1 label. Both exist only to run the failing control of each claim, like
 - **C15 (pre-auth bounds).** A frame header declaring 4 MB on an unpromoted inbound connection kills it at the length prefix; 8 non-opening frames kill it; the provisional timeout reaps
   an idle connection on a quiet responder with no other traffic.
 - The H10 limit tests of ADR-068 (restart replay, clock step-back) are replaced by C1 and C2; their old behaviour is kept as the controls.
+
+- **C13b (replayer with a higher token, round 3 P1-1).** X's `Confirm` is held by a proxy; while held, a replay connection of X's Msg1 reaches provisional (higher token); release the
+  `Confirm`: X promotes. CONTROL: `record_token_at_provisional` locks X out.
+- **C14b (bind refused, round 3 P1-2).** Make `bind_inbound` fail (`max_inbound_per_ip_`): the live session's keys, counters and connection are unchanged and nothing is installed. A test-only
+  hook between "Confirm read" and "bind" makes C14 deterministic. CONTROL: `skip_bind_check`.
+- **C16 (provisional cannot rekey, round 3 P1-3).** On a connection that replay turned provisional, send Authenticate frames (a ring-forgotten Msg1, a ring-hit Msg1, an Authenticate with
+  `from` = X): X's live session keys and counters are unchanged and the connection is killed. CONTROL: `provisional_reaches_rekey`.
+- **C17 (burst with a large frame, round 3 P1-4).** One TCP write: `Confirm` + a 64 KB frame + 200 small frames: all arrive in order. CONTROL: `lift_max_body_async` kills the connection.
+- **C18 (replay cost, round 3 P2-3).** A connect-replay-close loop with a recent `e` costs no DH (zero bytes, global filter). CONTROL: `no_global_filter`. The loop with an `e` outside the
+  set is measured (Msg1 per second, I/O-thread stall) against master and a junk baseline; reported, not a gate.
+- **C19 (around the confirm, round 3 P2-4/P2-5).** A frame from the responder queued before `Confirm` arrives is dropped by the existing no-session path, counted, no crash; a re-delivered
+  `Confirm` after promotion is refused by the counter.
 
 ## Residuals and what this does not do
 - A replay after a restart, or after the key's ring rotates, gets Msg2 (58 B). That tells the replayer the responder is alive and still admits that key (a membership oracle for a key whose
@@ -157,6 +185,21 @@ emptied by any member; 5 P1 per-key cap with oldest-drop lets replays evict the 
 Claims that rev. 2 would have failed: C10, C11, C12; C6 and C9 were weak. Design points both rounds tried to break and could not: a mutated `e`, nonce or key reuse from `Confirm`,
 a replayer opening `Confirm`, the schema frame and `has_session` before confirmation, token ABA, filling the ring by an unadmitted party, the ADR-076 glare cases, and the rejection of option (a).
 
+**Round 3 (rev. 3) and its disposition in rev. 4** (no P0; verdict "needs rev. 4"; the core held: a mutated `e` fails the Noise tag, a replayer cannot forge `Confirm`, the ring limits are honest):
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| 1 | P1 | Promotion step 1 ambiguous: a replayer's provisional connection with a higher token locks the genuine member out | **Accepted**: only promotion writes `last_promoted_token`, C13b |
+| 2 | P1 | Bind-then-install not implementable: `identify_inbound` is void, posted, and drops the bind result | **Accepted**: synchronous `bool bind_inbound`, C14b, a deterministic test hook |
+| 3 | P1 | T1's tentative `from` could reopen the rekey path from a provisional connection | **Accepted**: provisional Authenticate frames dropped and counted, never reach rekey, C16 |
+| 4 | P1 | The 512-byte pre-auth `max_body` is lifted too late for a same-chunk burst | **Accepted**: per-frame `max_body`, synchronous raise at promotion, C17 |
+| 5 | P2 | Several claims had no failing control | **Accepted**: every control is a named fault flag; CI flips each one |
+| 6 | P2 | C4 replayed after a restart with nothing to displace (vacuous) | **Accepted**: C4 rewritten |
+| 7 | P2 | Replay costs ~4 DH (was ~2); pending caps do not bound CPU | **Accepted in part**: global recent-`e` filter before any DH, C18; residual measured, not gated |
+| 8 | P2 | Counter hand-off provisional to installed session unspecified | **Accepted**: session moved from the provisional state, C19 |
+| 9 | P2 | `last_promoted_token` has no erase rule; responder frames before `Confirm`; "admission snapshot" vague | **Accepted**: erase on close and revocation, C19, step 2 specified |
+Checked and sound in round 3: ring replay across restarts and eviction (harmless under D1), the clock-free claim, the version label change (the cosmetic "v1" strings only feed an HMAC),
+pending-cap starvation (the same exposure as junk connections).
+
 ## Evidence required before Accepted
-A third red-team round on rev. 3. C1-C15 green under Release, ASan+UBSan and TSan on Linux (GCC and Clang). 20 runs of `pinned_tcp_check` and `pinned_flood_check` with 0 failures.
+A fourth red-team round on rev. 4. C1-C19 green under Release, ASan+UBSan and TSan on Linux (GCC and Clang). 20 runs of `pinned_tcp_check` and `pinned_flood_check` with 0 failures.
 `pinned_privacy_check` unchanged.
