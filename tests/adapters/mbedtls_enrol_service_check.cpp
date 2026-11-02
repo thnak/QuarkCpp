@@ -250,7 +250,7 @@ int main() {
         {
             Client member(a.t.listen_port());
             Bytes hello;
-            for (std::uint8_t byte : {0x31, 0x4B, 0x52, 0x51, 0x02, 0x00, 0x42, 0, 0, 0, 0, 0, 0, 0}) hello.push_back(static_cast<std::byte>(byte));
+            for (std::uint8_t byte : std::initializer_list<std::uint8_t>{0x31, 0x4B, 0x52, 0x51, 0x02, 0x00, 0x42, 0, 0, 0, 0, 0, 0, 0}) hello.push_back(static_cast<std::byte>(byte));
             check(member.send_all(hello), "V4 setup: a member HELLO is sent");
             Bytes got_hello;
             bool hello_eof = false;
