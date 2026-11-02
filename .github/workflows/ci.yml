@@ -314,7 +314,7 @@ jobs:
         run: ctest --test-dir build-sodium -R "noise_ik|sodium_aead|pinned_|security_sodium" -j 2 --output-on-failure --timeout 600
 
   # Issue #51 (assessment M6): differential test of the Noise IK glue against an independent implementation (Python `noiseprotocol`,
-  # hash-pinned in ci/noise-differential-requirements.txt, installed into a throwaway directory: a TEST tool, never a library dependency).
+  # hash-pinned in ci/pins.env, unzipped into a throwaway directory by ci/install-noise-reference.sh: a TEST tool, never a library dependency).
   # 10^4 random transcripts must be byte-identical, and two copies of noise.hpp with one changed line (MixHash / MixKey) must be caught.
   test-noise-differential:
     name: test-noise-differential (gcc-release)
@@ -333,7 +333,7 @@ jobs:
         run: bash ci/install-deps.sh --with-sodium
 
       - name: Install the Python reference (hash-verified)
-        run: python3 -m pip install --require-hashes --no-deps --target /opt/noise-ref -r ci/noise-differential-requirements.txt
+        run: bash ci/install-noise-reference.sh /opt/noise-ref
 
       - name: Configure
         run: |
