@@ -247,6 +247,25 @@ public:
         return anon_refused_.load(std::memory_order_relaxed);
     }
 
+    // ADR-074 D4c: ENROLMENT HANDOFF. A joiner has no identity yet, so it opens a TLS connection on this listener. Its first bytes are a TLS record header
+    // 0x16 0x03 {0x01|0x03} (handshake; legacy record version 1.0 or 1.2). No member wire starts so: in HELLO mode the first bytes are the magic
+    // 'Q','R','K','1' (0x31 first); in pinned mode the first bytes are a u32 little-endian frame length, and the only frame a never-identified connection
+    // may send is an opener of at most kAnonOpenerMax bytes, whose length bytes cannot be 16 03 01 .. (>= 66326) or 16 03 03 .. (>= 50 MB). So the
+    // first chunk of a never-identified INBOUND connection that starts so is unambiguous (a chunk shorter than 3 bytes is not recognised: mbedTLS writes
+    // a whole record at once). When a handoff is installed, such a connection leaves the member
+    // pending pool at once (it stops counting against max_pending_inbound*), and `fn` is called ON THE I/O THREAD with its fd and the bytes read so far:
+    // it must be cheap and non-blocking (it only admits and queues; the TLS work runs elsewhere). True = `fn` took the fd and will close it; false = the
+    // transport closes it, having sent nothing. Without a handoff the connection is treated as any other (and dies as a bad HELLO / bad frame). Before start().
+    struct EnrolHandoff {
+        pal::fd_t fd = pal::invalid_fd;
+        std::uint64_t peer_addr = 0;  // IPv4, host order
+        std::uint16_t peer_port = 0;
+        std::vector<std::byte> initial;  // the first bytes the connection delivered (the ClientHello, at least its first three bytes)
+    };
+    using EnrolHandoffFn = std::function<bool(EnrolHandoff&)>;
+    void set_enrol_handoff(EnrolHandoffFn fn) { enrol_handoff_ = std::move(fn); }
+    [[nodiscard]] std::uint64_t enrol_handoffs() const noexcept { return enrol_handoffs_.load(std::memory_order_relaxed); }
+
     void identify_inbound(std::uint64_t token, NodeId peer) override {
         io_.post([this, token, peer] {
             for (auto& [fd, c] : pending_in_) {
@@ -556,6 +575,7 @@ private:
         std::uint64_t peer_addr = 0;    // accepted socket's source (IPv4, host order)
         std::uint16_t peer_port = 0;
         bool has_peer_addr = false;
+        bool sniffed = false;            // the first inbound chunk of an accepted connection was looked at for an enrol ClientHello
         St st = St::Connecting;
         bool initiated_by_self = false;  // did WE dial? (the dedup discriminant, 021 §2)
         bool identified = false;         // peer NodeId confirmed via hello (accept side learns it here)
@@ -884,7 +904,9 @@ private:
             Conn* raw = c.get();
             pending_in_[raw->fd] = std::move(c);
             by_fd_[raw->fd] = raw;
-            raw->interest = EPOLLIN | EPOLLOUT;  // EPOLLOUT to push our hello out
+            // With an enrol handoff installed (HELLO mode) our hello waits until the first inbound chunk is classified: a joiner expects a TLS server, so
+            // it must receive nothing before its handshake reply. A member peer sends its own hello at once, so the wait is about one half round trip.
+            raw->interest = (enrol_handoff_ && !anonymous_) ? EPOLLIN : (EPOLLIN | EPOLLOUT);  // EPOLLOUT to push our hello out
             io_.add_fd(raw->fd, raw->interest, [this, f = raw->fd](std::uint32_t ev) { on_conn(f, ev); });
             if (pending_hello_timeout_ns_ > 0) {
                 // A socket that never identifies must not pin a pending slot forever (slowloris).
@@ -1012,6 +1034,15 @@ private:
             }
             const std::byte* p = buf.data();
             std::size_t n = *r;
+            if (!c->sniffed && !c->initiated_by_self && !c->identified) {
+                c->sniffed = true;
+                if (enrol_handoff_ && n >= 3 && p[0] == std::byte{0x16} && p[1] == std::byte{0x03} && (p[2] == std::byte{0x01} || p[2] == std::byte{0x03}) &&
+                    c->hello_in_.empty()) {
+                    hand_off_enrol(c, p, n);  // `c` is gone after this
+                    return;
+                }
+                if (enrol_handoff_ && !anonymous_) flush(c);  // classified as a member: now our held hello may go out
+            }
             // Consume the peer's fixed hello first (it may straddle recv boundaries).
             if (!c->peer_hello_read) {
                 const std::size_t need = hello_size - c->hello_in_.size();
@@ -1450,6 +1481,25 @@ private:
     }
 
     // ---- teardown / reconnect -------------------------------------------------------------------
+    // ADR-074 D4c (loop thread): detach a never-identified inbound connection and give it, with the bytes read, to the enrolment handler. The socket is
+    // NOT closed here when the handler takes it. A pending connection is not counted open, so there is nothing to unmark.
+    void hand_off_enrol(Conn* c, const std::byte* p, std::size_t n) {
+        EnrolHandoff h;
+        h.fd = c->fd;
+        h.peer_addr = c->peer_addr;
+        h.peer_port = c->peer_port;
+        h.initial.assign(p, p + n);
+        io_.del_fd(h.fd);
+        by_fd_.erase(h.fd);
+        pending_in_.erase(h.fd);  // destroys `c`
+        if (enrol_handoff_(h)) {
+            enrol_handoffs_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            pal::close_fd(h.fd);
+            drops_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     void handle_dead(Conn* c) {
         const NodeId peer = c->peer;
         const bool was_identified = c->identified;
@@ -1976,6 +2026,8 @@ private:
     std::unordered_set<std::uint64_t> denied_peers_;      // N3: peers closed because the snapshot denies them
     std::int64_t pending_hello_timeout_ns_ = 5'000'000'000;  // 5s to identify
     std::uint64_t accept_serial_ = 0;
+    EnrolHandoffFn enrol_handoff_;  // ADR-074 D4c; set before start(), read on the loop thread
+    std::atomic<std::uint64_t> enrol_handoffs_{0};
     pal::fd_t listener_ = pal::invalid_fd;
 
     pal::IoContext io_;

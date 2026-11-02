@@ -89,6 +89,15 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   add_test(NAME mbedtls_enrol_session_check COMMAND mbedtls_enrol_session_check)
 endif()
 
+# tests/adapters/mbedtls_enrol_service_check.cpp: ADR-074 D4c step 4 - enrolment over a real TcpTransport listener (handoff, caps, no ticket, off the I/O thread).
+if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrol_service_check.cpp")
+  add_executable(mbedtls_enrol_service_check tests/adapters/mbedtls_enrol_service_check.cpp)
+  target_include_directories(mbedtls_enrol_service_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_compile_definitions(mbedtls_enrol_service_check PRIVATE QUARK_ALLOW_INSECURE)  # F1: the member listener is a dev plaintext TcpTransport here
+  target_link_libraries(mbedtls_enrol_service_check PRIVATE quark::quark quark::security_mbedtls quark_warnings Threads::Threads)
+  add_test(NAME mbedtls_enrol_service_check COMMAND mbedtls_enrol_service_check)
+endif()
+
 # =============================================================================================================
 # Optional pinned-key transport-security backend (libsodium; Noise IK, issue #40 / ADR-068). OFF by default so the
 # std-only core build links nothing extra — the same posture as QUARK_WITH_MBEDTLS above (020 "honest exception":
