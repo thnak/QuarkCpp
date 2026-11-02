@@ -56,6 +56,7 @@ canonical stamped numbers (those live in the ADRs: ADR-005/006/007/009/010/013/0
 | `serialize_bench` | 016 tagless wire encode vs memcpy | ≤200/500 ns, near-memcpy |
 | `supervision_bench` (+`_noguard`) | 007/ADR-009 handler-guard success-path cost | guarded/no-guard ratio ≤ noise |
 | `placement_bench` | 010/026 VirtualBins O(1) vs raw HRW O(N) | placement p99 ≤20/50 ns, **N-independent** |
+| `mailbox_1p1c_bench` | 003 cross-thread 1P→1C floor (issue #32 A/B baseline) | — (informational; no 023 budget for this shape) |
 
 **Measured results, machine-of-record, and reproduce steps: [`../PERFORMANCE.md`](../PERFORMANCE.md).**
 
@@ -131,3 +132,11 @@ performance half:
 tests, renders one consolidated table, and diffs against the checked-in `mailbox_baseline_r8.json`
 (captured against the current shipped mailbox) — re-run after any future mailbox redesign to compare
 side by side: `python3 bench/mailbox_regression_dashboard.py [--update-baseline] [--html out.html]`.
+
+**Cross-thread 1P→1C floor (issue #32).** `mailbox_1p1c_bench` is the one cross-thread mailbox bench:
+one producer enqueues while one consumer drains, with a bounded in-flight window — the shape ADR-064
+and issue #32 measure (the ~158 ns/msg floor). It prints ns/msg and M msg/s with **no 023 verdict** on
+purpose: the 023 throughput budgets are the single-thread peak/tight-loop numbers, so this is an A/B
+baseline (and rolling trend) for a mailbox redesign, not a budget claim. Pin two cores:
+`taskset -c 0-1 build/bench/mailbox_1p1c_bench [total] [window] [reps]`. The gate's `-c 0-3` pin leaves
+it room to spread; it prints no verdict tokens, so `ci_bench_gate.sh` only checks that it runs.
