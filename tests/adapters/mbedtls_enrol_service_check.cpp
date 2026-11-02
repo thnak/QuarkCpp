@@ -118,7 +118,8 @@ struct Anchor {
     World w;
     net::TcpTransport t{NodeId{kAnchor}, pal::ipv4_loopback, 0};
     std::unique_ptr<EnrolService> svc;
-    explicit Anchor(EnrolServiceConfig cfg = {}) {
+    explicit Anchor(EnrolServiceConfig cfg = {}, bool pinned = false) {
+        t.set_pinned_wire(pinned);  // #45 pinned wire: no HELLO either way, the first bytes are a u32 LE frame length
         svc = std::make_unique<EnrolService>(w.anchor_id, *w.enr, cfg, [this] { return w.clock.load(); });
         t.set_enrol_handoff([this](net::TcpTransport::EnrolHandoff& h) { return svc->handoff(h.fd, h.peer_addr, std::move(h.initial)); });
         t.on_receive([this](MessageFrame f) { rec(std::move(f)); });
@@ -333,6 +334,50 @@ int main() {
         check(c.send_all(out), "V6 setup");
         check(wait_until([&] { return a.svc->active() == 1; }), "V6 the enrolment is running");
         check(wait_until([&] { return a.svc->timed_out() == 1 && a.svc->active() == 0; }, 5000), "V6 a stalled enrolment is closed at the deadline and frees its slot");
+    }
+
+    // ---------------------------------------------------------------------------------------------- V7
+    // The PINNED member wire (no HELLO: the first bytes are a u32 LE frame length). The discrimination rests on the length bytes of an opener never being
+    // `16 03 01|03 ..` (ADR-074 D4c). Until now that was argued in the ADR only.
+    {
+        Anchor a({}, /*pinned=*/true);
+        check(a.t.pinned_wire(), "V7 setup: the listener runs the pinned wire");
+        (void)new_ticket(a.w);  // a spare, so a live ticket survives the first enrolment
+        const auto t = new_ticket(a.w);
+        EnrolJoinerSession j(a.w.code(t));
+        Client c(a.t.listen_port());
+        check(drive(j, c, 5000) == JS::Joined, "V7 a joiner enrols on a PINNED-wire listener");
+        check(a.t.enrol_handoffs() == 1, "V7 handed off exactly once");
+        check(wait_until([&] { return a.svc->replied() == 1 && a.svc->active() == 0; }), "V7 the service answered and released its slot");
+        check(wait_until([&] { return a.t.pending_inbound_count() == 0; }), "V7 the pinned pending pool holds nothing");
+
+        // Selectivity: a length-prefixed opener-shaped chunk (length 32 = 20 00 00 00) is NOT a TLS record header, so it stays on the member path.
+        Client opener(a.t.listen_port());
+        Bytes fake{std::byte{0x20}, std::byte{0}, std::byte{0}, std::byte{0}};
+        for (int i = 0; i < 32; ++i) fake.push_back(std::byte{0xAB});
+        check(opener.send_all(fake), "V7 setup: a pinned-framed opener-shaped chunk is sent");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        check(a.t.enrol_handoffs() == 1, "V7 a pinned-framed chunk is not handed off");
+
+        // The pinned wire sends nothing on accept (no held HELLO to release): an enrol client sees nothing before its own ClientHello.
+        Client quiet(a.t.listen_port());
+        Bytes got;
+        bool eof = false;
+        quiet.recv_for(200, got, eof);
+        check(got.empty() && !eof, "V7 the pinned acceptor sends nothing before the peer speaks");
+    }
+    // V7b: with NO live ticket a pinned-wire enrol hello is closed with zero bytes, as on the HELLO wire (V2).
+    {
+        Anchor a({}, /*pinned=*/true);
+        EnrolJoinerSession probe(a.w.code(enrol::Ticket{}));
+        Client c(a.t.listen_port());
+        Bytes out;
+        probe.start(out);
+        check(c.send_all(out), "V7b setup");
+        Bytes got;
+        bool eof = false;
+        c.recv_for(3000, got, eof);
+        check(eof && got.empty() && a.svc->refused_no_ticket() == 1, "V7b no live ticket: closed with zero bytes on the pinned wire");
     }
 
     std::printf(g_ok ? "mbedtls_enrol_service_check: all checks passed\n" : "mbedtls_enrol_service_check: FAILED\n");
