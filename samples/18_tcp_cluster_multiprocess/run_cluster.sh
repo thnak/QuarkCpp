@@ -12,6 +12,13 @@ NUM_NODES="${1:-4}"
 MSGS="${2:-150}"
 BASE_PORT="${3:-21000}"
 
+# main.cpp holds a shared settle window of 8000 + (num_nodes * messages)/25 ms, so a large matrix runs to
+# that window before exiting. Give each process headroom past it: otherwise this harness's timeout kills a
+# legitimate run first (8x100000 needs ~41 s, and a flat 30 s made that gate unreachable). Small matrices
+# keep the 30 s floor, so a genuine hang is still detected promptly.
+PROC_TIMEOUT_S=$(( (8000 + NUM_NODES * MSGS / 25 + 15000) / 1000 ))
+if (( PROC_TIMEOUT_S < 30 )); then PROC_TIMEOUT_S=30; fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN=""
 for candidate in "$SCRIPT_DIR/../../build-samples/samples/18_tcp_cluster_multiprocess" \
@@ -29,7 +36,7 @@ echo "launching $NUM_NODES separate processes (logs in $LOGDIR) ..."
 
 pids=()
 for ((i = 1; i <= NUM_NODES; i++)); do
-  taskset -c 0-3 timeout 30 "$BIN" "$i" "$NUM_NODES" "$MSGS" "$BASE_PORT" >"$LOGDIR/node_$i.log" 2>&1 &
+  taskset -c 0-3 timeout "$PROC_TIMEOUT_S" "$BIN" "$i" "$NUM_NODES" "$MSGS" "$BASE_PORT" >"$LOGDIR/node_$i.log" 2>&1 &
   pids+=($!)
 done
 
