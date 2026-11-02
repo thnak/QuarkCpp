@@ -313,6 +313,38 @@ jobs:
       - name: Test (adapter checks)
         run: ctest --test-dir build-sodium -R "noise_ik|sodium_aead|pinned_|security_sodium" -j 2 --output-on-failure --timeout 600
 
+  # Issue #51 (assessment M6): differential test of the Noise IK glue against an independent implementation (Python `noiseprotocol`,
+  # hash-pinned in ci/pins.env, unzipped into a throwaway directory by ci/install-noise-reference.sh: a TEST tool, never a library dependency).
+  # 10^4 random transcripts must be byte-identical, and two copies of noise.hpp with one changed line (MixHash / MixKey) must be caught.
+  test-noise-differential:
+    name: test-noise-differential (gcc-release)
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:13686cb105f4d2650dd83c469945f85d2ca603a3b674c7799499098d370bcebe
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install toolchain + libsodium (exact lock)
+        run: bash ci/install-deps.sh --with-sodium
+
+      - name: Install the Python reference (hash-verified)
+        run: bash ci/install-noise-reference.sh /opt/noise-ref
+
+      - name: Configure
+        run: |
+          PYTHONPATH=/opt/noise-ref cmake -S . -B build-diff -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14             -DQUARK_WITH_SODIUM=ON -DQUARK_BUILD_BENCH=OFF -DQUARK_SODIUM_INCLUDE_DIR=/usr/include -DQUARK_SODIUM_LIBRARY=/usr/lib/x86_64-linux-gnu/libsodium.a
+
+      - name: Build
+        run: cmake --build build-diff -j 2
+
+      - name: Test (differential + controls)
+        run: PYTHONPATH=/opt/noise-ref ctest --test-dir build-diff -R "differential_noise_ik" --output-on-failure --timeout 900 --no-tests=error
+
   # Issue #71: the opt-in mbedTLS adapter and its checks (AEAD, handshake, trust anchor, enrolment wire/channel/session/service) ran only on a developer machine.
   # Ubuntu 24.04 ships mbedTLS 2.28 (floor is 3.6.2), so ci/install-mbedtls.sh builds the pinned release from its hash-verified tarball.
   test-mbedtls-checks:
