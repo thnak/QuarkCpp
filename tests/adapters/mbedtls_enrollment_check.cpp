@@ -95,6 +95,7 @@ struct CertSpec {
     int is_ca = 0;
     unsigned int key_usage = 0;  // 0: no keyUsage extension
     std::int64_t not_before = 0, not_after = 0;
+    std::vector<std::string> ekus;  // extended-key-usage OIDs (DER content bytes); empty: no EKU extension
 };
 
 Bytes write_cert(mbedtls_pk_context& subject_key, mbedtls_pk_context& issuer_key, const std::string& issuer_dn,
@@ -114,6 +115,15 @@ Bytes write_cert(mbedtls_pk_context& subject_key, mbedtls_pk_context& issuer_key
     mbedtls_x509write_crt_set_validity(&w, x509_time(spec.not_before).c_str(), x509_time(spec.not_after).c_str());
     mbedtls_x509write_crt_set_basic_constraints(&w, spec.is_ca, -1);
     if (spec.key_usage != 0) mbedtls_x509write_crt_set_key_usage(&w, spec.key_usage);
+    std::vector<mbedtls_asn1_sequence> eku(spec.ekus.size());
+    if (!spec.ekus.empty()) {
+        for (std::size_t i = 0; i < spec.ekus.size(); ++i) {
+            eku[i].buf = {MBEDTLS_ASN1_OID, spec.ekus[i].size(),
+                          reinterpret_cast<unsigned char*>(const_cast<char*>(spec.ekus[i].data()))};
+            eku[i].next = i + 1 < eku.size() ? &eku[i + 1] : nullptr;
+        }
+        mbedtls_x509write_crt_set_ext_key_usage(&w, eku.data());
+    }
     std::vector<unsigned char> buf(4096);
     const int len = mbedtls_x509write_crt_der(&w, buf.data(), buf.size(), &SharedRng::random, &SharedRng::instance());
     mbedtls_x509write_crt_free(&w);
@@ -337,6 +347,33 @@ void issued_section(Ca& ca, Ca& rogue, const std::shared_ptr<const TrustStore>& 
     // An end-entity certificate (CA:FALSE) cannot act as an intermediate.
     const Bytes not_ca_inter = write_cert(inter_key.v, ca.key.v, ca.dn, {inter_dn, 0, 0, kNow - kDay, kNow + 365 * kDay});
     check(!ok(concat(via_inter, not_ca_inter)), "a leaf signed by a non-CA certificate is refused");
+
+    // ADR-074 D4 (#72): nothing off the verified path rides along after the leaf.
+    const Bytes plain_leaf = ca.issue(spki, leaf_spec(cn));
+    check(ok(plain_leaf), "control: a leaf alone is accepted");
+    Ca unrelated("Unrelated CA");
+    Pk other_key;
+    gen_key(other_key.v);
+    const Bytes stray = write_cert(other_key.v, unrelated.key.v, unrelated.dn,
+                                   {"CN=stray", 1, MBEDTLS_X509_KU_KEY_CERT_SIGN, kNow - kDay, kNow + 365 * kDay});
+    check(!ok(concat(plain_leaf, stray)), "an unrelated extra certificate after the leaf is refused");
+    check(!ok(concat(plain_leaf, ca.cert)), "a self-signed root carried after the leaf is refused");
+    check(!ok(concat(concat(via_inter, inter_cert), stray)), "an extra certificate after the real chain is refused");
+
+    // ADR-074 D4 (#72): the leaf must be usable for the mutual-TLS handshake.
+    const std::string kClient(MBEDTLS_OID_CLIENT_AUTH), kServer(MBEDTLS_OID_SERVER_AUTH);
+    CertSpec both = leaf_spec(cn);
+    both.ekus = {kClient, kServer};
+    check(ok(ca.issue(spki, both)), "control: digitalSignature with clientAuth + serverAuth is accepted");
+    CertSpec no_sig = leaf_spec(cn);
+    no_sig.key_usage = MBEDTLS_X509_KU_KEY_ENCIPHERMENT;
+    check(!ok(ca.issue(spki, no_sig)), "keyUsage without digitalSignature is refused");
+    CertSpec client_only = leaf_spec(cn);
+    client_only.ekus = {kClient};
+    check(!ok(ca.issue(spki, client_only)), "extendedKeyUsage with only clientAuth is refused");
+    CertSpec server_only = leaf_spec(cn);
+    server_only.ekus = {kServer};
+    check(!ok(ca.issue(spki, server_only)), "extendedKeyUsage with only serverAuth is refused");
 }
 
 void overlap_section(Ca& old_ca, Ca& new_ca) {

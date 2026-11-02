@@ -210,8 +210,27 @@ public:
         }
         if (!any_root) return false;
         std::uint32_t flags = 0;
-        return mbedtls_x509_crt_verify(&chain.v, &roots.v, nullptr, nullptr, &flags, &leaf_time_checked, nullptr) == 0 &&
-               flags == 0;
+        if (mbedtls_x509_crt_verify(&chain.v, &roots.v, nullptr, nullptr, &flags, &leaf_time_checked, nullptr) != 0 ||
+            flags != 0)
+            return false;
+
+        // ADR-074 D4: the joiner relays what the anchor returns, so the chain carries nothing the verified
+        // path does not use. Each certificate after the leaf must be the issuer of the one before it, and
+        // none may be a self-signed root (the roots are configured, never sent).
+        for (const mbedtls_x509_crt* prev = &leaf; prev->next != nullptr; prev = prev->next) {
+            const mbedtls_x509_crt* c = prev->next;
+            if (!detail::same_bytes({prev->issuer_raw.p, prev->issuer_raw.len}, {c->subject_raw.p, c->subject_raw.len}) ||
+                detail::same_bytes({c->issuer_raw.p, c->issuer_raw.len}, {c->subject_raw.p, c->subject_raw.len}))
+                return false;
+        }
+
+        // The leaf must be usable for the handshake. Both mbedTLS checks return 0 when the extension is absent
+        // (ext_types is private in 3.x), so an absent keyUsage / extendedKeyUsage stays accepted.
+        if (mbedtls_x509_crt_check_key_usage(&leaf, MBEDTLS_X509_KU_DIGITAL_SIGNATURE) != 0) return false;
+        if ((mbedtls_x509_crt_check_extended_key_usage(&leaf, MBEDTLS_OID_CLIENT_AUTH, MBEDTLS_OID_SIZE(MBEDTLS_OID_CLIENT_AUTH)) != 0 ||
+             mbedtls_x509_crt_check_extended_key_usage(&leaf, MBEDTLS_OID_SERVER_AUTH, MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH)) != 0))
+            return false;
+        return true;
     }
 
 private:
