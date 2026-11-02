@@ -71,7 +71,7 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   target_link_libraries(mbedtls_enrollment_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
   add_test(NAME mbedtls_enrollment_check COMMAND mbedtls_enrollment_check)
 endif()
-# tests/adapters/mbedtls_enrol_channel_check.cpp: ADR-074 D4c — the server-authenticated channel an enrolment travels in (the joiner
+# tests/adapters/mbedtls_enrol_channel_check.cpp: ADR-074 D4c ï¿½ the server-authenticated channel an enrolment travels in (the joiner
 # trusts only the join code's CA pin; client certificate, wrong cluster/node, rogue CA, pin mismatch all refused).
 if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrol_channel_check.cpp")
   add_executable(mbedtls_enrol_channel_check tests/adapters/mbedtls_enrol_channel_check.cpp)
@@ -180,6 +180,14 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_SODIUM)
     add_test(NAME pinned_key_copies_check_control COMMAND pinned_key_copies_check_control)
     set_tests_properties(pinned_key_copies_check_control PROPERTIES WILL_FAIL TRUE)
   endif()
+
+  # #64: the instrumented allocator lives in its own TU (tests/adapters/heap_probe.hpp explains why) so GCC does not inline
+  # the replacement's free() into a caller's new-expression and report -Wmismatched-new-delete.
+  foreach(_probed pinned_key_copies_check pinned_key_copies_check_control)
+    if(TARGET ${_probed})
+      target_sources(${_probed} PRIVATE tests/adapters/heap_probe.cpp)
+    endif()
+  endforeach()
 
   # Cross-mode (TLS CA chain <-> pinned): needs BOTH adapters in one binary.
   if(QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/pinned_crossmode_check.cpp")
