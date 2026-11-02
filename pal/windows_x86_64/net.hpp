@@ -187,8 +187,10 @@ inline void close_fd(fd_t s) noexcept {
 // (WSAEWOULDBLOCK is expected and NOT an error — Windows' non-blocking-connect-in-progress signal,
 // the analogue of POSIX EINPROGRESS) — completion is signalled by writable readiness, at which point
 // connect_result(s) reports success/failure. A synchronous connect (loopback) may complete here too.
-[[nodiscard]] inline std::expected<fd_t, std::error_code> tcp_connect(std::uint64_t addr,
-                                                                      std::uint16_t port) noexcept {
+// `source_addr != 0` first binds the socket to that local IPv4 address (port 0 = any) so the connection leaves from
+// it (#68: the new-source-IP reconnect test); 0 keeps the unbound behaviour exactly.
+[[nodiscard]] inline std::expected<fd_t, std::error_code> tcp_connect(std::uint64_t addr, std::uint16_t port,
+                                                                      std::uint64_t source_addr = 0) noexcept {
     ensure_winsock();
     const fd_t s = ::socket(AF_INET, SOCK_STREAM, 0);
     if (s == invalid_fd) return std::unexpected(last_error());
@@ -197,6 +199,14 @@ inline void close_fd(fd_t s) noexcept {
         return std::unexpected(r.error());
     }
     set_nodelay(s);
+    if (source_addr != 0) {
+        const ::sockaddr_in src = to_sockaddr_in(source_addr, 0);
+        if (::bind(s, reinterpret_cast<const ::sockaddr*>(&src), sizeof(src)) != 0) {
+            const int err = ::WSAGetLastError();
+            close_fd(s);
+            return std::unexpected(std::error_code(err, std::system_category()));
+        }
+    }
     const ::sockaddr_in sa = to_sockaddr_in(addr, port);
     if (::connect(s, reinterpret_cast<const ::sockaddr*>(&sa), sizeof(sa)) != 0) {
         const int err = ::WSAGetLastError();

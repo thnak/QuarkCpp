@@ -175,6 +175,10 @@ public:
     // multi-homed peers that legitimately reconnect from a different address while the old link lives.
     void set_strict_peer_addr_binding(bool on) noexcept { strict_peer_addr_binding_ = on; }
 
+    // #68: bind every outgoing dial to this local IPv4 address (host order, port 0) first; 0 (default) = unbound.
+    // A test seam for the new-source-IP reconnect (a phone moving Wi-Fi to cellular). Set before the dials it affects.
+    void set_dial_source_addr(std::uint64_t a) noexcept { dial_source_addr_.store(a, std::memory_order_relaxed); }
+
     // ADR-071 (#47 B1): a new connection from an identified peer whose existing connection has been
     // confirmed for at least this long is a RECONNECT (the peer changed network, restarted, or the old
     // socket is half-open) and supersedes it whichever side dialled. Younger than this, the pair is a
@@ -838,7 +842,7 @@ private:
     }
 
     Conn* dial(NodeId to, const Endpoint& ep) {
-        auto fd = pal::tcp_connect(ep.addr, ep.port);
+        auto fd = pal::tcp_connect(ep.addr, ep.port, dial_source_addr_);
         if (!fd) return nullptr;
         auto c = std::make_unique<Conn>();
         c->in.set_max_body(max_frame_body_);
@@ -1634,7 +1638,7 @@ private:
             discard_relay_fallback_state(peer);  // ADR-048
             return;
         }
-        auto fd = pal::tcp_connect(ep->addr, ep->port);
+        auto fd = pal::tcp_connect(ep->addr, ep->port, dial_source_addr_);
         if (!fd) {  // dial failed outright — back off and try again
             schedule_reconnect(peer);
             return;
@@ -1790,7 +1794,7 @@ private:
             arm_direct_probe(peer, epoch);
             return;
         }
-        auto fd = pal::tcp_connect(pit->second.addr, pit->second.port);
+        auto fd = pal::tcp_connect(pit->second.addr, pit->second.port, dial_source_addr_);
         if (!fd) {  // still unreachable — try again next interval
             arm_direct_probe(peer, epoch);
             return;
@@ -2014,6 +2018,7 @@ private:
     std::uint64_t max_outbound_data_bytes_ = 64ull << 20;      // C1: per-peer data backlog cap
     std::uint64_t max_outbound_control_bytes_ = 256ull << 20;  // C1: per-peer control backlog hard cap
     std::uint32_t max_inbound_per_ip_ = 64;       // identified inbound connections per source IP
+    std::atomic<std::uint64_t> dial_source_addr_{0};  // #68: local source for dials (0 = unbound)
     bool strict_peer_addr_binding_ = true;        // a live peer's slot cannot be taken from another IP
     std::int64_t supersede_window_ns_ = 1'000'000'000;  // B1: older than this ⇒ a new conn is a reconnect
     // #65: how long a dialer defers confirmation waiting for the acceptor's DialHint. The hint follows

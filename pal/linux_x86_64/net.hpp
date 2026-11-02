@@ -157,8 +157,10 @@ inline void close_fd(int fd) noexcept {
 // Begin a non-blocking connect. Returns the fd immediately; the connect is IN PROGRESS (EINPROGRESS is
 // expected and NOT an error) — completion is signalled by EPOLLOUT, at which point connect_result(fd)
 // reports success/failure. A synchronous connect (loopback) may complete here; that is also success.
-[[nodiscard]] inline std::expected<int, std::error_code> tcp_connect(std::uint64_t addr,
-                                                                     std::uint16_t port) noexcept {
+// `source_addr != 0` first binds the socket to that local IPv4 address (port 0 = any) so the connection leaves from
+// it (#68: the new-source-IP reconnect test); 0 keeps the unbound behaviour exactly.
+[[nodiscard]] inline std::expected<int, std::error_code> tcp_connect(std::uint64_t addr, std::uint16_t port,
+                                                                     std::uint64_t source_addr = 0) noexcept {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return std::unexpected(last_error());
     if (auto r = set_nonblocking(fd); !r) {
@@ -166,6 +168,14 @@ inline void close_fd(int fd) noexcept {
         return std::unexpected(r.error());
     }
     set_nodelay(fd);
+    if (source_addr != 0) {
+        const ::sockaddr_in src = to_sockaddr_in(source_addr, 0);
+        if (::bind(fd, reinterpret_cast<const ::sockaddr*>(&src), sizeof(src)) < 0) {
+            const auto e = last_error();
+            close_fd(fd);
+            return std::unexpected(e);
+        }
+    }
     const ::sockaddr_in sa = to_sockaddr_in(addr, port);
     if (::connect(fd, reinterpret_cast<const ::sockaddr*>(&sa), sizeof(sa)) < 0 && errno != EINPROGRESS) {
         const auto e = last_error();
