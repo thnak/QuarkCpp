@@ -71,6 +71,14 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   target_link_libraries(mbedtls_enrollment_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
   add_test(NAME mbedtls_enrollment_check COMMAND mbedtls_enrollment_check)
 endif()
+# tests/adapters/mbedtls_enrol_channel_check.cpp: ADR-074 D4c — the server-authenticated channel an enrolment travels in (the joiner
+# trusts only the join code's CA pin; client certificate, wrong cluster/node, rogue CA, pin mismatch all refused).
+if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrol_channel_check.cpp")
+  add_executable(mbedtls_enrol_channel_check tests/adapters/mbedtls_enrol_channel_check.cpp)
+  target_include_directories(mbedtls_enrol_channel_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(mbedtls_enrol_channel_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
+  add_test(NAME mbedtls_enrol_channel_check COMMAND mbedtls_enrol_channel_check)
+endif()
 
 # =============================================================================================================
 # Optional pinned-key transport-security backend (libsodium; Noise IK, issue #40 / ADR-068). OFF by default so the

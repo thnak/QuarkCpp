@@ -276,6 +276,11 @@ binding. Found and folded in:
   the test from the SPKI alone, Enrollment end to end, concurrent use, each rule mutation-tested).
   Because a Quark engine now refuses to present a CA:TRUE leaf, the peer-side refusal of one (the
   handshake's verify callback) is kept for non-Quark peers but has no test that reaches it.
+  D4c step 1 done: `enrol_wire.hpp` (join code binary and typed form, request and reply wire, bounded stream reader; `enrol_wire_test`).
+  D4c step 2 done: `mbedtls_enrol_channel.hpp` (`EnrolServerChannel` / `EnrolJoinerChannel`: TLS 1.3, certificate on the anchor only; the joiner trusts only the
+  join code's CA hash and checks member role, cluster, NodeId, chain and usage before it may send anything; `mbedtls_enrol_channel_check`). Limit: mbedTLS as the
+  server refuses a certificate without digitalSignature or with a clientAuth-only EKU itself, so the joiner's own checks of those two are defence in depth and are
+  not reached by any test. Steps 3 (anchor and joiner sessions over `Enrollment`) and 4 (the listener, caps, off-I/O-thread work) remain.
   Next: D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning,
   join-code encoding), which also calls `validate_identity_not_root` at transport start.
 
