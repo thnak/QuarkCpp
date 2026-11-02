@@ -196,6 +196,50 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_SODIUM)
     endif()
   endforeach()
 
+  # #51 (assessment M6): differential test of the Noise IK glue against an independent implementation (the Python `noiseprotocol`
+  # package). The C++ tool is always built; the tests are registered only when Python 3 with that package is found, and under names
+  # the CI regex "noise_ik|sodium_aead|pinned_|security_sodium" does not match. CONTROLS: copies of noise.hpp with ONE line changed
+  # in MixHash / MixKey, built into their own tools, which the driver must report as DIFFERENT (--expect-mismatch).
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/noise_ik_differential_tool.cpp")
+    add_executable(noise_ik_differential_tool tests/adapters/noise_ik_differential_tool.cpp)
+    target_link_libraries(noise_ik_differential_tool PRIVATE quark::security_sodium quark_warnings)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/quark/adapters/sodium/noise.hpp" _noise_src)
+    set(_mut_hash_from "void mix_hash(std::span<const std::byte> data) noexcept { h_ = hash(h_, data); }")
+    set(_mut_hash_to   "void mix_hash(std::span<const std::byte> data) noexcept { h_ = hash(data, h_); }")
+    set(_mut_key_from  "std::memcpy(k.data(), temp_k.data(), kKeyLen);")
+    set(_mut_key_to    "std::memcpy(k.data(), temp_k.data() + 1, kKeyLen);")
+    foreach(_mut hash key)
+      string(REPLACE "${_mut_${_mut}_from}" "${_mut_${_mut}_to}" _mutated "${_noise_src}")
+      if(_mutated STREQUAL _noise_src)  # the control must really differ, or it proves nothing
+        message(FATAL_ERROR "noise_ik_differential: the mix_${_mut} mutation did not apply (noise.hpp changed?)")
+      endif()
+      set(_mdir "${CMAKE_BINARY_DIR}/noise_ik_mutant_${_mut}")
+      file(WRITE "${_mdir}/quark/adapters/sodium/noise.hpp" "${_mutated}")
+      add_executable(noise_ik_differential_tool_mut_${_mut} tests/adapters/noise_ik_differential_tool.cpp)
+      target_include_directories(noise_ik_differential_tool_mut_${_mut} BEFORE PRIVATE "${_mdir}")
+      target_link_libraries(noise_ik_differential_tool_mut_${_mut} PRIVATE quark::security_sodium quark_warnings)
+    endforeach()
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import noise.connection, cryptography"
+                      RESULT_VARIABLE _noise_py_rc OUTPUT_QUIET ERROR_QUIET)
+      if(_noise_py_rc EQUAL 0)
+        set(_diff_py "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/noise_ik_differential.py")
+        add_test(NAME differential_noise_ik COMMAND "${Python3_EXECUTABLE}" "${_diff_py}" --tool $<TARGET_FILE:noise_ik_differential_tool>)
+        foreach(_mut hash key)
+          add_test(NAME differential_noise_ik_control_${_mut}
+                   COMMAND "${Python3_EXECUTABLE}" "${_diff_py}" --tool $<TARGET_FILE:noise_ik_differential_tool_mut_${_mut}>
+                           --expect-mismatch --n 200)
+        endforeach()
+        set_tests_properties(differential_noise_ik differential_noise_ik_control_hash differential_noise_ik_control_key
+                             PROPERTIES LABELS "differential")
+        message(STATUS "Quark: Noise IK differential tests ENABLED (noiseprotocol found)")
+      else()
+        message(STATUS "Quark: Noise IK differential tests skipped (pip install noiseprotocol cryptography)")
+      endif()
+    endif()
+  endif()
+
   # Cross-mode (TLS CA chain <-> pinned): needs BOTH adapters in one binary.
   if(QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/pinned_crossmode_check.cpp")
     add_executable(pinned_crossmode_check tests/adapters/pinned_crossmode_check.cpp)
