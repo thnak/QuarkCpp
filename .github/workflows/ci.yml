@@ -313,6 +313,46 @@ jobs:
       - name: Test (adapter checks)
         run: ctest --test-dir build-sodium -R "noise_ik|sodium_aead|pinned_|security_sodium" -j 2 --output-on-failure --timeout 600
 
+  # Issue #71: the opt-in mbedTLS adapter and its checks (AEAD, handshake, trust anchor, enrolment wire/channel/session/service) ran only on a developer machine.
+  # Ubuntu 24.04 ships mbedTLS 2.28 (floor is 3.6.2), so ci/install-mbedtls.sh builds the pinned release from its hash-verified tarball.
+  test-mbedtls-checks:
+    name: test-mbedtls-checks (gcc-release)
+    needs: supply-chain
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/thnak/quark-ci@sha256:13686cb105f4d2650dd83c469945f85d2ca603a3b674c7799499098d370bcebe
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Install toolchain + libsodium (exact lock)
+        run: bash ci/install-deps.sh --with-sodium
+
+      - name: Build the pinned mbedTLS (hash-verified)
+        run: bash ci/install-mbedtls.sh /opt/mbedtls
+
+      - name: Configure (mbedTLS)
+        run: |
+          cmake -S . -B build-mbedtls -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14             -DQUARK_WITH_MBEDTLS=ON -DQUARK_BUILD_BENCH=OFF -DCMAKE_PREFIX_PATH=/opt/mbedtls
+
+      - name: Build (mbedTLS)
+        run: cmake --build build-mbedtls -j 2
+
+      - name: Test (mbedTLS checks)
+        run: ctest --test-dir build-mbedtls -R "mbedtls_|enrol|security_" -j 2 --output-on-failure --timeout 600
+
+      - name: Configure (both adapters, cross-mode)
+        run: |
+          cmake -S . -B build-both -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14             -DQUARK_WITH_MBEDTLS=ON -DQUARK_WITH_SODIUM=ON -DQUARK_BUILD_BENCH=OFF -DCMAKE_PREFIX_PATH=/opt/mbedtls             -DQUARK_SODIUM_INCLUDE_DIR=/usr/include -DQUARK_SODIUM_LIBRARY=/usr/lib/x86_64-linux-gnu/libsodium.a
+
+      - name: Build + test (cross-mode)
+        run: |
+          cmake --build build-both -j 2 --target pinned_crossmode_check
+          ctest --test-dir build-both -R pinned_crossmode --output-on-failure --timeout 600
+
   test-windows:
     name: test-windows (${{ matrix.config.name }})
     needs: supply-chain
