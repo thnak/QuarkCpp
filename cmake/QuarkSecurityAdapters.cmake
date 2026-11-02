@@ -98,6 +98,14 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   add_test(NAME mbedtls_enrol_service_check COMMAND mbedtls_enrol_service_check)
 endif()
 
+# tests/adapters/mbedtls_enrol_e2e_check.cpp: ADR-074 D4c / #36 - a node with only a join code enrols and then joins as a member over TcpTransport + SecureTransport.
+if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrol_e2e_check.cpp")
+  add_executable(mbedtls_enrol_e2e_check tests/adapters/mbedtls_enrol_e2e_check.cpp)
+  target_include_directories(mbedtls_enrol_e2e_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(mbedtls_enrol_e2e_check PRIVATE quark::quark quark::security_mbedtls quark_warnings Threads::Threads)
+  add_test(NAME mbedtls_enrol_e2e_check COMMAND mbedtls_enrol_e2e_check)
+endif()
+
 # =============================================================================================================
 # Optional pinned-key transport-security backend (libsodium; Noise IK, issue #40 / ADR-068). OFF by default so the
 # std-only core build links nothing extra — the same posture as QUARK_WITH_MBEDTLS above (020 "honest exception":
