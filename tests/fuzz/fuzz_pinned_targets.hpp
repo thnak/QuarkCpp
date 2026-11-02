@@ -439,6 +439,16 @@ inline void add_pinned_seeds(std::vector<std::vector<std::byte>>& out) {
         for (char c : good) g.push_back(static_cast<std::byte>(c));
         out.push_back(g);  // a bare label: exercises the decode/round-trip properties
     }
+
+    // Planted-OOB control: control_msg1_parse_copy trips only on exactly 154 input bytes with the high
+    // nibble 0xF in byte 0. libFuzzer executes every corpus entry before mutating, so this seed makes the
+    // CI control deterministic; without it the campaign had to mutate both the length and byte 0, and a
+    // 20 s run often never reached the planted read (a control that cannot find a planted bug is unproven).
+    {
+        Buf control_seed(154, std::byte{0});
+        control_seed[0] = std::byte{0xF2};  // high nibble 0xF; low bits also select a valid pinned mode
+        out.push_back(std::move(control_seed));
+    }
 }
 
 }  // namespace quark::fuzz
