@@ -159,7 +159,7 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_SODIUM)
   find_package(Threads REQUIRED)
   foreach(_chk noise_ik_vectors_check sodium_aead_check pinned_handshake_check pinned_privacy_check
                pinned_secure_transport_check pinned_tcp_check pinned_flood_check
-               pinned_nodeid_role_check)
+               pinned_nodeid_role_check pinned_key_copies_check)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/${_chk}.cpp")
       add_executable(${_chk} tests/adapters/${_chk}.cpp)
       target_include_directories(${_chk} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -169,6 +169,18 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_SODIUM)
       add_test(NAME ${_chk} COMMAND ${_chk})
     endif()
   endforeach()
+  # #64 step 2 CONTROL: the same source with the pre-fix by-value KeyPair heap copy restored. The heap scan MUST find the
+  # marker, so this target is registered WILL_FAIL — a control that stops demonstrating the leak fails the build.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/pinned_key_copies_check.cpp")
+    add_executable(pinned_key_copies_check_control tests/adapters/pinned_key_copies_check.cpp)
+    target_include_directories(pinned_key_copies_check_control PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    target_compile_definitions(pinned_key_copies_check_control PRIVATE QUARK_ALLOW_INSECURE
+      QUARK_TEST_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors" QUARK_PINNED_KEY_COPIES_CONTROL=1)
+    target_link_libraries(pinned_key_copies_check_control PRIVATE quark::security_sodium quark_warnings Threads::Threads)
+    add_test(NAME pinned_key_copies_check_control COMMAND pinned_key_copies_check_control)
+    set_tests_properties(pinned_key_copies_check_control PROPERTIES WILL_FAIL TRUE)
+  endif()
+
   # Cross-mode (TLS CA chain <-> pinned): needs BOTH adapters in one binary.
   if(QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/pinned_crossmode_check.cpp")
     add_executable(pinned_crossmode_check tests/adapters/pinned_crossmode_check.cpp)

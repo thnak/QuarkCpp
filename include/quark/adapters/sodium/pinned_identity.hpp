@@ -14,6 +14,11 @@
 // ONE-WAY MAP: Ed25519 -> X25519 is not invertible (the sign bit of x is lost), so a responder cannot recover the
 // initiator's Ed25519 key from its Noise static. Message 1 therefore CARRIES the Ed25519 key in its (encrypted) payload and
 // the responder checks that converting it yields exactly the Noise static that authenticated the message.
+//
+// LOCKED STORAGE (#64, AeroCoWorker ADR-047 D3): the Ed25519 secret and the derived X25519 static secret live in
+// LockedBuffer — sodium_malloc'ed and mlock'ed with the result CHECKED — and an identity whose secret cannot be locked is
+// REFUSED (from_secret_key returns nullopt). The handshake borrows these through NoiseStatic(); it never copies them.
+// Everything transient is wiped on every exit path instead; see secure_memory.hpp for why only the identity is mlocked.
 #pragma once
 
 #include <sodium.h>
@@ -28,6 +33,7 @@
 #include <stdexcept>
 
 #include "quark/adapters/sodium/noise.hpp"
+#include "quark/adapters/sodium/secure_memory.hpp"
 #include "quark/core/pinned_key.hpp"
 
 namespace quark::adapters {
@@ -63,8 +69,16 @@ class PinnedIdentity {
 public:
     static constexpr std::size_t kSecretKeyBytes = crypto_sign_ed25519_SECRETKEYBYTES;  // 64: seed || public key
 
+    // A BORROWED view of the node's Noise static key (#64): `sk` points into this identity's LOCKED buffer and is valid
+    // for the identity's lifetime; `pk` is public. The handshake takes this view instead of copying the secret.
+    struct NoiseStatic {
+        std::span<const std::byte> sk;
+        noise::Key32 pk{};
+    };
+
     // From a libsodium Ed25519 secret key (seed || public key), e.g. one the application persisted. nullopt when the
-    // key is inconsistent or its public half cannot be converted to X25519.
+    // key is inconsistent, its public half cannot be converted to X25519, or the secret cannot be held in LOCKED memory:
+    // fail closed (#64, AeroCoWorker ADR-047 D3) — an unlocked copy of the seed would defeat the application's custody.
     // `role` is the role the APPLICATION assigns this device (ADR-075); it sets bit 63 of the NodeId and must equal the role
     // every peer's trust data holds for this key, or peers refuse the handshake.
     [[nodiscard]] static std::optional<PinnedIdentity> from_secret_key(std::span<const std::byte, kSecretKeyBytes> sk,
@@ -72,26 +86,30 @@ public:
                                                                        NodeIdDerivation how = NodeIdDerivation::RoleBit) {
         if (!noise::init()) return std::nullopt;
         PinnedIdentity id;
+        id.secret_ = LockedBuffer(kSecretKeyBytes);
+        id.x_sk_ = LockedBuffer(noise::kKeyLen);
+        if (!id.secret_.ok() || !id.x_sk_.ok()) return std::nullopt;  // no lock => no identity
         std::memcpy(id.secret_.data(), sk.data(), kSecretKeyBytes);
         if (::crypto_sign_ed25519_sk_to_pk(noise::uc(id.public_.data()), noise::uc(id.secret_.data())) != 0)
             return std::nullopt;
-        if (::crypto_sign_ed25519_sk_to_curve25519(noise::uc(id.noise_.sk.data()), noise::uc(id.secret_.data())) != 0)
+        if (::crypto_sign_ed25519_sk_to_curve25519(noise::uc(id.x_sk_.data()), noise::uc(id.secret_.data())) != 0)
             return std::nullopt;
-        if (::crypto_sign_ed25519_pk_to_curve25519(noise::uc(id.noise_.pk.data()), noise::uc(id.public_.data())) != 0)
+        if (::crypto_sign_ed25519_pk_to_curve25519(noise::uc(id.x_pk_.data()), noise::uc(id.public_.data())) != 0)
             return std::nullopt;
         // The two derivations of the X25519 public key must agree; if they ever did not, fail closed.
-        if (noise::public_from_private(id.noise_.sk) != id.noise_.pk) return std::nullopt;
+        if (noise::public_from_private(id.x_sk_.span()) != id.x_pk_) return std::nullopt;
         id.role_ = role;
         id.node_ = derive_pinned_node_id(id.public_, role, how);
         if (id.node_.value == 0) return std::nullopt;
         return id;
     }
 
-    // A fresh random identity (provisioning and tests). Throws only if libsodium cannot initialise.
+    // A fresh random identity (provisioning and tests). Throws if libsodium is unavailable or a key cannot be locked:
+    // the retry exists only for the 2^-63 NodeId-0 case and is BOUNDED, so a refused lock cannot spin here forever.
     [[nodiscard]] static PinnedIdentity generate(PinnedRole role = PinnedRole::Member,
                                                  NodeIdDerivation how = NodeIdDerivation::RoleBit) {
         if (!noise::init()) throw std::runtime_error("PinnedIdentity: libsodium unavailable");
-        for (;;) {
+        for (int attempt = 0; attempt < 8; ++attempt) {
             std::array<std::byte, crypto_sign_ed25519_PUBLICKEYBYTES> pk{};
             std::array<std::byte, kSecretKeyBytes> sk{};
             ::crypto_sign_ed25519_keypair(noise::uc(pk.data()), noise::uc(sk.data()));
@@ -99,48 +117,33 @@ public:
             noise::wipe(sk);
             if (id) return std::move(*id);
         }
+        throw std::runtime_error("PinnedIdentity: cannot lock a fresh key (sodium_malloc/mlock refused)");
     }
 
     PinnedIdentity(const PinnedIdentity&) = delete;
     PinnedIdentity& operator=(const PinnedIdentity&) = delete;
-    PinnedIdentity(PinnedIdentity&& o) noexcept
-        : public_(o.public_), node_(o.node_), role_(o.role_), secret_(o.secret_), noise_(o.noise_) {
-        o.wipe_secrets();
-    }
-    PinnedIdentity& operator=(PinnedIdentity&& o) noexcept {
-        if (this != &o) {
-            wipe_secrets();
-            public_ = o.public_;
-            node_ = o.node_;
-            role_ = o.role_;
-            secret_ = o.secret_;
-            noise_ = o.noise_;
-            o.wipe_secrets();
-        }
-        return *this;
-    }
-    ~PinnedIdentity() { wipe_secrets(); }
+    // Moving transfers the locked buffers; the source owns nothing afterwards, so nothing is left unwiped.
+    PinnedIdentity(PinnedIdentity&&) noexcept = default;
+    PinnedIdentity& operator=(PinnedIdentity&&) noexcept = default;
+    ~PinnedIdentity() = default;  // LockedBuffer zeroes, unlocks and frees
 
     [[nodiscard]] const Ed25519PublicKey& public_key() const noexcept { return public_; }
     [[nodiscard]] NodeId node_id() const noexcept { return node_; }
     [[nodiscard]] PinnedRole role() const noexcept { return role_; }
     // For the application to persist (it owns key storage; Quark never writes it anywhere).
     [[nodiscard]] std::span<const std::byte, kSecretKeyBytes> secret_key() const noexcept {
-        return std::span<const std::byte, kSecretKeyBytes>(secret_);
+        return std::span<const std::byte, kSecretKeyBytes>(secret_.data(), kSecretKeyBytes);
     }
-    [[nodiscard]] const noise::KeyPair& noise_static() const noexcept { return noise_; }
+    [[nodiscard]] NoiseStatic noise_static() const noexcept { return NoiseStatic{x_sk_.span(), x_pk_}; }
 
 private:
     PinnedIdentity() = default;
-    void wipe_secrets() noexcept {
-        noise::wipe(secret_);
-        noise::wipe(noise_.sk);
-    }
     Ed25519PublicKey public_{};
     NodeId node_{};
     PinnedRole role_ = PinnedRole::Member;
-    std::array<std::byte, kSecretKeyBytes> secret_{};
-    noise::KeyPair noise_{};
+    LockedBuffer secret_;   // 64 B, LOCKED: the Ed25519 seed || public key
+    LockedBuffer x_sk_;     // 32 B, LOCKED: the derived X25519 static secret
+    noise::Key32 x_pk_{};   // public half
 };
 
 // Ed25519 -> X25519 for a PEER's public key. False for an invalid or small-order point.

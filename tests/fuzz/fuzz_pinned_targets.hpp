@@ -129,16 +129,18 @@ struct Fixture {
         // A valid Msg1 and Msg2 from deterministic ephemerals (the same construction the engine uses).
         Key32 rs{};
         if (!adapters::ed25519_to_x25519(b_pub, rs)) fuzz_fail("responder key conversion");
+        const auto ns = init_f->identity().noise_static();
         adapters::noise::IkHandshake ini(adapters::noise::Role::Initiator, adapters::pinned_prologue(),
-                                         init_f->identity().noise_static(), &rs, fixed_ephemeral(0x77));
+                                         ns.sk, ns.pk, &rs, fixed_ephemeral(0x77));
         adapters::PinnedMsg1Payload p1;
         p1.cluster = cluster;
         p1.node = a_id;
         p1.timestamp_ns = static_cast<std::uint64_t>(kClockNs);
         p1.ed25519 = a_pub;
         if (!ini.write_msg1(adapters::encode_pinned_msg1_payload(p1), valid_msg1)) fuzz_fail("seed Msg1");
+        const auto ns_resp = resp_f->identity().noise_static();
         adapters::noise::IkHandshake rsp(adapters::noise::Role::Responder, adapters::pinned_prologue(),
-                                         resp_f->identity().noise_static(), nullptr, fixed_ephemeral(0x88));
+                                         ns_resp.sk, ns_resp.pk, nullptr, fixed_ephemeral(0x88));
         Bytes pl;
         if (!rsp.read_msg1(valid_msg1, pl)) fuzz_fail("seed Msg1 does not authenticate");
         if (!rsp.write_msg2(adapters::encode_pinned_msg2_payload({adapters::kPinnedVersion, b_id}), valid_msg2))
@@ -175,8 +177,9 @@ inline void feed_initiator_noise(std::span<const std::byte> msg2) {
     Fixture& f = fx();
     Key32 rs{};
     if (!adapters::ed25519_to_x25519(f.b_pub, rs)) fuzz_fail("responder key conversion");
+    const auto ns = f.init_f->identity().noise_static();
     adapters::noise::IkHandshake ini(adapters::noise::Role::Initiator, adapters::pinned_prologue(),
-                                     f.init_f->identity().noise_static(), &rs, fixed_ephemeral(0x77));
+                                     ns.sk, ns.pk, &rs, fixed_ephemeral(0x77));
     Bytes m1;
     if (!ini.write_msg1(adapters::encode_pinned_msg1_payload({}), m1)) fuzz_fail("initiator Msg1");
     Bytes pl;
@@ -244,8 +247,9 @@ inline void run_pinned_noise(const std::byte* p, std::size_t n) {
             if (sel & 0x80u) put64(18, static_cast<std::uint64_t>(kClockNs));
             Key32 rs{};
             if (!adapters::ed25519_to_x25519(f.b_pub, rs)) fuzz_fail("responder key conversion");
+            const auto ns = f.init_f->identity().noise_static();
             adapters::noise::IkHandshake ini(adapters::noise::Role::Initiator, adapters::pinned_prologue(),
-                                             f.init_f->identity().noise_static(), &rs, fixed_ephemeral(0x66));
+                                             ns.sk, ns.pk, &rs, fixed_ephemeral(0x66));
             Bytes m1;
             if (!ini.write_msg1(pl, m1)) fuzz_fail("hostile Msg1 could not be built");
             const auto decoded = adapters::decode_pinned_msg1_payload(pl);

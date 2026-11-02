@@ -321,13 +321,18 @@ int main() {
             const bool good = atk.read_msg1(m1, g) && atk.write_msg2(pl, o);
             noise::CipherState s, r;
             const bool sp = good && atk.split(s, r);
-            return std::pair{sp, r.key()};  // responder recv == initiator send direction
+            noise::Key32 k{};
+            if (sp) std::memcpy(k.data(), r.key().data(), k.size());  // copy: key() borrows the cipher's storage
+            return std::pair{sp, k};  // responder recv == initiator send direction
+        };
+        const auto same_key = [](const noise::Key32& a, std::span<const std::byte> b) {
+            return b.size() == a.size() && std::equal(a.begin(), a.end(), b.begin());
         };
         const auto fresh = attacker_key(er_other);
         check(fresh.first, "H9: with the stolen static key the attacker CAN process the captured Msg1", ok);
-        check(fresh.second != real_send.key(), "H9: ...but with a fresh ephemeral it derives DIFFERENT session keys (forward secrecy)", ok);
+        check(!same_key(fresh.second, real_send.key()), "H9: ...but with a fresh ephemeral it derives DIFFERENT session keys (forward secrecy)", ok);
         const auto leaked = attacker_key(er);
-        check(leaked.first && leaked.second == real_send.key(),
+        check(leaked.first && same_key(leaked.second, real_send.key()),
               "H9 CONTROL: with the real responder ephemeral (which is erased after the handshake) the same code derives the SAME keys", ok);
     }
     {

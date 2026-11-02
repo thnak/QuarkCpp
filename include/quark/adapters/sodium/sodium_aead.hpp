@@ -9,6 +9,13 @@
 //
 // THREAD SAFETY: unlike the mbedTLS GCM context, libsodium's one-shot AEAD calls keep no state beyond the const key,
 // so one instance is safe to call concurrently. (PeerSession still serialises per session; nothing relies on it here.)
+//
+// KEY STORAGE (#64): the transport key is a 32-byte member in ORDINARY heap, not mlocked. One sodium_malloc buffer costs
+// a whole locked page and a process holds two per live session, so locking them would exhaust a default 64 KiB
+// RLIMIT_MEMLOCK after a handful of sessions and turn "fail closed" into a refusal of honest handshakes. The key is
+// therefore wiped in the destructor, which runs when the last shared_ptr to it is dropped (session erase, renegotiation,
+// shutdown). Residual: a page swapped out, or a crash/heap dump taken while the session is alive, can contain it. The
+// long-lived identity secret is the copy that IS locked (pinned_identity.hpp).
 #pragma once
 
 #include <sodium.h>

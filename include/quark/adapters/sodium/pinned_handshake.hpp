@@ -31,6 +31,12 @@
 // HMAC-BLAKE2b(split_key, "quark-pinned/v1 c2s|s2c" || handshake_hash) — a label domain of its own, disjoint from TLS mode's
 // exporter labels ("quark c2s"/"quark s2c"), and bound to this very handshake. They feed `SodiumAeadChaCha20Poly1305`
 // inside the existing per-lane-counter envelope (secure_transport.hpp) unchanged.
+//
+// KEY COPIES (#64): the handshake BORROWS the identity's static secret (PinnedIdentity::noise_static()) and never copies
+// it; only the public half and the peer's public key are copied. Split's transport keys and the two envelope keys are
+// derived into stack buffers that are wiped on every exit (ScopedWipe), and each per-session cipher holds its key in
+// ordinary heap that its destructor wipes — the residual is documented at sodium_aead.hpp. The identity's own secret is
+// the only copy held in LOCKED memory, and an identity that cannot be locked is refused (see pinned_identity.hpp).
 #pragma once
 
 #include <atomic>
@@ -174,6 +180,9 @@ struct PinnedOptions {
     bool check_role_bit = true;
     // ADR-075. LegacyRaw ONLY for the #63 control (ADR-068's original derivation). Must equal the identity's and book's.
     NodeIdDerivation node_id_derivation = NodeIdDerivation::RoleBit;
+    // #64 CONTROL ONLY: keep the pre-fix HEAP COPY of the static KeyPair (what IkHandshake used to store by value), so
+    // the by-value-copy control shows the marker in the heap scan. Never set outside tests/adapters/pinned_key_copies_check.
+    bool test_copy_static_key = false;
 };
 
 // Shared by every engine one factory creates; engines hold it by shared_ptr so they may outlive the factory.
@@ -250,6 +259,21 @@ private:
         return static_cast<unsigned>(peer) + w >= ours && static_cast<unsigned>(peer) <= static_cast<unsigned>(ours) + w;
     }
 
+    // #64: the static secret is BORROWED from the identity (PinnedIdentity::NoiseStatic), never copied. The
+    // `test_copy_static_key` switch restores the pre-fix heap copy for the heap-scan control; it is never set in
+    // production. `rs_pub` is the responder's public key (initiator only).
+    [[nodiscard]] std::unique_ptr<noise::IkHandshake> make_handshake(noise::Role role,
+                                                                     const PinnedIdentity::NoiseStatic& ns,
+                                                                     const noise::Key32* rs_pub) {
+        if (ctx_->options.test_copy_static_key) {
+            test_static_copy_ = std::make_unique<noise::KeyPair>();
+            std::memcpy(test_static_copy_->sk.data(), ns.sk.data(), noise::kKeyLen);
+            test_static_copy_->pk = ns.pk;
+            return std::make_unique<noise::IkHandshake>(role, pinned_prologue(), *test_static_copy_, rs_pub);
+        }
+        return std::make_unique<noise::IkHandshake>(role, pinned_prologue(), ns.sk, ns.pk, rs_pub);
+    }
+
     // ---- initiator ----
     Step advance_initiator(std::span<const std::byte> in, std::vector<std::byte>& out) {
         if (state_ == State::Start) {
@@ -270,8 +294,7 @@ private:
             noise::Key32 rs{};
             if (!ed25519_to_x25519(*key, rs)) return fail("peer key is not a valid curve point");
             peer_key_ = *key;
-            hs_ = std::make_unique<noise::IkHandshake>(noise::Role::Initiator, pinned_prologue(),
-                                                       ctx_->identity.noise_static(), &rs);
+            hs_ = make_handshake(noise::Role::Initiator, ctx_->identity.noise_static(), &rs);
             PinnedMsg1Payload p;
             p.version = ctx_->options.version;
             p.cluster = cluster_;
@@ -305,8 +328,7 @@ private:
         if (in.size() != kPinnedMsg1Len) return fail("Msg1 length wrong");
         const std::span<const std::byte> in_buf_ = in;
 
-        hs_ = std::make_unique<noise::IkHandshake>(noise::Role::Responder, pinned_prologue(),
-                                                   ctx_->identity.noise_static(), nullptr);
+        hs_ = make_handshake(noise::Role::Responder, ctx_->identity.noise_static(), nullptr);
         noise::Bytes payload;
         if (!hs_->read_msg1(in_buf_, payload)) return fail("Msg1 did not authenticate");  // a prober: stay silent
         const auto p = decode_pinned_msg1_payload(payload);
@@ -358,12 +380,11 @@ private:
         const char* recv_label = is_client_ ? kLabelS2C : kLabelC2S;
         auto derive = [&](const noise::CipherState& cs, const char* label) {
             noise::Hash64 d = noise::hmac(cs.key(), std::as_bytes(std::span<const char>(label, std::strlen(label))), h);
+            ScopedWipe d_guard(d);  // scrubbed on the normal path AND if make_shared throws
             noise::Key32 k{};
+            ScopedWipe k_guard(k);
             std::memcpy(k.data(), d.data(), k.size());
-            auto c = std::make_shared<SodiumAeadChaCha20Poly1305>(std::span<const std::byte, noise::kKeyLen>(k));
-            noise::wipe(k);
-            noise::wipe(d);
-            return c;
+            return std::make_shared<SodiumAeadChaCha20Poly1305>(std::span<const std::byte, noise::kKeyLen>(k));
         };
         result_.send_cipher = derive(send, send_label);
         result_.recv_cipher = derive(recv, recv_label);
@@ -385,6 +406,7 @@ private:
     std::shared_ptr<const std::unordered_set<Fingerprint>> revoked_;
     State state_ = State::Start;
     std::unique_ptr<noise::IkHandshake> hs_;
+    std::unique_ptr<noise::KeyPair> test_static_copy_;  // #64 control only (see make_handshake)
     Ed25519PublicKey peer_key_{};
     std::optional<PinnedRole> peer_role_;
     Result result_{};

@@ -122,7 +122,9 @@ inline Bytes craft_msg1(const PinnedIdentity& signer, const Ed25519PublicKey& re
                         const Bytes& prologue = adapters::pinned_prologue()) {
     adapters::noise::Key32 rs{};
     (void)adapters::ed25519_to_x25519(responder_key, rs);
-    adapters::noise::IkHandshake hs(adapters::noise::Role::Initiator, prologue, signer.noise_static(), &rs);
+    // #64: the static secret is borrowed from the identity, not copied into the handshake.
+    const adapters::PinnedIdentity::NoiseStatic ns = signer.noise_static();
+    adapters::noise::IkHandshake hs(adapters::noise::Role::Initiator, prologue, ns.sk, ns.pk, &rs);
     Bytes msg;
     (void)hs.write_msg1(adapters::encode_pinned_msg1_payload(payload), msg);
     return msg;

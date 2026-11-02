@@ -44,7 +44,7 @@ Dial dial(HandshakeEngine& eng, std::uint16_t port) {
 }
 
 // ---- Noise XX responder (CONTROL): `-> e` / `<- e, ee, s, es` — it discloses its static key to whoever sends an ephemeral.
-ConnHandler xx_handler(const noise::KeyPair& s) {
+ConnHandler xx_handler(PinnedIdentity::NoiseStatic s) {
     return [s](Bytes& received, Bytes& reply) -> Verdict {
         if (received.size() < noise::kDhLen) return Verdict::Continue;
         noise::SymmetricState ss;

@@ -19,8 +19,16 @@
 // Not in this file: the Quark protocol on top (payload layout, trust provider, replay rule) — see
 // pinned_handshake.hpp. This file is Noise only, so it can be tested against the vectors in isolation.
 //
-// Opt-in adapter: compiled only with QUARK_WITH_SODIUM=ON (cmake/QuarkSecurityAdapters.cmake); the core never
-// includes it.
+// KEY COPIES (#64): the handshake does NOT copy the node's static key. IkHandshake borrows it (a span for the secret,
+// a copy of the public half only) and the caller's identity must outlive the handshake, which PinnedContext
+// guarantees; a temporary KeyPair is rejected at compile time. The ephemeral secret, the chaining key and the cipher
+// keys are ordinary members that are WIPED on every overwrite and in the destructor, and every stack temporary that
+// holds a DH output or a derived key is scrubbed by ScopedWipe on every exit path. They are deliberately NOT
+// mlocked: one sodium_malloc buffer costs a whole locked page, ~7 are live per handshake, and up to 256 handshakes
+// are parked, which exceeds a default 64 KiB RLIMIT_MEMLOCK and would turn a handshake flood into an outage (see
+// secure_memory.hpp). The identity's own copies — the only long-lived ones — ARE locked and fail closed.
+//
+// Opt-in adapter: compiled only with QUARK_WITH_SODIUM=ON (cmake/QuarkSecurityAdapters.cmake); the core never includes it.
 #pragma once
 
 #include <sodium.h>
@@ -33,6 +41,8 @@
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include "quark/adapters/sodium/secure_memory.hpp"
 
 namespace quark::adapters::noise {
 
@@ -57,9 +67,7 @@ using Hash64 = std::array<std::byte, kHashLen>;
     return rc >= 0;
 }
 
-inline void wipe(std::span<std::byte> s) noexcept {
-    if (!s.empty()) ::sodium_memzero(s.data(), s.size());
-}
+inline void wipe(std::span<std::byte> s) noexcept { secure_wipe(s); }
 
 // ---- Hash / HMAC / HKDF (Noise §4.3) --------------------------------------------------------------
 [[nodiscard]] inline Hash64 hash(std::span<const std::byte> a, std::span<const std::byte> b = {}) noexcept {
@@ -75,22 +83,25 @@ inline void wipe(std::span<std::byte> s) noexcept {
 
 // HMAC-BLAKE2b (RFC 2104 with H = BLAKE2b-512, B = 128). `key` is at most kBlockLen bytes here (the callers
 // pass a 64-byte chaining key / temp key or a 32-byte key); a longer key is hashed first as RFC 2104 says.
+// Every key-derived local is scrubbed by ScopedWipe, so no path (including an unwinding one) leaves one behind.
 [[nodiscard]] inline Hash64 hmac(std::span<const std::byte> key, std::span<const std::byte> a,
                                  std::span<const std::byte> b = {}) noexcept {
     std::array<std::byte, kBlockLen> k0{};
+    ScopedWipe k0_guard(k0);
     if (key.size() > kBlockLen) {
         Hash64 hk = hash(key);
+        ScopedWipe hk_guard(hk);
         std::memcpy(k0.data(), hk.data(), hk.size());
-        wipe(hk);
     } else if (!key.empty()) {
         std::memcpy(k0.data(), key.data(), key.size());
     }
     std::array<std::byte, kBlockLen> ipad{}, opad{};
+    ScopedWipe ipad_guard(ipad), opad_guard(opad);
     for (std::size_t i = 0; i < kBlockLen; ++i) {
         ipad[i] = k0[i] ^ std::byte{0x36};
         opad[i] = k0[i] ^ std::byte{0x5c};
     }
-    const Hash64 inner = [&] {
+    Hash64 inner = [&] {
         Hash64 out{};
         ::crypto_generichash_state st;
         ::crypto_generichash_init(&st, nullptr, 0, kHashLen);
@@ -101,33 +112,37 @@ inline void wipe(std::span<std::byte> s) noexcept {
         ::sodium_memzero(&st, sizeof st);  // its buffered block held k0 ^ ipad
         return out;
     }();
-    const Hash64 out = hash(std::span<const std::byte>(opad), std::span<const std::byte>(inner));
-    wipe(k0);
-    wipe(ipad);
-    wipe(opad);
-    return out;
+    ScopedWipe inner_guard(inner);
+    return hash(std::span<const std::byte>(opad), std::span<const std::byte>(inner));
 }
 
 // Noise HKDF producing 2 outputs (the only arity IK needs besides Split, which is also 2).
 inline void hkdf2(std::span<const std::byte> chaining_key, std::span<const std::byte> ikm, Hash64& out1,
                   Hash64& out2) noexcept {
     Hash64 temp = hmac(chaining_key, ikm);
+    ScopedWipe temp_guard(temp);
     const std::byte one{0x01}, two{0x02};
     out1 = hmac(temp, std::span<const std::byte>(&one, 1));
     out2 = hmac(temp, std::span<const std::byte>(out1), std::span<const std::byte>(&two, 1));
-    wipe(temp);
 }
 
 // ---- DH -------------------------------------------------------------------------------------------
-[[nodiscard]] inline Key32 public_from_private(const Key32& sk) noexcept {
+[[nodiscard]] inline Key32 public_from_private(std::span<const std::byte> sk) noexcept {
     Key32 pk{};
     ::crypto_scalarmult_base(uc(pk.data()), uc(sk.data()));
     return pk;
 }
+[[nodiscard]] inline Key32 public_from_private(const Key32& sk) noexcept {
+    return public_from_private(std::span<const std::byte>(sk));
+}
 
 // False when libsodium rejects the result (a low-order/invalid public key yields the all-zero output).
-[[nodiscard]] inline bool dh(const Key32& sk, const Key32& pk, Key32& out) noexcept {
+[[nodiscard]] inline bool dh(std::span<const std::byte> sk, std::span<const std::byte> pk,
+                             std::span<std::byte> out) noexcept {
     return ::crypto_scalarmult(uc(out.data()), uc(sk.data()), uc(pk.data())) == 0;
+}
+[[nodiscard]] inline bool dh(const Key32& sk, const Key32& pk, Key32& out) noexcept {
+    return dh(std::span<const std::byte>(sk), std::span<const std::byte>(pk), std::span<std::byte>(out));
 }
 
 struct KeyPair {
@@ -141,19 +156,28 @@ public:
     CipherState() = default;
     CipherState(const CipherState&) = delete;
     CipherState& operator=(const CipherState&) = delete;
-    CipherState(CipherState&& o) noexcept : k_(o.k_), n_(o.n_), has_key_(o.has_key_) { o.reset(); }
+    // The source is wiped, not just left moved-from: a move must never leave the key readable.
+    CipherState(CipherState&& o) noexcept : k_(o.k_), n_(o.n_), has_key_(o.has_key_) {
+        wipe(o.k_);
+        o.n_ = 0;
+        o.has_key_ = false;
+    }
     CipherState& operator=(CipherState&& o) noexcept {
         if (this != &o) {
+            wipe(k_);  // the key this object already held is scrubbed before it is overwritten
             k_ = o.k_;
             n_ = o.n_;
             has_key_ = o.has_key_;
-            o.reset();
+            wipe(o.k_);
+            o.n_ = 0;
+            o.has_key_ = false;
         }
         return *this;
     }
     ~CipherState() { reset(); }
 
     void initialize_key(const Key32& k) noexcept {
+        wipe(k_);  // a previous key never lingers under the new one
         k_ = k;
         n_ = 0;
         has_key_ = true;
@@ -161,7 +185,7 @@ public:
     [[nodiscard]] bool has_key() const noexcept { return has_key_; }
     // The raw key. Exposed ONLY so the Quark adapter can derive its session envelope keys from Noise's Split()
     // outputs under a Quark-specific label (pinned_handshake.hpp); nothing else should read it.
-    [[nodiscard]] const Key32& key() const noexcept { return k_; }
+    [[nodiscard]] std::span<const std::byte> key() const noexcept { return std::span<const std::byte>(k_); }
     [[nodiscard]] std::uint64_t nonce() const noexcept { return n_; }
     void set_nonce(std::uint64_t n) noexcept { n_ = n; }
 
@@ -234,6 +258,7 @@ public:
     SymmetricState& operator=(const SymmetricState&) = delete;
     ~SymmetricState() { wipe(ck_); }
 
+    // A re-initialized state scrubs the previous chaining key instead of leaving it under the new one.
     void initialize(std::string_view protocol_name) noexcept {
         const auto name = std::as_bytes(std::span<const char>(protocol_name.data(), protocol_name.size()));
         if (name.size() <= kHashLen) {
@@ -242,6 +267,7 @@ public:
         } else {
             h_ = hash(name);
         }
+        wipe(ck_);
         ck_ = h_;
         cs_ = CipherState{};
     }
@@ -250,14 +276,14 @@ public:
 
     void mix_key(std::span<const std::byte> ikm) noexcept {
         Hash64 next_ck{}, temp_k{};
-        hkdf2(ck_, ikm, next_ck, temp_k);
-        ck_ = next_ck;
+        ScopedWipe next_guard(next_ck), temp_guard(temp_k);
+        hkdf2(std::span<const std::byte>(ck_), ikm, next_ck, temp_k);
+        wipe(ck_);  // the old chaining key is scrubbed before the new one replaces it
+        std::memcpy(ck_.data(), next_ck.data(), kHashLen);
         Key32 k{};
+        ScopedWipe k_guard(k);
         std::memcpy(k.data(), temp_k.data(), kKeyLen);  // HASHLEN == 64: truncate to 32 (Noise §5.2)
         cs_.initialize_key(k);
-        wipe(next_ck);
-        wipe(temp_k);
-        wipe(k);
     }
 
     [[nodiscard]] bool encrypt_and_hash(std::span<const std::byte> pt, Bytes& out) {
@@ -276,23 +302,21 @@ public:
     // Split (Noise §5.2): the two transport keys, truncated to 32 bytes. c1 encrypts initiator->responder.
     void split(CipherState& c1, CipherState& c2) noexcept {
         Hash64 t1{}, t2{};
-        hkdf2(ck_, std::span<const std::byte>{}, t1, t2);
+        ScopedWipe t1_guard(t1), t2_guard(t2);
+        hkdf2(std::span<const std::byte>(ck_), std::span<const std::byte>{}, t1, t2);
         Key32 k1{}, k2{};
+        ScopedWipe k1_guard(k1), k2_guard(k2);
         std::memcpy(k1.data(), t1.data(), kKeyLen);
         std::memcpy(k2.data(), t2.data(), kKeyLen);
         c1.initialize_key(k1);
         c2.initialize_key(k2);
-        wipe(t1);
-        wipe(t2);
-        wipe(k1);
-        wipe(k2);
     }
 
     [[nodiscard]] const Hash64& handshake_hash() const noexcept { return h_; }
 
 private:
     Hash64 h_{};
-    Hash64 ck_{};
+    Hash64 ck_{};  // chaining key (HASHLEN = 64), wiped on every overwrite and in the destructor
     CipherState cs_;
 };
 
@@ -319,10 +343,17 @@ public:
     // replayed; production code never passes one (reusing an ephemeral destroys the handshake's security).
     using EphemeralSource = std::function<void(Key32& sk)>;
 
+    // `s` is BORROWED for the handshake's whole life: the caller's identity must outlive it (PinnedContext does).
     // `rs_pub` is the responder's static public key; required for the initiator, ignored for the responder.
     IkHandshake(Role role, std::span<const std::byte> prologue, const KeyPair& s, const Key32* rs_pub,
                 EphemeralSource ephemeral = {})
-        : role_(role), s_(s), ephemeral_(std::move(ephemeral)) {
+        : IkHandshake(role, prologue, std::span<const std::byte>(s.sk), s.pk, rs_pub, std::move(ephemeral)) {}
+    // A temporary static key would dangle in the borrowed view: reject it at compile time.
+    IkHandshake(Role, std::span<const std::byte>, KeyPair&&, const Key32*, EphemeralSource = {}) = delete;
+
+    IkHandshake(Role role, std::span<const std::byte> prologue, std::span<const std::byte> s_sk,
+                const Key32& s_pk, const Key32* rs_pub, EphemeralSource ephemeral = {})
+        : role_(role), s_sk_(s_sk), s_pk_(s_pk), ephemeral_(std::move(ephemeral)) {
         ss_.initialize(kSuiteName);
         ss_.mix_hash(prologue);
         if (role == Role::Initiator) {
@@ -330,33 +361,27 @@ public:
             have_rs_ = rs_pub != nullptr;
             ss_.mix_hash(rs_);  // pre-message "<- s": the initiator hashes the responder's static
         } else {
-            ss_.mix_hash(s_.pk);  // ... and the responder hashes its own
+            ss_.mix_hash(s_pk_);  // ... and the responder hashes its own
         }
     }
-    ~IkHandshake() {
-        wipe(s_.sk);
-        wipe(e_.sk);
-    }
+    ~IkHandshake() { wipe(e_sk_); }  // the borrowed static secret is NEVER wiped or copied here
     IkHandshake(const IkHandshake&) = delete;
     IkHandshake& operator=(const IkHandshake&) = delete;
 
     // ---- initiator ----
     // `-> e, es, s, ss` + payload. Appends the message to `out`.
     [[nodiscard]] bool write_msg1(std::span<const std::byte> payload, Bytes& out) {
-        if (role_ != Role::Initiator || stage_ != 0 || !have_rs_) return fail();
+        if (role_ != Role::Initiator || stage_ != 0 || !have_rs_ || s_sk_.size() != kKeyLen) return fail();
         gen_ephemeral();
-        out.insert(out.end(), e_.pk.begin(), e_.pk.end());
-        ss_.mix_hash(e_.pk);
+        out.insert(out.end(), e_pk_.begin(), e_pk_.end());
+        ss_.mix_hash(e_pk_);
         Key32 d{};
-        if (!dh(e_.sk, rs_, d)) {  // es
-            wipe(d);
-            return fail();
-        }
+        ScopedWipe d_guard(d);  // scrubbed on every return below, not just the success path
+        if (!dh(e_sk_, rs_, d)) return fail();  // es
         ss_.mix_key(d);
-        if (!ss_.encrypt_and_hash(s_.pk, out)) return fail();  // s
-        if (!dh(s_.sk, rs_, d)) return fail();                 // ss
+        if (!ss_.encrypt_and_hash(s_pk_, out)) return fail();  // s
+        if (!dh(s_sk_, rs_, d)) return fail();                 // ss
         ss_.mix_key(d);
-        wipe(d);
         if (!ss_.encrypt_and_hash(payload, out)) return fail();
         stage_ = 1;
         return true;
@@ -364,15 +389,16 @@ public:
 
     // `<- e, ee, se` + payload. The decrypted payload is appended to `payload`.
     [[nodiscard]] bool read_msg2(std::span<const std::byte> in, Bytes& payload) {
-        if (role_ != Role::Initiator || stage_ != 1 || in.size() < kMsg2Overhead) return fail();
+        if (role_ != Role::Initiator || stage_ != 1 || in.size() < kMsg2Overhead || s_sk_.size() != kKeyLen)
+            return fail();
         std::memcpy(re_.data(), in.data(), kDhLen);
         ss_.mix_hash(re_);
         Key32 d{};
-        if (!dh(e_.sk, re_, d)) return fail();  // ee
+        ScopedWipe d_guard(d);
+        if (!dh(e_sk_, re_, d)) return fail();  // ee
         ss_.mix_key(d);
-        if (!dh(s_.sk, re_, d)) return fail();  // se (initiator static x responder ephemeral)
+        if (!dh(s_sk_, re_, d)) return fail();  // se (initiator static x responder ephemeral)
         ss_.mix_key(d);
-        wipe(d);
         if (!ss_.decrypt_and_hash(in.subspan(kDhLen), payload)) return fail();
         stage_ = 2;
         return true;
@@ -383,20 +409,21 @@ public:
     // appended to `payload`. FALSE means the message did not authenticate (a prober without our static key,
     // or a corrupted/forged message): the caller must stay SILENT.
     [[nodiscard]] bool read_msg1(std::span<const std::byte> in, Bytes& payload) {
-        if (role_ != Role::Responder || stage_ != 0 || in.size() < kMsg1Overhead) return fail();
+        if (role_ != Role::Responder || stage_ != 0 || in.size() < kMsg1Overhead || s_sk_.size() != kKeyLen)
+            return fail();
         std::memcpy(re_.data(), in.data(), kDhLen);
         ss_.mix_hash(re_);
         Key32 d{};
-        if (!dh(s_.sk, re_, d)) return fail();  // es (responder static x initiator ephemeral)
+        ScopedWipe d_guard(d);
+        if (!dh(s_sk_, re_, d)) return fail();  // es (responder static x initiator ephemeral)
         ss_.mix_key(d);
         Bytes rs_plain;
         if (!ss_.decrypt_and_hash(in.subspan(kDhLen, kDhLen + kTagLen), rs_plain) || rs_plain.size() != kDhLen)
             return fail();
         std::memcpy(rs_.data(), rs_plain.data(), kDhLen);
         have_rs_ = true;
-        if (!dh(s_.sk, rs_, d)) return fail();  // ss
+        if (!dh(s_sk_, rs_, d)) return fail();  // ss
         ss_.mix_key(d);
-        wipe(d);
         if (!ss_.decrypt_and_hash(in.subspan(kDhLen + kDhLen + kTagLen), payload)) return fail();
         stage_ = 1;
         return true;
@@ -404,16 +431,16 @@ public:
 
     // `<- e, ee, se` + payload.
     [[nodiscard]] bool write_msg2(std::span<const std::byte> payload, Bytes& out) {
-        if (role_ != Role::Responder || stage_ != 1) return fail();
+        if (role_ != Role::Responder || stage_ != 1 || s_sk_.size() != kKeyLen) return fail();
         gen_ephemeral();
-        out.insert(out.end(), e_.pk.begin(), e_.pk.end());
-        ss_.mix_hash(e_.pk);
+        out.insert(out.end(), e_pk_.begin(), e_pk_.end());
+        ss_.mix_hash(e_pk_);
         Key32 d{};
-        if (!dh(e_.sk, re_, d)) return fail();  // ee
+        ScopedWipe d_guard(d);
+        if (!dh(e_sk_, re_, d)) return fail();  // ee
         ss_.mix_key(d);
-        if (!dh(e_.sk, rs_, d)) return fail();  // se (responder ephemeral x initiator static)
+        if (!dh(e_sk_, rs_, d)) return fail();  // se (responder ephemeral x initiator static)
         ss_.mix_key(d);
-        wipe(d);
         if (!ss_.encrypt_and_hash(payload, out)) return fail();
         stage_ = 2;
         return true;
@@ -425,6 +452,7 @@ public:
         if (stage_ != 2) return false;
         CipherState c1, c2;
         ss_.split(c1, c2);
+        if (!c1.has_key() || !c2.has_key()) return false;
         if (role_ == Role::Initiator) {
             send = std::move(c1);
             recv = std::move(c2);
@@ -437,7 +465,7 @@ public:
 
     [[nodiscard]] const Key32& remote_static() const noexcept { return rs_; }
     [[nodiscard]] const Hash64& handshake_hash() const noexcept { return ss_.handshake_hash(); }
-    [[nodiscard]] const Key32& local_ephemeral_public() const noexcept { return e_.pk; }
+    [[nodiscard]] const Key32& local_ephemeral_public() const noexcept { return e_pk_; }
 
 private:
     bool fail() noexcept {
@@ -446,15 +474,17 @@ private:
     }
     void gen_ephemeral() {
         if (ephemeral_)
-            ephemeral_(e_.sk);
+            ephemeral_(e_sk_);
         else
-            ::randombytes_buf(e_.sk.data(), e_.sk.size());
-        e_.pk = public_from_private(e_.sk);
+            ::randombytes_buf(e_sk_.data(), e_sk_.size());
+        e_pk_ = public_from_private(e_sk_);
     }
 
     Role role_;
-    KeyPair s_{};
-    KeyPair e_{};
+    std::span<const std::byte> s_sk_;  // BORROWED: the caller's static secret (never copied, never wiped here)
+    Key32 s_pk_{};                     // public half, safe to copy
+    Key32 e_sk_{};                     // ephemeral secret, wiped in the destructor
+    Key32 e_pk_{};                     // public half
     Key32 rs_{};
     Key32 re_{};
     bool have_rs_ = false;

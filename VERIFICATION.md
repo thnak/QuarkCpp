@@ -229,3 +229,22 @@ exists to catch, not a false alarm to suppress.
 thnak-server (Ubuntu, x86-64), libsodium 1.0.18 built from `libsodium-1.0.18.tar.gz` into `~/local/sodium` (sha256 `6f504490b342a4f8a4c4a02fc9b866cbef8622d5df4e5452b46be121e46636c1`, the value libsodium publishes; the `.minisig` was downloaded but `minisign` is not installed there, so only the checksum was verified), `-DQUARK_WITH_SODIUM=ON`, RelWithDebInfo. 28 (ASan/UBSan) / 27 (TSan) CTest tests: the noise/sodium/pinned checks, `admission_*`, `lan_discovery_*`, `multi_cluster_isolation_test`, `tcp_reconnect_supersede_test`, `tcp_admission_redial_test`, `swim_lease_hardening_test`, `security_secure_transport_renegotiation_loop_test`, `pinned_flood_check`, the nm isolation test and its control. Results: GCC 15.2 ASan+UBSan 28/28, Clang 21.1 ASan+UBSan 28/28, GCC 15.2 TSan (-j1) 27/27, GCC 15.2 TSan with `-DQUARK_FORCE_ATOMIC_SHARED_PTR_FALLBACK` 27/27, Clang 21.1 TSan (-j1) 27/27; zero sanitizer reports. Windows MSVC Release: 271/271.
 
 The ADR-068..073 "UNRUN" Linux/sanitizer entries above are now run; see each ADR's "Issue #49 evidence".
+
+## Pinned-path key custody (#64 step 2, 2026-11-02)
+
+`tests/adapters/pinned_key_copies_check` (CTest, `QUARK_WITH_SODIUM=ON`) takes a real identity's derived X25519 static
+secret and its Ed25519 seed as markers, runs two handshakes in process (the rekey shape `SecureTransport` uses), destroys
+every engine and identity, then scans every live **and freed** ordinary-heap block for those markers. The global
+`operator new/delete` are instrumented and each block is snapshotted into a bounded quarantine at free time, so a copy
+freed before the scan is still visible; T0 is a positive control that plants the marker in an ordinary heap block and
+must find it. Windows MSVC 19.51 Release: `x25519 hits live=0 freed=0`, seed `0 freed=0`, T3 (a refused `mlock` refuses
+the identity, and `generate()` throws instead of spinning on the retry) passed. The control build
+(`-DQUARK_PINNED_KEY_COPIES_CONTROL`, registered `WILL_FAIL`) restores the pre-fix by-value `KeyPair` copy through
+`PinnedOptions::test_copy_static_key` and observes the leak: `x25519 hits live=0 freed=2`, exit 1. Under ASan/TSan the
+instrumented allocator is compiled out (the sanitizer owns `operator new`) and the functional/lock-refusal checks still
+run.
+
+Only the identity's two secrets are `sodium_malloc`'d and mlocked (a refused lock refuses the identity); the per-handshake
+and per-session key material is wiped on every exit instead. Locking it would cost one page per buffer — ~7 per handshake —
+and up to 256 parked handshakes would exceed a default 64 KiB `RLIMIT_MEMLOCK`, turning a handshake flood into an outage
+of honest handshakes, which `pinned_flood_check` F1 forbids.
