@@ -276,6 +276,9 @@ public:
         mbedtls_ssl_set_hostname(&ssl_, nullptr);
     }
 
+    // After Done only: the pinned CA certificate the anchor's chain was verified against (DER). The joiner checks what the anchor ISSUES against it.
+    [[nodiscard]] const std::vector<std::byte>& pinned_ca_der() const noexcept { return ca_der_; }
+
 private:
     bool verify_peer() override {
         const mbedtls_x509_crt* leaf = mbedtls_ssl_get_peer_cert(&ssl_);
@@ -312,6 +315,7 @@ private:
         if (mbedtls_x509_crt_has_ext_type(leaf, MBEDTLS_X509_EXT_EXTENDED_KEY_USAGE) &&
             mbedtls_x509_crt_check_extended_key_usage(leaf, MBEDTLS_OID_SERVER_AUTH, MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH)) != 0)
             return refuse("the anchor's certificate extended key usage lacks serverAuth");
+        ca_der_.assign(reinterpret_cast<const std::byte*>(ca->raw.p), reinterpret_cast<const std::byte*>(ca->raw.p) + ca->raw.len);
         return true;
     }
     bool refuse(const char* why) {
@@ -321,6 +325,7 @@ private:
     }
 
     AnchorPin pin_;
+    std::vector<std::byte> ca_der_;
 };
 
 }  // namespace quark::adapters

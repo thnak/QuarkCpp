@@ -280,7 +280,12 @@ binding. Found and folded in:
   D4c step 2 done: `mbedtls_enrol_channel.hpp` (`EnrolServerChannel` / `EnrolJoinerChannel`: TLS 1.3, certificate on the anchor only; the joiner trusts only the
   join code's CA hash and checks member role, cluster, NodeId, chain and usage before it may send anything; `mbedtls_enrol_channel_check`). Limit: mbedTLS as the
   server refuses a certificate without digitalSignature or with a clientAuth-only EKU itself, so the joiner's own checks of those two are defence in depth and are
-  not reached by any test. Steps 3 (anchor and joiner sessions over `Enrollment`) and 4 (the listener, caps, off-I/O-thread work) remain.
+  not reached by any test.
+  D4c step 3 done: `mbedtls_enrol_session.hpp` (`EnrolAnchorSession`: handshake, exactly one framed request, `Enrollment::submit`, the collapsed reply sealed back,
+  a late reply from another thread delivered through `on_ready` + `drain`, safe to destroy mid-issuance; `EnrolJoinerSession`: generates its own key, and accepts
+  the issued chain only if the leaf carries its key, chains to the pinned CA, is of the join code's cluster, is not CA-capable and is not the anchor's id;
+  `mbedtls_enrol_session_check`, 12 mutants killed). Not run under ASan/TSan yet (the Windows toolchain does not link ASan): CI/Linux. Step 4 (the listener, caps,
+  off-I/O-thread work) remains.
   Next: D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning,
   join-code encoding), which also calls `validate_identity_not_root` at transport start.
 

@@ -80,6 +80,15 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   add_test(NAME mbedtls_enrol_channel_check COMMAND mbedtls_enrol_channel_check)
 endif()
 
+# tests/adapters/mbedtls_enrol_session_check.cpp: ADR-074 D4c step 3 - one whole enrolment in memory (anchor session over a real Enrollment, joiner session
+# that verifies what it is issued itself).
+if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrol_session_check.cpp")
+  add_executable(mbedtls_enrol_session_check tests/adapters/mbedtls_enrol_session_check.cpp)
+  target_include_directories(mbedtls_enrol_session_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(mbedtls_enrol_session_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
+  add_test(NAME mbedtls_enrol_session_check COMMAND mbedtls_enrol_session_check)
+endif()
+
 # =============================================================================================================
 # Optional pinned-key transport-security backend (libsodium; Noise IK, issue #40 / ADR-068). OFF by default so the
 # std-only core build links nothing extra — the same posture as QUARK_WITH_MBEDTLS above (020 "honest exception":
