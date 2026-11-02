@@ -276,6 +276,32 @@ binding. Found and folded in:
   the test from the SPKI alone, Enrollment end to end, concurrent use, each rule mutation-tested).
   Because a Quark engine now refuses to present a CA:TRUE leaf, the peer-side refusal of one (the
   handshake's verify callback) is kept for non-Quark peers but has no test that reaches it.
+  D4c step 1 done: `enrol_wire.hpp` (join code binary and typed form, request and reply wire, bounded stream reader; `enrol_wire_test`).
+  D4c step 2 done: `mbedtls_enrol_channel.hpp` (`EnrolServerChannel` / `EnrolJoinerChannel`: TLS 1.3, certificate on the anchor only; the joiner trusts only the
+  join code's CA hash and checks member role, cluster, NodeId, chain and usage before it may send anything; `mbedtls_enrol_channel_check`). Limit: mbedTLS as the
+  server refuses a certificate without digitalSignature or with a clientAuth-only EKU itself, so the joiner's own checks of those two are defence in depth and are
+  not reached by any test.
+  D4c step 3 done: `mbedtls_enrol_session.hpp` (`EnrolAnchorSession`: handshake, exactly one framed request, `Enrollment::submit`, the collapsed reply sealed back,
+  a late reply from another thread delivered through `on_ready` + `drain`, safe to destroy mid-issuance; `EnrolJoinerSession`: generates its own key, and accepts
+  the issued chain only if the leaf carries its key, chains to the pinned CA, is of the join code's cluster, is not CA-capable and is not the anchor's id;
+  `mbedtls_enrol_session_check`, 12 mutants killed). Not run under ASan/TSan yet (the Windows toolchain does not link ASan): CI/Linux.
+  D4c step 4 done (amends D4 "Wire": how an enrol hello is told apart):
+  * **Discrimination.** An enrol connection starts with a TLS record header `0x16 0x03 {0x01|0x03}`. No member wire can: HELLO mode starts with the magic (`0x31` first);
+    pinned mode starts with a u32 LE frame length, and the one frame a never-identified connection may send is an opener of at most `kAnonOpenerMax` bytes, whose
+    length bytes cannot be `16 03 01 ..` (>= 66326) or `16 03 03 ..` (>= 50 MB). Decided on the first inbound chunk (>= 3 bytes; mbedTLS writes a record at once).
+    A TLS-looking prefix of two bytes only is not recognised and dies as a bad HELLO/frame. (An earlier draft of this note said "`16 03` is always >= 16 MiB":
+    wrong, caught when writing the comment; the third byte is needed.)
+  * **Handoff seam.** `TcpTransport::set_enrol_handoff(fn)`: on a match the connection leaves `pending_in_` at once (it never counts against `max_pending_inbound*`),
+    and `fn(EnrolHandoff{fd, peer_addr, peer_port, initial})` runs on the I/O thread, cheap and non-blocking; true = taken, false = the transport closes it, zero bytes sent.
+  * **HELLO mode cost.** A TLS joiner expects a server, so with a handoff installed the acceptor HOLDS its HELLO until the first chunk is classified (about half a
+    round trip for a member peer, whose own hello is immediate). Found by the test: without the hold the joiner read 14 bytes of HELLO before its handshake reply.
+    Pinned mode sends nothing on accept and is unchanged.
+  * **`EnrolService`** (`mbedtls_enrol_service.hpp`): its own worker thread and `IoContext`, so TLS, CSR/HMAC and a blocking custodian never run on the transport's I/O
+    thread (tested: a custodian blocking 1.5 s does not delay a member frame). Admission on the transport thread before any TLS work: no live ticket, `max_concurrent`,
+    `max_per_ip` (all refused with zero bytes, counted not audited per socket: an audit line per flood connection would be the amplifier). Per-enrolment deadline;
+    it also drives `Enrollment::expire`. `validate_identity_not_root` at transport start is the application's call (unchanged, tested in `mbedtls_enrollment_check`).
+  * **Residual.** A prober that sends a ClientHello while a ticket is live gets a TLS ServerHello: the node is visible as an enrol anchor only for the ticket window.
+    ASan/TSan not run locally (Windows toolchain); CI/Linux.
   Next: D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning,
   join-code encoding), which also calls `validate_identity_not_root` at transport start.
 
