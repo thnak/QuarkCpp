@@ -1,8 +1,8 @@
 # ADR-080 — Portable device client library for non-member sessions (#37 gap 4, #39)
 
-Status: **Proposed**; slices S1, S2, S3a and S3b implemented and tested (S3c mTLS+HELLO conditional). Consumer:
-AeroCoWorker device attach (ADR-017) and the solo-user relay. Follows ADR-040 (mTLS), ADR-068/072 (pinned key, pinned
-wire) and ADR-074 D3 (client role).
+Status: **Proposed**; slices S1, S2, S3a, S3b and S3c implemented and tested. Consumer: AeroCoWorker device attach
+(ADR-017) and the solo-user relay. Follows ADR-040 (mTLS), ADR-068/072 (pinned key, pinned wire) and ADR-074 D3
+(client role).
 
 ## Problem
 
@@ -63,8 +63,13 @@ new wire format:
 - **S3b — done (recipe, tested)**: reconnect/resume stays with the application by design. The check drops the dead
   stream/transport/SecureTransport and builds fresh ones, completes a new handshake and exchanges frames again;
   the app replays from its own log/sequence number. No hidden reconnect state in the library.
-- S3c — **conditional, not implemented**: the mTLS+HELLO client path, only if AeroCoWorker's devices need mTLS
-  rather than pinned keys (its ADR-044 Q1 uses pinned keys today).
+- **S3c — done**: `include/quark/client/hello_client_transport.hpp`, the HELLO wire's dialling side (14-byte HELLO
+  both ways, magic/version/node validation, the acceptor's DialHint consumed as transport-internal). Tested twice:
+  `client_hello_transport_test` (real `TcpTransport` member, plaintext, isolates the wire; mutation control: not
+  consuming the DialHint delivers it to the application and fails) and `mbedtls_client_library_check` (client-role
+  mTLS identity from `test_pki`, real member, frames both ways; control: a certificate from a different root gets
+  no member session and no frame). The client's HELLO is sent in `start()`, so `start()` must precede the first
+  `SecureTransport::send()`.
 
 ## Residuals
 
@@ -74,5 +79,6 @@ new wire format:
 - The reader thread is one per client transport (one device connection); no shared reactor, by design.
 - `SocketByteStream` is desktop-only by construction (PAL backends exist for Linux and Windows x86-64/arm64, ADR-059
   arm64 is cross-compiled only). A phone app supplies its own blocking socket behind `ByteStream`, as designed.
-- S3c: a device that must speak the HELLO wire (mTLS) needs a HELLO-aware client transport; not implemented because
-  AeroCoWorker's devices use pinned keys.
+- The HELLO client cannot share a listener that has an enrol handoff installed for every HELLO: a device connecting
+  there is classified as a would-be joiner and refused without a live ticket (ADR-074 D4c). A deployment that
+  serves both must route by ticket/role at the application boundary; the pinned wire has no such interaction.

@@ -81,10 +81,10 @@ void gen_ec_key(mbedtls_pk_context& pk, Rng& rng) {
     return out;
 }
 
-// Leaf cert signed by `ca_key`/`ca_cert`, CN = "quark:<cluster_id>:<node_id>" (parsed by
-// mbedtls_handshake.hpp's detail::parse_cn_identity).
-[[nodiscard]] GeneratedCert make_leaf(Rng& rng, const GeneratedCert& ca_cert, mbedtls_pk_context& ca_key,
-                                      std::uint64_t cluster_id, std::uint64_t node_id) {
+// Leaf cert signed by `ca_key`/`ca_cert` with an explicit CN (ADR-080: a client-role cert uses
+// "quark-client:<cluster>:<node>"). `serial_seed` only distinguishes serials.
+[[nodiscard]] GeneratedCert make_leaf_cn(Rng& rng, const GeneratedCert& ca_cert, mbedtls_pk_context& ca_key,
+                                         const std::string& cn, std::uint64_t serial_seed) {
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
     gen_ec_key(pk, rng);
@@ -102,12 +102,11 @@ void gen_ec_key(mbedtls_pk_context& pk, Rng& rng) {
     mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
     mbedtls_x509write_crt_set_subject_key(&crt, &pk);
     mbedtls_x509write_crt_set_issuer_key(&crt, &ca_key);
-    const std::string subject_dn =
-        "CN=quark:" + std::to_string(cluster_id) + ":" + std::to_string(node_id);
+    const std::string subject_dn = std::string("CN=") + cn;
     mbedtls_x509write_crt_set_subject_name(&crt, subject_dn.c_str());
     mbedtls_x509write_crt_set_issuer_name(&crt, issuer_dn);
     unsigned char serial[8];
-    for (int i = 0; i < 8; ++i) serial[i] = static_cast<unsigned char>((node_id >> (i * 8)) & 0xFF);
+    for (int i = 0; i < 8; ++i) serial[i] = static_cast<unsigned char>((serial_seed >> (i * 8)) & 0xFF);
     if (serial[0] == 0) serial[0] = 1;
     mbedtls_x509write_crt_set_serial_raw(&crt, serial, 8);
     mbedtls_x509write_crt_set_validity(&crt, "20250101000000", "20351231235959");
@@ -126,5 +125,13 @@ void gen_ec_key(mbedtls_pk_context& pk, Rng& rng) {
     out.cert_der = tail_bytes(cert_buf, cert_len);
     out.key_der = tail_bytes(key_buf, key_len);
     return out;
+}
+
+// Leaf cert with the member CN "quark:<cluster_id>:<node_id>" (parsed by
+// mbedtls_handshake.hpp's detail::parse_cn_identity).
+[[nodiscard]] GeneratedCert make_leaf(Rng& rng, const GeneratedCert& ca_cert, mbedtls_pk_context& ca_key,
+                                      std::uint64_t cluster_id, std::uint64_t node_id) {
+    return make_leaf_cn(rng, ca_cert, ca_key,
+                        "quark:" + std::to_string(cluster_id) + ":" + std::to_string(node_id), node_id);
 }
 }  // namespace test_pki

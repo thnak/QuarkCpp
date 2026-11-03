@@ -98,6 +98,14 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_D
   add_test(NAME mbedtls_enrol_service_check COMMAND mbedtls_enrol_service_check)
 endif()
 
+# tests/adapters/mbedtls_client_library_check.cpp: ADR-080 S3c — the HELLO-wire client transport + mbedTLS engine end to end.
+if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_client_library_check.cpp")
+  add_executable(mbedtls_client_library_check tests/adapters/mbedtls_client_library_check.cpp)
+  target_include_directories(mbedtls_client_library_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_link_libraries(mbedtls_client_library_check PRIVATE quark::security_mbedtls quark_warnings Threads::Threads)
+  add_test(NAME mbedtls_client_library_check COMMAND mbedtls_client_library_check)
+endif()
+
 # tests/adapters/mbedtls_enrol_e2e_check.cpp: ADR-074 D4c / #36 - a node with only a join code enrols and then joins as a member over TcpTransport + SecureTransport.
 if(QUARK_BUILD_TESTS AND QUARK_WITH_MBEDTLS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/mbedtls_enrol_e2e_check.cpp")
   add_executable(mbedtls_enrol_e2e_check tests/adapters/mbedtls_enrol_e2e_check.cpp)
