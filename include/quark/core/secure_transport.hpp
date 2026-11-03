@@ -187,6 +187,13 @@ public:
     // #79: explicit open (ADR-081 made the mechanism public as request_session; `open` is the consumer name).
     void open(NodeId peer) { request_session(peer); }
 
+    // #80: explicit renegotiation of an existing session. Same glare-free rule as every handshake — only the
+    // designated initiator acts; the peer answers passively. A no-op while another handshake is in flight.
+    void renegotiate(NodeId peer) {
+        if (!handshake_factory_) return;  // no per-session keys to rotate (handshake disabled)
+        try_renegotiate(peer);
+    }
+
     // #79: why a session ended. `ConnectFailed` also covers a dial that never reached a session (the inner
     // transport reports the failed connection); a peer denied by the far end is indistinguishable from it.
     enum class SessionEndReason : std::uint8_t {
@@ -201,6 +208,13 @@ public:
     }
     void set_session_down_hook(std::function<void(NodeId, SessionEndReason)> fn) {
         session_down_hook_ = std::move(fn);
+    }
+
+    // #80: reject counters for `peer` on `lane` (0 = Data, 1 = Control); 0 when no session exists.
+    [[nodiscard]] std::uint64_t rejects(NodeId peer, std::size_t lane) const {
+        if (lane >= PeerSession::kLanes) return 0;
+        const auto s = try_get_session(peer);
+        return s ? s->rejects(lane) : 0;
     }
 
     // #79: per-peer count of frames dropped because no session existed yet (pre-session send). A frame the
@@ -1158,6 +1172,7 @@ private:
             }
             if (!session->recv_cipher().open(nonce, std::span<const std::byte>(aad), sealed, plaintext)) {
                 tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
+                session->note_reject(lane);  // #80: per-session, per-lane burst signal
                 drop_code = errc::serialization;
                 drop_detail = "secure transport: AEAD open failed (tamper/wrong key)";
             } else if (!session->accept_recv_seq(lane, seq)) {
@@ -1165,6 +1180,7 @@ private:
                 // replayed frame has seq <= its lane's high-water mark => reject (composes with 017
                 // dedup; stops an adversarial wire replay).
                 replays_rejected_.fetch_add(1, std::memory_order_relaxed);
+                session->note_reject(lane);  // #80
                 drop_code = errc::unavailable;
                 drop_detail = "secure transport: replayed sequence number rejected";
             }
