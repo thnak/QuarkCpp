@@ -101,6 +101,11 @@ public:
         std::lock_guard<std::mutex> g(mu_);
         return ignored_gossip_;
     }
+    // #78: read back the mode for a consumer's start-up self-check.
+    [[nodiscard]] bool authority_only() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return authority_only_;
+    }
 
     // Merge a peer's gossiped revocation set into ours (union). Returns true iff this added at least
     // one NEW fingerprint — callers (e.g. a future gossip-priority policy) can use this to decide

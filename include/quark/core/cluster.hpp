@@ -947,6 +947,15 @@ public:
         return out;
     }
     [[nodiscard]] std::uint8_t wire_version() const noexcept { return cfg_.wire_version; }
+    // #78: the configuration a consumer's start-up self-check reads back (post-sanitize values).
+    struct Posture {
+        bool authority_only_revocation = false;
+        std::uint32_t control_rate_per_sec = 0;
+        std::uint32_t control_burst = 0;
+    };
+    [[nodiscard]] Posture posture() const noexcept {
+        return Posture{cfg_.authority_only_revocation, cfg_.control_rate_per_sec, cfg_.control_burst};
+    }
     // Frames refused for an out-of-window wire version (counted per frame; events dedupe per peer).
     [[nodiscard]] std::uint64_t version_refusals() const noexcept {
         return version_refusals_.load(std::memory_order_relaxed);

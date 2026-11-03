@@ -47,6 +47,10 @@ public:
 
     [[nodiscard]] virtual std::size_t tag_size() const noexcept = 0;
 
+    // #78: a consumer's start-up self-check must be able to tell this seam's test double from a
+    // production cipher at run time. Real adapters inherit `false`.
+    [[nodiscard]] virtual bool is_test_double() const noexcept { return false; }
+
     // Fixed-buffer, non-allocating seal/open for callers that own their output buffer. `out` must be
     // caller-owned (stack/thread_local) and at least `plaintext.size() + tag_size()` bytes; writes
     // {ciphertext||tag} into it and returns the length written. Same authentication semantics as
@@ -107,6 +111,7 @@ public:
     }
 
     [[nodiscard]] std::size_t tag_size() const noexcept override { return kTagSize; }
+    [[nodiscard]] bool is_test_double() const noexcept override { return true; }
 
     // ADDITIVE fixed-buffer forms (F1): identical algorithm to seal()/open() above, writing directly
     // into caller-supplied storage instead of growing a std::vector. Zero heap allocation.

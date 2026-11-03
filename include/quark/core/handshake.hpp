@@ -19,6 +19,7 @@
 
 #include "quark/core/aead.hpp"
 #include "quark/core/ids.hpp"
+#include "quark/core/pinned_key.hpp"  // TrustMode (#78)
 #include "quark/core/tls_identity.hpp"
 
 namespace quark {
@@ -65,6 +66,13 @@ public:
         bool is_client, NodeId self, NodeId expected_peer, ClusterId cluster_id,
         IdentityMaterial::Snapshot own_identity, TrustStore::Snapshot trust,
         std::shared_ptr<const std::unordered_set<Fingerprint>> revoked) = 0;
+
+    // #78: the details a consumer's start-up self-check reads back. A test double reports `true`;
+    // real adapters inherit `false`.
+    [[nodiscard]] virtual bool is_test_double() const noexcept { return false; }
+    // The trust mode this factory implements. A factory that authenticates by certificate chain
+    // (mbedTLS) inherits the default; the pinned-key factory overrides it.
+    [[nodiscard]] virtual TrustMode trust_mode() const noexcept { return TrustMode::CaChain; }
 };
 
 }  // namespace quark

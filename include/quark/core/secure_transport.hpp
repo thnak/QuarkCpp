@@ -483,6 +483,51 @@ public:
         return pending_.size();
     }
 
+    // #78: read-only posture for a consumer's start-up self-check. Reads the configuration this
+    // transport holds; no behaviour change. The setters are cold setup, so call this before traffic.
+    struct Posture {
+        bool handshake_enabled = false;
+        TrustMode trust_mode = TrustMode::CaChain;
+        bool handshake_factory_is_test_double = false;
+        ClusterId cluster_id{};
+        std::size_t max_pending_handshakes = 0;
+        std::size_t max_pending_per_ip = 0;
+        std::size_t reserved_handshake_slots = 0;
+        std::int64_t handshake_timeout_ns = 0;
+        std::int64_t min_renegotiate_interval_ns = 0;
+        std::uint64_t max_frames_per_key = 0;
+        std::int64_t renegotiate_interval_ns = 0;
+        bool admission_bound = false;
+        bool close_hook_set = false;
+        bool reset_hook_set = false;
+        bool audit_sink_set = false;
+        AdmissionTestFaults admission_test_faults{};
+        SecureTransportTestFaults test_faults{};
+    };
+    [[nodiscard]] Posture posture() const noexcept {
+        Posture p;
+        p.handshake_enabled = handshake_factory_ != nullptr;
+        if (handshake_factory_) {
+            p.trust_mode = handshake_factory_->trust_mode();
+            p.handshake_factory_is_test_double = handshake_factory_->is_test_double();
+        }
+        p.cluster_id = cluster_id_;
+        p.max_pending_handshakes = max_pending_handshakes_;
+        p.max_pending_per_ip = max_pending_per_ip_;
+        p.reserved_handshake_slots = reserved_handshake_slots_;
+        p.handshake_timeout_ns = handshake_timeout_ns_;
+        p.min_renegotiate_interval_ns = min_renegotiate_interval_ns_;
+        p.max_frames_per_key = max_frames_per_key_;
+        p.renegotiate_interval_ns = renegotiate_interval_ns_;
+        p.admission_bound = admission_.enabled();
+        p.close_hook_set = static_cast<bool>(close_hook_);
+        p.reset_hook_set = static_cast<bool>(reset_hook_);
+        p.audit_sink_set = audit_.fn != nullptr;
+        p.admission_test_faults = admission_.faults;
+        p.test_faults = test_faults_;
+        return p;
+    }
+
 private:
     [[nodiscard]] std::int64_t now_ns() const noexcept { return clock_fn_(clock_ctx_); }
 

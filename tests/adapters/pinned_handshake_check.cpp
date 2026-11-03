@@ -415,6 +415,40 @@ int main() {
               "H10 DOCUMENTED LIMIT: an initiator whose clock/counter went backwards is refused until the clock catches up", ok);
     }
 
+    // ---- #78: the factory's read-only posture -----------------------------------------------------------------
+    {
+        PinnedOptions opt;
+        opt.version = 7;
+        opt.version_window = 0;
+        opt.max_clock_skew_ns = 12'345;
+        opt.replay_capacity = 17;
+        opt.replay_guard = false;
+        opt.check_role_bit = false;
+        opt.node_id_derivation = NodeIdDerivation::LegacyRaw;
+        opt.test_copy_static_key = true;
+        Node a(opt);
+        const auto p = a.factory->posture();
+        check(p.trust_mode == TrustMode::PinnedKey && a.factory->trust_mode() == TrustMode::PinnedKey,
+              "#78: the pinned factory reports PinnedKey", ok);
+        check(!a.factory->is_test_double(), "#78: a real factory is not a test double", ok);
+        check(p.version == 7 && p.version_window == 0 && p.max_clock_skew_ns == 12'345 &&
+                  p.replay_capacity == 17 && !p.replay_guard && !p.check_role_bit &&
+                  p.node_id_derivation == NodeIdDerivation::LegacyRaw && p.test_copy_static_key &&
+                  p.clock_injected,
+              "#78: every PinnedOptions field reads back", ok);
+        // CONTROL: a default factory reads back the documented defaults, not the values above.
+        Node d{PinnedOptions{}};
+        const auto q = d.factory->posture();
+        check(q.version == kPinnedVersion && q.version_window == 1 && q.max_clock_skew_ns == 120'000'000'000 &&
+                  q.replay_capacity == 4096 && q.replay_guard && q.check_role_bit &&
+                  q.node_id_derivation == NodeIdDerivation::RoleBit && !q.test_copy_static_key &&
+                  q.clock_injected,
+              "#78 CONTROL: a default factory reads back the documented defaults", ok);
+        PinnedHandshakeEngineFactory no_clock(PinnedIdentity::generate(PinnedRole::Member, NodeIdDerivation::RoleBit),
+                                              nullptr, nullptr, PinnedOptions{});
+        check(!no_clock.posture().clock_injected, "#78: an un-injected clock reads back as not injected", ok);
+    }
+
     std::printf(ok ? "pinned_handshake_check: OK\n" : "pinned_handshake_check: FAILED\n");
     return ok ? 0 : 1;
 }

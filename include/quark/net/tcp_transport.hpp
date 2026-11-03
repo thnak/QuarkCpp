@@ -154,6 +154,41 @@ public:
         return max_sealed_payload_for_body_cap(max_frame_body_, tag_size);
     }
 
+    // #78: read-only posture for a consumer's start-up self-check. Every field is a value this transport
+    // was configured with; nothing here changes behaviour. Call before start() (the relay maps are
+    // loop-thread-owned afterwards).
+    struct Posture {
+        std::uint32_t max_frame_body = net::max_frame_body;
+        std::uint32_t max_pending_inbound = 0;
+        std::uint32_t max_pending_inbound_per_ip = 0;
+        std::uint32_t max_inbound_per_ip = 0;
+        std::int64_t pending_hello_timeout_ns = 0;
+        std::uint64_t max_outbound_data_bytes = 0;
+        std::uint64_t max_outbound_control_bytes = 0;
+        bool admission_bound = false;
+        bool relay_configured = false;
+        bool allow_insecure_plaintext = false;
+        bool pinned_wire = false;
+        TcpTestFaults test_faults{};
+    };
+    [[nodiscard]] Posture posture() const noexcept {
+        Posture p;
+        p.max_frame_body = max_frame_body_;
+        p.max_pending_inbound = max_pending_in_;
+        p.max_pending_inbound_per_ip = max_pending_per_ip_;
+        p.max_inbound_per_ip = max_inbound_per_ip_;
+        p.pending_hello_timeout_ns = pending_hello_timeout_ns_;
+        p.max_outbound_data_bytes = max_outbound_data_bytes_;
+        p.max_outbound_control_bytes = max_outbound_control_bytes_;
+        p.admission_bound = admission_ != nullptr;
+        p.relay_configured = fallback_timeout_ns_ != 0 || relay_forwarding_enabled_ ||
+                             static_cast<bool>(accept_relayed_) || !relays_.empty() || !relay_via_.empty();
+        p.allow_insecure_plaintext = allow_insecure_plaintext_;
+        p.pinned_wire = anonymous_;
+        p.test_faults = faults_;
+        return p;
+    }
+
     // ADR-053: the HELLO version this transport speaks (default `hello_version`). Call before start().
     // Exists so a rolling upgrade (and the N / N-1 / N-2 tests) can run nodes at different versions.
     void set_hello_version(std::uint16_t v) noexcept { hello_ver_ = v; }

@@ -433,6 +433,29 @@ public:
     [[nodiscard]] const PinnedIdentity& identity() const noexcept { return ctx_->identity; }
     [[nodiscard]] PinnedReplayGuard& replay_guard() noexcept { return ctx_->replay; }
 
+    // #78: read-only posture for a consumer's start-up self-check. Reads the options the factory was
+    // constructed with; no behaviour change.
+    struct Posture {
+        TrustMode trust_mode = TrustMode::PinnedKey;
+        std::uint16_t version = 0;
+        std::uint16_t version_window = 0;
+        std::int64_t max_clock_skew_ns = 0;
+        std::size_t replay_capacity = 0;
+        bool replay_guard = false;
+        bool check_role_bit = false;
+        NodeIdDerivation node_id_derivation = NodeIdDerivation::RoleBit;
+        bool test_copy_static_key = false;
+        bool clock_injected = false;
+    };
+    [[nodiscard]] Posture posture() const noexcept {
+        const PinnedOptions& o = ctx_->options;
+        return Posture{TrustMode::PinnedKey, o.version, o.version_window, o.max_clock_skew_ns,
+                       o.replay_capacity, o.replay_guard, o.check_role_bit, o.node_id_derivation,
+                       o.test_copy_static_key, static_cast<bool>(o.clock_unix_ns)};
+    }
+    [[nodiscard]] bool is_test_double() const noexcept override { return false; }
+    [[nodiscard]] TrustMode trust_mode() const noexcept override { return TrustMode::PinnedKey; }
+
 private:
     std::shared_ptr<PinnedContext> ctx_;
 };
