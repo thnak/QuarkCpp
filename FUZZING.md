@@ -43,7 +43,8 @@ called by `TcpTransport::do_read` (one rule, shared, no socket needed).
 
    Half of the iterations are random bytes, half are 1-4 havoc mutations of a seed. To include the pinned Noise
    targets configure with `-DQUARK_WITH_SODIUM=ON` plus `-DQUARK_SODIUM_INCLUDE_DIR=... -DQUARK_SODIUM_LIBRARY=...`
-   (Windows static libsodium: also `-DQUARK_SODIUM_STATIC=ON`). Pinned campaign on Windows under MSVC ASan:
+   (Windows static libsodium: also `-DQUARK_SODIUM_STATIC=ON`; add `-DQUARK_SODIUM_LIBRARY_DEBUG=...` when the
+   prebuilt ships a separate /MTd Debug library). Pinned campaign on Windows under MSVC ASan:
 
    ```bash
    cmake -S . -B build-fz-asan -G "Visual Studio 18 2026" -A x64 -DQUARK_SANITIZE=address -DQUARK_WITH_SODIUM=ON ...

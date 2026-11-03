@@ -116,20 +116,42 @@ endif()
 # Enable with:  cmake -B build -DQUARK_WITH_SODIUM=ON -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
 # (vcpkg.json declares libsodium), or against a system libsodium (apt: libsodium-dev), or an explicit prebuilt via
 #   -DQUARK_SODIUM_INCLUDE_DIR=<dir containing sodium.h> -DQUARK_SODIUM_LIBRARY=<path to libsodium.lib / .a / .so>
+#   [-DQUARK_SODIUM_LIBRARY_DEBUG=<path to the Debug library>]
 # Never copy a prebuilt into this repository; point at it. A STATIC MSVC prebuilt built /MT (the libsodium release zip)
-# linked into a /MD build needs -DQUARK_SODIUM_STATIC=ON, which defines SODIUM_STATIC and adds /NODEFAULTLIB:libcmt.lib.
+# linked into a /MD build needs -DQUARK_SODIUM_STATIC=ON, which defines SODIUM_STATIC and suppresses the matching static
+# CRT: libcmt in Release-like configurations, libcmtd in Debug. The Windows zip ships a Debug library built /MTd, so give
+# it its own path with QUARK_SODIUM_LIBRARY_DEBUG; otherwise the single QUARK_SODIUM_LIBRARY is used everywhere (#82).
 # =============================================================================================================
 option(QUARK_WITH_SODIUM "Build the libsodium pinned-key adapter (Noise IK + ChaCha20-Poly1305, ADR-068)" OFF)
-option(QUARK_SODIUM_STATIC "libsodium is a static library (defines SODIUM_STATIC; MSVC: /NODEFAULTLIB:libcmt.lib)" OFF)
+option(QUARK_SODIUM_STATIC "libsodium is a static library (defines SODIUM_STATIC; MSVC: suppresses the static CRT)" OFF)
 set(QUARK_SODIUM_INCLUDE_DIR "" CACHE PATH "Directory containing sodium.h (non-vcpkg builds)")
 set(QUARK_SODIUM_LIBRARY "" CACHE FILEPATH "libsodium library file (non-vcpkg builds)")
+set(QUARK_SODIUM_LIBRARY_DEBUG "" CACHE FILEPATH
+    "Debug-config libsodium library file (non-vcpkg builds; defaults to QUARK_SODIUM_LIBRARY)")
 
 if(QUARK_WITH_SODIUM)
   add_library(quark_security_sodium INTERFACE)
   find_package(unofficial-sodium CONFIG QUIET)
-  if(QUARK_SODIUM_INCLUDE_DIR AND QUARK_SODIUM_LIBRARY)
+  if(QUARK_SODIUM_INCLUDE_DIR AND (QUARK_SODIUM_LIBRARY OR QUARK_SODIUM_LIBRARY_DEBUG))
     target_include_directories(quark_security_sodium INTERFACE "${QUARK_SODIUM_INCLUDE_DIR}")
-    target_link_libraries(quark_security_sodium INTERFACE quark::quark "${QUARK_SODIUM_LIBRARY}")
+    # #82: link the configuration's own prebuilt. The libsodium Windows zip ships a /MT Release library and a
+    # /MTd Debug one, so a /MDd build must not be handed the Release path. A missing Debug path falls back to
+    # the single QUARK_SODIUM_LIBRARY; a Debug-only setup links its path in every configuration.
+    set(_quark_sodium_release_lib "${QUARK_SODIUM_LIBRARY}")
+    if(NOT _quark_sodium_release_lib)
+      set(_quark_sodium_release_lib "${QUARK_SODIUM_LIBRARY_DEBUG}")
+    endif()
+    set(_quark_sodium_debug_lib "${QUARK_SODIUM_LIBRARY_DEBUG}")
+    if(NOT _quark_sodium_debug_lib)
+      set(_quark_sodium_debug_lib "${_quark_sodium_release_lib}")
+    endif()
+    if(_quark_sodium_debug_lib STREQUAL _quark_sodium_release_lib)
+      target_link_libraries(quark_security_sodium INTERFACE quark::quark "${_quark_sodium_release_lib}")
+    else()
+      target_link_libraries(quark_security_sodium INTERFACE quark::quark
+        "$<$<CONFIG:Debug>:${_quark_sodium_debug_lib}>"
+        "$<$<NOT:$<CONFIG:Debug>>:${_quark_sodium_release_lib}>")
+    endif()
   elseif(TARGET unofficial-sodium::sodium)
     target_link_libraries(quark_security_sodium INTERFACE quark::quark unofficial-sodium::sodium)
   else()
@@ -146,7 +168,11 @@ if(QUARK_WITH_SODIUM)
   if(QUARK_SODIUM_STATIC)
     target_compile_definitions(quark_security_sodium INTERFACE SODIUM_STATIC=1)
     if(MSVC)
-      target_link_options(quark_security_sodium INTERFACE "/NODEFAULTLIB:libcmt.lib")
+      # #82: the static prebuilt's Debug library is /MTd, so a /MDd build suppresses libcmtd; Release-like
+      # configurations keep suppressing libcmt (the release zip is /MT).
+      target_link_options(quark_security_sodium INTERFACE
+        "$<$<CONFIG:Debug>:/NODEFAULTLIB:libcmtd.lib>"
+        "$<$<NOT:$<CONFIG:Debug>>:/NODEFAULTLIB:libcmt.lib>")
     endif()
   endif()
   add_library(quark::security_sodium ALIAS quark_security_sodium)
