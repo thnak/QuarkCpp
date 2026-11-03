@@ -116,6 +116,16 @@ public:
     virtual void identify_inbound(std::uint64_t token, NodeId peer) { (void)token; (void)peer; }
     virtual void reject_inbound(std::uint64_t token) { (void)token; }
 
+    // ADR-081 (#83): either end of an admitted pinned pair may open the session. `request_session` asks the
+    // transport to open a BARE connection to `peer` (no frame, no identity): the accepting end is then the
+    // designated initiator and starts the handshake itself. Default: no-op (a transport without a dial target).
+    virtual void request_session(NodeId peer) { (void)peer; }
+    // Whether a bare connection is meaningful here: only the pinned wire (no HELLO, single peer) understands it.
+    [[nodiscard]] virtual bool supports_bare_session_request() const noexcept { return false; }
+    // ADR-081: the accepting transport reports an inbound connection's token (pinned wire only). The secure
+    // layer decides whether to bind it and start the handshake; the transport itself sends nothing.
+    virtual void set_inbound_ready_hook(std::function<void(std::uint64_t token)> fn) { (void)fn; }
+
     // Register the inbound sink for THIS node's transport endpoint. Frames addressed to this node are
     // handed to `cb` (the distributed router's `deliver`).
     virtual void on_receive(std::function<void(MessageFrame)> cb) = 0;

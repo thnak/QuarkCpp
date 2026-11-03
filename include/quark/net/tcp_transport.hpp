@@ -316,6 +316,20 @@ public:
     void set_enrol_handoff(EnrolHandoffFn fn) { enrol_handoff_ = std::move(fn); }
     [[nodiscard]] std::uint64_t enrol_handoffs() const noexcept { return enrol_handoffs_.load(std::memory_order_relaxed); }
 
+    // ADR-081 (#83): a bare connection (no frame) so the accepting, designated-initiator end can open the
+    // handshake. Nothing about the requester is sent; an existing connection needs no request.
+    void request_session(NodeId peer) override {
+        if (peer == self_) return;
+        io_.post([this, peer] {
+            if (conns_.count(peer.value) != 0) return;  // connecting/Open/Backoff already
+            (void)ensure_conn(peer);
+        });
+    }
+    void set_inbound_ready_hook(std::function<void(std::uint64_t)> fn) override {
+        inbound_ready_hook_ = std::move(fn);
+    }
+    [[nodiscard]] bool supports_bare_session_request() const noexcept override { return anonymous_; }
+
     void identify_inbound(std::uint64_t token, NodeId peer) override {
         io_.post([this, token, peer] {
             for (auto& [fd, c] : pending_in_) {
@@ -958,6 +972,9 @@ private:
             // it must receive nothing before its handshake reply. A member peer sends its own hello at once, so the wait is about one half round trip.
             raw->interest = (enrol_handoff_ && !anonymous_) ? EPOLLIN : (EPOLLIN | EPOLLOUT);  // EPOLLOUT to push our hello out
             io_.add_fd(raw->fd, raw->interest, [this, f = raw->fd](std::uint32_t ev) { on_conn(f, ev); });
+            // ADR-081: pinned wire only — report the bare accepted connection so the secure layer can decide
+            // (it binds the token and starts the handshake if this end is the designated initiator).
+            if (anonymous_ && inbound_ready_hook_) inbound_ready_hook_(raw->accept_serial);
             if (pending_hello_timeout_ns_ > 0) {
                 // A socket that never identifies must not pin a pending slot forever (slowloris).
                 // The serial guards against fd reuse after the original socket closed.
@@ -2090,6 +2107,7 @@ private:
     bool anonymous_ = false;                           // #45 pinned wire
     std::atomic<std::uint64_t> anon_refused_{0};
     std::function<void(NodeId)> peer_down_hook_;  // set before start(); called on the loop thread
+    std::function<void(std::uint64_t)> inbound_ready_hook_;  // ADR-081: pinned bare inbound connection
 
     // Connection state — all loop-thread-owned. conns_: identified peers (keyed by NodeId). pending_in_:
     // accepted connections whose peer NodeId is not yet known (keyed by fd). by_fd_: raw handler lookup.

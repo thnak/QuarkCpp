@@ -316,7 +316,7 @@ public:
         if (handshake_factory_) {
             session = try_get_session(to);
             if (!session) {  // S2: no session ⇒ no delivery — kick off a handshake, drop this frame
-                ensure_handshake(to);
+                request_session(to);
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -476,6 +476,31 @@ public:
     // Known peers get the reserved slots when the general pool is full and bypass the per-IP cap;
     // they are still authenticated by the certificate during the handshake. The default is none.
     void set_known_peer(std::function<bool(NodeId)> fn) { known_peer_ = std::move(fn); }
+
+    // ADR-081 (#83): ask for a session with no frame. The designated initiator starts at once; the other end
+    // asks the transport to open a bare connection, and the accepting (initiator) end opens the handshake.
+    void request_session(NodeId peer) {
+        if (!handshake_factory_ || peer.value == 0 || peer == self_ || try_get_session(peer)) return;
+        if (local_is_client(self_, peer)) {
+            ensure_handshake(peer);
+            return;
+        }
+        if (!inner_->supports_bare_session_request()) return;  // ADR-081: pinned wire only
+        inner_->request_session(peer);
+    }
+
+    // ADR-081: for a pinned single-peer link, the accepting end learns which peer a bare inbound connection
+    // belongs to. It binds the token and, being the designated initiator, opens the handshake on it; the peer
+    // is authenticated by that handshake before any application frame flows.
+    void set_inbound_session_peer(NodeId peer) {
+        inbound_session_peer_ = peer;
+        inner_->set_inbound_ready_hook([this](std::uint64_t token) {
+            const NodeId p = inbound_session_peer_;
+            if (p.value == 0 || !handshake_factory_ || !local_is_client(self_, p)) return;
+            inner_->identify_inbound(token, p);
+            ensure_handshake(p);
+        });
+    }
     void set_max_pending_handshakes(std::size_t n) noexcept {
         max_pending_handshakes_ = n == 0 ? 1 : n;
     }
@@ -1240,6 +1265,7 @@ private:
     HandshakeAdmission handshake_admission_;
     HandshakeAdmissionAddr handshake_admission_addr_;
     std::function<bool(NodeId)> known_peer_;
+    NodeId inbound_session_peer_{};  // ADR-081: pinned single-peer accept side
     std::size_t max_pending_handshakes_ = kMaxPendingHandshakes;
     std::size_t max_pending_per_ip_ = 64;
     std::size_t reserved_handshake_slots_ = 16;

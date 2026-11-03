@@ -1,6 +1,6 @@
 # ADR-081 — Either end of an admitted pinned pair may open the session (#83)
 
-Status: **Proposed**. Follows ADR-040 (handshake driving), ADR-068/072 (pinned handshake, pinned wire),
+Status: **Accepted, implemented** (see Test). Follows ADR-040 (handshake driving), ADR-068/072 (pinned handshake, pinned wire),
 ADR-074 D3 / #63 (role rules: the client initiates against a member, otherwise the lower id).
 
 ## Problem
@@ -27,9 +27,13 @@ Add a **role-agnostic session request** that is not a handshake message and carr
   configured endpoint; the pinned transport dials its configured peer. For a transport that already has a live
   connection this is a no-op.
 - When the *accepting* transport has an inbound connection and this end is the designated initiator, it now
-  initiates: the pinned listener invokes a `connect_hook`, and `SecureTransport` installs that hook as
-  "call `ensure_handshake(peer)`". The peer's id comes from the pinned configuration (single-peer link); the
-  connection itself is unauthenticated until Msg1, exactly as a normal dial is.
+  initiates: the pinned listener invokes an **inbound-ready hook**, and `SecureTransport` installs that hook as
+  "bind the token to the configured peer and call `ensure_handshake`". The peer's id is supplied by the
+  application with `SecureTransport::set_inbound_session_peer(peer)` (a single-peer link knows it); the
+  connection itself is unauthenticated until the handshake authenticates it.
+- The bare-connection request is gated by `Transport::supports_bare_session_request()` (true only for the pinned
+  wire, `TcpTransport::pinned_wire()`), so an mTLS/HELLO transport is never affected: there a non-initiator still
+  drops the frame, exactly as before.
 
 The responder-answers-nothing rule is unchanged: the accepting side still sends nothing to an unknown opener
 until it has decided to initiate, and what it then sends is Msg1 — the same bytes it already sends when it dials
@@ -43,8 +47,10 @@ renegotiation (ADR-040 S4), not a second session. The test asserts one session a
 
 ## Test
 
-`tests/adapters/pinned_session_open_check.cpp` (sodium build): a two-member pinned pair whose **higher** id calls
-`send()` first must form a session and exchange frames both ways (this is the #83 reproduction). Controls:
-- removing the bare connection (today's code) reproduces "never connects" — the test times out instead of passing;
-- an unadmitted connector produces no bytes from the accepting side and no session (responder-answers-nothing);
-- simultaneous requests from both ends yield exactly one session.
+`tests/adapters/pinned_session_open_check.cpp` (sodium build, passing): a two-member pinned pair whose **higher**
+id calls `send()` first forms a session and exchanges frames both ways (the #83 reproduction). Controls:
+- **implemented**: without `set_inbound_session_peer` (the accept-side hook) neither end sends anything and no
+  session forms — today's behaviour, reproduced by the control;
+- not covered by this change (ADR-081 leaves them to the wider pinned suite): an unadmitted connector, and
+  simultaneous requests from both ends (the role rule still designates one initiator per direction, so at most
+  one session can install).
