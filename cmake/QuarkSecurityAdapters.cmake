@@ -203,7 +203,7 @@ if(QUARK_BUILD_TESTS AND QUARK_WITH_SODIUM)
                pinned_secure_transport_check pinned_tcp_check pinned_flood_check
                pinned_nodeid_role_check pinned_key_copies_check pinned_timing_oracle_check
                pinned_reconnect_newip_check pinned_client_library_check pinned_session_open_check
-               pinned_reject_burst_check)
+               pinned_reject_burst_check pinned_admission_check)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/adapters/${_chk}.cpp")
       add_executable(${_chk} tests/adapters/${_chk}.cpp)
       target_include_directories(${_chk} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

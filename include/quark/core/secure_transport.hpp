@@ -560,6 +560,12 @@ public:
         inner_->set_inbound_ready_hook([this](std::uint64_t token) {
             const NodeId p = inbound_session_peer_;
             if (p.value == 0 || !handshake_factory_ || !local_is_client(self_, p)) return;
+            // A denied peer must not get its connection BOUND to the peer id (a bound-but-unauthenticated
+            // socket would block the real peer's next dial). Refuse it exactly like a refused handshake.
+            if (admission_.enabled() && admission_.ask(p).verdict == AdmissionVerdict::Deny) {
+                inner_->reject_inbound(token);
+                return;
+            }
             inner_->identify_inbound(token, p);
             ensure_handshake(p);
         });

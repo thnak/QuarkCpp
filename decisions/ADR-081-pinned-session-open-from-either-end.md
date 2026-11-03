@@ -31,6 +31,9 @@ Add a **role-agnostic session request** that is not a handshake message and carr
   "bind the token to the configured peer and call `ensure_handshake`". The peer's id is supplied by the
   application with `SecureTransport::set_inbound_session_peer(peer)` (a single-peer link knows it); the
   connection itself is unauthenticated until the handshake authenticates it.
+- A bare connection from a peer the current snapshot refuses is rejected (`reject_inbound`) and NOT bound to
+  the peer id: an unauthenticated socket holding the identity would block the real peer's next dial. Found by
+  `pinned_admission_check` (deny, re-admit, reconnect over the pinned stack).
 - The bare-connection request is gated by `Transport::supports_bare_session_request()` (true only for the pinned
   wire, `TcpTransport::pinned_wire()`), so an mTLS/HELLO transport is never affected: there a non-initiator still
   drops the frame, exactly as before.
