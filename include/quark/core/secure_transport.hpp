@@ -552,6 +552,21 @@ public:
         inner_->request_session(peer);
     }
 
+    // #57 (ADR-072 §5): open a session to a DISCOVERED endpoint. `expected` is the peer the application's roster says
+    // should answer there (NodeId derived from its key); the address is dialled but never recorded as that peer's
+    // endpoint, and the session is installed only if Msg2 authenticates the key pinned for `expected`. The first
+    // thing sent is the Msg1 to that key, or nothing at all when the key directory knows none. Only the designated
+    // initiator dials (see local_is_client); the other end is dialled and answers, so a no-op there is correct,
+    // not a failure. Pinned wire only.
+    void open_address(NodeId expected, std::uint64_t addr, std::uint16_t port) {
+        if (!handshake_factory_ || expected.value == 0 || expected == self_ || try_get_session(expected)) return;
+        if (!inner_->supports_bare_session_request()) return;  // pinned wire only
+        if (!local_is_client(self_, expected)) return;
+        if (admission_.enabled() && admission_.ask(expected).verdict == AdmissionVerdict::Deny) return;
+        inner_->dial_candidate(expected, addr, port);  // posted before Msg1, which therefore finds the connection
+        ensure_handshake(expected);
+    }
+
     // ADR-081: for a pinned single-peer link, the accepting end learns which peer a bare inbound connection
     // belongs to. It binds the token and, being the designated initiator, opens the handshake on it; the peer
     // is authenticated by that handshake before any application frame flows.

@@ -61,6 +61,13 @@ mDNS-style name conflicts, goodbyes, isolation knob), `lan_discovery_feed.hpp` (
   wire and defeats rotation. A platform that forces the machine's own name leaks that name in the A/SRV records. Not preventable in Quark.
 - *(Update 2026-11-01: F3 is unblocked by ADR-072, which identifies the peer by the handshake. Dialling a discovered endpoint by address is
   not built yet: #57.)*
+- *(Update 2026-11-03, #57: built on the pinned wire. `secure_discovery_feed(SecureTransport&, ExpectedPeerFn)` asks the application's roster which
+  peer an advertisement belongs to (a NodeId derived from the key it pinned) and calls `SecureTransport::open_address`, which dials the address
+  with `Transport::dial_candidate` and starts the Noise IK handshake. The address is never written to `peers_`, so an advertisement cannot
+  replace a known peer's endpoint, and a dead or hostile address is not redialled. A session exists only if Msg2 authenticates the pinned
+  key. The roster is still the application's: Noise IK pins the responder key before Msg1, so a bare address with no expected key cannot be
+  dialled (nothing is sent when the key directory knows none). Only the designated initiator dials; the other end is dialled. Proof:
+  `tests/adapters/pinned_discovery_dial_check.cpp`. `tcp_discovery_feed` + `NodeResolver` stays for the HELLO wire.)*
 - **F3: no NodeId before the handshake.** `TcpTransport` dials by `NodeId`; a discovered endpoint has none. The feed takes an
   application `NodeResolver` (tests map port to node as a stand-in). A true dial-by-address needs the pinned-key handshake (#40) so the
   answering node's identity is learned from the handshake. **Owed.**

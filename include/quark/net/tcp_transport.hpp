@@ -325,6 +325,16 @@ public:
             (void)ensure_conn(peer);
         });
     }
+    // #57: a connection to a discovered address that is NOT recorded in `peers_`. With no `peers_` entry,
+    // handle_dead() erases the connection instead of redialling, so an advertisement can neither overwrite a known
+    // peer's endpoint nor keep a dead attacker address alive. Pinned wire only (HELLO would put a NodeId on the wire).
+    void dial_candidate(NodeId expected, std::uint64_t addr, std::uint16_t port) override {
+        if (!anonymous_ || expected == self_ || expected.value == 0) return;
+        io_.post([this, expected, addr, port] {
+            if (conns_.count(expected.value) != 0) return;  // connecting/Open/Backoff already
+            (void)dial(expected, Endpoint{expected, addr, port});
+        });
+    }
     void set_inbound_ready_hook(std::function<void(std::uint64_t)> fn) override {
         inbound_ready_hook_ = std::move(fn);
     }
@@ -341,15 +351,30 @@ public:
             }
         });
     }
+    // #56 / ADR-083: a refused opener is closed no EARLIER than `anon_refusal_floor_ns_` after the opener frame arrived,
+    // whatever the refusal path cost (the right key does one more DH than a random Msg1, an un-admitted key one more
+    // lookup). The floor timer is armed when the opener ARRIVES, before any key-dependent work, so its firing time does
+    // not depend on how long the verdict took (arming it after the verdict would put the processing time back into the
+    // close time, quantised by the poll timeout). 0 disables (the old, measurably distinguishable behaviour, kept as the
+    // test control). EXPERIMENTAL (#56 is open): measured on MSVC loopback this does not yet remove the oracle (poll timeouts are
+    // relative and ms-rounded, so the wake time still depends on when the loop re-polled). A verdict slower than the floor is closed as soon as it arrives and counted as an overrun.
+    void set_anonymous_refusal_floor_ns(std::uint64_t ns) noexcept { anon_refusal_floor_ns_ = ns; }
+    [[nodiscard]] std::uint64_t anonymous_refusal_floor_overruns() const noexcept {
+        return anon_floor_overruns_.load(std::memory_order_relaxed);
+    }
     void reject_inbound(std::uint64_t token) override {
         io_.post([this, token] {
             for (auto& [fd, c] : pending_in_) {
                 (void)fd;
-                if (c->accept_serial == token) {
-                    anon_refused_.fetch_add(1, std::memory_order_relaxed);
-                    handle_dead(c.get());
+                if (c->accept_serial != token) continue;
+                if (c->floor_open) {  // the floor timer will close it, whenever it fires
+                    c->refuse_pending = true;
                     return;
                 }
+                if (c->floor_armed) anon_floor_overruns_.fetch_add(1, std::memory_order_relaxed);
+                anon_refused_.fetch_add(1, std::memory_order_relaxed);
+                handle_dead(c.get());
+                return;
             }
         });
     }
@@ -636,6 +661,9 @@ private:
         NodeId peer{};
         pal::fd_t fd = pal::invalid_fd;
         std::uint64_t accept_serial = 0;  // identifies an accepted socket across fd reuse
+        bool floor_armed = false;         // #56: a refusal-floor timer was armed when the opener arrived
+        bool floor_open = false;          // #56: ... and has not fired yet
+        bool refuse_pending = false;      // #56: the verdict was a refusal; close when the floor timer fires
         std::uint64_t peer_addr = 0;    // accepted socket's source (IPv4, host order)
         std::uint16_t peer_port = 0;
         bool has_peer_addr = false;
@@ -1159,6 +1187,19 @@ private:
                             return;
                         }
                         c->opener_seen = true;
+                        if (anon_refusal_floor_ns_ != 0) {  // armed BEFORE the verdict is computed (see reject_inbound)
+                            c->floor_armed = c->floor_open = true;
+                            io_.post_after(static_cast<std::int64_t>(anon_refusal_floor_ns_),
+                                           [this, fd = c->fd, serial = c->accept_serial] {
+                                const auto pit = pending_in_.find(fd);
+                                if (pit == pending_in_.end() || pit->second->accept_serial != serial) return;
+                                pit->second->floor_open = false;
+                                if (pit->second->refuse_pending) {
+                                    anon_refused_.fetch_add(1, std::memory_order_relaxed);
+                                    handle_dead(pit->second.get());
+                                }
+                            });
+                        }
                         f.inbound_token = anon_token;
                         if (receiver_) receiver_(std::move(f));
                         return;
@@ -2106,6 +2147,8 @@ private:
     std::atomic<std::uint64_t> stale_auth_purged_{0};  // #48
     bool anonymous_ = false;                           // #45 pinned wire
     std::atomic<std::uint64_t> anon_refused_{0};
+    std::atomic<std::uint64_t> anon_floor_overruns_{0};
+    std::uint64_t anon_refusal_floor_ns_ = 0;  // #56: OFF by default; measured NOT sufficient yet, see reject_inbound()
     std::function<void(NodeId)> peer_down_hook_;  // set before start(); called on the loop thread
     std::function<void(std::uint64_t)> inbound_ready_hook_;  // ADR-081: pinned bare inbound connection
 
