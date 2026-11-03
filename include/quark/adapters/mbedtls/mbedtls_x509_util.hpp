@@ -14,7 +14,30 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/x509_crt.h>
 
+#include "quark/core/error.hpp"        // result / errc / fail (#39 startup validation)
+#include "quark/core/tls_identity.hpp"  // TlsIdentity / TrustStore
+
 namespace quark::adapters::detail {
+
+// Owning wrappers so every early return frees what was parsed.
+struct Crt {
+    mbedtls_x509_crt v;
+    Crt() { mbedtls_x509_crt_init(&v); }
+    ~Crt() { mbedtls_x509_crt_free(&v); }
+    Crt(const Crt&) = delete;
+    Crt& operator=(const Crt&) = delete;
+};
+struct Pk {
+    mbedtls_pk_context v;
+    Pk() { mbedtls_pk_init(&v); }
+    ~Pk() { mbedtls_pk_free(&v); }
+    Pk(const Pk&) = delete;
+    Pk& operator=(const Pk&) = delete;
+};
+
+[[nodiscard]] inline const unsigned char* uchars(std::span<const std::byte> s) {
+    return reinterpret_cast<const unsigned char*>(s.data());
+}
 
 // Append every certificate of a concatenation of DER certificates (each self-delimiting) to `chain`.
 // `mbedtls_x509_crt_parse_der` parses ONE certificate per call, so a multi-root bundle must be walked.
@@ -95,3 +118,34 @@ struct Spki {
 }
 
 }  // namespace quark::adapters::detail
+
+namespace quark::adapters {
+
+// ADR-074 C5 at startup: refuse a node identity that is CA key material — its private key or certificate
+// key equal to the key of any root in `trust` (current and still-in-window previous), or a CA-capable
+// certificate (an issuing intermediate's). Lives here (rather than in mbedtls_enrollment.hpp) so the
+// handshake seam can apply it before the transport starts; MbedtlsHandshakeEngine enforces the same rule
+// on every handshake. The key is parsed without an RNG: a node identity's DER is unencrypted.
+[[nodiscard]] inline result<void> validate_identity_not_root(const TlsIdentity& own,
+                                                             const TrustStore::Snapshot& trust) {
+    detail::Pk key;
+    detail::Crt cert, roots;
+    if (mbedtls_pk_parse_key(&key.v, detail::uchars(own.private_key_der), own.private_key_der.size(),
+                             nullptr, 0, nullptr, nullptr) != 0)
+        return fail(errc::validation, "own identity private key does not parse (ADR-074 C5)");
+    if (mbedtls_x509_crt_parse_der(&cert.v, detail::uchars(own.cert_chain_der), own.cert_chain_der.size()) != 0)
+        return fail(errc::validation, "own identity certificate does not parse (ADR-074 C5)");
+    for (const TrustedRoots* bundle : {trust.current.get(), trust.previous.get()}) {
+        if (bundle == nullptr || bundle->ca_chain_der.empty()) continue;
+        if (!detail::parse_der_concat(roots.v, bundle->ca_chain_der))
+            return fail(errc::validation, "trust roots do not parse (ADR-074 C5)");
+    }
+    if (roots.v.raw.len == 0) return fail(errc::validation, "no trust roots configured (ADR-074 C5)");
+    if (detail::key_is_a_root(key.v, roots.v) || detail::key_is_a_root(cert.v.pk, roots.v) ||
+        detail::ca_capable(cert.v))
+        return fail(errc::validation, "own identity is CA key material: a CA key must never be in a Quark process "
+                                      "(ADR-074 C5)");
+    return {};
+}
+
+}  // namespace quark::adapters

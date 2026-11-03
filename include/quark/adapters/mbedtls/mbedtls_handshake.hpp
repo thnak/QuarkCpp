@@ -350,6 +350,15 @@ private:
 
 class MbedtlsHandshakeEngineFactory final : public HandshakeEngineFactory {
 public:
+    // #39: the C5 rule at startup, not only per handshake. SecureTransport calls this from
+    // enable_handshake(), so a node that was mistakenly provisioned with CA key material refuses to
+    // start instead of failing its first peer.
+    [[nodiscard]] result<void> validate_identity(const IdentityMaterial::Snapshot& own_identity,
+                                                 const TrustStore::Snapshot& trust) const override {
+        if (!own_identity.current) return fail(errc::validation, "no own identity material (ADR-074 C5)");
+        return validate_identity_not_root(*own_identity.current, trust);
+    }
+
     [[nodiscard]] std::unique_ptr<HandshakeEngine> create(
         bool is_client, NodeId self, NodeId expected_peer, ClusterId cluster_id,
         IdentityMaterial::Snapshot own_identity, TrustStore::Snapshot trust,

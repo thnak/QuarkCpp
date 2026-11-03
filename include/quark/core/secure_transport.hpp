@@ -152,13 +152,27 @@ public:
     // no longer auto-vivified on first use (the pre-handshake Phase 2 shape) — a peer must complete a
     // handshake before ANY frame is sent/delivered (S2: "no session ⇒ no delivery"). `identity`/`trust`
     // must outlive this SecureTransport. Call before any send()/inbound traffic for `self`.
-    void enable_handshake(HandshakeEngineFactory& factory, ClusterId cluster_id,
-                          const IdentityMaterial& identity, const TrustStore& trust) noexcept {
+    //
+    // #39: the factory validates the material BEFORE it is installed (the mTLS factory applies ADR-074
+    // C5: a node never starts with CA key material). A refused identity leaves the handshake disabled
+    // and returns false; startup_error() carries the reason. The old void call sites keep working.
+    bool enable_handshake(HandshakeEngineFactory& factory, ClusterId cluster_id,
+                          const IdentityMaterial& identity, const TrustStore& trust) {
+        const std::int64_t now = now_ns();
+        if (auto v = factory.validate_identity(identity.snapshot(now), trust.snapshot(now)); !v) {
+            startup_error_ = v.error();
+            handshake_factory_ = nullptr;
+            return false;
+        }
+        startup_error_.reset();
         handshake_factory_ = &factory;
         cluster_id_ = cluster_id;
         identity_ = &identity;
         trust_ = &trust;
+        return true;
     }
+    // Why enable_handshake() refused the material (empty once it succeeded). Cold path.
+    [[nodiscard]] std::optional<error> startup_error() const noexcept { return startup_error_; }
 
     // Phase 6 fallback path (ADR-040 C2): invoked when an in-flight RENEGOTIATION fails — the stale
     // session is dropped and this hook is the only way SecureTransport (which knows nothing about
@@ -1166,6 +1180,7 @@ private:
     // ADR-040 Phase 3: null (handshake disabled, Phase 2 auto-vivify shape) unless enable_handshake()
     // was called. identity_/trust_ are non-owned; caller-guaranteed to outlive this SecureTransport.
     HandshakeEngineFactory* handshake_factory_ = nullptr;
+    std::optional<error> startup_error_;  // #39: enable_handshake's refusal reason
     ClusterId cluster_id_{};
     const IdentityMaterial* identity_ = nullptr;
     const TrustStore* trust_ = nullptr;

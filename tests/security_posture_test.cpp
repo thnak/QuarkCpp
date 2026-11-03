@@ -149,7 +149,8 @@ void secure_posture() {
     secure.set_reset_hook([](NodeId) {});
     secure.set_audit_sink(default_audit_sink());
     secure.set_admission(auth, [](NodeId) {});
-    secure.enable_handshake(factory, ClusterId{99}, identity, trust);
+    check(secure.enable_handshake(factory, ClusterId{99}, identity, trust),
+          "#78 setup: a default-accepting factory enables the handshake", ok);
 
     const SecureTransport::Posture p = secure.posture();
     check(p.handshake_enabled, "#78: handshake enabled reads back", ok);

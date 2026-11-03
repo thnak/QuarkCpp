@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "quark/core/aead.hpp"
+#include "quark/core/error.hpp"
 #include "quark/core/ids.hpp"
 #include "quark/core/pinned_key.hpp"  // TrustMode (#78)
 #include "quark/core/tls_identity.hpp"
@@ -66,6 +67,15 @@ public:
         bool is_client, NodeId self, NodeId expected_peer, ClusterId cluster_id,
         IdentityMaterial::Snapshot own_identity, TrustStore::Snapshot trust,
         std::shared_ptr<const std::unordered_set<Fingerprint>> revoked) = 0;
+
+    // #39: cold-path validation of the identity/trust the transport is about to install, so a node
+    // refuses to START with unusable material instead of failing its first handshake. The default
+    // accepts (a seam with no certificate rules, e.g. a test double); the mTLS adapter applies
+    // ADR-074 C5 (a node never runs with CA key material).
+    [[nodiscard]] virtual result<void> validate_identity(const IdentityMaterial::Snapshot&,
+                                                         const TrustStore::Snapshot&) const {
+        return {};
+    }
 
     // #78: the details a consumer's start-up self-check reads back. A test double reports `true`;
     // real adapters inherit `false`.

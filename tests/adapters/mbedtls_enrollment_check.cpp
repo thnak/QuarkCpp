@@ -30,12 +30,20 @@
 #include "quark/core/enrollment.hpp"
 #include "quark/core/handshake.hpp"
 #include "quark/core/ids.hpp"
+#include "quark/core/secure_transport.hpp"
 #include "quark/core/tls_identity.hpp"
 
 using namespace quark;
 using namespace quark::adapters;
 
 namespace {
+
+// Moves nothing: the startup checks below only exercise enable_handshake's validation.
+class NullTransport final : public Transport {
+public:
+    void send(NodeId, MessageFrame) override {}
+    void on_receive(std::function<void(MessageFrame)>) override {}
+};
 
 bool g_ok = true;
 void check(bool c, const char* what) {
@@ -576,6 +584,30 @@ void c5_section(Ca& ca, const std::shared_ptr<const TrustStore>& trust) {
     IdentityMaterial good_identity(std::make_shared<const TlsIdentity>(node));
     auto good = factory.create(true, NodeId{1}, NodeId{2}, ClusterId{7}, good_identity.snapshot(0), roots, nullptr);
     check(good->advance({}, out) != HandshakeEngine::Step::Failed, "C5 control: an ordinary identity starts a handshake");
+
+    // #39: the SAME check at transport start, not only inside a handshake. SecureTransport asks the
+    // factory for validate_identity() before installing the material; a refusal must leave the
+    // handshake disabled (the control that fails if the wiring is removed: `posture().handshake_enabled`).
+    IdentityMaterial ca_material(std::make_shared<const TlsIdentity>(ca_as_node));
+    check(!factory.validate_identity(ca_material.snapshot(0), roots),
+          "C5 startup: the factory's validate_identity refuses CA key material");
+    check(static_cast<bool>(factory.validate_identity(good_identity.snapshot(0), roots)),
+          "C5 startup control: an ordinary identity passes validate_identity");
+
+    NullTransport inner;
+    MockCipher cipher{1};
+    TrustStore trust_store(trust->snapshot(0).current);
+    SecureTransport secure(inner, cipher, NodeId{1});
+    check(!secure.enable_handshake(factory, ClusterId{7}, ca_material, trust_store),
+          "C5 startup: enable_handshake refuses CA key material (the node does not start)");
+    check(secure.startup_error().has_value(), "C5 startup: the refusal reason is reported");
+    check(!secure.posture().handshake_enabled,
+          "C5 startup control: a refused identity leaves the handshake disabled");
+    check(secure.enable_handshake(factory, ClusterId{7}, good_identity, trust_store),
+          "C5 startup control: an ordinary identity enables the handshake");
+    check(!secure.startup_error().has_value(), "C5 startup control: the error is cleared after a valid start");
+    check(secure.posture().handshake_enabled,
+          "C5 startup control: the handshake is enabled after a valid start");
 }
 
 }  // namespace
