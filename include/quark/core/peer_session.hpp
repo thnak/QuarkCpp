@@ -77,7 +77,13 @@ public:
     // #80 (ADR-023 rule 4): rejected frames per lane (tamper or replay), written with the hot path under
     // session_mu_ and read lock-free by the burst policy. Reset on renegotiation: a fresh key retires the
     // rejects counted under the old one.
-    void note_reject(std::size_t lane) noexcept { rejects_[lane].fetch_add(1, std::memory_order_relaxed); }
+    void note_reject(std::size_t lane, std::int64_t now_ns, std::int64_t window_ns) noexcept {
+        if (now_ns - reject_window_start_ns_[lane] > window_ns) {  // new burst window for this lane
+            reject_window_start_ns_[lane] = now_ns;
+            rejects_[lane].store(0, std::memory_order_relaxed);
+        }
+        rejects_[lane].fetch_add(1, std::memory_order_relaxed);
+    }
     [[nodiscard]] std::uint64_t rejects(std::size_t lane) const noexcept {
         return rejects_[lane].load(std::memory_order_relaxed);
     }
@@ -179,6 +185,7 @@ private:
     std::array<std::uint64_t, kLanes> recv_high_{};
     std::atomic<std::uint64_t> frames_sealed_on_key_{0};
     std::array<std::atomic<std::uint64_t>, kLanes> rejects_{};  // #80
+    std::array<std::int64_t, kLanes> reject_window_start_ns_{};  // #80: start of the current burst window
     std::atomic<bool> revoked_{false};
     std::atomic<std::uint64_t> admission_gen_{0};
     std::atomic<std::int64_t> renegotiated_at_ns_{0};

@@ -210,6 +210,17 @@ public:
         session_down_hook_ = std::move(fn);
     }
 
+    // #80 (ADR-023 rule 4): renegotiate when one lane rejects `threshold` frames inside `window_ns`, at most
+    // once per `min_interval_ns`. Only the designated initiator acts (glare-free); `enabled=false` is the
+    // control. Defaults: 5 rejects / 10 s, at most once / 30 s.
+    struct RejectBurstPolicy {
+        std::uint64_t threshold = 5;
+        std::int64_t window_ns = 10'000'000'000;
+        std::int64_t min_interval_ns = 30'000'000'000;
+        bool enabled = true;
+    };
+    void set_reject_burst_policy(const RejectBurstPolicy& p) noexcept { burst_policy_ = p; }
+
     // #80: reject counters for `peer` on `lane` (0 = Data, 1 = Control); 0 when no session exists.
     [[nodiscard]] std::uint64_t rejects(NodeId peer, std::size_t lane) const {
         if (lane >= PeerSession::kLanes) return 0;
@@ -770,6 +781,22 @@ private:
         return false;
     }
 
+    // #80 (ADR-023 rule 4): act on a lane's reject burst — renegotiate, throttled to one attempt per
+    // min_interval_ns. Called after the session lock is released (try_renegotiate sends a frame).
+    void maybe_burst_renegotiate(NodeId peer, std::size_t lane) {
+        if (!burst_policy_.enabled || !handshake_factory_ || !local_is_client(self_, peer)) return;
+        const auto s = try_get_session(peer);
+        if (!s || s->rejects(lane) < burst_policy_.threshold) return;
+        const std::int64_t now = now_ns();
+        {
+            std::lock_guard<std::mutex> g(burst_mu_);
+            const auto it = last_burst_ns_.find(peer.value);
+            if (it != last_burst_ns_.end() && now - it->second < burst_policy_.min_interval_ns) return;
+            last_burst_ns_[peer.value] = now;
+        }
+        renegotiate(peer);
+    }
+
     // ADR-040 Phase 6, C2: client-role-only renegotiation trigger (same glare-free rule as an initial
     // handshake — only the lower NodeId renegotiates; the peer's server-role engine responds passively
     // via the ordinary handle_authenticate_frame path below, which now finds an EXISTING session and
@@ -1164,6 +1191,7 @@ private:
         // D3: record the drop reason under the session lock, run the audit sink AFTER releasing it.
         const char* drop_detail = nullptr;
         errc drop_code = errc::ok;
+        bool rejected = false;
         {
             std::lock_guard<std::mutex> g(session->session_mu());
             if (session->revoked()) {
@@ -1172,7 +1200,8 @@ private:
             }
             if (!session->recv_cipher().open(nonce, std::span<const std::byte>(aad), sealed, plaintext)) {
                 tamper_rejected_.fetch_add(1, std::memory_order_relaxed);
-                session->note_reject(lane);  // #80: per-session, per-lane burst signal
+                session->note_reject(lane, now_ns(), burst_policy_.window_ns);  // #80
+                rejected = true;
                 drop_code = errc::serialization;
                 drop_detail = "secure transport: AEAD open failed (tamper/wrong key)";
             } else if (!session->accept_recv_seq(lane, seq)) {
@@ -1180,12 +1209,14 @@ private:
                 // replayed frame has seq <= its lane's high-water mark => reject (composes with 017
                 // dedup; stops an adversarial wire replay).
                 replays_rejected_.fetch_add(1, std::memory_order_relaxed);
-                session->note_reject(lane);  // #80
+                session->note_reject(lane, now_ns(), burst_policy_.window_ns);  // #80
+                rejected = true;
                 drop_code = errc::unavailable;
                 drop_detail = "secure transport: replayed sequence number rejected";
             }
         }
         if (drop_detail) {
+            if (rejected) maybe_burst_renegotiate(frame.from, lane);  // #80: outside the session lock
             audit_(AuditRecord{AuditKind::AuthnFailure, drop_code, frame.from.value, drop_detail, 0});
             return;
         }
@@ -1276,6 +1307,9 @@ private:
     std::function<void(NodeId, SessionEndReason)> session_down_hook_;        // #79
     mutable std::mutex drop_mu_;
     std::unordered_map<std::uint64_t, std::uint64_t> dropped_no_session_;    // #79
+    RejectBurstPolicy burst_policy_{};                                        // #80
+    std::mutex burst_mu_;                                                     // #80
+    std::unordered_map<std::uint64_t, std::int64_t> last_burst_ns_;            // #80
 
     std::uint64_t max_frames_per_key_ = kDefaultMaxFramesPerKey;
     std::int64_t renegotiate_interval_ns_ = kDefaultRenegotiateIntervalNs;
