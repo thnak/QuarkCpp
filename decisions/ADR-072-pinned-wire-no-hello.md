@@ -21,6 +21,13 @@ claim could displace a live connection (#46, N1).
    new network), without firing peer-down for the session the same handshake just swapped in place. The address binding and the id election apply only to
    unauthenticated HELLO claims, which no longer exist on this wire. A HELLO sent to a pinned listener is garbage and is refused with zero bytes.
 
+5. **Dial by address (#57).** `Transport::dial_candidate(expected, addr, port)` (pinned wire only) opens a connection to a discovered endpoint
+   without recording it in `peers_`; `SecureTransport::open_address` then sends Msg1 to the key pinned for `expected`. An advertisement is
+   unauthenticated, so it never becomes a peer's endpoint, is not redialled when it dies, and yields a session only for the key that answers.
+   Proof: `tests/adapters/pinned_discovery_dial_check.cpp` (two nodes with no seeds and no resolver connect; a fake advertisement at an
+   attacker's listener gets one opener frame, whose Msg1 the expected node's engine accepts and which shows no key or NodeId, and no session;
+   an unknown advertisement is never dialled; controls: discovery off, and the real address).
+
 ## Proof (`tests/adapters/pinned_tcp_check.cpp`, real sockets, recording proxy; each with a control)
 T1 two-way delivery, b never dials. T2 capture: no NodeId, key or cluster id anywhere on the wire (CONTROL, HELLO wire: both NodeIds visible).
 T3 a silent prober, random bytes, a wrong-key Msg1 and a replayed HELLO all get ZERO bytes (CONTROL: the HELLO wire sends 14 bytes unprompted).

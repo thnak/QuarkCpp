@@ -120,6 +120,13 @@ public:
     // transport to open a BARE connection to `peer` (no frame, no identity): the accepting end is then the
     // designated initiator and starts the handshake itself. Default: no-op (a transport without a dial target).
     virtual void request_session(NodeId peer) { (void)peer; }
+    // #57 (ADR-072 §5): dial a DISCOVERED endpoint by address. The caller (the secure layer) names the peer it EXPECTS
+    // to answer; the endpoint is NOT recorded as that peer's listen address (a LAN advertisement is unauthenticated, so
+    // it must not redirect or replace a peer's known endpoint). Whatever answers is only trusted if the handshake
+    // authenticates the expected key; no reconnect is scheduled (discovery re-announces). Pinned wire only; default no-op.
+    virtual void dial_candidate(NodeId expected, std::uint64_t addr, std::uint16_t port) {
+        (void)expected; (void)addr; (void)port;
+    }
     // Whether a bare connection is meaningful here: only the pinned wire (no HELLO, single peer) understands it.
     [[nodiscard]] virtual bool supports_bare_session_request() const noexcept { return false; }
     // ADR-081: the accepting transport reports an inbound connection's token (pinned wire only). The secure
