@@ -175,12 +175,16 @@ if(QUARK_WITH_SODIUM)
   endif()
   if(QUARK_SODIUM_STATIC)
     target_compile_definitions(quark_security_sodium INTERFACE SODIUM_STATIC=1)
-    if(MSVC)
+    # #82: the MSVC-ABI toolchains (cl and clang++/clang-cl targeting MSVC) use the same linker and CRT
+    # directives, so the suppression must apply to both — `MSVC` alone is false for clang.
+    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
       # #82: the static prebuilt's Debug library is /MTd, so a /MDd build suppresses libcmtd; Release-like
       # configurations keep suppressing libcmt (the release zip is /MT).
+      # LINKER: makes CMake hand the option to the linker through the driver (`-Xlinker` for clang),
+      # instead of emitting a bare /NODEFAULTLIB that clang treats as an input file.
       target_link_options(quark_security_sodium INTERFACE
-        "$<$<CONFIG:Debug>:/NODEFAULTLIB:libcmtd.lib>"
-        "$<$<NOT:$<CONFIG:Debug>>:/NODEFAULTLIB:libcmt.lib>")
+        "$<$<CONFIG:Debug>:LINKER:/NODEFAULTLIB:libcmtd.lib>"
+        "$<$<NOT:$<CONFIG:Debug>>:LINKER:/NODEFAULTLIB:libcmt.lib>")
     endif()
   endif()
   add_library(quark::security_sodium ALIAS quark_security_sodium)
