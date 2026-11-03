@@ -1,7 +1,7 @@
 # ADR-080 — Portable device client library for non-member sessions (#37 gap 4, #39)
 
-Status: **Proposed**. Consumer: AeroCoWorker device attach (ADR-017) and the solo-user relay. Follows ADR-040 (mTLS),
-ADR-068/072 (pinned key, pinned wire) and ADR-074 D3 (client role).
+Status: **Proposed**; slices S1 and S2 implemented and tested (S3 open). Consumer: AeroCoWorker device attach (ADR-017)
+and the solo-user relay. Follows ADR-040 (mTLS), ADR-068/072 (pinned key, pinned wire) and ADR-074 D3 (client role).
 
 ## Problem
 
@@ -49,10 +49,13 @@ new wire format:
 
 ## Proof plan
 
-- S1 (this slice): `ByteStream` + `PinnedClientTransport` over an in-memory blocking stream pair; two-way delivery
-  with ids restored, wire bytes carry `from == to == 0`, a malformed frame closes the transport.
-- S2: compose with `SecureTransport` + a pinned factory over the same seam and complete a client-role handshake and
-  data exchange against a `TcpTransport`-backed member on loopback (both real).
+- **S1 — done** (`tests/client_pinned_transport_test`): `ByteStream` + `PinnedClientTransport` over an in-memory
+  blocking stream pair; two-way delivery with ids restored, wire bytes carry `from == to == 0`, a malformed frame
+  closes the transport.
+- **S2 — done** (`tests/adapters/pinned_client_library_check`, sodium builds): a client-role device composed with
+  `SecureTransport` + the pinned engine against a real `TcpTransport` + `SecureTransport` member on loopback; the
+  handshake completes, data flows both ways, and an un-admitted client-role device gets no session (control).
+  Mutation control: removing the inbound id restoration makes the handshake fail, so the test exercises it.
 - S3: a PAL-backed `SocketByteStream` (desktop/`linux_x86_64`, `windows_x86_64`, `windows_arm64`), reconnect/resume
   hooks, and the mTLS+HELLO client path if AeroCoWorker needs it.
 
@@ -62,3 +65,5 @@ new wire format:
 - The client does not rotate keys; pinned mode has no certificate rotation. A long-lived device re-handshakes on
   reconnect (the application's policy).
 - The reader thread is one per client transport (one device connection); no shared reactor, by design.
+- The S2 check's `PalByteStream` is a test-only blocking stand-in (non-blocking PAL socket + retry/sleep). The
+  shipped desktop stream is S3; a real device supplies its own blocking socket behind `ByteStream`.
