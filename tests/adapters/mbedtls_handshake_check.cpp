@@ -7,6 +7,7 @@
 // class the ADR record flags), NodeId/ClusterId binding via the leaf cert's CN, mismatched-CA
 // rejection (mutual-auth gate before any session), and revoked-fingerprint rejection at handshake time
 // (S3). Only built when QUARK_WITH_MBEDTLS=ON.
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -207,6 +208,106 @@ struct DriveResult {
     }
     return r;
 }
+
+// --- Raw mbedTLS TLS peer (#39): the C5 peer-leaf rule is only reachable from a NON-Quark peer, -----
+// because a Quark engine refuses to PRESENT a CA:TRUE leaf. This drives a real mbedTLS TLS server
+// (memory BIO) against the Quark client engine, so the client's verify_cb runs on the peer's leaf.
+struct RawTlsPeer {
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt cert;
+    mbedtls_pk_context key;
+    RawTlsPeer() {
+        mbedtls_ssl_init(&ssl);
+        mbedtls_ssl_config_init(&conf);
+        mbedtls_x509_crt_init(&cert);
+        mbedtls_pk_init(&key);
+    }
+    ~RawTlsPeer() {
+        mbedtls_ssl_free(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_x509_crt_free(&cert);
+        mbedtls_pk_free(&key);
+    }
+    RawTlsPeer(const RawTlsPeer&) = delete;
+    RawTlsPeer& operator=(const RawTlsPeer&) = delete;
+};
+
+struct MemoryBio {
+    std::vector<unsigned char> to_server;
+    std::vector<unsigned char> to_client;
+};
+
+int memory_send(void* ctx, const unsigned char* buf, std::size_t len) {
+    auto* b = static_cast<MemoryBio*>(ctx);
+    b->to_client.insert(b->to_client.end(), buf, buf + len);
+    return static_cast<int>(len);
+}
+
+int memory_recv(void* ctx, unsigned char* buf, std::size_t len) {
+    auto* b = static_cast<MemoryBio*>(ctx);
+    if (b->to_server.empty()) return MBEDTLS_ERR_SSL_WANT_READ;
+    const std::size_t n = std::min(len, b->to_server.size());
+    std::memcpy(buf, b->to_server.data(), n);
+    b->to_server.erase(b->to_server.begin(), b->to_server.begin() + static_cast<std::ptrdiff_t>(n));
+    return static_cast<int>(n);
+}
+
+struct RawPeerResult {
+    HandshakeEngine::Step client_step = HandshakeEngine::Step::WantRead;
+    std::string client_reason;
+    bool harness_ok = false;
+};
+
+// Runs `client` against a raw mbedTLS server presenting `server_leaf`, until the client is Done or
+// Failed. harness_ok=false means the raw side or the byte pump failed, so a caller can tell a harness
+// bug from the peer-leaf refusal it is asserting.
+[[nodiscard]] RawPeerResult run_raw_tls_peer(HandshakeEngine& client, const GeneratedCert& server_leaf, Rng& rng) {
+    RawPeerResult r;
+    RawTlsPeer peer;
+    MemoryBio bio;
+    if (mbedtls_x509_crt_parse_der(&peer.cert,
+                                   reinterpret_cast<const unsigned char*>(server_leaf.cert_der.data()),
+                                   server_leaf.cert_der.size()) != 0)
+        return r;
+    if (mbedtls_pk_parse_key(&peer.key, reinterpret_cast<const unsigned char*>(server_leaf.key_der.data()),
+                             server_leaf.key_der.size(), nullptr, 0, &Rng::f_rng, rng.ctx()) != 0)
+        return r;
+    if (mbedtls_ssl_config_defaults(&peer.conf, MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT) != 0)
+        return r;
+    mbedtls_ssl_conf_rng(&peer.conf, &Rng::f_rng, rng.ctx());
+    mbedtls_ssl_conf_authmode(&peer.conf, MBEDTLS_SSL_VERIFY_NONE);
+    if (mbedtls_ssl_conf_own_cert(&peer.conf, &peer.cert, &peer.key) != 0) return r;
+    if (mbedtls_ssl_setup(&peer.ssl, &peer.conf) != 0) return r;
+    mbedtls_ssl_set_bio(&peer.ssl, &bio, &memory_send, &memory_recv, nullptr);
+
+    std::vector<std::byte> out;
+    r.client_step = client.advance({}, out);  // ClientHello
+    const auto feed_server = [&] {
+        bio.to_server.insert(bio.to_server.end(), reinterpret_cast<const unsigned char*>(out.data()),
+                             reinterpret_cast<const unsigned char*>(out.data()) + out.size());
+        out.clear();
+    };
+    feed_server();
+
+    constexpr int kMaxRounds = 32;
+    for (int round = 0; round < kMaxRounds; ++round) {
+        if (r.client_step == HandshakeEngine::Step::Failed || r.client_step == HandshakeEngine::Step::Done) break;
+        const int rc = mbedtls_ssl_handshake(&peer.ssl);
+        if (rc != 0 && rc != MBEDTLS_ERR_SSL_WANT_READ) return r;  // raw side failed: harness, not the client
+        if (bio.to_client.empty()) return r;  // stalled with nothing to feed the client
+        std::vector<std::byte> in(bio.to_client.size());
+        std::memcpy(in.data(), bio.to_client.data(), bio.to_client.size());
+        bio.to_client.clear();
+        r.client_step = client.advance(in, out);
+        feed_server();
+        if (rc == 0) break;  // the raw server is done; the client has all the bytes it needs
+    }
+    r.harness_ok = true;
+    r.client_reason.assign(client.failure_reason());
+    return r;
+}
 }  // namespace
 
 int main() {
@@ -380,6 +481,33 @@ int main() {
         check(server->advance({}, out) == HandshakeEngine::Step::Failed &&
                   server->failure_reason().find("C5") != std::string_view::npos,
               "ADR-074: a node refuses to run with a leaf claiming CA:TRUE", ok);
+    }
+    // #39: the CLIENT's verify_cb refusal of that same CA:TRUE leaf. A Quark engine cannot be made to
+    // present one, so this needs a raw (non-Quark) mbedTLS TLS peer. The control runs the identical
+    // harness with an ordinary, validly chained leaf and must COMPLETE — proving the refusal is the
+    // C5 peer-leaf rule, not a broken harness.
+    {
+        MbedtlsHandshakeEngineFactory factory;
+        Rng raw_rng;
+        auto bad_client =
+            factory.create(true, n1, n2, cluster, identity1.snapshot(0), trust_store.snapshot(0), nullptr);
+        const RawPeerResult bad = run_raw_tls_peer(*bad_client, leaf_ca_flag, raw_rng);
+        check(bad.harness_ok, "#39: the raw TLS peer harness completed", ok);
+        check(bad.client_step == HandshakeEngine::Step::Failed &&
+                  bad.client_reason.find("ertificate") != std::string::npos,
+              "ADR-074 C5: a raw peer's CA:TRUE leaf is refused by the client's verify_cb", ok);
+        if (bad.client_step != HandshakeEngine::Step::Failed)
+            std::fprintf(stderr, "    (client step %d, reason: %s)\n", static_cast<int>(bad.client_step),
+                         bad.client_reason.c_str());
+
+        auto control =
+            factory.create(true, n1, n2, cluster, identity1.snapshot(0), trust_store.snapshot(0), nullptr);
+        const RawPeerResult good = run_raw_tls_peer(*control, leaf2, raw_rng);
+        check(good.harness_ok && good.client_step == HandshakeEngine::Step::Done,
+              "CONTROL: the same raw peer presenting an ordinary leaf completes the handshake", ok);
+        if (good.client_step != HandshakeEngine::Step::Done)
+            std::fprintf(stderr, "    (control step %d, reason: %s)\n", static_cast<int>(good.client_step),
+                         good.client_reason.c_str());
     }
     refused_for(leaf_client_member_id, n2, "CN does not encode",
                 "ADR-074: a client CN carrying a MEMBER id is refused (disjoint id spaces)");
