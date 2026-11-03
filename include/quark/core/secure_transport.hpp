@@ -184,6 +184,33 @@ public:
     void set_reset_hook(std::function<void(NodeId)> fn) noexcept { reset_hook_ = std::move(fn); }
     void set_test_faults(const SecureTransportTestFaults& f) noexcept { test_faults_ = f; }
 
+    // #79: explicit open (ADR-081 made the mechanism public as request_session; `open` is the consumer name).
+    void open(NodeId peer) { request_session(peer); }
+
+    // #79: why a session ended. `ConnectFailed` also covers a dial that never reached a session (the inner
+    // transport reports the failed connection); a peer denied by the far end is indistinguishable from it.
+    enum class SessionEndReason : std::uint8_t {
+        PeerClosed,
+        ConnectFailed,
+        DeniedByAdmission,
+        LocalReset,
+        ProtocolError,
+    };
+    void set_session_up_hook(std::function<void(NodeId, std::uint64_t admission_generation)> fn) {
+        session_up_hook_ = std::move(fn);
+    }
+    void set_session_down_hook(std::function<void(NodeId, SessionEndReason)> fn) {
+        session_down_hook_ = std::move(fn);
+    }
+
+    // #79: per-peer count of frames dropped because no session existed yet (pre-session send). A frame the
+    // inner transport later sheds for backlog is counted by that transport (outbound_data_drops).
+    [[nodiscard]] std::uint64_t dropped_no_session(NodeId peer) const {
+        std::lock_guard<std::mutex> g(drop_mu_);
+        const auto it = dropped_no_session_.find(peer.value);
+        return it == dropped_no_session_.end() ? 0 : it->second;
+    }
+
     // The connection this peer's session was negotiated on has died. An mTLS session is
     // per-connection: keep it and the peer (which necessarily lost its own half) silently drops every
     // frame we seal, forever — and the server-role side can never re-initiate. Dropping it here makes
@@ -194,9 +221,10 @@ public:
         // per-connection key to retire — and dropping the session would restart its seq spaces at 0 under
         // that same key (AEAD nonce reuse, and a reset replay window). Keep it; only the handshake-gated
         // shape has per-connection state to drop.
+        bool had_session = false;
         if (handshake_factory_) {
             std::unique_lock<std::shared_mutex> g(map_mu_);
-            sessions_.erase(peer.value);
+            had_session = sessions_.erase(peer.value) != 0;
         }
         std::unique_ptr<HandshakeEngine> doomed;  // destroyed after pending_mu_ is released (D6)
         {
@@ -211,6 +239,9 @@ public:
             peer_schemas_.erase(peer.value);
         }
         sessions_dropped_on_disconnect_.fetch_add(1, std::memory_order_relaxed);
+        // #79: a session that existed ended with the connection; without one, the connect attempt failed.
+        if (session_down_hook_)
+            session_down_hook_(peer, had_session ? SessionEndReason::PeerClosed : SessionEndReason::ConnectFailed);
     }
     [[nodiscard]] std::uint64_t sessions_dropped_on_disconnect() const noexcept {
         return sessions_dropped_on_disconnect_.load(std::memory_order_relaxed);
@@ -289,6 +320,9 @@ public:
         }
         if (reset_hook_)
             for (const auto& session : revoked_clients) reset_hook_(session->peer());
+        if (session_down_hook_)  // #79: the revoked client's session was erased just above
+            for (const auto& session : revoked_clients)
+                session_down_hook_(session->peer(), SessionEndReason::LocalReset);
     }
 
     // Seal the payload and forward. AAD = {from,to,target,msg_type,lane,seq} so a frame replayed to
@@ -318,6 +352,10 @@ public:
             if (!session) {  // S2: no session ⇒ no delivery — kick off a handshake, drop this frame
                 request_session(to);
                 handshake_pending_dropped_.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> g(drop_mu_);
+                    ++dropped_no_session_[to.value];
+                }
                 return;
             }
         } else {
@@ -709,9 +747,12 @@ private:
                                                       std::move(result.recv_cipher),
                                                       identity_->generation(), result.peer_fingerprint,
                                                       now_ns());
-        session->set_admission_generation(admission_.generation());
+        const std::uint64_t gen = admission_.generation();
+        session->set_admission_generation(gen);
         std::unique_lock<std::shared_mutex> g(map_mu_);
         sessions_[expected_peer.value] = std::move(session);
+        g.unlock();
+        if (session_up_hook_) session_up_hook_(expected_peer, gen);  // #79: never under map_mu_
         return false;
     }
 
@@ -805,6 +846,7 @@ private:
                 }
                 renegotiations_failed_.fetch_add(1, std::memory_order_relaxed);
                 if (reset_hook_) reset_hook_(peer);
+                if (session_down_hook_) session_down_hook_(peer, SessionEndReason::ProtocolError);  // #79
             } else if (is_client_node(peer) && reset_hook_) {
                 // ADR-074 D3: an INITIAL handshake from a client failed (e.g. its certificate is
                 // revoked). Close the connection instead of leaving a client socket open to retry.
@@ -1214,6 +1256,11 @@ private:
 
     // ADR-040 Phase 6: rotation/renegotiate policy + the reset-hook fallback (set_reset_hook banner above).
     std::function<void(NodeId)> reset_hook_;
+    std::function<void(NodeId, std::uint64_t)> session_up_hook_;             // #79
+    std::function<void(NodeId, SessionEndReason)> session_down_hook_;        // #79
+    mutable std::mutex drop_mu_;
+    std::unordered_map<std::uint64_t, std::uint64_t> dropped_no_session_;    // #79
+
     std::uint64_t max_frames_per_key_ = kDefaultMaxFramesPerKey;
     std::int64_t renegotiate_interval_ns_ = kDefaultRenegotiateIntervalNs;
     std::int64_t min_renegotiate_interval_ns_ = 250'000'000;  // #48: 250 ms

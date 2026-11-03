@@ -36,12 +36,40 @@ int main() {
         Stack hi_s(hi, /*pinned_wire=*/true);
         lo_s.sec.set_inbound_session_peer(hi.id);  // the acceptor is the designated initiator
         check(lo_s.start() && hi_s.start(), "both pinned listeners start");
-        hi_s.dial_via(lo.id, lo_s.tcp.listen_port());  // the requester knows the peer's endpoint
 
+        // #79: session lifecycle hooks and the pre-session drop counter.
+        std::atomic<int> up_lo{0}, up_hi{0}, down_hi{0};
+        std::atomic<std::uint64_t> gen_lo{0};
+        std::atomic<int> down_reason{-1};
+        lo_s.sec.set_session_up_hook([&](NodeId p, std::uint64_t gen) {
+            if (p == hi.id) { gen_lo.store(gen); up_lo.fetch_add(1); }
+        });
+        hi_s.sec.set_session_up_hook([&](NodeId p, std::uint64_t) {
+            if (p == lo.id) up_hi.fetch_add(1);
+        });
+        hi_s.sec.set_session_down_hook([&](NodeId p, SecureTransport::SessionEndReason r) {
+            if (p == lo.id) { down_reason.store(static_cast<int>(r)); down_hi.fetch_add(1); }
+        });
+
+        hi_s.dial_via(lo.id, lo_s.tcp.listen_port());  // the requester knows the peer's endpoint
+        hi_s.sec.send(lo.id, data(hi.id, lo.id, "pre-session"));
+        check(hi_s.sec.dropped_no_session(lo.id) == 1, "a pre-session send is counted per peer");
+
+        hi_s.sec.open(lo.id);  // #79: explicit open, no frame
+        check(wait_for([&] { return lo_s.sec.session_count() == 1 && hi_s.sec.session_count() == 1; }, 3000),
+              "open() brings the session up without a frame");
         check(deliver(hi_s, lo_s, lo.id, 1, "higher opens"), "the HIGHER id opens the session");
+        check(up_lo.load() == 1 && up_hi.load() == 1, "on_session_up fires once on each end");
+        check(gen_lo.load() == 0, "the up hook reports the admission generation (0 when admission is off)");
         check(deliver(lo_s, hi_s, hi.id, 1, "reply"), "the reply reaches the higher id");
         check(lo_s.sec.session_count() == 1 && hi_s.sec.session_count() == 1,
               "exactly one session on each end");
+
+        hi_s.sec.on_peer_disconnected(lo.id);  // #79: the down hook names the reason
+        check(down_hi.load() == 1 &&
+                  down_reason.load() == static_cast<int>(SecureTransport::SessionEndReason::PeerClosed),
+              "on_session_down reports PeerClosed when a live session's connection dies");
+        check(hi_s.sec.session_count() == 0, "the session is gone after the disconnect");
     }
 
     // ---- control: no accept-side hook => nothing opens -------------------------------------------
