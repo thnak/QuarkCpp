@@ -134,6 +134,19 @@ inline std::expected<void, std::error_code> set_nonblocking(fd_t s) noexcept {
     return {};
 }
 
+// ADR-080: the device client needs real blocking sockets without a reactor. set_blocking clears
+// non-blocking; shutdown_socket wakes a recv()/send() blocked in another thread (the ByteStream close()
+// contract), after which close_fd() reaps the socket.
+inline std::expected<void, std::error_code> set_blocking(fd_t s) noexcept {
+    u_long mode = 0;
+    if (::ioctlsocket(s, static_cast<long>(FIONBIO), &mode) != 0) return std::unexpected(last_error());
+    return {};
+}
+
+inline void shutdown_socket(fd_t s) noexcept {
+    if (s != invalid_fd) (void)::shutdown(s, SD_BOTH);
+}
+
 // Disable Nagle: actor frames are small and latency-sensitive (023). Best-effort — a failure here is
 // not fatal to correctness. (No MSG_NOSIGNAL equivalent needed on Windows: sockets never raise SIGPIPE
 // here — that is a POSIX-only concern the epoll backend's send_some() guards against.)
@@ -216,6 +229,24 @@ inline void close_fd(fd_t s) noexcept {
         }
     }
     return s;
+}
+
+// ADR-080: a BLOCKING connect for the portable device client (no IoContext). The returned socket parks
+// the calling thread in recv()/send(); pass it to client::SocketByteStream.
+[[nodiscard]] inline std::expected<fd_t, std::error_code> tcp_connect_blocking(std::uint64_t addr,
+                                                                               std::uint16_t port) noexcept {
+    ensure_winsock();
+    const fd_t s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s == invalid_fd) return std::unexpected(last_error());
+    set_nodelay(s);
+    const ::sockaddr_in sa = to_sockaddr_in(addr, port);
+    for (;;) {
+        if (::connect(s, reinterpret_cast<const ::sockaddr*>(&sa), sizeof(sa)) == 0) return s;
+        const int err = ::WSAGetLastError();
+        if (err == WSAEINTR) continue;  // a signal interrupted the blocking connect: retry
+        close_fd(s);
+        return std::unexpected(std::error_code(err, std::system_category()));
+    }
 }
 
 // After writable-readiness on a connecting socket: was the connect successful? SO_ERROR holds the

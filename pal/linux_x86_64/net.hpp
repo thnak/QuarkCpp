@@ -107,6 +107,20 @@ inline std::expected<void, std::error_code> set_nonblocking(int fd) noexcept {
     return {};
 }
 
+// ADR-080: the device client needs real blocking sockets without a reactor. set_blocking clears
+// O_NONBLOCK; shutdown_socket wakes a recv()/send() blocked in another thread (the ByteStream close()
+// contract), after which close_fd() reaps the descriptor.
+inline std::expected<void, std::error_code> set_blocking(int fd) noexcept {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return std::unexpected(last_error());
+    if (::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) return std::unexpected(last_error());
+    return {};
+}
+
+inline void shutdown_socket(int fd) noexcept {
+    if (fd >= 0) (void)::shutdown(fd, SHUT_RDWR);
+}
+
 // Disable Nagle: actor frames are small and latency-sensitive (023), so we never want the kernel to
 // coalesce-and-delay. Best-effort — a failure here is not fatal to correctness.
 inline void set_nodelay(int fd) noexcept {
@@ -183,6 +197,23 @@ inline void close_fd(int fd) noexcept {
         return std::unexpected(e);
     }
     return fd;
+}
+
+// ADR-080: a BLOCKING connect for the portable device client (no IoContext). The returned fd parks the
+// calling thread in recv()/send(); pass it to client::SocketByteStream.
+[[nodiscard]] inline std::expected<int, std::error_code> tcp_connect_blocking(std::uint64_t addr,
+                                                                              std::uint16_t port) noexcept {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return std::unexpected(last_error());
+    set_nodelay(fd);
+    const ::sockaddr_in sa = to_sockaddr_in(addr, port);
+    for (;;) {
+        if (::connect(fd, reinterpret_cast<const ::sockaddr*>(&sa), sizeof(sa)) == 0) return fd;
+        if (errno == EINTR) continue;  // a signal interrupted the blocking connect: retry
+        const auto e = last_error();
+        close_fd(fd);
+        return std::unexpected(e);
+    }
 }
 
 // After EPOLLOUT on a connecting socket: was the connect successful? SO_ERROR holds the verdict.

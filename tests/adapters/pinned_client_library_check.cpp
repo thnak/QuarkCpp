@@ -13,6 +13,7 @@
 
 #include "pinned_tcp_util.hpp"
 #include "quark/client/pinned_client_transport.hpp"
+#include "quark/client/socket_byte_stream.hpp"
 #include "quark/core/secure_transport.hpp"
 
 using namespace quark;
@@ -22,52 +23,6 @@ using namespace quark::test;
 namespace {
 
 void sleep_for(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
-
-// A blocking ByteStream over a non-blocking PAL socket. The application supplies its own (Android/iOS);
-// this is the test's minimal desktop stand-in, and it deliberately uses no PAL reactor: retry + sleep.
-class PalByteStream final : public client::ByteStream {
-public:
-    explicit PalByteStream(std::uint16_t port) {
-        if (auto fd = pal::tcp_connect(pal::ipv4_loopback, port)) fd_.store(*fd);
-        else closed_.store(true);
-        sleep_for(20);  // loopback: the connect completes; a real app would block in connect()
-    }
-    ~PalByteStream() override { close(); }
-
-    std::ptrdiff_t read(std::span<std::byte> out) override {
-        for (;;) {
-            const pal::fd_t fd = fd_.load(std::memory_order_acquire);
-            if (closed_.load(std::memory_order_acquire) || fd == pal::invalid_fd) return 0;
-            auto r = pal::recv_some(fd, out.data(), out.size());
-            if (r) return static_cast<std::ptrdiff_t>(*r);
-            if (r.error() != pal::would_block()) return -1;
-            sleep_for(1);
-        }
-    }
-
-    std::ptrdiff_t write(std::span<const std::byte> in) override {
-        std::size_t off = 0;
-        while (off < in.size()) {
-            const pal::fd_t fd = fd_.load(std::memory_order_acquire);
-            if (closed_.load(std::memory_order_acquire) || fd == pal::invalid_fd) return -1;
-            auto w = pal::send_some(fd, in.data() + off, in.size() - off);
-            if (w) off += *w;
-            else if (w.error() == pal::would_block()) sleep_for(1);
-            else return -1;
-        }
-        return static_cast<std::ptrdiff_t>(in.size());
-    }
-
-    void close() noexcept override {
-        closed_.store(true, std::memory_order_release);
-        const pal::fd_t fd = fd_.exchange(pal::invalid_fd);
-        if (fd != pal::invalid_fd) pal::close_fd(fd);
-    }
-
-private:
-    std::atomic<pal::fd_t> fd_{pal::invalid_fd};
-    std::atomic<bool> closed_{false};
-};
 
 }  // namespace
 
@@ -86,8 +41,13 @@ int main() {
     check(srv.start(), "the member's pinned listener starts", ok);
 
     // ---- admitted client-role device -------------------------------------------------------------
-    PalByteStream stream(srv.tcp.listen_port());
-    client::PinnedClientTransport dtrans(stream, device.id, member.id);
+    auto stream = client::SocketByteStream::connect(pal::ipv4_loopback, srv.tcp.listen_port());
+    check(stream.has_value(), "the shipped blocking SocketByteStream connects", ok);
+    if (!stream) {
+        std::printf("pinned_client_library_check: FAIL (connect)\n");
+        return 1;
+    }
+    client::PinnedClientTransport dtrans(**stream, device.id, member.id);
     MockCipher unused(0);
     SecureTransport dsec(dtrans, unused, device.id);
     auto id_blob = std::make_shared<const TlsIdentity>();
@@ -139,24 +99,69 @@ int main() {
         }
     }
 
+    // ---- reconnect: the APPLICATION owns the stream/transport/SecureTransport lifecycle -----------
+    // ADR-080: reconnect/resume is not hidden in the library. The app drops the dead objects and builds
+    // a new stream + transport + SecureTransport; the fresh handshake derives new keys, and replaying
+    // its own event log from its last sequence number stays the app's job.
+    dtrans.stop();
+    {
+        auto stream2 = client::SocketByteStream::connect(pal::ipv4_loopback, srv.tcp.listen_port());
+        check(stream2.has_value(), "RECONNECT: a second blocking stream connects", ok);
+        if (!stream2) return 1;
+        client::PinnedClientTransport dtrans2(**stream2, device.id, member.id);
+        SecureTransport dsec2(dtrans2, unused, device.id);
+        IdentityMaterial id2(id_blob);
+        TrustStore trust2(trust_blob);
+        dsec2.enable_handshake(*device.factory, cluster, id2, trust2);
+        std::mutex mu2;
+        std::vector<MessageFrame> at_device2;
+        dsec2.on_receive([&](MessageFrame f) {
+            std::lock_guard<std::mutex> g(mu2);
+            at_device2.push_back(std::move(f));
+        });
+
+        const std::uint64_t before = srv.got.load();
+        dsec2.send(member.id, data(device.id, member.id, "after reconnect"));
+        dtrans2.start();
+        const bool reconnected = wait_for([&] {
+            if (srv.got.load() >= before + 1) return true;
+            dsec2.send(member.id, data(device.id, member.id, "after reconnect"));
+            sleep_for(15);
+            return false;
+        });
+        check(reconnected, "RECONNECT: a fresh stream + transport + handshake delivers again", ok);
+        check(dsec2.session_count() == 1, "RECONNECT: the new client has a session", ok);
+        check(wait_for([&] {
+                  srv.sec.send(device.id, data(member.id, device.id, "reply after reconnect"));
+                  sleep_for(15);
+                  std::lock_guard<std::mutex> g(mu2);
+                  return !at_device2.empty();
+              }),
+              "RECONNECT: the member's reply reaches the new client instance", ok);
+        dtrans2.stop();
+    }
+
     // ---- CONTROL: an un-admitted client-role device is refused ------------------------------------
     {
         Node rogue{PinnedOptions{}, nullptr, PinnedRole::Client};
         (void)rogue.book->admit(cluster, member.pub);  // the rogue trusts the member; the member does not admit it
-        PalByteStream rstream(srv.tcp.listen_port());
-        client::PinnedClientTransport rtrans(rstream, rogue.id, member.id);
+        auto rstream = client::SocketByteStream::connect(pal::ipv4_loopback, srv.tcp.listen_port());
+        check(rstream.has_value(), "the rogue's blocking stream connects", ok);
+        if (!rstream) return 1;
+        client::PinnedClientTransport rtrans(**rstream, rogue.id, member.id);
         SecureTransport rsec(rtrans, unused, rogue.id);
         IdentityMaterial rid(id_blob);
         TrustStore rtrust(trust_blob);
         rsec.enable_handshake(*rogue.factory, cluster, rid, rtrust);
         std::atomic<int> rgot{0};
         rsec.on_receive([&](MessageFrame) { rgot.fetch_add(1); });
+        const std::size_t sessions_before = srv.sec.session_count();  // the device may have two after its reconnect
 
         rsec.send(member.id, data(rogue.id, member.id, "let me in"));
         rtrans.start();
         sleep_for(500);
         check(rsec.session_count() == 0, "CONTROL: an un-admitted client-role device gets no session", ok);
-        check(srv.sec.session_count() == 1, "CONTROL: the member installs no session for it", ok);
+        check(srv.sec.session_count() == sessions_before, "CONTROL: the member installs no session for it", ok);
         check(rgot.load() == 0, "CONTROL: it receives no frame", ok);
         rtrans.stop();
     }

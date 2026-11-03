@@ -1,7 +1,8 @@
 # ADR-080 — Portable device client library for non-member sessions (#37 gap 4, #39)
 
-Status: **Proposed**; slices S1 and S2 implemented and tested (S3 open). Consumer: AeroCoWorker device attach (ADR-017)
-and the solo-user relay. Follows ADR-040 (mTLS), ADR-068/072 (pinned key, pinned wire) and ADR-074 D3 (client role).
+Status: **Proposed**; slices S1, S2, S3a and S3b implemented and tested (S3c mTLS+HELLO conditional). Consumer:
+AeroCoWorker device attach (ADR-017) and the solo-user relay. Follows ADR-040 (mTLS), ADR-068/072 (pinned key, pinned
+wire) and ADR-074 D3 (client role).
 
 ## Problem
 
@@ -56,8 +57,14 @@ new wire format:
   `SecureTransport` + the pinned engine against a real `TcpTransport` + `SecureTransport` member on loopback; the
   handshake completes, data flows both ways, and an un-admitted client-role device gets no session (control).
   Mutation control: removing the inbound id restoration makes the handshake fail, so the test exercises it.
-- S3: a PAL-backed `SocketByteStream` (desktop/`linux_x86_64`, `windows_x86_64`, `windows_arm64`), reconnect/resume
-  hooks, and the mTLS+HELLO client path if AeroCoWorker needs it.
+- **S3a — done**: `include/quark/client/socket_byte_stream.hpp`, a real blocking socket through the PAL
+  (`tcp_connect_blocking`, `set_blocking`, `shutdown_socket` added to both backends). `close()` shuts the socket
+  down before closing it, so the transport's blocked reader wakes; `pinned_client_library_check` now uses it.
+- **S3b — done (recipe, tested)**: reconnect/resume stays with the application by design. The check drops the dead
+  stream/transport/SecureTransport and builds fresh ones, completes a new handshake and exchanges frames again;
+  the app replays from its own log/sequence number. No hidden reconnect state in the library.
+- S3c — **conditional, not implemented**: the mTLS+HELLO client path, only if AeroCoWorker's devices need mTLS
+  rather than pinned keys (its ADR-044 Q1 uses pinned keys today).
 
 ## Residuals
 
@@ -65,5 +72,7 @@ new wire format:
 - The client does not rotate keys; pinned mode has no certificate rotation. A long-lived device re-handshakes on
   reconnect (the application's policy).
 - The reader thread is one per client transport (one device connection); no shared reactor, by design.
-- The S2 check's `PalByteStream` is a test-only blocking stand-in (non-blocking PAL socket + retry/sleep). The
-  shipped desktop stream is S3; a real device supplies its own blocking socket behind `ByteStream`.
+- `SocketByteStream` is desktop-only by construction (PAL backends exist for Linux and Windows x86-64/arm64, ADR-059
+  arm64 is cross-compiled only). A phone app supplies its own blocking socket behind `ByteStream`, as designed.
+- S3c: a device that must speak the HELLO wire (mTLS) needs a HELLO-aware client transport; not implemented because
+  AeroCoWorker's devices use pinned keys.
