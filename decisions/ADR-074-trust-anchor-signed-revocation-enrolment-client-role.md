@@ -301,9 +301,16 @@ binding. Found and folded in:
     `max_per_ip` (all refused with zero bytes, counted not audited per socket: an audit line per flood connection would be the amplifier). Per-enrolment deadline;
     it also drives `Enrollment::expire`. `validate_identity_not_root` at transport start is the application's call (unchanged, tested in `mbedtls_enrollment_check`).
   * **Residual.** A prober that sends a ClientHello while a ticket is live gets a TLS ServerHello: the node is visible as an enrol anchor only for the ticket window.
-    ASan/TSan not run locally (Windows toolchain); CI/Linux.
-  Next: D4c the enrol wire path in SecureTransport (separate cap, off-I/O-thread crypto, anchor pinning,
-  join-code encoding), which also calls `validate_identity_not_root` at transport start.
+    ASan+UBSan and TSan were run on Linux (g++-14, Debug): the six enrol checks pass with no report. CI builds and runs them (job `test-mbedtls-checks`, #75).
+  * **Pinned wire and end to end (#36, closing).** The pinned (no HELLO) path is tested, not only argued: `mbedtls_enrol_service_check` V7/V7b (a joiner enrols on a
+    pinned listener; a pinned-framed opener is not handed off; no live ticket closes with zero bytes; control: sniff disabled in pinned mode fails V7).
+    `mbedtls_enrol_e2e_check` runs the whole path on real `TcpTransport` + `SecureTransport` (mbedTLS mTLS): a node with only a join code enrols, its issued identity passes
+    `validate_identity_not_root`, completes the mTLS handshake with the anchor and exchanges frames both ways while another enrolment is in flight on the same listener
+    (control: a certificate from another root exchanges no frame; a joiner trusting another root fails). `SecureTransport` itself needed no change: the handoff lives in
+    `TcpTransport` below it.
+  * **What stays with the application** (not Quark): reading the join code, creating tickets (`Enrollment::issue_ticket`), constructing `EnrolService` and installing
+    `set_enrol_handoff`, the custodian, and calling `validate_identity_not_root` at startup. Quark provides and tests each piece; AeroCoWorker's Host Service composes them.
+  Status: D4c implemented and tested (steps 1-4 plus the above); issue #36 closed.
 
 ## Not decided here
 

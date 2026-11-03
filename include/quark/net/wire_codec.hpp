@@ -31,6 +31,30 @@ namespace quark::net {
 // (reassembler buffer + MessageFrame payload) per frame.
 inline constexpr std::uint32_t max_frame_body = 4u * 1024u * 1024u;
 
+// The fixed MessageFrame header at the start of every body (everything encode_frame_body writes before
+// the payload): from, to, target.type, target.key, msg_type (5 × u64), mode + kind (2 × u8), deadline,
+// trace_id, principal.subject, principal.rights (4 × u64), payload length (u32) = 78 bytes. The body cap
+// above covers THIS header, so a consumer must not treat `max_frame_body` as a payload limit.
+inline constexpr std::uint32_t frame_body_header_size = 5 * 8 + 2 + 4 * 8 + 4;  // 78
+
+// Largest payload a frame may carry under a body cap of `max_body`. `overhead` is extra per-frame bytes a
+// decorator places inside the payload (SecureTransport's sequence prefix + AEAD tag — see below). Returns
+// 0 when the cap cannot hold even an empty frame.
+[[nodiscard]] constexpr std::uint32_t max_payload_for_body_cap(std::uint32_t max_body,
+                                                              std::uint32_t overhead = 0) noexcept {
+    const std::uint32_t fixed = frame_body_header_size + overhead;
+    return max_body > fixed ? max_body - fixed : 0;
+}
+
+// SecureTransport's sealed payload is [u64 sequence number][ciphertext][AEAD tag], so a sealed frame's
+// body is the 78-byte header + 8 + plaintext + tag. `tag_size` is the session Aead's tag_size().
+inline constexpr std::uint32_t sealed_seq_prefix_size = 8;
+
+[[nodiscard]] constexpr std::uint32_t max_sealed_payload_for_body_cap(
+    std::uint32_t max_body, std::uint32_t tag_size) noexcept {
+    return max_payload_for_body_cap(max_body, sealed_seq_prefix_size + tag_size);
+}
+
 // Wire offset of the one-byte FrameKind: [u32 body_len][from u64][to u64][target.type u64][target.key u64]
 // [msg_type u64][mode u8][kind u8]... Simple consumers (TcpTransport's Authenticate purge and its
 // data-bearing marker) need to classify a queued encoded frame without decoding it again.

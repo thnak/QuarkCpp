@@ -142,6 +142,17 @@ public:
                 for (auto& [id, c] : conns_) c->in.set_max_body(max_frame_body_);
             });
     }
+    [[nodiscard]] std::uint32_t max_frame_body() const noexcept { return max_frame_body_; }
+    // #84: the largest payload a frame may carry at the current cap. The cap covers the 78-byte frame
+    // header, so this is `cap - frame_body_header_size`, NOT the cap itself.
+    [[nodiscard]] std::uint32_t max_payload_bytes() const noexcept {
+        return max_payload_for_body_cap(max_frame_body_);
+    }
+    // #84: likewise for a frame that SecureTransport seals: its payload adds an 8-byte sequence prefix
+    // and the AEAD tag. Pass the session cipher's Aead::tag_size() (16 for both bundled adapters).
+    [[nodiscard]] std::uint32_t max_sealed_payload_bytes(std::uint32_t tag_size) const noexcept {
+        return max_sealed_payload_for_body_cap(max_frame_body_, tag_size);
+    }
 
     // ADR-053: the HELLO version this transport speaks (default `hello_version`). Call before start().
     // Exists so a rolling upgrade (and the N / N-1 / N-2 tests) can run nodes at different versions.
@@ -2012,7 +2023,7 @@ private:
     NodeId self_;
     std::uint64_t bind_addr_;
     std::uint16_t bind_port_;
-    std::uint32_t max_frame_body_ = max_frame_body;
+    std::uint32_t max_frame_body_ = net::max_frame_body;
     std::uint32_t max_pending_in_ = 1024;
     std::uint32_t max_pending_per_ip_ = 64;
     std::uint64_t max_outbound_data_bytes_ = 64ull << 20;      // C1: per-peer data backlog cap
