@@ -58,6 +58,7 @@ enum class MembershipEventKind : std::uint8_t {
                          // the view (tombstoned) and re-admission is refused until a later snapshot admits it
     Suspended = 7,       // ADR-071: the node announced a graceful suspend; a bounded lease is held for it
     Resumed = 8,         // ADR-071: a suspended node spoke again (higher incarnation); lease cleared
+    LeaseBudgetExceeded = 9,  // ADR-082 D2: a member's granted silent-lease time in the budget window passed the alarm fraction (once per window)
 };
 
 // Distinct, observable reason a peer was refused (never conflated with a timeout / cluster mismatch).

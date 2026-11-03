@@ -598,6 +598,11 @@ public:
         // ADR-071: receiver-side policy for peers' graceful-suspend announcements (lease cap, table cap)
         // and the default lease this node announces for itself.
         MobileProfile mobile{};
+        // ADR-082 D1: a second-hand claim about a verified member may not be more than this above the highest incarnation the
+        // member itself last sent us (a liar cannot poison its number), and a second-hand Alive clears OUR suspicion of it only
+        // while it has credit (reset by any frame from the member itself). 0 credit = strict.
+        std::uint64_t max_gossip_incarnation_ahead = 4;
+        std::uint8_t gossip_refute_credit = 1;
         // Test-only CONTROLS for ADR-071 "Red-team of the merged changes (#47)": each restores one pre-fix
         // behaviour so a test can show the old failure. Never set in production code.
         struct TestFaults {
@@ -605,6 +610,7 @@ public:
             bool keep_lease_on_tombstone = false;        // M3: a tombstone / eviction leaves the lease behind
             bool join_keeps_lease = false;               // M3: a Join does not clear the lease
             bool defer_eviction_while_suspended = false; // N2: no eviction check while this node is suspended
+            bool unauthenticated_gossip_subjects = false; // ADR-082 N4: second-hand claims about a member are trusted as before
         } test_faults{};
     };
 
@@ -838,6 +844,13 @@ public:
     [[nodiscard]] std::uint64_t network_changes() const noexcept { return network_changes_; }
     // Gossiped Suspect/Dead accusations ignored because we hold the accused's own lease (ADR-071 C1).
     [[nodiscard]] std::uint64_t suspicions_suppressed() const noexcept { return suspicions_suppressed_; }
+    // ADR-082: second-hand claims dropped for jumping too far above what the member itself said / second-hand refutations
+    // refused for lack of credit / lease alarms raised / leases granted.
+    [[nodiscard]] std::uint64_t gossip_subject_rejected() const noexcept { return gossip_subject_rejected_; }
+    [[nodiscard]] std::uint64_t gossip_refutes_refused() const noexcept { return gossip_refutes_refused_; }
+    [[nodiscard]] std::uint64_t lease_alarms() const noexcept { return lease_alarms_; }
+    [[nodiscard]] std::uint64_t lease_grants() const noexcept { return suspended_leases_.grants(); }
+    [[nodiscard]] std::int64_t lease_ns_granted_in_window(NodeId n) const { return suspended_leases_.granted_in_window(n.value); }
 
     // --- Join (021 §1/§3). Admit `joiner` iff its presented cluster id matches (accidental-merge
     // guard) — the in-process form of the join gate the 020 AUTHENTICATE step precedes. Returns true
@@ -1018,6 +1031,8 @@ private:
         std::uint8_t wire_version = 0;   // ADR-053: last wire version heard directly (0 = never)
         std::uint8_t reported = 0;       // last state shown to subscribers: 0 none, 1 live, 2 Dead, 3 Left
         std::uint64_t lease_expired_inc = 0;  // ADR-071: incarnation a suspend lease lapsed at (0 = never)
+        std::uint64_t confirmed_inc = 0;      // ADR-082: highest incarnation the member itself sent us (first-hand)
+        std::uint8_t refute_credit = 0;       // ADR-082: second-hand refutations that may still clear our suspicion of it
     };
 
     enum class Phase : std::uint8_t { Direct, Indirect };
@@ -1442,8 +1457,13 @@ private:
         const bool was_leased = suspended_leases_.contains(m.from.value);
         const std::int64_t asked = static_cast<std::int64_t>(
             std::min<std::uint64_t>(m.seq, static_cast<std::uint64_t>(cfg_.mobile.max_lease_ns)));
-        if (!suspended_leases_.grant(m.from.value, m.from_incarnation, asked, reason, now, cfg_.mobile))
-            return;  // zero lease or table full: treat the silence like any other
+        bool alarm = false;
+        if (!suspended_leases_.grant(m.from.value, m.from_incarnation, asked, reason, now, cfg_.mobile, &alarm))
+            return;  // zero lease, table full or budget spent: treat the silence like any other
+        if (alarm) {  // ADR-082 D2: too much of the window spent silent under leases; tell the application, change nothing
+            ++lease_alarms_;
+            push_event(MembershipEventKind::LeaseBudgetExceeded, m.from, cur);
+        }
         if (cur.status == MemberStatus::Suspect) {  // we had started to doubt it; its own word outranks that
             cur.status = MemberStatus::Alive;
             cur.verify_pending = false;
@@ -1458,6 +1478,7 @@ private:
     // only if a lease was held and the member is still live and admitted (never for a tombstone).
     void clear_lease_on_proof_of_life(NodeId n) {
         if (!suspended_leases_.contains(n.value)) return;
+        suspended_leases_.refund_unused(n.value, now_ns());
         suspended_leases_.clear(n.value);
         const auto it = members_.find(n.value);
         if (it != members_.end() && !is_tomb(it->second.status)) push_event(MembershipEventKind::Resumed, n, it->second);
@@ -1467,6 +1488,7 @@ private:
     void on_leased_peer_spoke(const ControlMsg& m) {
         const SuspendLeases::Entry* e = suspended_leases_.find(m.from.value);
         if (!e || m.from_incarnation <= e->incarnation) return;  // pre-suspend straggler: keep the lease
+        suspended_leases_.refund_unused(m.from.value, now_ns());
         suspended_leases_.clear(m.from.value);
         if (const auto it = members_.find(m.from.value); it != members_.end())
             push_event(MembershipEventKind::Resumed, m.from, it->second);
@@ -1475,6 +1497,7 @@ private:
     // Lapsed leases: the member never resumed within the bound. Hand it to the ordinary failure path:
     // Suspect now (a full suspicion window to refute), Dead if it stays silent. No zombie (ADR-071 C2).
     void expire_suspend_leases(std::int64_t now) {
+        suspended_leases_.prune_budgets(now, cfg_.mobile);
         if (suspended_leases_.size() == 0) return;
         for (const std::uint64_t id : suspended_leases_.expire(now)) {
             const auto it = members_.find(id);
@@ -1709,6 +1732,8 @@ private:
             m.incarnation = inc;
             m.status = st;
             m.verified = first_hand;
+            m.confirmed_inc = (src == Src::Direct || src == Src::Join) ? inc : 0;  // 0 = never heard first-hand: no jump bound
+            m.refute_credit = cfg_.gossip_refute_credit;
             m.first_seen_ns = now;
             set_tx(m, m.verified ? piggyback_count() : 0);  // do not re-gossip unverified ghosts
             if (is_tomb(st)) {
@@ -1730,6 +1755,21 @@ private:
         Member& cur = it->second;
         const bool was_live = !is_tomb(cur.status);
         const bool was_verified = cur.verified;
+        const bool second_hand = (src == Src::Gossip || src == Src::JoinSnapshot);
+        const bool d1 = !cfg_.test_faults.unauthenticated_gossip_subjects;  // ADR-082 D1 (the fault restores N4)
+        if (d1 && second_hand && cur.confirmed_inc != 0 && st != MemberStatus::Left &&
+            inc > cur.confirmed_inc + cfg_.max_gossip_incarnation_ahead) {
+            ++gossip_subject_rejected_;  // D1a: a third party may not move the member's number far from its own word
+            return;
+        }
+        if (src == Src::Direct && inc >= cur.confirmed_inc) {  // D1b/D1c: the member's own word
+            cur.confirmed_inc = inc;
+            cur.refute_credit = cfg_.gossip_refute_credit;
+            if (d1 && st == MemberStatus::Alive && was_live && cur.incarnation > inc) {
+                cur.incarnation = inc;  // a second-hand claim had inflated it; the member is the authority on its own number
+                set_tx(cur, piggyback_count());
+            }
+        }
         if (src == Src::Direct || src == Src::Join ||
             (src == Src::Local && st == MemberStatus::Alive))
             cur.verified = true;
@@ -1740,8 +1780,20 @@ private:
                 if (src == Src::JoinSnapshot && cur.status == MemberStatus::Dead && inc >= cur.incarnation) {
                     next = MemberStatus::Suspect;  // the seed says alive: re-test, don't trust blindly
                     take = true;
+                } else if (d1 && second_hand && src == Src::Gossip && cur.status == MemberStatus::Dead &&
+                           inc > cur.incarnation) {
+                    next = MemberStatus::Suspect;  // D1d: a third party cannot resurrect it; verify it ourselves
+                    take = true;
                 } else {
                     take = inc > cur.incarnation;  // a tombstone needs STRICTLY higher (R3)
+                    if (d1 && take && second_hand && cur.status == MemberStatus::Suspect) {
+                        if (cur.refute_credit == 0) {  // D1c: it must speak to us itself before another hearsay refutation counts
+                            ++gossip_refutes_refused_;
+                            take = false;
+                        } else {
+                            --cur.refute_credit;
+                        }
+                    }
                 }
                 break;
             case MemberStatus::Suspect:
@@ -2117,6 +2169,9 @@ private:
     bool suspended_self_ = false;             // this node called suspend() and has not resume()d
     std::uint64_t network_changes_ = 0;
     std::uint64_t suspicions_suppressed_ = 0;
+    std::uint64_t gossip_subject_rejected_ = 0;
+    std::uint64_t gossip_refutes_refused_ = 0;
+    std::uint64_t lease_alarms_ = 0;
 
     RevocationPullFn revocation_pull_;
     RevocationMergeFn revocation_merge_;
