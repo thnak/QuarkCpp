@@ -1,5 +1,7 @@
-// Issue #69 (measurement for #56): does the pinned responder's close time reveal whether a Msg1 was built for its right
-// static key? REPORT ONLY: prints a table and exits 0 whether or not the sets differ. It changes no handshake code.
+// Issue #69 measured, issue #56 / ADR-083 fixes: does the pinned responder's close time reveal whether a Msg1 was built for
+// its right static key? With --gate against the LOCAL responder: exit 1 if the sets are distinguishable (KS p <= 0.01).
+// Against a remote responder (--host/--port) it only reports. Controls: --inject-delay-us (a 1 ms oracle must be detected)
+// and --floor-off (the refusal floor disabled = the pre-fix behaviour, which must be detected as distinguishable).
 //   set A  a REAL Msg1 built for the responder's static key, from a static key the responder has NOT admitted
 //   set B  random bytes of the same length inside a well-formed Authenticate frame (a raw-random buffer would die in the
 //          frame decoder, a different code path, and would make any difference meaningless)
@@ -44,6 +46,9 @@ struct Args {
     std::uint16_t port = 0;
     std::string responder_pub_hex;
     long inject_us = 0;
+    bool floor_off = false;
+    bool gate = false;
+    long floor_us = -1;
 };
 
 bool parse_hex32(const std::string& s, Ed25519PublicKey& out) {
@@ -193,6 +198,9 @@ int main(int argc, char** argv) {
         else if (k == "--port") args.port = static_cast<std::uint16_t>(std::atoi(next().c_str()));
         else if (k == "--n") args.n = static_cast<std::size_t>(std::atoll(next().c_str()));
         else if (k == "--responder-pub") args.responder_pub_hex = next();
+        else if (k == "--floor-off") args.floor_off = true;
+        else if (k == "--gate") args.gate = true;
+        else if (k == "--floor-us") args.floor_us = std::atol(next().c_str());
         else if (k == "--inject-delay-us") args.inject_us = std::atol(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return 2; }
     }
@@ -212,6 +220,8 @@ int main(int argc, char** argv) {
         resp_pub = local_responder->pub;
         resp_id = local_responder->id;
         stack = std::make_unique<Stack>(*local_responder, true);
+        if (args.floor_off) stack->tcp.set_anonymous_refusal_floor_ns(0);
+        else if (args.floor_us >= 0) stack->tcp.set_anonymous_refusal_floor_ns(static_cast<std::uint64_t>(args.floor_us) * 1000u);
         if (!stack->start()) { std::fprintf(stderr, "responder failed to start\n"); return 1; }
         port = stack->tcp.listen_port();
     } else {
@@ -242,5 +252,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::printf("%s (p %s 0.01)\n", p <= 0.01 ? "DISTINGUISHABLE" : "not distinguishable", p <= 0.01 ? "<=" : ">");
-    return 0;
+    if (args.port != 0) return 0;  // remote: report only
+    std::printf("  floor overruns: %llu\n", static_cast<unsigned long long>(stack->tcp.anonymous_refusal_floor_overruns()));
+    if (args.floor_off) {  // CONTROL: the pre-fix behaviour must be seen
+        if (p <= 0.01) { std::printf("CONTROL (floor off) detected: the oracle exists without the floor\n"); return 0; }
+        std::fprintf(stderr, "CONTROL (floor off) NOT detected (p=%g): the measurement cannot see the original oracle\n", p);
+        return 1;
+    }
+    return (args.gate && p <= 0.01) ? 1 : 0;  // --gate: the acceptance test of #56 (not yet met)
 }
