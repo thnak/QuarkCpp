@@ -27,9 +27,11 @@ struct Ping {
     int n;
 };
 
-// 20ms IdleTimeout — with a 1ms wheel tick (set below) this is 20 ticks, evicting promptly without
-// racing the test's own message delivery.
-struct Sleepy : Actor<Sleepy, Sequential, IdleTimeout<20>> {
+// 1s IdleTimeout — with a 1ms wheel tick (set below) this is 1000 ticks. Phase A still completes in
+// ~1s, but the window after the reactivating message is wide enough that a preempted/slow CI runner
+// cannot evict the actor again before the test observes it active (the old 20ms window flaked on
+// Windows arm64: `went_dormant()` is literally `state() == Dormant`, not a sticky flag).
+struct Sleepy : Actor<Sleepy, Sequential, IdleTimeout<1000>> {
     static constexpr std::string_view quark_type_name = "quark.test.engine_idle_timeout_eviction_test.Sleepy";
     using protocol = Protocol<Ping>;
     std::atomic<int> handled{0};
@@ -91,17 +93,17 @@ int main() {
     // ---- Phase A: a message delivers normally, then the actor idles out to Dormant ---------------
     ref.tell(Ping{1});
     check(wait_until([&] { return actor.handled.load(std::memory_order_acquire) >= 1; },
-                     std::chrono::seconds(2)),
+                     std::chrono::seconds(5)),
           "first message delivered", ok);
 
-    check(wait_until([&] { return act.went_dormant(); }, std::chrono::seconds(2)),
-          "idle-timeout eviction fires within 2s of the actor going idle (011/ADR-028 Phase 2)", ok);
+    check(wait_until([&] { return act.went_dormant(); }, std::chrono::seconds(5)),
+          "idle-timeout eviction fires within 5s of the actor going idle (011/ADR-028 Phase 2)", ok);
     check(act.state() == ExecState::Dormant, "activation is Dormant after eviction", ok);
 
     // ---- Phase B: reactivation — a message posted to the now-Dormant actor is NOT lost ------------
     ref.tell(Ping{2});
     check(wait_until([&] { return actor.handled.load(std::memory_order_acquire) >= 3; },
-                     std::chrono::seconds(2)),
+                     std::chrono::seconds(5)),
           "the post-eviction message reactivates the actor and is delivered (no loss)", ok);
     check(!act.went_dormant(), "no longer Dormant once the reactivating message is drained", ok);
 
